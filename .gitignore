@@ -36,3 +36,8 @@ circuits/*/*/*.bin.in
 **/*/output.data*
 proof-builder-rpc/*.ckpt
 node/tla/states/
+
+local_docs/
+scripts/testnet/
+scripts/devnet/
+*.DS_Store

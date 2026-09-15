@@ -24,9 +24,8 @@ use prometheus_client::registry::Registry;
 use secp256k1::Secp256k1;
 use store::localdb::{GraphRuntimeUpdate, StorageProcessor};
 use store::{
-    BridgeOutGlobalStats, GoatTxProcessingStatus, GoatTxRecord, GoatTxType, Graph, GraphStatus,
-    GraphStatusSource, Instance, InstanceBridgeInStatus, InstanceBridgeOutStatus, Node,
-    UInt64Array3, create_local_db,
+    BridgeOutGlobalStats, Graph, GraphStatus, GraphStatusSource, Instance, InstanceBridgeInStatus,
+    Node, SwapEscrow, SwapEscrowStatus, UInt64Array3, create_local_db,
 };
 use tokio::signal;
 use tokio_util::sync::CancellationToken;
@@ -55,7 +54,7 @@ struct Opts {
 #[derive(Debug)]
 struct MockSeedSummary {
     bridge_in_instance_id: Uuid,
-    bridge_out_instance_id: Uuid,
+    swap_escrow_hash: String,
     ready_graph_id: Uuid,
     challenge_graph_id: Uuid,
     operator_pubkey: String,
@@ -147,7 +146,6 @@ fn seeded_bridge_in_instance(
     let utxo = vec![Utxo { txid: [utxo_byte; 32], vout: 0, amount_sats: amount as u64 }];
     Ok(Instance {
         instance_id,
-        is_bridge_in: true,
         network: Network::Testnet4.to_string(),
         from_addr: get_rand_btc_address_p2wpkh(Network::Testnet4),
         to_addr: mock_goat_addr(0x31),
@@ -161,7 +159,6 @@ fn seeded_bridge_in_instance(
         user_refund_addr: get_rand_btc_address_p2wpkh(Network::Testnet4),
         pegin_data_tx_hash: mock_tx_hash(0xa2),
         post_pegin_txhash: Some(mock_tx_hash(0xa3)),
-        bridge_out_amount: "0".to_string(),
         status_updated_at: now - 120,
         created_at: now - 3_600,
         updated_at: now,
@@ -169,21 +166,20 @@ fn seeded_bridge_in_instance(
     })
 }
 
-fn seeded_bridge_out_instance(instance_id: Uuid, now: i64, escrow_hash: String) -> Instance {
-    Instance {
-        instance_id,
-        is_bridge_in: false,
+fn seeded_swap_escrow(escrow_hash: String, now: i64) -> SwapEscrow {
+    SwapEscrow {
+        escrow_hash,
         network: Network::Testnet4.to_string(),
-        from_addr: mock_goat_addr(0x41),
-        to_addr: get_rand_btc_address_p2wpkh(Network::Testnet4),
-        amount: 0,
-        input_utxos: "[]".to_string(),
-        status: InstanceBridgeOutStatus::Initialize.to_string(),
-        goat_tx_hash: mock_tx_hash(0xb1),
-        goat_tx_height: 123_500,
-        escrow_hash: Some(escrow_hash),
-        bridge_out_amount: "25000000".to_string(),
-        bridge_out_lock_time: now + 3_600,
+        status: SwapEscrowStatus::Initialize.to_string(),
+        offerer_addr: mock_goat_addr(0x41),
+        claimer_addr: mock_goat_addr(0x42),
+        btc_addr: get_rand_btc_address_p2wpkh(Network::Testnet4),
+        token: mock_goat_addr(0x43),
+        amount: "25000000".to_string(),
+        refund_deadline: now + 3_600,
+        escrow_data: Some(hex::encode([0xe1; 64])),
+        init_tx_hash: mock_tx_hash(0xb1),
+        init_tx_height: 123_500,
         status_updated_at: now - 60,
         created_at: now - 900,
         updated_at: now,
@@ -281,7 +277,6 @@ async fn seed_mock_data(
     let graph_from_addr = mock_goat_addr(0x51);
     let bridge_in_instance_id = mock_uuid("11111111-1111-1111-1111-111111111111");
     let bridge_in_pending_id = mock_uuid("11111111-1111-1111-1111-111111111112");
-    let bridge_out_instance_id = mock_uuid("22222222-2222-2222-2222-222222222222");
     let ready_graph_id = mock_uuid("33333333-3333-3333-3333-333333333333");
     let challenge_graph_id = mock_uuid("33333333-3333-3333-3333-333333333334");
     let escrow_hash = mock_tx_hash(0xc1);
@@ -309,7 +304,7 @@ async fn seed_mock_data(
         now,
         0x12,
     )?;
-    let bridge_out = seeded_bridge_out_instance(bridge_out_instance_id, now, escrow_hash.clone());
+    let swap_escrow = seeded_swap_escrow(escrow_hash.clone(), now);
 
     let none_sub_status = r#"{"watchtower_challenge_status":[],"verifier_challenge_status":[],"disprove_type":null,"disprove_index":-1}"#.to_string();
     let challenge_sub_status = r#"{"watchtower_challenge_status":[true,false],"verifier_challenge_status":["None"],"disprove_type":null,"disprove_index":-1}"#.to_string();
@@ -340,24 +335,13 @@ async fn seed_mock_data(
     for node in [current_node, committee_node, operator_node, watchtower_node] {
         tx.upsert_node(&node).await?;
     }
-    for instance in [bridge_in_success, bridge_in_pending, bridge_out] {
+    for instance in [bridge_in_success, bridge_in_pending] {
         tx.upsert_instance(&instance).await?;
     }
+    tx.insert_swap_escrow_if_absent(&swap_escrow).await?;
     for graph in [ready_graph, challenge_graph] {
         seed_graph_runtime(&mut tx, &graph).await?;
     }
-    tx.upsert_goat_tx_record(&GoatTxRecord {
-        instance_id: bridge_out_instance_id,
-        graph_id: Uuid::nil(),
-        tx_type: GoatTxType::SwapInitialize.to_string(),
-        tx_hash: mock_tx_hash(0xe1),
-        height: 123_501,
-        is_local: true,
-        processing_status: GoatTxProcessingStatus::Processed.to_string(),
-        extra: Some(escrow_hash),
-        created_at: now,
-    })
-    .await?;
     tx.upsert_bridge_out_global_stats(&BridgeOutGlobalStats {
         id: 1,
         initial_txn: 1,
@@ -374,7 +358,7 @@ async fn seed_mock_data(
 
     Ok(MockSeedSummary {
         bridge_in_instance_id,
-        bridge_out_instance_id,
+        swap_escrow_hash: escrow_hash,
         ready_graph_id,
         challenge_graph_id,
         operator_pubkey,
@@ -417,7 +401,7 @@ async fn main() -> Result<()> {
     println!("Gateway contract: {MOCK_GATEWAY_CONTRACT}");
     println!("Swap contract: {MOCK_SWAP_CONTRACT}");
     println!("Bridge-in instance: {}", seed_summary.bridge_in_instance_id);
-    println!("Bridge-out instance: {}", seed_summary.bridge_out_instance_id);
+    println!("Swap escrow: {}", seed_summary.swap_escrow_hash);
     println!("Ready graph: {}", seed_summary.ready_graph_id);
     println!("Challenge graph: {}", seed_summary.challenge_graph_id);
     println!("Operator pubkey: {}", seed_summary.operator_pubkey);

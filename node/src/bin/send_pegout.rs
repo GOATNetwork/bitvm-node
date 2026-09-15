@@ -17,9 +17,10 @@
 use anyhow::{Context, Result, bail};
 use bitvm_noded::env::get_bitvm_key;
 use bitvm_noded::rpc_service::auth::{
-    AUTH_SIGNATURE_HEADER, AUTH_TIMESTAMP_HEADER, sign_request_auth,
+    AUTH_NONCE_HEADER, AUTH_SIGNATURE_HEADER, AUTH_TIMESTAMP_HEADER, sign_request_auth,
 };
 use clap::{Parser, Subcommand};
+use http::Method;
 use serde::{Deserialize, Serialize};
 use tokio::time::{Duration, sleep};
 use uuid::Uuid;
@@ -125,18 +126,23 @@ async fn call_pegout(
     dry_run: bool,
     skip_locked: bool,
 ) -> Result<PegoutApiResponse> {
-    let url = format!("{}/v1/graphs/pegout", base_url.trim_end_matches('/'));
+    let request_target = "/v1/graphs/pegout";
+    let url = format!("{}{}", base_url.trim_end_matches('/'), request_target);
     let body =
         PegoutApiRequest { graph_id: graph_id.map(|id| id.to_string()), dry_run, skip_locked };
+    let body = serde_json::to_vec(&body).context("failed to serialize pegout API request")?;
 
     let keypair = get_bitvm_key().context("failed to load BITVM_SECRET")?;
-    let (timestamp, signature) = sign_request_auth(&keypair);
+    let (timestamp, nonce, signature) =
+        sign_request_auth(&keypair, &Method::POST, request_target, &body);
 
     let resp = client
         .post(&url)
         .header(AUTH_TIMESTAMP_HEADER, &timestamp)
+        .header(AUTH_NONCE_HEADER, &nonce)
         .header(AUTH_SIGNATURE_HEADER, &signature)
-        .json(&body)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body)
         .send()
         .await
         .with_context(|| format!("failed to reach node API at {url}"))?;

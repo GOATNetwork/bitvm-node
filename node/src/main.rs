@@ -21,7 +21,8 @@ use bitvm_noded::utils::{
     self, generate_local_key, save_local_info, set_node_external_socket_addr_env,
 };
 use bitvm_noded::{
-    rpc_service, run_maintenance_tasks, run_sequencer_set_hash_monitor_task, run_watch_event_task,
+    rpc_service, run_kickoff_scan_task, run_maintenance_tasks, run_sequencer_set_hash_monitor_task,
+    run_watch_event_task,
 };
 
 use anyhow::Result;
@@ -53,7 +54,14 @@ struct Opts {
     #[arg(long)]
     bootnodes: Vec<String>,
 
-    /// Metric endpoint path.
+    /// Dedicated Prometheus metrics listener address, e.g. `10.0.0.7:9108`.
+    ///
+    /// Unset disables the metrics listener entirely. Bind a private address and a
+    /// port unique to this process; the business RPC never serves metrics.
+    #[arg(long)]
+    metrics_addr: Option<String>,
+
+    /// Metric endpoint path served by the dedicated metrics listener.
     #[arg(long, default_value = "/metrics")]
     metrics_path: String,
 
@@ -143,6 +151,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
         )
         .into());
     }
+    // Bind the metrics listener before any background task starts, so an invalid path
+    // or an unavailable metrics port aborts startup with an explicit error.
+    let metrics_listener = match opt.metrics_addr.as_deref() {
+        Some(metrics_addr) => {
+            rpc_service::validate_metrics_path(&opt.metrics_path)?;
+            Some(rpc_service::bind_metrics_listener(metrics_addr).await?)
+        }
+        None => None,
+    };
+
     let mut metric_registry = Registry::default();
 
     // Create cancellation token for graceful shutdown
@@ -203,19 +221,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
         bitcoin_network = ?get_network(),
         version = env!("CARGO_PKG_VERSION"),
         rpc_addr = %opt.rpc_addr,
+        metrics_addr = opt.metrics_addr.as_deref().unwrap_or("disabled"),
         min_required_verifier,
         "node initialization completed"
     );
 
-    let actor_clone1 = actor.clone();
     let actor_clone2 = actor.clone();
     let actor_clone3 = actor.clone();
-    let local_db_clone1 = local_db.clone();
     let local_db_clone2 = local_db.clone();
     let local_db_clone3 = local_db.clone();
     let local_db_clone4 = local_db.clone();
+    let local_db_clone5 = local_db.clone();
     let opt_rpc_addr = opt.rpc_addr.clone();
-    let peer_id_string_clone = peer_id_string.clone();
 
     tracing::debug!("RPC service listening on {}", &opt.rpc_addr);
     if actor == Actor::Operator {
@@ -226,21 +243,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
     save_local_info(&local_db).await;
     metrics_state.mark_startup_ready();
 
+    // Both listeners share the same application and metrics state.
+    let app_state = rpc_service::AppState::create_arc_app_state(
+        local_db.clone(),
+        actor.clone(),
+        peer_id_string.clone(),
+        metrics_state.clone(),
+    )
+    .await?;
+
     // Spawn RPC service task with cancellation support
     let cancel_token_clone = cancellation_token.clone();
     let rpc_task_span = node_span.clone();
-    let rpc_metrics = metrics_state.clone();
+    let rpc_app_state = app_state.clone();
     task_handles.push(tokio::spawn(
         async move {
-            match rpc_service::serve(
-                opt_rpc_addr,
-                local_db_clone1,
-                actor_clone1,
-                peer_id_string_clone,
-                rpc_metrics,
-                cancel_token_clone,
-            )
-            .await
+            match rpc_service::serve_with_app_state(opt_rpc_addr, rpc_app_state, cancel_token_clone)
+                .await
             {
                 Ok(tag) => Ok(tag),
                 Err(error) => {
@@ -260,6 +279,41 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .instrument(rpc_task_span),
     ));
     task_names.push("rpc_service");
+
+    if let Some(listener) = metrics_listener {
+        let cancel_token_clone = cancellation_token.clone();
+        let metrics_task_span = node_span.clone();
+        let metrics_app_state = app_state.clone();
+        let metrics_path = opt.metrics_path.clone();
+        task_handles.push(tokio::spawn(
+            async move {
+                match rpc_service::serve_metrics(
+                    listener,
+                    metrics_path,
+                    metrics_app_state,
+                    cancel_token_clone,
+                )
+                .await
+                {
+                    Ok(tag) => Ok(tag),
+                    Err(error) => {
+                        tracing::error!(
+                            event = "core_task_wrapper_error",
+                            service = "bitvm-noded",
+                            task = "metrics_service",
+                            outcome = "failed",
+                            error_class = "metrics",
+                            error = %error,
+                            "metrics service task exited with an error"
+                        );
+                        Err("metrics_error".to_string())
+                    }
+                }
+            }
+            .instrument(metrics_task_span),
+        ));
+        task_names.push("metrics_service");
+    }
     // if actor == Actor::Committee || actor == Actor::Operator {
     let cancel_token_clone = cancellation_token.clone();
     let event_watcher_task_span = node_span.clone();
@@ -368,6 +422,44 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .instrument(maintenance_task_span),
     ));
     task_names.push("maintenance");
+
+    let cancel_token_clone = cancellation_token.clone();
+    let kickoff_scan_span = node_span.clone();
+    let kickoff_scan_metrics = metrics_state.clone();
+    task_handles.push(tokio::spawn(
+        async move {
+            let goat_client =
+                Arc::new(GOATClient::new(goat_config_from_env().await, get_goat_network()));
+            let btc_client =
+                Arc::new(BTCClient::new(get_network(), get_btc_url_from_env().as_deref()));
+            match run_kickoff_scan_task(
+                local_db_clone5,
+                btc_client,
+                goat_client,
+                10,
+                cancel_token_clone,
+                kickoff_scan_metrics,
+            )
+            .await
+            {
+                Ok(tag) => Ok(tag),
+                Err(error) => {
+                    tracing::error!(
+                        event = "core_task_wrapper_error",
+                        service = "bitvm-noded",
+                        task = "kickoff_scan",
+                        outcome = "failed",
+                        error_class = "maintenance",
+                        error = %error,
+                        "kickoff scan task exited with an error"
+                    );
+                    Err("kickoff_scan_error".to_string())
+                }
+            }
+        }
+        .instrument(kickoff_scan_span),
+    ));
+    task_names.push("kickoff_scan");
 
     let swarm_actor = actor.clone();
     let cancel_token_clone = cancellation_token.clone();

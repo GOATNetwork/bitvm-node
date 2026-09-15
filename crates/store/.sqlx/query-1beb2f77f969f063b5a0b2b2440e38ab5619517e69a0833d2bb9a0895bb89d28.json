@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE swap_escrow SET status = ?, status_updated_at = ?, updated_at = ? WHERE status = ? AND refund_deadline > 0 AND refund_deadline < ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 5
+    },
+    "nullable": []
+  },
+  "hash": "1beb2f77f969f063b5a0b2b2440e38ab5619517e69a0833d2bb9a0895bb89d28"
+}

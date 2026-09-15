@@ -12,7 +12,7 @@ use bitcoin::{
 };
 use bitcoin_script::script;
 use bitvm_gc::babe_adapter::{
-    BABE_M_CC, BabeProverState, CACSetupPackage, TxAssertWitness, assert_wots_message,
+    BABE_M_CC, BabeProverState, CACSetupPackage, Seed, TxAssertWitness, assert_wots_message,
     build_assert_witness, build_setup_package, derive_finalized_indices, extract_gc_circuit_data,
     open_and_solder, recover_operator_proof_from_assert_witness, verify_setup,
 };
@@ -82,7 +82,7 @@ static MOCK_FIXTURE: OnceLock<std::result::Result<MockProofGcFixture, String>> =
 struct MockProofGcFixture {
     version: u32,
     setup_package: CACSetupPackage,
-    opened: Vec<(usize, u64)>,
+    opened: Vec<(usize, Seed)>,
     prover_state: BabeProverState,
     gc_data: BitvmGcCircuitData,
     proof_bytes: Vec<u8>,
@@ -554,13 +554,11 @@ fn committee_pre_sign_graph(graph: &mut BitvmGcGraph, keys: &TestKeys) -> Result
 }
 
 fn committee_sign_pegin(graph: &BitvmGcGraph, keys: &TestKeys) -> Result<Transaction> {
-    let parameters_hash = graph.parameters.instance_parameters.parameters_hash()?;
-    let instance_id = graph.parameters.instance_parameters.instance_id;
     let mut pub_nonces = Vec::with_capacity(keys.committee.len());
     let mut sec_nonces = Vec::with_capacity(keys.committee.len());
     for keypair in &keys.committee {
         let (sec_nonce, pub_nonce, _) = CommitteeMasterKey::new(*keypair)
-            .nonce_for_instance_job_with_keypair(instance_id, parameters_hash, *keypair);
+            .nonce_for_instance_job_with_keypair(&graph.parameters.instance_parameters, *keypair)?;
         pub_nonces.push(pub_nonce);
         sec_nonces.push(sec_nonce);
     }

@@ -18,7 +18,7 @@ use std::time::Duration;
 use tokio::select;
 use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use zeroize::Zeroizing;
 
 pub struct BitvmSwarmWrapper(pub Swarm<AllBehaviours>);
@@ -261,7 +261,19 @@ impl BitvmNetworkManager {
                         }
                         SwarmEvent::Behaviour(AllBehavioursEvent::Gossipsub(gossipsub::Event::Subscribed { peer_id, topic})) => {
                             debug!("subscribing: {:?}, {:?}", peer_id, topic);
-                            let topic_limb = split_topic_name(topic.as_str());//topic.as_str().split_once("/topic/").expect("should be $proto/topic/$actor");
+                            let topic_limb = match split_topic_name(topic.as_str()) {
+                                Ok(topic_limb) => topic_limb,
+                                Err(error) => {
+                                    warn!(
+                                        %peer_id,
+                                        topic = %topic,
+                                        %error,
+                                        "Disconnecting peer subscribed to malformed topic"
+                                    );
+                                    let _ = self.swarm.disconnect_peer_id(peer_id);
+                                    continue;
+                                }
+                            };
                             if topic_limb.0 != env::get_proto_base() {
                                continue;
                             }

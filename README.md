@@ -23,23 +23,25 @@ all 8 of those findings have been fixed and verified in the shipped Rust
 code** - see `audit/TLAPlus-20260630.md` for the full report, including what
 each real applied fix looks like.
 
-**CI's `tla-plus` job is expected to be GREEN.** Each bug config (e.g.
-`GraphLifecycle.cfg`) is kept as a **permanent historical record**,
-deliberately still modeling the pre-fix code, and correctly reproducing its
-original counterexample - but that expected failure is only printed as an
-informational reproduction pointer in the job summary, it does not fail the
-job. The only thing that *does* fail the job is a bug config **unexpectedly
-passing**, since that would mean either the spec silently stopped
-demonstrating the bug it's supposed to, or (more alarmingly) the fix's guard
-got removed again. See that job's own comments in
-`.github/workflows/ci.yml` for the full reasoning.
+**CI runs every spec on every pull request** (the `tla-plus` job, in
+parallel with fmt/clippy/test). Each config is listed in the job with a tier
+that says what TLC's result must be:
 
-Concretely: for each bug found, there is a **pair** of configs - one modeling
-the pre-fix code (still models it as buggy on purpose - **expected to
-fail**, a permanent historical record, not a live issue, and does not fail
-CI) and one modeling the fix design (**expected to pass**, and does fail CI
-if it doesn't - for every finding below, that design has since actually been
-applied to the shipped Rust code, not just proven sound in the abstract).
+- **pass** - a fix or baseline design; must verify clean, otherwise the
+  design regressed.
+- **historical** - a bug already fixed in the code. The config deliberately
+  still models the pre-fix code and is kept as a **permanent regression
+  record**: it must still reproduce its counterexample. An unexpected pass
+  means the spec stopped demonstrating the bug, or the fix was reverted.
+- **live** - a known, still-unfixed bug; while its config reproduces the
+  counterexample it blocks merge. Fix the code, then move the row to
+  `historical`.
+
+The outcome is taken from TLC's exit status, so a config on which TLC does
+not finish (parse error, missing file) fails the job in every tier. Each
+finding therefore has a **pair** of configs - one modeling the pre-fix code
+(**expected to fail**) and one modeling the fix design (**expected to
+pass**) - and the table below gives both.
 
 **Setup** (once): install a JRE (11+) and download the official TLA+ tools jar:
 
@@ -74,6 +76,11 @@ java -jar ~/.local/share/tlaplus/tla2tools.jar -config <Spec>.cfg <Spec>.tla
 | `MessageStateRace.tla` | `MessageStateRaceFixed.cfg` | fix design (**applied in `991faaa`**) | pass - guarding the resurrect-to-Pending write against terminal status closes the race |
 | `Take1ChallengeRace.tla` | `Take1ChallengeRace.cfg` | **pre-fix code (historical)** | **fails, by design**: `connector_a` (Take1 vs. Challenge) had *no* margin check anywhere in `validate_timelock_config`; on Regtest the pre-fix shipped value gave a challenger exactly zero reaction margin - fixed in `991faaa` |
 | `Take1ChallengeRace.tla` | `Take1ChallengeRaceFixed.cfg` | fix design (**applied in `991faaa`**) | pass - the missing margin check (mirroring Finding 4's floor) was added, closing the gap |
+| `VerifierKickoffFailOpen.tla` | `VerifierKickoffFailOpen.cfg` | **pre-fix code (historical)** | **fails, by design**: issue #429 - the verifier consumed `KickoffSent` while GOAT SPV lagged the kickoff and never retried, so no Challenge was sent - fixed in #455 |
+| `VerifierKickoffFailOpen.tla` | `VerifierKickoffFailOpenFixed.cfg` | fix design (**applied in #455**) | pass - deferring the message until SPV catches up guarantees the Challenge fires before Take1 |
+| `KickoffScanCoverage.tla` | `KickoffScanCoverage.cfg` | **pre-fix code (historical)** | **fails, by design**: issue #431 - `detect_kickoff` watched only the lowest-nonce graph per operator, so a kickoff on a later graph was never observed - fixed in #451 |
+| `KickoffScanCoverage.tla` | `KickoffScanCoverageResidual.cfg` | **pre-fix code (historical)** | **fails, by design**: #451's chain walk was capped at 32 successors, so a kickoff deeper than that escaped a single round - fixed by removing the cap and running the scan as its own task |
+| `KickoffScanCoverage.tla` | `KickoffScanCoverageFixed.cfg` | fix design (**current code**) | pass - the uncapped walk from the root reaches every graph on the confirmed pre-kickoff chain |
 | `MultiActorRace.tla` | `MultiActorRace.cfg` | verification (no bug; still holds under real shipped values) | pass - also confirms `operator_commit`'s margin against the shared `ConnectorF` UTXO (the `OperatorCommitTimeoutTransaction` path, `ConnectorF` leaf 1's second spender) holds, closing a gap where only a scalar Rust check existed |
 
 Additional standalone tools available in the jar if needed: SANY (parser/type-checker)

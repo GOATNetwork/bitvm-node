@@ -1,6 +1,7 @@
 use crate::action::{
     ConfirmInstance, GOATMessage, GOATMessageContent, MessageDeferReason, PeginConfirmNonce,
-    PeginConfirmPartialSig, PeginRequest, PostReady, push_local_unhandled_messages_with_reason,
+    PeginConfirmNonceConsensus, PeginConfirmPartialSig, PeginRequest, PostReady,
+    push_local_unhandled_messages_with_reason,
 };
 use crate::env::{
     COMMITTEE_INSTANCE_KEYS_DIR, get_bitvm_key, get_committee_instance_key_delete_timelock_blocks,
@@ -9,15 +10,12 @@ use crate::env::{
 };
 use crate::rpc_service::current_time_secs;
 use crate::scheduled_tasks::event_watch_task::generate_instance_from_bridge_in_request_event;
-use crate::scheduled_tasks::get_timestamp_from_contract_data;
-use crate::utils::evm_swap_utils::IEscrowManager::EscrowData;
 use crate::utils::{
     SELF_SENDER, check_bridge_in_uxto_available_or_self_spent, gen_instance_parameters_local,
-    get_committee_endorse_sigs_for_pegin, get_committee_partial_sig_for_instance,
-    get_committee_pub_nonce_for_instance, load_committee_instance_keypair,
-    store_committee_pub_nonce_for_instance, upsert_message,
+    get_committee_agg_nonce_consensus_for_instance, get_committee_endorse_sigs_for_pegin,
+    get_committee_partial_sig_for_instance, get_committee_pub_nonce_for_instance,
+    load_committee_instance_keypair, store_committee_pub_nonce_for_instance, upsert_message,
 };
-use alloy::sol_types::SolType;
 use bitvm_lib::actors::Actor;
 use bitvm_lib::keys::CommitteeMasterKey;
 use bitvm_lib::timelocks::default_connector_z_timelock_blocks;
@@ -33,16 +31,13 @@ use std::str::FromStr;
 use std::sync::{LazyLock, Mutex};
 use std::vec;
 use store::localdb::{InstanceQuery, InstanceUpdate, LocalDB, StorageProcessor};
-use store::{
-    GoatTxProcessingStatus, GoatTxType, Instance, InstanceBridgeInStatus, InstanceBridgeOutStatus,
-};
+use store::{GoatTxProcessingStatus, GoatTxType, Instance, InstanceBridgeInStatus};
 use tracing::{info, warn};
 use uuid::Uuid;
 
 const TASK_KEY_INSTANCE_WINDOW_EXPIRATION: &str = "instance_window_expiration_monitor";
 const TASK_KEY_INSTANCE_EXPIRATION: &str = "instance_expiration_monitor";
 const TASK_KEY_INSTANCE_BTC_TX: &str = "instance_btc_tx_monitor";
-const TASK_KEY_INSTANCE_BRIDGE_OUT: &str = "instance_bridge_out_monitor";
 const TASK_KEY_PEGIN_CONFIRM_RECOVERY: &str = "pegin_confirm_recovery_monitor";
 
 #[derive(Clone, Debug)]
@@ -242,7 +237,6 @@ pub async fn instance_window_expiration_monitor(
         local_db,
         TASK_KEY_INSTANCE_WINDOW_EXPIRATION,
         InstanceQuery::default()
-            .with_is_bridge_in(true)
             .with_status(InstanceBridgeInStatus::UserInited.to_string())
             .with_pegin_request_height_threshold(current_height - window_blocks),
         batch_size,
@@ -303,8 +297,7 @@ pub async fn instance_window_expiration_monitor(
         let mut update = InstanceUpdate::new_with_instance_id(instance.instance_id)
             .with_status(next_status.to_string())
             .with_committees_answers(instance.committees_answers.clone())
-            .with_only_if_status_in(vec![InstanceBridgeInStatus::UserInited.to_string()])
-            .with_only_if_is_bridge_in(true);
+            .with_only_if_status_in(vec![InstanceBridgeInStatus::UserInited.to_string()]);
         if reached_quorum {
             if let Some(btc_txid) = instance.btc_txid.clone() {
                 update = update.with_btc_txid(btc_txid);
@@ -357,7 +350,7 @@ pub async fn instance_expiration_monitor(
         find_one_instance_page(
             local_db,
             TASK_KEY_INSTANCE_EXPIRATION,
-            InstanceQuery::default().with_is_bridge_in(true).with_statuses(vec![
+            InstanceQuery::default().with_statuses(vec![
                 InstanceBridgeInStatus::Presigned.to_string(),
                 InstanceBridgeInStatus::PresignedFailed.to_string(),
             ]),
@@ -394,7 +387,7 @@ pub async fn instance_btc_tx_monitor(
     let instances = find_one_instance_page(
         local_db,
         TASK_KEY_INSTANCE_BTC_TX,
-        InstanceQuery::default().with_is_bridge_in(true).with_statuses(vec![
+        InstanceQuery::default().with_statuses(vec![
             InstanceBridgeInStatus::UserInited.to_string(),
             InstanceBridgeInStatus::CommitteesAnswered.to_string(),
             InstanceBridgeInStatus::Presigned.to_string(),
@@ -527,9 +520,7 @@ pub async fn pegin_confirm_recovery_monitor(
     let instances = find_one_instance_page(
         local_db,
         TASK_KEY_PEGIN_CONFIRM_RECOVERY,
-        InstanceQuery::default()
-            .with_is_bridge_in(true)
-            .with_status(InstanceBridgeInStatus::Presigned.to_string()),
+        InstanceQuery::default().with_status(InstanceBridgeInStatus::Presigned.to_string()),
         get_instance_maintenance_batch_size(),
     )
     .await?;
@@ -607,13 +598,8 @@ pub async fn pegin_confirm_recovery_monitor(
             continue;
         }
 
-        let instance_parameters_hash = instance_parameters.parameters_hash()?;
         let (_, derived_pub_nonce, nonce_sig) = committee_master_key
-            .nonce_for_instance_job_with_keypair(
-                instance_id,
-                instance_parameters_hash,
-                instance_keypair,
-            );
+            .nonce_for_instance_job_with_keypair(&instance_parameters, instance_keypair)?;
         let pub_nonce = match get_committee_pub_nonce_for_instance(
             local_db,
             instance_id,
@@ -664,68 +650,49 @@ pub async fn pegin_confirm_recovery_monitor(
             instance_id = %instance_id,
             "queued persisted PeginConfirm nonce for re-publication"
         );
+        if let Some((_, consensus_hash, signature)) =
+            get_committee_agg_nonce_consensus_for_instance(local_db, instance_id)
+                .await?
+                .into_iter()
+                .find(|(pubkey, _, _)| *pubkey == local_committee_pubkey)
+        {
+            let message = GOATMessage::new(
+                Actor::Committee,
+                GOATMessageContent::PeginConfirmNonceConsensus(PeginConfirmNonceConsensus {
+                    instance_id,
+                    committee_pubkey: local_committee_pubkey,
+                    consensus_hash,
+                    signature,
+                }),
+            );
+            push_local_unhandled_messages_with_reason(
+                local_db,
+                instance_id,
+                &message,
+                0,
+                MessageDeferReason::RecoveryRepublish,
+                "re-publishing persisted PeginConfirm nonce consensus",
+            )
+            .await?;
+            tracing::info!(
+                event = "pegin_confirm_recovery",
+                action = "republish_nonce_consensus",
+                instance_id = %instance_id,
+                "queued persisted PeginConfirm nonce consensus for re-publication"
+            );
+        }
     }
     Ok(())
 }
 
-pub async fn get_bridge_out_deadline<'a>(
-    storage_processor: &mut StorageProcessor<'a>,
-    instance_id: &Uuid,
-) -> anyhow::Result<i64> {
-    let deadline = if let Some(tx_record) = storage_processor
-        .find_graph_goat_tx_record(
-            instance_id,
-            &Uuid::nil(),
-            &GoatTxType::SwapInitialize.to_string(),
-        )
-        .await?
-        && let Some(encode_escrow_data) = tx_record.extra
-        && let Ok(escrow_data_bytes) = hex::decode(&encode_escrow_data)
-        && let Ok(escrow_data) = EscrowData::abi_decode(&escrow_data_bytes)
-    {
-        get_timestamp_from_contract_data(&escrow_data.refundData.0)
-    } else {
-        0
-    };
-    Ok(deadline)
-}
-
-pub async fn instance_bridge_out_monitor(local_db: &LocalDB) -> anyhow::Result<()> {
-    let batch_size = get_instance_maintenance_batch_size();
-    let current_time = current_time_secs();
-    let instances = find_one_instance_page(
-        local_db,
-        TASK_KEY_INSTANCE_BRIDGE_OUT,
-        InstanceQuery::default()
-            .with_is_bridge_in(false)
-            .with_status(InstanceBridgeOutStatus::Initialize.to_string())
-            .with_raw_condition("escrow_hash IS NOT NULL".to_string()),
-        batch_size,
-    )
-    .await?;
+/// Mark still-initializing swap escrows whose refund deadline has passed as
+/// timed out.
+pub async fn swap_escrow_timeout_monitor(local_db: &LocalDB) -> anyhow::Result<()> {
     let mut storage_processor = local_db.acquire().await?;
-    for instance in instances {
-        let mut instance_update = InstanceUpdate::new_with_instance_id(instance.instance_id)
-            .with_only_if_status_in(vec![InstanceBridgeOutStatus::Initialize.to_string()])
-            .with_only_if_is_bridge_in(false);
-        let lock_time = if instance.bridge_out_lock_time == 0 {
-            let lock_time =
-                get_bridge_out_deadline(&mut storage_processor, &instance.instance_id).await?;
-            instance_update = instance_update.with_bridge_out_lock_time(lock_time);
-            lock_time
-        } else {
-            instance.bridge_out_lock_time
-        };
-        if lock_time < current_time && lock_time > 0 {
-            instance_update =
-                instance_update.with_status(InstanceBridgeOutStatus::Timeout.to_string());
-        }
-
-        if instance_update.has_updates() {
-            storage_processor.update_instance(&instance_update).await?;
-        }
+    let timed_out = storage_processor.timeout_expired_swap_escrows(current_time_secs()).await?;
+    if timed_out > 0 {
+        info!("marked {timed_out} swap escrows as timed out");
     }
-
     Ok(())
 }
 

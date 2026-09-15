@@ -176,7 +176,7 @@ fn sort_json_value(value: &mut Value) {
 }
 
 /// Adds one length-prefixed field to the authentication digest.
-fn hash_field(hasher: &mut Sha256, field: &[u8]) {
+pub fn hash_field(hasher: &mut Sha256, field: &[u8]) {
     hasher.update((field.len() as u64).to_be_bytes());
     hasher.update(field);
 }

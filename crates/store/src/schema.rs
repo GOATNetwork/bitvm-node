@@ -219,8 +219,13 @@ pub enum InstanceBridgeInStatus {
     Canceled,   // UserCanceled
 }
 
+/// Lifecycle of a swap-based bridge-out escrow.
+///
+/// `Initialize`, `Claim`, and `Refund` mirror the swap contract events;
+/// `Timeout` is derived locally when the refund deadline passes without an
+/// observed claim. A later on-chain Claim/Refund event still overrides it.
 #[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Display, EnumString)]
-pub enum InstanceBridgeOutStatus {
+pub enum SwapEscrowStatus {
     #[default]
     Initialize,
     Claim,
@@ -228,23 +233,56 @@ pub enum InstanceBridgeOutStatus {
     Refund,
 }
 
+/// Normalize an escrow hash to its canonical storage form:
+/// lowercase, 0x-prefixed 32-byte hex.
+pub fn normalize_escrow_hash(escrow_hash: &str) -> String {
+    let stripped = escrow_hash
+        .strip_prefix("0x")
+        .or_else(|| escrow_hash.strip_prefix("0X"))
+        .unwrap_or(escrow_hash);
+    format!("0x{}", stripped.to_ascii_lowercase())
+}
+
+/// A swap-based bridge-out escrow, keyed by the on-chain escrow hash.
+/// Fully independent of the BitVM `Instance`/`Graph` flow.
+#[derive(Clone, FromRow, Debug, Serialize, Deserialize, Default)]
+pub struct SwapEscrow {
+    pub escrow_hash: String, // 0x-prefixed 32-byte hex, lowercase
+    pub network: String,
+    pub status: String,              // SwapEscrowStatus
+    pub offerer_addr: String,        // goat account funding the escrow
+    pub claimer_addr: String,        // goat account entitled to claim
+    pub btc_addr: String,            // btc address receiving the payout
+    pub token: String,               // escrow token contract address
+    pub amount: String,              // escrow amount, U256 decimal string
+    pub refund_deadline: i64,        // unix secs after which refund is possible
+    pub escrow_data: Option<String>, // hex abi-encoded EscrowData from the Initialize tx
+    pub init_tx_hash: String,        // swap Initialize goat tx
+    pub init_tx_height: i64,
+    pub claim_tx_hash: String,                    // swap Claim goat tx
+    pub claim_btc_txid: Option<SerializableTxid>, // btc payout tx committed by the claim
+    pub refund_tx_hash: String,                   // swap Refund goat tx
+    pub status_updated_at: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
 #[derive(Clone, FromRow, Debug, Serialize, Deserialize, Default)]
 pub struct Instance {
     pub instance_id: Uuid,
-    pub is_bridge_in: bool,
     pub network: String,
     pub from_addr: String,
     pub to_addr: String, // goat deposit addr
     pub amount: i64,
     pub fees: UInt64Array3,
     pub input_utxos: String,  // init should been []
-    pub status: String,       // InstanceBridgeInStatus | InstanceBridgeOutStatus
-    pub goat_tx_hash: String, // bridgeIn:pegin Request tx || bridgeOut goat tx
+    pub status: String,       // InstanceBridgeInStatus
+    pub goat_tx_hash: String, // pegin Request tx
     pub goat_tx_height: i64,
     pub user_xonly_pubkey: ByteArray32,
     pub user_change_addr: String,
     pub user_refund_addr: String,
-    pub btc_txid: Option<SerializableTxid>, // bridgeIn: Pegin Prepare Request tx || bridgeOut Btc tx
+    pub btc_txid: Option<SerializableTxid>, // Pegin Prepare Request tx
     pub btc_height: i64,
     pub pegin_confirm_txid: Option<SerializableTxid>, // btc txid
     pub pegin_cancel_txid: Option<SerializableTxid>,  // btc txid
@@ -252,10 +290,7 @@ pub struct Instance {
     pub committees_answers: IndexMap<String, Vec<u8>>,
     pub pegin_data_tx_hash: String,
     pub parameters: Option<String>,
-    pub escrow_hash: Option<String>,
-    pub bridge_out_lock_time: i64,
     pub post_pegin_txhash: Option<String>,
-    pub bridge_out_amount: String,
     pub status_updated_at: i64,
     pub created_at: i64,
     pub updated_at: i64,
@@ -565,6 +600,9 @@ pub struct P2pOutboxMessage {
     pub next_retry_at: i64,
     pub lease_until: i64,
     pub last_error: Option<String>,
+    pub retry_until: i64,
+    pub retry_interval_secs: i64,
+    pub ack_peer_id: String,
     pub created_at: i64,
 }
 
@@ -659,10 +697,12 @@ pub enum MessageType {
     SolderingProof,
     VerifierGraphParamsEndorsement,
     NonceGeneration,
+    AggNonceConsensus,
     CommitteePresign,
     GraphFinalize,
     EndorseGraph,
     PeginConfirmNonce,
+    PeginConfirmNonceConsensus,
     PeginConfirmPartialSig,
     PostReady,
     KickoffReady,
@@ -728,10 +768,6 @@ pub enum GoatTxType {
     WithdrawHappyPath,
     WithdrawUnhappyPath,
     WithdrawDisproved,
-    // swap
-    SwapInitialize,
-    SwapClaim,
-    SwapRefund,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default, Display, EnumString)]

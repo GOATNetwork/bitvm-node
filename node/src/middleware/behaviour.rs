@@ -47,8 +47,10 @@ pub fn get_topic_name(topic: &str) -> String {
     format!("{}/topic/{}", crate::env::get_proto_base(), topic)
 }
 
-pub fn split_topic_name(topic_hash: &str) -> (&str, &str) {
-    topic_hash.split_once("/topic/").expect("should be $proto/topic/$actor")
+pub fn split_topic_name(topic_hash: &str) -> anyhow::Result<(&str, &str)> {
+    topic_hash
+        .split_once("/topic/")
+        .ok_or_else(|| anyhow::anyhow!("topic should be $proto/topic/$actor"))
 }
 
 #[cfg(test)]
@@ -58,7 +60,8 @@ mod tests {
     fn test_split_topic_name() {
         let topic_short = "hello";
         let topic_full = get_topic_name(topic_short);
-        let topic_split = split_topic_name(&topic_full);
+        let topic_split = split_topic_name(&topic_full).unwrap();
         assert_eq!(topic_split.1, topic_short);
+        assert!(split_topic_name(topic_short).is_err());
     }
 }

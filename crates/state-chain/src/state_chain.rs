@@ -111,6 +111,15 @@ impl StateChainState {
             let cosmos_block: LightBlock = serde_json::from_slice(&block.cosmos_block)
                 .expect("failed to deserialize cosmos block");
             if current_block_hash != self.genesis_evm_block_hash {
+                // Link this block to the one we last applied. Both ends of the
+                // chain are committed on Bitcoin - the genesis hash through the
+                // commit-chain digest, the final block through the signed cosmos
+                // header whose payload names it - so an unforgeable parent chain
+                // between them authenticates every intermediate block.
+                assert_eq!(
+                    evm_header.parent_hash.0, self.latest_evm_block_hash,
+                    "evm block does not extend the current chain tip"
+                );
                 let data_hash: [u8; 32] = cosmos_block
                     .signed_header
                     .header

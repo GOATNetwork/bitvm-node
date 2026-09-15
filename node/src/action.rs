@@ -2,7 +2,10 @@
 #![allow(clippy::single_match)]
 #![allow(clippy::collapsible_else_if)]
 
-use crate::env::{get_local_node_info, get_p2p_inbox_batch_size, get_p2p_outbox_batch_size};
+use crate::env::{
+    get_local_node_info, get_p2p_graph_setup_retry_interval_secs,
+    get_p2p_graph_setup_retry_window_secs, get_p2p_inbox_batch_size, get_p2p_outbox_batch_size,
+};
 use crate::handle::{
     HandlerContext, HeavyTaskContext, dispatch as handle_dispatch, heavy_task_from_content,
     is_heavy_task_message_type, run_heavy_task,
@@ -13,7 +16,7 @@ use crate::rpc_service::current_time_secs;
 use crate::utils::*;
 use alloy::primitives::Address as EvmAddress;
 use anyhow::{Context, Result, anyhow, bail};
-use bitcoin::{PublicKey, Txid};
+use bitcoin::{PublicKey, Txid, XOnlyPublicKey};
 use bitvm_lib::actors::Actor;
 use bitvm_lib::babe_adapter::{BabeBundleBuilder, CACSetupPackage};
 use bitvm_lib::committee::*;
@@ -27,8 +30,11 @@ use client::{
 use libp2p::gossipsub::MessageId;
 use libp2p::{PeerId, Swarm, gossipsub};
 use musig2::{PartialSignature, PubNonce};
-use secp256k1::schnorr::Signature as SchnorrSignature;
+use secp256k1::{
+    Keypair, Message as SecpMessage, SECP256K1, schnorr::Signature as SchnorrSignature,
+};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fmt;
 use std::str::FromStr;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -221,6 +227,7 @@ pub enum MessageDeferReason {
     RecoveryRepublish,
     PreviousGraphPending,
     CommitteeNoncesPending,
+    CommitteeNonceConsensusPending,
     CommitteeEndorsementsPending,
     BitcoinTransactionPending,
     BitcoinConfirmationPending,
@@ -242,6 +249,7 @@ impl MessageDeferReason {
             Self::RecoveryRepublish => "recovery_republish",
             Self::PreviousGraphPending => "previous_graph_pending",
             Self::CommitteeNoncesPending => "committee_nonces_pending",
+            Self::CommitteeNonceConsensusPending => "committee_nonce_consensus_pending",
             Self::CommitteeEndorsementsPending => "committee_endorsements_pending",
             Self::BitcoinTransactionPending => "bitcoin_transaction_pending",
             Self::BitcoinConfirmationPending => "bitcoin_confirmation_pending",
@@ -267,12 +275,15 @@ pub enum GOATMessageContent {
     GenCircuits(GenCircuits),
     CutCircuits(CutCircuits),
     SolderingProofReady(SolderingProofReady),
+    GraphSetupAck(GraphSetupAck),
     VerifierGraphParamsEndorsement(VerifierGraphParamsEndorsement),
     NonceGeneration(NonceGeneration),
+    AggNonceConsensus(AggNonceConsensus),
     CommitteePresign(CommitteePresign),
     EndorseGraph(EndorseGraph),
     GraphFinalize(GraphFinalize),
     PeginConfirmNonce(PeginConfirmNonce),
+    PeginConfirmNonceConsensus(PeginConfirmNonceConsensus),
     PeginConfirmPartialSig(PeginConfirmPartialSig),
     PostReady(PostReady),
     KickoffReady(KickoffReady),
@@ -310,7 +321,8 @@ impl GOATMessageContent {
             Self::RequestNodeInfo(_)
             | Self::ResponseNodeInfo(_)
             | Self::SyncGraphRequest(_)
-            | Self::SyncGraph(_) => P2PMessageDelivery::Immediate,
+            | Self::SyncGraph(_)
+            | Self::GraphSetupAck(_) => P2PMessageDelivery::Immediate,
             _ => P2PMessageDelivery::Inbox,
         }
     }
@@ -326,12 +338,15 @@ impl GOATMessageContent {
             Self::GenCircuits(_) => "GenCircuits",
             Self::CutCircuits(_) => "CutCircuits",
             Self::SolderingProofReady(_) => "SolderingProofReady",
+            Self::GraphSetupAck(_) => "GraphSetupAck",
             Self::VerifierGraphParamsEndorsement(_) => "VerifierGraphParamsEndorsement",
             Self::NonceGeneration(_) => "NonceGeneration",
+            Self::AggNonceConsensus(_) => "AggNonceConsensus",
             Self::CommitteePresign(_) => "CommitteePresign",
             Self::EndorseGraph(_) => "EndorseGraph",
             Self::GraphFinalize(_) => "GraphFinalize",
             Self::PeginConfirmNonce(_) => "PeginConfirmNonce",
+            Self::PeginConfirmNonceConsensus(_) => "PeginConfirmNonceConsensus",
             Self::PeginConfirmPartialSig(_) => "PeginConfirmPartialSig",
             Self::PostReady(_) => "PostReady",
             Self::KickoffReady(_) => "KickoffReady",
@@ -373,10 +388,12 @@ impl GOATMessageContent {
             Self::SolderingProofReady(message) => Some(message.graph_id),
             Self::VerifierGraphParamsEndorsement(message) => Some(message.graph_id),
             Self::NonceGeneration(message) => Some(message.graph_id),
+            Self::AggNonceConsensus(message) => Some(message.graph_id),
             Self::CommitteePresign(message) => Some(message.graph_id),
             Self::EndorseGraph(message) => Some(message.graph_id),
             Self::GraphFinalize(message) => Some(message.graph_id),
             Self::PeginConfirmNonce(message) => Some(message.instance_id),
+            Self::PeginConfirmNonceConsensus(message) => Some(message.instance_id),
             Self::PeginConfirmPartialSig(message) => Some(message.instance_id),
             Self::PostReady(message) => Some(message.instance_id),
             _ => None,
@@ -406,10 +423,12 @@ fn is_pegin_message_type(message_type: &str) -> bool {
             | "SolderingProofReady"
             | "VerifierGraphParamsEndorsement"
             | "NonceGeneration"
+            | "AggNonceConsensus"
             | "CommitteePresign"
             | "EndorseGraph"
             | "GraphFinalize"
             | "PeginConfirmNonce"
+            | "PeginConfirmNonceConsensus"
             | "PeginConfirmPartialSig"
             | "PostReady"
     )
@@ -432,6 +451,56 @@ pub struct ConfirmInstance {
 pub struct InitGraph {
     pub instance_id: Uuid,
     pub graph_id: Uuid,
+    pub operator_pubkey: PublicKey,
+    pub operator_peer_id: Vec<u8>,
+    pub signature: SchnorrSignature,
+}
+
+const INIT_GRAPH_SIGNATURE_DOMAIN: &[u8] = b"bitvm2-node/init-graph/v1";
+
+fn init_graph_signature_message(
+    instance_id: Uuid,
+    graph_id: Uuid,
+    operator_pubkey: &PublicKey,
+    operator_peer_id: &[u8],
+) -> SecpMessage {
+    let mut hasher = Sha256::new();
+    hasher.update(INIT_GRAPH_SIGNATURE_DOMAIN);
+    hasher.update(instance_id.as_bytes());
+    hasher.update(graph_id.as_bytes());
+    hasher.update(operator_pubkey.to_bytes());
+    hasher.update((operator_peer_id.len() as u32).to_be_bytes());
+    hasher.update(operator_peer_id);
+    SecpMessage::from_digest(hasher.finalize().into())
+}
+
+pub fn sign_init_graph(
+    instance_id: Uuid,
+    graph_id: Uuid,
+    operator_keypair: &Keypair,
+    operator_peer_id: Vec<u8>,
+) -> InitGraph {
+    let operator_pubkey = operator_keypair.public_key().into();
+    let signature = SECP256K1.sign_schnorr(
+        &init_graph_signature_message(instance_id, graph_id, &operator_pubkey, &operator_peer_id),
+        operator_keypair,
+    );
+    InitGraph { instance_id, graph_id, operator_pubkey, operator_peer_id, signature }
+}
+
+pub fn verify_init_graph_signature(message: &InitGraph) -> bool {
+    SECP256K1
+        .verify_schnorr(
+            &message.signature,
+            &init_graph_signature_message(
+                message.instance_id,
+                message.graph_id,
+                &message.operator_pubkey,
+                &message.operator_peer_id,
+            ),
+            &XOnlyPublicKey::from(message.operator_pubkey),
+        )
+        .is_ok()
 }
 #[derive(Serialize, Deserialize, Clone)]
 pub struct GenCircuits {
@@ -445,16 +514,99 @@ pub struct CutCircuits {
     pub instance_id: Uuid,
     pub graph_id: Uuid,
     pub verifier_pubkey: PublicKey,
-    pub verifier_index: usize,
+    pub candidate_index: usize,
     pub selected_circuit_indexes: Vec<usize>,
 }
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct SolderingProofReady {
     pub instance_id: Uuid,
     pub graph_id: Uuid,
-    pub verifier_index: usize,
+    pub candidate_index: usize,
     pub payload_hash: [u8; 32],
     pub total_len: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub enum GraphSetupStage {
+    GenCircuits,
+    CutCircuits,
+    SolderingProofReady,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct GraphSetupAck {
+    pub outbox_id: String,
+    pub instance_id: Uuid,
+    pub graph_id: Uuid,
+    pub stage: GraphSetupStage,
+    pub acknowledger_peer_id: String,
+}
+
+pub fn graph_setup_outbox_id(content: &GOATMessageContent) -> Option<String> {
+    match content {
+        GOATMessageContent::InitGraph(message) => Some(format!("init-graph:{}", message.graph_id)),
+        GOATMessageContent::GenCircuits(message) => Some(format!(
+            "gen-circuits:{}:{}:{}",
+            message.instance_id, message.graph_id, message.verifier_pubkey
+        )),
+        GOATMessageContent::CutCircuits(message) => Some(format!(
+            "cut-circuits:{}:{}:{}",
+            message.instance_id, message.graph_id, message.verifier_pubkey
+        )),
+        GOATMessageContent::SolderingProofReady(message) => Some(format!(
+            "soldering-proof-ready:{}:{}:{}",
+            message.graph_id,
+            message.candidate_index,
+            hex::encode(message.payload_hash),
+        )),
+        _ => None,
+    }
+}
+
+fn graph_setup_ack(content: &GOATMessageContent) -> Option<GraphSetupAck> {
+    let (instance_id, graph_id, stage) = match content {
+        GOATMessageContent::GenCircuits(message) => {
+            (message.instance_id, message.graph_id, GraphSetupStage::GenCircuits)
+        }
+        GOATMessageContent::CutCircuits(message) => {
+            (message.instance_id, message.graph_id, GraphSetupStage::CutCircuits)
+        }
+        GOATMessageContent::SolderingProofReady(message) => {
+            (message.instance_id, message.graph_id, GraphSetupStage::SolderingProofReady)
+        }
+        _ => return None,
+    };
+    Some(GraphSetupAck {
+        outbox_id: graph_setup_outbox_id(content)?,
+        instance_id,
+        graph_id,
+        stage,
+        acknowledger_peer_id: get_local_node_info().peer_id,
+    })
+}
+
+pub async fn enqueue_graph_setup_outbox_message(
+    local_db: &LocalDB,
+    message: GOATMessage,
+    ack_peer_id: Option<&str>,
+) -> Result<String> {
+    let outbox_id = graph_setup_outbox_id(&message.content)
+        .ok_or_else(|| anyhow!("not a graph setup message"))?;
+    let serialized = message.serialize_message().await?;
+    let now = current_time_secs();
+    local_db
+        .acquire()
+        .await?
+        .enqueue_p2p_outbox_retry_message(
+            &outbox_id,
+            message.content.event_type(),
+            &serialized,
+            now + get_p2p_graph_setup_retry_window_secs(),
+            get_p2p_graph_setup_retry_interval_secs(),
+            ack_peer_id,
+        )
+        .await?;
+    Ok(outbox_id)
 }
 #[derive(Serialize, Deserialize, Clone)]
 pub struct VerifierGraphParamsEndorsement {
@@ -479,6 +631,14 @@ pub struct NonceGeneration {
     pub committee_pubkey: PublicKey,
     pub pub_nonces: CommitteePubNonces,
     pub nonce_sigs: CommitteeNonceSignatures,
+}
+#[derive(Serialize, Deserialize, Clone)]
+pub struct AggNonceConsensus {
+    pub instance_id: Uuid,
+    pub graph_id: Uuid,
+    pub committee_pubkey: PublicKey,
+    pub consensus_hash: [u8; 32],
+    pub signature: SchnorrSignature,
 }
 #[derive(Serialize, Deserialize, Clone)]
 pub struct CommitteePresign {
@@ -512,6 +672,13 @@ pub struct PeginConfirmNonce {
     pub committee_pubkey: PublicKey,
     pub pub_nonce: PubNonce,
     pub nonce_sig: SchnorrSignature,
+}
+#[derive(Serialize, Deserialize, Clone)]
+pub struct PeginConfirmNonceConsensus {
+    pub instance_id: Uuid,
+    pub committee_pubkey: PublicKey,
+    pub consensus_hash: [u8; 32],
+    pub signature: SchnorrSignature,
 }
 #[derive(Serialize, Deserialize, Clone)]
 pub struct PeginConfirmPartialSig {
@@ -750,7 +917,26 @@ pub async fn handle_inbound_p2p_message(
 
     match decoded.content.p2p_delivery() {
         P2PMessageDelivery::Inbox => {
-            enqueue_p2p_message(local_db, actor, from_peer_id, id, message, &decoded).await
+            enqueue_p2p_message(local_db, actor, from_peer_id, id, message, &decoded).await?;
+            if let Some(ack) = graph_setup_ack(&decoded.content) {
+                // ACKs are deliberately ephemeral. A duplicate delivery is
+                // acknowledged again, which lets the sender recover when its
+                // previous ACK was dropped.
+                if let Err(error) = send_to_peer(
+                    swarm,
+                    GOATMessage::new(Actor::All, GOATMessageContent::GraphSetupAck(ack)),
+                )
+                .await
+                {
+                    tracing::debug!(
+                        event = "p2p_graph_setup_ack",
+                        outcome = "publish_failed",
+                        error = %error,
+                        "inbound graph-setup message remains durable; sender will retry"
+                    );
+                }
+            }
+            Ok(())
         }
         P2PMessageDelivery::Immediate => {
             tracing::debug!(
@@ -1275,10 +1461,20 @@ async fn handle_p2p_outbox_messages(
 ) -> Result<()> {
     let now = current_time_secs();
     let mut storage = local_db.start_immediate_transaction().await?;
+    let expired = storage.expire_p2p_outbox_retry_messages(now).await?;
     let messages = storage
         .claim_p2p_outbox_messages(now, now + P2P_INBOX_LEASE_SECS, get_p2p_outbox_batch_size())
         .await?;
     storage.commit().await?;
+
+    if expired > 0 {
+        tracing::warn!(
+            event = "p2p_outbox",
+            outcome = "retry_window_expired",
+            expired,
+            "graph-setup outbound messages reached their retry window without the expected ACK"
+        );
+    }
 
     for message in messages {
         let outbound = match GOATMessage::deserialize_message(&message.content).await {
@@ -1304,14 +1500,21 @@ async fn handle_p2p_outbox_messages(
         let mut storage = local_db.acquire().await?;
         match result {
             Ok(_) => {
-                storage.complete_p2p_outbox_message(&message.message_id).await?;
-                tracing::info!(
-                    event = "p2p_outbox",
-                    outcome = "published",
-                    message_id = %message.message_id,
-                    message_type = %message.msg_type,
-                    "published durable outbound P2P message"
-                );
+                if message.retry_until > 0 {
+                    let next_retry_at = current_time_secs() + message.retry_interval_secs;
+                    storage.schedule_p2p_outbox_retry(&message.message_id, next_retry_at).await?;
+                    tracing::info!(
+                        event = "p2p_outbox",
+                        outcome = "published_retry_window",
+                        message_id = %message.message_id,
+                        message_type = %message.msg_type,
+                        next_retry_at,
+                        retry_until = message.retry_until,
+                        "published graph-setup P2P message; awaiting ACK or retry window expiry"
+                    );
+                } else {
+                    storage.complete_p2p_outbox_message(&message.message_id).await?;
+                }
             }
             Err(error) => {
                 let retry_after_secs = p2p_retry_delay_secs(message.attempt_count);
@@ -1872,7 +2075,7 @@ mod tests {
         let ready = SolderingProofReady {
             instance_id: Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap(),
             graph_id: Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap(),
-            verifier_index: 3,
+            candidate_index: 3,
             payload_hash: [0xabu8; 32],
             total_len: 1024,
         };
@@ -1882,7 +2085,7 @@ mod tests {
 
         assert!(object.contains_key("instance_id"));
         assert!(object.contains_key("graph_id"));
-        assert!(object.contains_key("verifier_index"));
+        assert!(object.contains_key("candidate_index"));
         assert!(object.contains_key("payload_hash"));
         assert!(object.contains_key("total_len"));
         assert!(!object.contains_key("payload_path"));

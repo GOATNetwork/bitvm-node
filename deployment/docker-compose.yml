@@ -8,12 +8,15 @@ services:
     volumes:
       - ./committee_0:/var/data
       - ./committee_0/.env:/app/.env
+    env_file:
+      - ./committee_0/.env
+    environment:
+      METRICS_ADDR: "0.0.0.0:9108"
+    restart: unless-stopped
     ports:
       - "8900:9100"
       - "8443:8443"
-    env_file:
-      - ./committee_0/.env
-    restart: unless-stopped
+      - "127.0.0.1:9900:9108"
 
   committee_1:
     image: ghcr.io/goatnetwork/bitvm-node:${TAG:-0.1.0}
@@ -24,8 +27,11 @@ services:
     ports:
       - "8901:9100"
       - "8444:8443"
+      - "127.0.0.1:9901:9108"
     env_file:
       - ./committee_1/.env
+    environment:
+      METRICS_ADDR: "0.0.0.0:9108"
     restart: unless-stopped
     depends_on:
       - committee_0
@@ -39,8 +45,11 @@ services:
     ports:
       - "8902:9100"
       - "8445:8443"
+      - "127.0.0.1:9902:9108"
     env_file:
       - ./verifier_0/.env
+    environment:
+      METRICS_ADDR: "0.0.0.0:9108"
     restart: unless-stopped
     depends_on:
       - committee_0
@@ -54,8 +63,11 @@ services:
     ports:
       - "8903:9100"
       - "8456:8443"
+      - "127.0.0.1:9903:9108"
     env_file:
       - ./operator_0/.env
+    environment:
+      METRICS_ADDR: "0.0.0.0:9108"
     restart: unless-stopped
     depends_on:
       - committee_0
@@ -69,8 +81,11 @@ services:
     ports:
       - "8904:9100"
       - "8457:8443"
+      - "127.0.0.1:9904:9108"
     env_file:
       - ./watchtower_0/.env
+    environment:
+      METRICS_ADDR: "0.0.0.0:9108"
     restart: unless-stopped
     depends_on:
       - committee_0

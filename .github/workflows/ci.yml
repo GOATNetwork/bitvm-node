@@ -8,7 +8,7 @@ on:
     tags:
       - v[0-9]+.*
   # Run on every pull request regardless of base branch, so the TLA+ formal-
-  # verification gate (and the rest of CI behind it) runs on ANY PR.
+  # verification check (and the rest of CI) runs on ANY PR.
   pull_request:
 
 env:
@@ -52,6 +52,9 @@ jobs:
       #                To clear it: fix the code, then change its tier to
       #                `historical` here (the spec is frozen and cannot detect
       #                the code fix on its own).
+      # A spec on which TLC does not finish (parse error, missing file, JVM
+      # problem) is a hard failure in every tier: the outcome is taken from
+      # TLC's exit status, so a broken spec can never pass as "reproduces".
       # Adding any future finding is one row; that is the whole maintenance
       # surface. No per-issue logic lives in the script below.
       - name: TLA+ formal verification (verify fixes, reproduce fixed bugs, block live ones)
@@ -67,12 +70,28 @@ jobs:
             echo "Every spec is run and its live TLC result reported below. Tiers:"
             echo "**pass** must verify; **historical** (fixed bug) must still reproduce"
             echo "its counterexample; **live** (unfixed bug) blocks merge while it does."
+            echo "A run on which TLC does not finish fails whatever the tier."
             echo
             echo "| Spec | Tier | TLC result | Status |"
             echo "|---|---|---|---|"
           } >> "$GITHUB_STEP_SUMMARY"
-          # true iff TLC reports the spec holds (no violation found)
-          verifies() { java -jar "$JAR" -config "$1" "$2" 2>/dev/null | grep -q "Model checking completed. No error has been found."; }
+          # Run one spec and classify TLC's exit status: 0 = the spec holds,
+          # 10-14 = a violation was found (assumption/deadlock/safety/liveness/
+          # assert), anything else = TLC did not finish. The log is kept for
+          # the failure case. TLC names its state directory by the current
+          # second, so give each run its own parent to keep back-to-back runs
+          # from colliding. The runner's default shell is `bash -e`, so a
+          # non-zero TLC status must be captured with `|| rc=$?` instead of
+          # read back from `$?`, or the first counterexample aborts the step.
+          run_tlc() {
+            local rc=0
+            java -jar "$JAR" -metadir "states/$1" -config "$1" "$2" > tlc.log 2>&1 || rc=$?
+            case $rc in
+              0) outcome=verified ;;
+              1[0-4]) outcome=counterexample ;;
+              *) outcome=failed ;;
+            esac
+          }
           while IFS='|' read -r tier cfg tla desc; do
             tier="$(echo "$tier" | tr -d '[:space:]')"
             cfg="$(echo "$cfg" | tr -d '[:space:]')"
@@ -82,7 +101,19 @@ jobs:
             case "$tier" in \#*) continue ;; esac
             repro="cd node/tla && java -jar ~/.local/share/tlaplus/tla2tools.jar -config $cfg $tla"
             # run the check - never short-circuit; record the real outcome
-            if verifies "$cfg" "$tla"; then tlc="verified (no violation)"; ok=1; else tlc="counterexample found"; ok=0; fi
+            run_tlc "$cfg" "$tla"
+            case "$outcome" in
+              verified)       tlc="verified (no violation)"; ok=1 ;;
+              counterexample) tlc="counterexample found";    ok=0 ;;
+              *)              tlc="TLC did not finish";      ok="" ;;
+            esac
+            if [ -z "$ok" ]; then
+              status="TOOL FAILURE"; hard_fail=$((hard_fail+1))
+              echo "::error::[$tier] $cfg / $tla: TLC did not finish ($desc). Repro: $repro"
+              tail -n 20 tlc.log
+              echo "| \`$tla\` (\`$cfg\`) | $tier | $tlc | $status - $desc |" >> "$GITHUB_STEP_SUMMARY"
+              continue
+            fi
             case "$tier" in
               pass)
                 if [ "$ok" = 1 ]; then status="OK"; else
@@ -116,7 +147,7 @@ jobs:
           pass       | MessageStateRaceFixed.cfg          | MessageStateRace.tla               | Finding 7 fix - terminal-guarded resurrect
           pass       | Take1ChallengeRaceFixed.cfg        | Take1ChallengeRace.tla             | Finding 9 fix - connector_a margin check added
           pass       | VerifierKickoffFailOpenFixed.cfg   | VerifierKickoffFailOpen.tla        | Issue #429 fix design - defer/retry mirrors committee
-          pass       | KickoffScanCoverageFixed.cfg       | KickoffScanCoverage.tla            | Issue #431 fix - scan_kickoff_chain with adequate depth
+          pass       | KickoffScanCoverageFixed.cfg       | KickoffScanCoverage.tla            | Issue #431 fix - root-only chain walk, uncapped depth (current code)
           historical | GraphLifecycle.cfg                 | GraphLifecycle.tla                 | Finding 1: Graph.status race (fixed 991faaa)
           historical | GraphLifecycleFineGrained.cfg      | GraphLifecycleFineGrained.tla      | Finding 1b: naive guard still unsafe (fixed 991faaa)
           historical | InstancePresignedBug.cfg           | InstancePresigned.tla              | Finding 2: Instance.status regression past Presigned (fixed 991faaa)
@@ -124,8 +155,8 @@ jobs:
           historical | MessageStateRace.cfg               | MessageStateRace.tla               | Finding 7: MessageState resurrection (fixed 991faaa)
           historical | Take1ChallengeRace.cfg             | Take1ChallengeRace.tla             | Finding 9: connector_a has no margin check (fixed 991faaa)
           historical | KickoffScanCoverage.cfg            | KickoffScanCoverage.tla            | Issue #431: detect_kickoff one-per-operator coverage gap (fixed by #451)
-          live       | VerifierKickoffFailOpen.cfg        | VerifierKickoffFailOpen.tla        | Issue #429: verifier KickoffSent fail-open (SPV lag skips Challenge, never retried)
-          live       | KickoffScanCoverageResidual.cfg    | KickoffScanCoverage.tla            | Issue #431 residual: MAX_PREKICKOFF_SUCCESSORS_PER_SCAN=32 depth cap leaves deeper decoy chains uncovered
+          historical | VerifierKickoffFailOpen.cfg        | VerifierKickoffFailOpen.tla        | Issue #429: verifier KickoffSent fail-open (SPV lag skipped Challenge, never retried) (fixed by #455)
+          historical | KickoffScanCoverageResidual.cfg    | KickoffScanCoverage.tla            | Issue #431 residual: root-only walk capped at 32 (fixed: the cap is removed, the scan runs as its own task)
           SPECS
           {
             echo
