@@ -279,8 +279,14 @@ fn is_retryable_reqwest_error(error: &reqwest::Error) -> bool {
 
 /// Only classify transport-level RPC failures. Contract reverts, malformed
 /// responses and application errors are intentionally left terminal.
-fn is_retryable_external_rpc_error(error: &anyhow::Error) -> bool {
+pub(crate) fn is_retryable_external_rpc_error(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
+        // Inspect contract transport errors before traversing their transparent sources.
+        if let Some(alloy::contract::Error::TransportError(error)) =
+            cause.downcast_ref::<alloy::contract::Error>()
+        {
+            return error.is_transport_error();
+        }
         if let Some(error) = cause.downcast_ref::<reqwest::Error>() {
             return is_retryable_reqwest_error(error);
         }
@@ -2729,6 +2735,22 @@ mod tests {
         assert!(
             p2p_retryable_dispatch_error(&error).is_some(),
             "a real SQLite-busy error must remain retryable"
+        );
+    }
+
+    #[test]
+    fn contract_revert_is_not_a_retryable_transport_failure() {
+        let response =
+            serde_json::from_str(r#"{"code":3,"message":"execution reverted"}"#).unwrap();
+        let error = anyhow::Error::new(alloy::contract::Error::TransportError(
+            alloy::transports::TransportError::ErrorResp(response),
+        ))
+        .context("validate SyncGraph instance parameters");
+        assert!(!is_retryable_external_rpc_error(&error));
+        assert!(
+            classify_retryable_dispatch_error(error)
+                .downcast_ref::<RetryableDispatchError>()
+                .is_none()
         );
     }
 

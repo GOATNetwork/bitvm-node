@@ -229,12 +229,9 @@ pub async fn validate_graph_instance_parameters(
     goat_client: &GOATClient,
     parameters: &BitvmGcInstanceParameters,
 ) -> Result<()> {
-    let expected =
-        read_instance_info_from_goat(goat_client, parameters.instance_id).await.map_err(|e| {
-            SpecialError::InvalidGraph(format!(
-                "failed to load instance parameters from GoatChain: {e}"
-            ))
-        })?;
+    let expected = read_instance_info_from_goat(goat_client, parameters.instance_id)
+        .await
+        .context("failed to load instance parameters from GoatChain")?;
     if parameters != &expected {
         bail!(SpecialError::InvalidGraph(
             "instance parameters mismatch with GoatChain peg-in data".to_string()
@@ -242,11 +239,8 @@ pub async fn validate_graph_instance_parameters(
     }
 
     for input in &expected.user_info.inputs {
-        let funding_tx = btc_client.get_tx(&input.outpoint.txid).await.map_err(|e| {
-            SpecialError::InvalidGraph(format!(
-                "failed to load peg-in funding transaction {}: {e}",
-                input.outpoint.txid
-            ))
+        let funding_tx = btc_client.get_tx(&input.outpoint.txid).await.with_context(|| {
+            format!("failed to load peg-in funding transaction {}", input.outpoint.txid)
         })?;
         let Some(funding_tx) = funding_tx else {
             bail!(SpecialError::InvalidGraph(format!(
@@ -283,11 +277,7 @@ pub async fn validate_graph_instance_parameters(
     if btc_client
         .get_tx(&pegin_deposit_txid)
         .await
-        .map_err(|e| {
-            SpecialError::InvalidGraph(format!(
-                "failed to load peg-in deposit transaction {pegin_deposit_txid}: {e}"
-            ))
-        })?
+        .with_context(|| format!("failed to load peg-in deposit transaction {pegin_deposit_txid}"))?
         .is_none()
     {
         bail!(SpecialError::InvalidGraph(format!(
@@ -3248,16 +3238,13 @@ pub async fn build_genesis_prekickoff_tx(
     let next_kickoff_connector = KickoffConnector::new(network, &operator_taproot_public_key);
     let next_prekickoff_connector = PrekickoffConnector::new(network, &operator_taproot_public_key);
     let init_amount = prekickoff_replenishment_amount();
-    let cur_prekickoff_connector_input = Input {
-        outpoint: fund_address(
-            btc_client,
-            node_keypair,
-            cur_prekickoff_connector.generate_taproot_address(),
-            init_amount,
-        )
-        .await?,
-        amount: init_amount,
-    };
+    let cur_prekickoff_connector_input = genesis_funding_input(
+        btc_client,
+        node_keypair,
+        cur_prekickoff_connector.generate_taproot_address(),
+        init_amount,
+    )
+    .await?;
     let fee_amount = prekickoff_fee_amount(0);
     PrekickoffTransaction::new_for_validation(
         &cur_prekickoff_connector,
@@ -3272,6 +3259,26 @@ pub async fn build_genesis_prekickoff_tx(
         verifier_num,
     )
     .map_err(|e| anyhow::anyhow!("failed to create pre-kickoff txn: {e}"))
+}
+
+/// Reuse a matching unspent output, or fund the genesis address.
+async fn genesis_funding_input(
+    btc_client: &BTCClient,
+    node_keypair: Keypair,
+    address: Address,
+    amount: Amount,
+) -> Result<Input> {
+    let existing = btc_client
+        .get_address_utxo(address.clone())
+        .await?
+        .into_iter()
+        .filter(|utxo| utxo.value == amount)
+        .min_by_key(|utxo| (utxo.txid, utxo.vout));
+    let outpoint = match existing {
+        Some(utxo) => OutPoint { txid: utxo.txid, vout: utxo.vout },
+        None => fund_address(btc_client, node_keypair, address, amount).await?,
+    };
+    Ok(Input { outpoint, amount })
 }
 
 pub async fn build_prekickoff_params(
