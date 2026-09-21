@@ -445,20 +445,25 @@ pub async fn validate_init_graph_base(
     Ok(())
 }
 
-/// Verify the stake conditions required for an operator to create a graph.
-/// This mirrors the Gateway graph-posting requirement and is shared by graph
-/// validation and the early InitGraph admission check.
-pub async fn validate_operator_stake(
+/// Operator stake verdict; RPC failures are returned as errors.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OperatorStakeStatus {
+    Staked,
+    NotRegistered,
+    Insufficient { locked: u64, min: u64 },
+}
+
+pub async fn operator_stake_status(
     goat_client: &GOATClient,
     operator_pubkey: &PublicKey,
-) -> Result<()> {
+) -> Result<OperatorStakeStatus> {
     let operator_xonly_pubkey = XOnlyPublicKey::from(*operator_pubkey).serialize();
     let operator_addr = goat_client
         .stake_mana_pubkey_to_address(&operator_xonly_pubkey)
         .await
         .context("query operator address")?;
     if operator_addr == [0; 20] {
-        bail!("operator not registered");
+        return Ok(OperatorStakeStatus::NotRegistered);
     }
     let min_stake_amount =
         goat_client.gateway_get_min_stake_amount().await.context("query minimum operator stake")?;
@@ -467,9 +472,25 @@ pub async fn validate_operator_stake(
         .await
         .context("query operator locked stake")?;
     if locked_stake < min_stake_amount {
-        bail!("insufficient operator stake: locked={locked_stake}, min={min_stake_amount}");
+        return Ok(OperatorStakeStatus::Insufficient {
+            locked: locked_stake,
+            min: min_stake_amount,
+        });
     }
-    Ok(())
+    Ok(OperatorStakeStatus::Staked)
+}
+
+pub async fn validate_operator_stake(
+    goat_client: &GOATClient,
+    operator_pubkey: &PublicKey,
+) -> Result<()> {
+    match operator_stake_status(goat_client, operator_pubkey).await? {
+        OperatorStakeStatus::Staked => Ok(()),
+        OperatorStakeStatus::NotRegistered => bail!("operator not registered"),
+        OperatorStakeStatus::Insufficient { locked, min } => {
+            bail!("insufficient operator stake: locked={locked}, min={min}")
+        }
+    }
 }
 
 pub fn validate_verifier_graph_params_endorsements(

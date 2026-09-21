@@ -151,8 +151,40 @@ pub const ENV_MAINTENANCE_RUN_TIMEOUT_SECS: &str = "MAINTENANCE_RUN_TIMEOUT_SECS
 pub const DEFAULT_MAINTENANCE_RUN_TIMEOUT_SECS: u64 = 60;
 pub const ENV_P2P_INBOX_BATCH_SIZE: &str = "P2P_INBOX_BATCH_SIZE";
 pub const DEFAULT_P2P_INBOX_BATCH_SIZE: i64 = 16;
-pub const ENV_P2P_OUTBOX_BATCH_SIZE: &str = "P2P_OUTBOX_BATCH_SIZE";
-pub const DEFAULT_P2P_OUTBOX_BATCH_SIZE: i64 = 16;
+/// Maximum decoded JSON gossip size.
+pub const ENV_P2P_MAX_JSON_MESSAGE_BYTES: &str = "P2P_MAX_JSON_MESSAGE_BYTES";
+pub const DEFAULT_P2P_MAX_JSON_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
+/// Ceiling on the payload bytes queued in the durable P2P inbox. The per-class
+/// and per-sender quotas are derived from it, see `p2p_admission::InboundLimits`.
+pub const ENV_P2P_INBOX_MAX_QUEUED_BYTES: &str = "P2P_INBOX_MAX_QUEUED_BYTES";
+pub const DEFAULT_P2P_INBOX_MAX_QUEUED_BYTES: i64 = 2 * 1024 * 1024 * 1024;
+/// Ceilings on libp2p connections. Inbound only: outgoing dials stay unlimited.
+/// Keep the inbound ceiling well below the process file descriptor limit.
+pub const ENV_P2P_MAX_INCOMING_CONNECTIONS: &str = "P2P_MAX_INCOMING_CONNECTIONS";
+pub const DEFAULT_P2P_MAX_INCOMING_CONNECTIONS: u32 = 512;
+/// Inbound slots, out of `P2P_MAX_INCOMING_CONNECTIONS`, only registered peers
+/// may take.
+pub const ENV_P2P_INBOUND_REGISTERED_RESERVE: &str = "P2P_INBOUND_REGISTERED_RESERVE";
+pub const DEFAULT_P2P_INBOUND_REGISTERED_RESERVE: u32 = 128;
+/// Comma-separated peer IDs eligible for reserved inbound capacity.
+/// Does not grant registration, message quota or ban exemption.
+pub const ENV_P2P_RESERVED_PEERS: &str = "P2P_RESERVED_PEERS";
+/// Comma-separated `<peer id>=<operator master public key>` bindings.
+/// Stake is verified on chain at startup.
+pub const ENV_P2P_TRUSTED_OPERATOR_BINDINGS: &str = "P2P_TRUSTED_OPERATOR_BINDINGS";
+/// Longest wait between two re-publishes of a signing-round outbox row.
+pub const ENV_P2P_PROTOCOL_RETRY_MAX_SECS: &str = "P2P_PROTOCOL_RETRY_MAX_SECS";
+pub const DEFAULT_P2P_PROTOCOL_RETRY_MAX_SECS: i64 = 600;
+/// Handler execution timeout on the business/control worker.
+/// Timeout cancels at an await; durable messages are retried.
+pub const ENV_P2P_HANDLER_TIMEOUT_SECS: &str = "P2P_HANDLER_TIMEOUT_SECS";
+pub const DEFAULT_P2P_HANDLER_TIMEOUT_SECS: u64 = 300;
+/// Comma-separated peer IDs whose persisted replay marks are cleared at startup.
+pub const ENV_P2P_REPLAY_MARK_RESET_PEERS: &str = "P2P_REPLAY_MARK_RESET_PEERS";
+pub const ENV_P2P_MAX_PENDING_INCOMING_CONNECTIONS: &str = "P2P_MAX_PENDING_INCOMING_CONNECTIONS";
+pub const DEFAULT_P2P_MAX_PENDING_INCOMING_CONNECTIONS: u32 = 128;
+pub const ENV_P2P_MAX_CONNECTIONS_PER_PEER: &str = "P2P_MAX_CONNECTIONS_PER_PEER";
+pub const DEFAULT_P2P_MAX_CONNECTIONS_PER_PEER: u32 = 4;
 pub const ENV_ENABLE_COMMITTEE_INSTANCE_KEY_DELETE: &str = "ENABLE_COMMITTEE_INSTANCE_KEY_DELETE";
 pub const DEFAULT_ENABLE_COMMITTEE_INSTANCE_KEY_DELETE: bool = false;
 pub const ENV_COMMITTEE_INSTANCE_KEY_DELETE_TIMELOCK_BLOCKS: &str =
@@ -736,12 +768,132 @@ pub fn get_p2p_inbox_batch_size() -> i64 {
         .unwrap_or(DEFAULT_P2P_INBOX_BATCH_SIZE)
 }
 
-pub fn get_p2p_outbox_batch_size() -> i64 {
-    std::env::var(ENV_P2P_OUTBOX_BATCH_SIZE)
+pub fn get_p2p_max_json_message_bytes() -> usize {
+    std::env::var(ENV_P2P_MAX_JSON_MESSAGE_BYTES)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .map(|size| {
+            size.clamp(64 * 1024, crate::middleware::behaviour::MAX_GOSSIPSUB_TRANSMIT_SIZE)
+        })
+        .unwrap_or(DEFAULT_P2P_MAX_JSON_MESSAGE_BYTES)
+}
+
+fn p2p_connection_limit(name: &str, default: u32) -> u32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|limit| *limit > 0)
+        .unwrap_or(default)
+}
+
+pub fn get_p2p_max_incoming() -> u32 {
+    p2p_connection_limit(ENV_P2P_MAX_INCOMING_CONNECTIONS, DEFAULT_P2P_MAX_INCOMING_CONNECTIONS)
+}
+
+pub fn get_p2p_inbound_registered_reserve() -> u32 {
+    p2p_connection_limit(ENV_P2P_INBOUND_REGISTERED_RESERVE, DEFAULT_P2P_INBOUND_REGISTERED_RESERVE)
+}
+
+pub fn get_p2p_reserved_peers() -> std::collections::HashSet<libp2p::PeerId> {
+    parse_reserved_peers(&std::env::var(ENV_P2P_RESERVED_PEERS).unwrap_or_default())
+}
+
+pub fn parse_reserved_peers(value: &str) -> std::collections::HashSet<libp2p::PeerId> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .filter_map(|entry| {
+            let parsed = libp2p::PeerId::from_str(entry).ok();
+            if parsed.is_none() {
+                tracing::error!("ignoring malformed {ENV_P2P_RESERVED_PEERS} entry {entry:?}");
+            }
+            parsed
+        })
+        .collect()
+}
+
+/// Signing-round retry ceiling; defaults to one quarter of the pre-signing window, clamped to 30–600 seconds.
+pub fn get_p2p_protocol_retry_max_secs() -> i64 {
+    std::env::var(ENV_P2P_PROTOCOL_RETRY_MAX_SECS)
         .ok()
         .and_then(|value| value.parse::<i64>().ok())
-        .map(|size| size.clamp(1, 128))
-        .unwrap_or(DEFAULT_P2P_OUTBOX_BATCH_SIZE)
+        .map(|secs| secs.clamp(30, 3600))
+        .unwrap_or_else(|| {
+            (get_instance_presigned_time_expired_secs() / 4)
+                .clamp(30, DEFAULT_P2P_PROTOCOL_RETRY_MAX_SECS)
+        })
+}
+
+pub fn get_p2p_handler_timeout() -> std::time::Duration {
+    let secs = std::env::var(ENV_P2P_HANDLER_TIMEOUT_SECS)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|secs| secs.clamp(5, 3600))
+        .unwrap_or(DEFAULT_P2P_HANDLER_TIMEOUT_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
+/// Parse `P2P_TRUSTED_OPERATOR_BINDINGS`. A malformed entry is reported and
+/// skipped: a typo must not stop the node, nor silently trust something else.
+pub fn get_p2p_trusted_operator_bindings() -> Vec<(libp2p::PeerId, [u8; 32])> {
+    parse_trusted_operator_bindings(
+        &std::env::var(ENV_P2P_TRUSTED_OPERATOR_BINDINGS).unwrap_or_default(),
+    )
+}
+
+pub fn parse_trusted_operator_bindings(value: &str) -> Vec<(libp2p::PeerId, [u8; 32])> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .filter_map(|entry| {
+            let parsed = entry.split_once('=').and_then(|(peer_id, pubkey)| {
+                let peer_id = libp2p::PeerId::from_str(peer_id.trim()).ok()?;
+                let pubkey = PublicKey::from_str(pubkey.trim()).ok()?;
+                Some((peer_id, bitcoin::XOnlyPublicKey::from(pubkey).serialize()))
+            });
+            if parsed.is_none() {
+                tracing::error!(
+                    "ignoring malformed {ENV_P2P_TRUSTED_OPERATOR_BINDINGS} entry {entry:?}; \
+                     expected <peer id>=<public key>"
+                );
+            }
+            parsed
+        })
+        .collect()
+}
+
+pub fn get_p2p_replay_mark_reset_peers() -> Vec<String> {
+    std::env::var(ENV_P2P_REPLAY_MARK_RESET_PEERS)
+        .map(|peers| {
+            peers
+                .split(',')
+                .map(str::trim)
+                .filter(|peer| !peer.is_empty())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub fn get_p2p_max_pending_incoming() -> u32 {
+    p2p_connection_limit(
+        ENV_P2P_MAX_PENDING_INCOMING_CONNECTIONS,
+        DEFAULT_P2P_MAX_PENDING_INCOMING_CONNECTIONS,
+    )
+}
+
+pub fn get_p2p_max_per_peer() -> u32 {
+    p2p_connection_limit(ENV_P2P_MAX_CONNECTIONS_PER_PEER, DEFAULT_P2P_MAX_CONNECTIONS_PER_PEER)
+}
+
+pub fn get_p2p_inbox_max_queued_bytes() -> i64 {
+    std::env::var(ENV_P2P_INBOX_MAX_QUEUED_BYTES)
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .map(|size| size.max(256 * 1024 * 1024))
+        .unwrap_or(DEFAULT_P2P_INBOX_MAX_QUEUED_BYTES)
 }
 
 pub fn is_enable_committee_instance_key_delete() -> bool {

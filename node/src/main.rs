@@ -25,7 +25,7 @@ use bitvm_noded::{
 };
 
 use anyhow::Result;
-use bitvm_noded::action::reclaim_stale_queue_claims;
+use bitvm_noded::action::{load_persisted_peer_bindings, reclaim_stale_queue_claims};
 use bitvm_noded::metrics_service::{MetricsState, set_node_metrics_state};
 use bitvm_noded::middleware::swarm::{BitvmNetworkManager, BitvmSwarmConfig};
 use bitvm_noded::p2p_msg_handler::BitvmNodeProcessor;
@@ -212,18 +212,34 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let metric_registry = Arc::new(Mutex::new(metric_registry));
     let metrics_state = MetricsState::new(metric_registry);
     set_node_metrics_state(metrics_state.clone());
+    let goat_client =
+        Arc::new(GOATClient::new(env::goat_config_from_env().await, env::get_goat_network()));
+    // Restore persisted operator bindings into the admission registry.
+    match load_persisted_peer_bindings(&local_db, &goat_client).await {
+        Ok(loaded) if loaded > 0 => tracing::info!(
+            event = "p2p_admission",
+            outcome = "bindings_loaded",
+            loaded,
+            "re-seeded operator bindings from previous sessions"
+        ),
+        Ok(_) => {}
+        Err(error) => tracing::warn!(
+            event = "p2p_admission",
+            outcome = "bindings_load_failed",
+            error = %error,
+            "failed to re-seed operator bindings; they will be relearned from gossip"
+        ),
+    }
     let handler = BitvmNodeProcessor {
         local_db: local_db.clone(),
         btc_client: Arc::new(BTCClient::new(get_network(), get_btc_url_from_env().as_deref())),
-        goat_client: Arc::new(GOATClient::new(
-            env::goat_config_from_env().await,
-            env::get_goat_network(),
-        )),
-        http_client: HttpAsyncClient::new(None),
+        goat_client,
+        http_client: Arc::new(HttpAsyncClient::new(None)),
         soldering_builder: actor_needs_soldering_builder(&actor)
             .then(|| Arc::new(BabeBundleBuilder::new())),
         metrics_state: metrics_state.clone(),
         shutdown_token: cancellation_token.clone(),
+        worker: Default::default(),
     };
 
     tracing::info!(

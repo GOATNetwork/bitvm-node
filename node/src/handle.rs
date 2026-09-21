@@ -6,7 +6,7 @@ use crate::env::{
 };
 use crate::error::SpecialError;
 use crate::metrics_service::MetricsState;
-use crate::middleware::AllBehaviours;
+use crate::middleware::publisher::MessagePublisher;
 use crate::rpc_service::current_time_secs;
 use crate::scheduled_tasks::graph_maintenance_tasks::ChallengeSubStatus;
 use crate::soldering_payload_store::{
@@ -42,8 +42,8 @@ use goat::transactions::base::output_topology;
 use goat::transactions::pre_signed::PreSignedTransaction;
 use goat::transactions::pre_signed_musig2::verify_public_nonce;
 use goat::wots::{Wots, Wots96};
+use libp2p::PeerId;
 use libp2p::gossipsub::MessageId;
-use libp2p::{PeerId, Swarm};
 use secp256k1::{Message as SecpMessage, SECP256K1};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -53,7 +53,7 @@ use store::{GoatTxType, GraphStatus, SerializableTxid};
 use uuid::Uuid;
 
 pub struct HandlerContext<'a> {
-    pub swarm: &'a mut Swarm<AllBehaviours>,
+    pub swarm: &'a mut dyn MessagePublisher,
     pub local_db: &'a LocalDB,
     pub btc_client: &'a Arc<BTCClient>,
     pub goat_client: &'a Arc<GOATClient>,
@@ -7038,18 +7038,45 @@ async fn handle_sync_graph_request(
     // sent by other nodes when they find a graph is missing locally
     // 1. (Relayer) send SyncGraph response if have the graph
     if !is_relayer() {
-        tracing::warn!("Ignore SyncGraphRequest for {instance_id}:{graph_id}: not a relayer node");
+        tracing::debug!("Ignore SyncGraphRequest for {instance_id}:{graph_id}: not a relayer node");
         return Ok(());
     }
-    if let Some(graph) = get_graph(ctx.local_db, instance_id, graph_id).await? {
-        let message_content =
-            GOATMessageContent::SyncGraph(SyncGraph { instance_id, graph_id, graph });
-        let message = GOATMessage::new(Actor::All, message_content);
-        send_to_peer(ctx.swarm, message).await?;
-    } else {
-        // TODO: if no relayer has the graph, how to recover?
-        tracing::warn!("Graph not found for SyncGraphRequest {instance_id}:{graph_id}");
+    // Check graph ownership before charging the response budget or recording cooldown.
+    let now = std::time::Instant::now();
+    let graph_key = graph_id.to_string();
+    if crate::p2p_admission::sync_graph_response_gate().is_cooling(&graph_key, now) {
+        return Ok(());
     }
+    // Require the graph to belong to the requested instance.
+    if !ctx.local_db.acquire().await?.has_graph_of_instance(&instance_id, &graph_id).await? {
+        tracing::debug!("Graph not found for SyncGraphRequest {instance_id}:{graph_id}");
+        return Ok(());
+    }
+    let requester_registered =
+        crate::p2p_admission::peer_registry().sender_class(&ctx.from_peer_id, now).is_registered();
+    if !crate::p2p_admission::sync_graph_response_budget(requester_registered).allow(now) {
+        tracing::debug!(
+            "Defer SyncGraphRequest for {instance_id}:{graph_id}: sync-graph response budget spent"
+        );
+        return Ok(());
+    }
+    let Some(graph) = get_graph(ctx.local_db, instance_id, graph_id).await? else {
+        // TODO: if no relayer has the graph, how to recover?
+        tracing::warn!("Graph not loadable for SyncGraphRequest {instance_id}:{graph_id}");
+        return Ok(());
+    };
+    // The cooldown is taken only for a response that is actually going out.
+    if !crate::p2p_admission::sync_graph_response_gate().allow(&graph_key, now) {
+        return Ok(());
+    }
+    let message_content = GOATMessageContent::SyncGraph(SyncGraph { instance_id, graph_id, graph });
+    send_protocol_message(
+        ctx.swarm,
+        ctx.local_db,
+        GOATMessage::new(Actor::All, message_content),
+        StoredValue::Fresh,
+    )
+    .await?;
     Ok(())
 }
 
@@ -7060,24 +7087,40 @@ async fn handle_sync_graph(
     graph_id: Uuid,
     graph: &SimplifiedBitvmGcGraph,
 ) -> Result<()> {
-    // sent by relayer nodes in response to SyncGraphRequest
-    if !ctx
-        .goat_client
-        .committee_mana_is_validate_peer_id(&ctx.from_peer_id.to_bytes())
-        .await
-        .with_context(|| {
-            format!(
-                "failed to validate SyncGraph sender {} against the committee registry",
-                ctx.from_peer_id
-            )
-        })?
+    // Accept only responses to a recorded local request.
+    if !crate::p2p_admission::requested_graphs()
+        .contains(&graph_id.to_string(), std::time::Instant::now())
     {
-        tracing::warn!(
-            "Ignore SyncGraph for {instance_id}:{graph_id}: sender {} is not a registered committee peer",
+        tracing::debug!(
+            "Ignore SyncGraph for {instance_id}:{graph_id}: no matching local sync request"
+        );
+        return Ok(());
+    }
+    // Require a cached committee identity for the relayer.
+    if !crate::p2p_admission::peer_registry()
+        .is_committee(&ctx.from_peer_id, std::time::Instant::now())
+    {
+        tracing::debug!(
+            "Ignore SyncGraph for {instance_id}:{graph_id}: sender {} is not a committee peer",
             ctx.from_peer_id
         );
         return Ok(());
     }
+    // Apply rejection cooldown per graph and sender; RPC failures leave the gate open.
+    let gate_key = format!("{graph_id}:{}", ctx.from_peer_id);
+    if crate::p2p_admission::sync_graph_validation_gate()
+        .is_cooling(&gate_key, std::time::Instant::now())
+    {
+        tracing::debug!(
+            "Ignore SyncGraph for {instance_id}:{graph_id}: this sender's graph was rejected recently"
+        );
+        return Ok(());
+    }
+    let reject = |why: String| {
+        crate::p2p_admission::sync_graph_validation_gate()
+            .allow(&gate_key, std::time::Instant::now());
+        tracing::warn!("Ignore SyncGraph for {instance_id}:{graph_id}: {why}");
+    };
 
     if !message_identity_matches(
         "SyncGraph",
@@ -7088,13 +7131,12 @@ async fn handle_sync_graph(
         graph.parameters.graph_id,
         graph.parameters.graph_nonce,
     ) {
+        reject("envelope and graph parameters name different graphs".to_string());
         return Ok(());
     }
 
-    validate_graph_id_on_goat(ctx.goat_client, instance_id, graph_id).await.map_err(|e| {
-        anyhow!(
-            "Failed to validate graph_id on GoatChain for SyncGraph {instance_id}:{graph_id}: {e}"
-        )
+    validate_graph_id_on_goat(ctx.goat_client, instance_id, graph_id).await.with_context(|| {
+        format!("Failed to validate graph_id on GoatChain for SyncGraph {instance_id}:{graph_id}")
     })?;
     let validation = validate_graph_instance_parameters(
         ctx.btc_client,
@@ -7104,37 +7146,37 @@ async fn handle_sync_graph(
     .await;
     ctx.metrics_state.record_graph_validation(validation.is_ok());
     if let Err(e) = validation {
-        tracing::warn!(
-            "Ignore SyncGraph for {instance_id}:{graph_id}: invalid instance parameters: {e}"
-        );
+        // This check talks to both chains. "Could not ask" is not a verdict on
+        // the graph: let the inbox retry instead of rejecting a good answer.
+        if crate::action::is_retryable_external_rpc_error(&e) {
+            return Err(e).context("validate SyncGraph instance parameters");
+        }
+        reject(format!("invalid instance parameters: {e}"));
         return Ok(());
     }
     let graph = BitvmGcGraph::from_simplified(graph)?;
     let graph_data = build_graph_data(&graph)?;
     let graph_data_on_goat = ctx.goat_client.gateway_get_graph_data(&graph_id).await?;
     if graph_data != graph_data_on_goat {
-        tracing::warn!(
-            "Ignore SyncGraph for {instance_id}:{graph_id}: reconstructed graph data does not match GoatChain"
-        );
+        reject("reconstructed graph data does not match GoatChain".to_string());
         return Ok(());
     }
 
     if let Err(e) = verify_graph_operator_pre_signatures(&graph) {
-        tracing::warn!(
-            "Ignore SyncGraph for {instance_id}:{graph_id}: invalid operator pre-signatures: {e}"
-        );
+        reject(format!("invalid operator pre-signatures: {e}"));
         return Ok(());
     }
     if let Err(e) = verify_graph_committee_pre_signatures(&graph) {
-        tracing::warn!(
-            "Ignore SyncGraph for {instance_id}:{graph_id}: invalid committee pre-signatures: {e}"
-        );
+        reject(format!("invalid committee pre-signatures: {e}"));
         return Ok(());
     }
     let simplified_graph = graph.to_simplified()?;
     let _ = store_finalized_graph_if_needed(ctx.local_db, &simplified_graph).await?;
     refresh_and_compensate(ctx, instance_id, graph_id, &graph, GraphStatus::OperatorPresigned)
         .await?;
+    // Close only after compensation succeeds. Otherwise a transient refresh
+    // failure would make this inbox row's retry look unsolicited and drop it.
+    crate::p2p_admission::requested_graphs().remove(&graph_id.to_string());
     Ok(())
 }
 
@@ -7142,19 +7184,104 @@ async fn handle_sync_graph(
 /// sender's own record: the registry is keyed by `peer_id`, and without this
 /// check any peer could overwrite any other node's row.
 fn accept_node_info(ctx: &HandlerContext<'_>, node_info: &NodeInfo, message_kind: &str) -> bool {
-    if !node_info_matches_sender(node_info, &ctx.from_peer_id) {
-        tracing::warn!(
-            "Ignore {message_kind} from {}: payload claims peer_id {}",
-            ctx.from_peer_id,
-            node_info.peer_id
-        );
-        return false;
-    }
-    if let Err(reason) = validate_node_info_payload(node_info) {
+    let Err(reason) = check_node_info(ctx, node_info) else {
+        return true;
+    };
+    // Log registered-peer failures individually and aggregate unregistered-peer failures.
+    let registered = crate::p2p_admission::peer_registry()
+        .sender_class(&ctx.from_peer_id, std::time::Instant::now())
+        .is_registered();
+    if registered {
         tracing::warn!("Ignore {message_kind} from {}: {reason}", ctx.from_peer_id);
-        return false;
+    } else {
+        crate::p2p_admission::record_drop(crate::p2p_admission::DropReason::NodeInfoRejected);
+        tracing::debug!("Ignore {message_kind} from {}: {reason}", ctx.from_peer_id);
     }
-    true
+    false
+}
+
+fn check_node_info(
+    ctx: &HandlerContext<'_>,
+    node_info: &NodeInfo,
+) -> std::result::Result<(), String> {
+    if !node_info_matches_sender(node_info, &ctx.from_peer_id) {
+        return Err(format!("payload claims peer_id {}", node_info.peer_id));
+    }
+    validate_node_info_payload(node_info)?;
+    if node_info.binding_sig.is_empty() {
+        return Ok(());
+    }
+    // A present-but-invalid binding is a forgery attempt (claiming another key's
+    // authorisation), not a benign omission, so reject the whole payload.
+    if crate::action::verify_node_info_binding(node_info).is_none() {
+        return Err("node info binding signature is invalid".to_string());
+    }
+    // `binding_issued_at` orders re-bindings, newest winning. One dated far ahead
+    // would win against every honest re-binding until that date.
+    if node_info.binding_issued_at
+        > current_time_secs() + crate::action::NODE_INFO_BINDING_MAX_FUTURE_SECS
+    {
+        return Err("node info binding is dated in the future".to_string());
+    }
+    Ok(())
+}
+
+/// Record verified operator bindings by x-only key; confirm stake asynchronously.
+async fn learn_node_info_binding(
+    local_db: &LocalDB,
+    goat_client: &Arc<GOATClient>,
+    node_info: &NodeInfo,
+) {
+    if node_info.actor != Actor::Operator.to_string() {
+        return;
+    }
+    let Some(operator_key) = crate::action::verify_node_info_binding(node_info) else {
+        return;
+    };
+    let operator_key = crate::p2p_admission::operator_key(&operator_key);
+    if let Ok(peer_id) = PeerId::from_str(&node_info.peer_id) {
+        let released_confirmed_key = crate::p2p_admission::peer_registry()
+            .observe_operator_binding(&peer_id, &operator_key, node_info.binding_issued_at);
+        if released_confirmed_key {
+            // The peer moved to another key: what was confirmed for the old one
+            // must not be there to be restored after a restart.
+            crate::p2p_admission::revoke_persisted_operator(local_db, &peer_id).await;
+        }
+        crate::p2p_admission::refresh_operator_binding_in_background(
+            local_db,
+            goat_client,
+            peer_id,
+            operator_key,
+        );
+    }
+}
+
+/// Store accepted NodeInfo within the unregistered-row limit and learn its binding.
+async fn record_node_info(ctx: &HandlerContext<'_>, node_info: &NodeInfo) -> Result<()> {
+    let registered = crate::p2p_admission::peer_registry()
+        .sender_class(&ctx.from_peer_id, std::time::Instant::now())
+        .is_registered();
+    let admissible = registered
+        || ctx
+            .local_db
+            .acquire()
+            .await?
+            .node_row_admissible(
+                &node_info.peer_id,
+                crate::action::NODE_TABLE_MAX_UNREGISTERED_ROWS,
+                current_time_secs() - crate::action::NODE_TABLE_EVICTABLE_AFTER_SECS,
+                &crate::env::get_peer_id(),
+            )
+            .await?;
+    if admissible {
+        save_node_info(ctx.local_db, node_info).await?;
+    } else {
+        crate::p2p_admission::record_drop(crate::p2p_admission::DropReason::NodeTableFull);
+    }
+    // The binding is learned either way: it lives in the bounded registry, and
+    // an operator must be able to become registered while the table is full.
+    learn_node_info_binding(ctx.local_db, ctx.goat_client, node_info).await;
+    Ok(())
 }
 
 async fn handle_request_node_info(
@@ -7162,13 +7289,37 @@ async fn handle_request_node_info(
     node_info: &NodeInfo,
 ) -> Result<()> {
     if accept_node_info(ctx, node_info, "RequestNodeInfo") {
-        save_node_info(ctx.local_db, node_info).await?;
+        record_node_info(ctx, node_info).await?;
     }
     // Answer regardless: the response only carries this node's own public info,
     // and staying silent would break discovery for a misconfigured peer.
-    let message_content = GOATMessageContent::ResponseNodeInfo(crate::env::get_local_node_info());
-    send_to_peer(ctx.swarm, GOATMessage::new(Actor::All, message_content)).await?;
+    // Coalesce recent requests into one broadcast response.
+    if crate::p2p_admission::node_info_response_gate().try_respond(std::time::Instant::now()) {
+        publish_node_info_response(ctx.swarm).await?;
+    }
     Ok(())
+}
+
+async fn publish_node_info_response(swarm: &mut dyn MessagePublisher) -> Result<()> {
+    let message_content = GOATMessageContent::ResponseNodeInfo(crate::env::get_local_node_info());
+    send_to_peer(swarm, GOATMessage::new(Actor::All, message_content)).await?;
+    Ok(())
+}
+
+/// Answer the `RequestNodeInfo`s that arrived while the previous response was
+/// still cooling down. Called from the regular tick.
+pub async fn flush_deferred_node_info_response(swarm: &mut dyn MessagePublisher) {
+    if !crate::p2p_admission::node_info_response_gate().take_pending(std::time::Instant::now()) {
+        return;
+    }
+    if let Err(error) = publish_node_info_response(swarm).await {
+        tracing::debug!(
+            event = "p2p_node_info",
+            outcome = "deferred_response_failed",
+            error = %error,
+            "failed to publish the deferred node info response; peers will ask again"
+        );
+    }
 }
 
 async fn handle_response_node_info(
@@ -7176,7 +7327,7 @@ async fn handle_response_node_info(
     node_info: &NodeInfo,
 ) -> Result<()> {
     if accept_node_info(ctx, node_info, "ResponseNodeInfo") {
-        save_node_info(ctx.local_db, node_info).await?;
+        record_node_info(ctx, node_info).await?;
     }
     Ok(())
 }

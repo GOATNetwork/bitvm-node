@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use zeroize::Zeroizing;
 
-pub struct BitvmSwarmWrapper(pub Swarm<AllBehaviours>);
+pub struct BitvmSwarmWrapper(pub Swarm<AllBehaviours>, Option<super::publisher::NetworkPublisher>);
 
 impl std::fmt::Debug for BitvmSwarmWrapper {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -31,7 +31,11 @@ impl std::fmt::Debug for BitvmSwarmWrapper {
 
 impl BitvmSwarmWrapper {
     pub fn new(swarm: Swarm<AllBehaviours>) -> Self {
-        Self(swarm)
+        Self(swarm, None)
+    }
+
+    pub fn publisher(&self) -> super::publisher::NetworkPublisher {
+        self.1.clone().expect("network manager owns the publish command receiver")
     }
 
     pub fn inner(&self) -> &Swarm<AllBehaviours> {
@@ -67,11 +71,16 @@ pub enum TickMessageType {
 
 #[allow(async_fn_in_trait)]
 pub trait P2pMessageHandler {
+    /// Handle received gossip and report one verdict for `id` and `propagation_source`.
+    /// `sequence_number` is signed by the author.
+    #[allow(clippy::too_many_arguments)]
     async fn recv_and_dispatch(
         &self,
         swarm: &mut BitvmSwarmWrapper,
         actor: Actor,
         from_peer_id: PeerId,
+        propagation_source: PeerId,
+        sequence_number: Option<u64>,
         id: MessageId,
         message: &[u8],
     ) -> anyhow::Result<()>;
@@ -112,6 +121,7 @@ pub struct BitvmNetworkManager {
     swarm: BitvmSwarmWrapper,
     connected_peers: Gauge,
     required_topics_healthy: Gauge,
+    publish_commands: tokio::sync::mpsc::Receiver<super::publisher::PublishCommand>,
 }
 impl BitvmNetworkManager {
     pub fn new(
@@ -149,12 +159,14 @@ impl BitvmNetworkManager {
             let (peer_id, multi_addr) = parse_boot_node_str(peer)?;
             swarm.behaviour_mut().kademlia.add_address(&peer_id, multi_addr);
         }
+        let (publisher, publish_commands) = super::publisher::channel();
         Ok(BitvmNetworkManager {
             config,
-            swarm: BitvmSwarmWrapper::new(swarm),
+            swarm: BitvmSwarmWrapper(swarm, Some(publisher)),
             peer_id: key_pair.public().to_peer_id(),
             connected_peers,
             required_topics_healthy,
+            publish_commands,
         })
     }
 
@@ -212,15 +224,20 @@ impl BitvmNetworkManager {
         info!("multi_addr: {}/p2p/{}", address.to_string(), self.peer_id.to_string());
         let mut heart_beat_interval = interval(Duration::from_secs(self.config.heartbeat_interval));
         let mut interval = interval(Duration::from_secs(self.config.regular_task_interval));
+        // Use Delay ticks and coalesced worker notifications.
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             select! {
+                    Some(command) = self.publish_commands.recv() => {
+                        command.execute(&mut self.swarm);
+                    }
                     _ = cancellation_token.cancelled() => {
                         info!("Swarm received shutdown signal");
                         msg_handler.graceful_shutdown().await?;
                         return Ok("swarm_shutdown".to_string());
                     }
 
-                    _ticker = interval.tick() => {
+                    _ = interval.tick() => {
                         match msg_handler.handle_tick_message(&mut self.swarm, self.peer_id, actor.clone(), TickMessageType::RegularlyAction).await {
                                 Ok(_) => {}
                                 Err(e) => {
@@ -255,7 +272,7 @@ impl BitvmNetworkManager {
                             let data_prefix = hex::encode(&message.data[..message.data.len().min(16)]);
                             let data_starts_with_goatbin = message.data.starts_with(b"GOATBIN1");
                             match msg_handler.recv_and_dispatch(&mut self.swarm, actor.clone(),
-                                source, id.clone(), &message.data).await {
+                                source, propagation_source, message.sequence_number, id.clone(), &message.data).await {
                                 Ok(_) => {},Err(e) => {
                                     tracing::error!(
                                         error = ?e,
