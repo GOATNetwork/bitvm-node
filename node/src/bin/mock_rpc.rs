@@ -131,6 +131,8 @@ fn seeded_node(
         reward: "0".to_string(),
         service_fee_rate: 0.001,
         available_peg_btc: U256::from(4_700_000_000_000_000_000_000_000_u128).to_string(),
+        binding_sig: String::new(),
+        binding_issued_at: 0,
         updated_at: now,
         created_at: now,
     }

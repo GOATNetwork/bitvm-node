@@ -4079,7 +4079,8 @@ fn validate_node_socket_addr(socket_addr: &str) -> std::result::Result<(), Strin
 }
 
 pub async fn save_node_info(local_db: &LocalDB, node_info: &NodeInfo) -> Result<()> {
-    info!("save_node_info for {}", node_info.peer_id);
+    // Reachable once per announcement from any peer: not louder than debug.
+    tracing::debug!("save_node_info for {}", node_info.peer_id);
     let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
     let mut storage_process = local_db.acquire().await?;
     storage_process
@@ -4093,6 +4094,8 @@ pub async fn save_node_info(local_db: &LocalDB, node_info: &NodeInfo) -> Result<
             reward: "0".to_string(),
             service_fee_rate: node_info.service_fee_rate,
             available_peg_btc: node_info.available_peg_btc.clone(),
+            binding_sig: node_info.binding_sig.clone(),
+            binding_issued_at: node_info.binding_issued_at,
             updated_at: current_time,
             created_at: current_time,
         })
@@ -4117,7 +4120,7 @@ pub async fn save_local_info(local_db: &LocalDB) {
 }
 
 pub async fn update_node_timestamp(local_db: &LocalDB, peer_id: &str) -> Result<()> {
-    tracing::info!("update timestamp for {peer_id}");
+    tracing::debug!("update timestamp for {peer_id}");
     let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
     let mut storage_process = local_db.acquire().await?;
     match storage_process.update_node_timestamp(peer_id, current_time).await {
@@ -6573,6 +6576,7 @@ mod node_info_tests {
             node_name: "zkm".to_string(),
             service_fee_rate: 0.001,
             available_peg_btc: "1000".to_string(),
+            ..Default::default()
         }
     }
 

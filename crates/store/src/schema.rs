@@ -166,6 +166,11 @@ pub struct Node {
     pub reward: String,
     pub service_fee_rate: f64,
     pub available_peg_btc: String,
+    /// Hex master-key signature authorizing this peer binding; empty when absent.
+    pub binding_sig: String,
+    /// When the binding was issued. Orders re-bindings so one key maps to a
+    /// single peer id at a time.
+    pub binding_issued_at: i64,
     pub updated_at: i64,
     pub created_at: i64,
 }
@@ -585,8 +590,44 @@ pub struct P2pInboxMessage {
     pub lease_until: i64,
     pub lease_token: String,
     pub last_error: Option<String>,
+    /// How the sender was classified when the row was admitted. See
+    /// [`P2pInboxAdmissionClass`]; empty means the caller did not classify it.
+    pub admission_class: String,
+    /// Digest of `content`, used to collapse an identical payload re-published
+    /// by the same sender while the first copy is still queued.
+    pub content_hash: Option<Vec<u8>>,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+/// Sender classification recorded on an inbox row for quota accounting.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Display, EnumString)]
+pub enum P2pInboxAdmissionClass {
+    /// Committee member registered by peer ID on chain.
+    Committee,
+    /// A verifier (on-chain peer id registry) or an operator (staked master key
+    /// bound to the peer id by a NodeInfo binding proof).
+    Registered,
+    /// Anyone else, including anonymous peers.
+    Unregistered,
+}
+
+impl P2pInboxAdmissionClass {
+    /// Whether the sender's identity is backed by an on-chain registration.
+    pub const fn is_registered(self) -> bool {
+        !matches!(self, Self::Unregistered)
+    }
+}
+
+/// Queued (`Pending` + `Processing` + `Quarantined`) inbox usage for one
+/// admission class, with the share attributable to the sender being admitted.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct P2pInboxClassUsage {
+    pub admission_class: String,
+    pub rows: i64,
+    pub bytes: i64,
+    pub peer_rows: i64,
+    pub peer_bytes: i64,
 }
 
 #[derive(Clone, FromRow, Debug, Serialize, Deserialize, Default)]
@@ -602,6 +643,8 @@ pub struct P2pOutboxMessage {
     pub retry_until: i64,
     pub retry_interval_secs: i64,
     pub ack_peer_id: String,
+    /// Publishes that went through, unlike `attempt_count`, which counts claims.
+    pub publish_count: i64,
     pub created_at: i64,
 }
 

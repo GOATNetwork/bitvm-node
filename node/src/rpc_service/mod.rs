@@ -816,6 +816,8 @@ mod tests {
                 .to_string(),
             updated_at: current_time_secs(),
             created_at: current_time_secs(),
+            binding_sig: String::new(),
+            binding_issued_at: 0,
         });
         let goat_addr = get_rand_goat_address();
         nodes.push(Node {
@@ -832,6 +834,8 @@ mod tests {
                 .to_string(),
             updated_at: current_time_secs(),
             created_at: current_time_secs(),
+            binding_sig: String::new(),
+            binding_issued_at: 0,
         });
 
         let local_db = create_local_db(&temp_sqlite_db_path()).await;

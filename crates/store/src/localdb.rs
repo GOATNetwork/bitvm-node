@@ -3,10 +3,10 @@ use crate::{
     BridgeOutGlobalStats, EventWatchMetricsSnapshot, GoatTxRecord, Graph, GraphBtcTxVoutMonitor,
     GraphRawData, GraphStatus, GraphStatusSource, GraphStatusTransitionOutcome, Instance,
     LongRunningTaskProof, Message, MessageDebugOverview, MessageDebugReason, MetricsStateCount,
-    Node, NodeAlertMetricsSnapshot, NodesOverview, OperatorProof, P2pInboxMessage,
-    P2pOutboxMessage, PeginGraphProcessData, PeginInstanceProcessData, PendingGraphInit,
-    SequencerSetHashChange, SequencerSetScanState, SerializableTxid, SwapEscrow, SwapEscrowStatus,
-    WatchContract, WatchtowerProof,
+    Node, NodeAlertMetricsSnapshot, NodesOverview, OperatorProof, P2pInboxAdmissionClass,
+    P2pInboxClassUsage, P2pInboxMessage, P2pOutboxMessage, PeginGraphProcessData,
+    PeginInstanceProcessData, PendingGraphInit, SequencerSetHashChange, SequencerSetScanState,
+    SerializableTxid, SwapEscrow, SwapEscrowStatus, WatchContract, WatchtowerProof,
 };
 
 use indexmap::IndexMap;
@@ -17,7 +17,6 @@ use sqlx::types::Uuid;
 use sqlx::{Row, Sqlite, SqliteConnection, SqlitePool, Transaction, migrate::MigrateDatabase};
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::warn;
 
 fn get_current_timestamp_secs() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64
@@ -31,7 +30,7 @@ const MESSAGE_COLUMNS: &str = "message_id, business_id, from_peer, actor, msg_ty
 /// Columns every `p2p_inbox` SELECT must fetch.
 const P2P_INBOX_COLUMNS: &str = "message_id, business_id, actor, from_peer, msg_type, content, \
      content_size, state, attempt_count, abandon_count, next_retry_at, lease_until, lease_token, \
-     last_error, created_at, updated_at";
+     last_error, admission_class, content_hash, created_at, updated_at";
 
 fn message_from_row(row: &SqliteRow) -> Result<Message, sqlx::Error> {
     Ok(Message {
@@ -68,6 +67,8 @@ fn p2p_inbox_message_from_row(row: &SqliteRow) -> Result<P2pInboxMessage, sqlx::
         lease_until: row.try_get("lease_until")?,
         lease_token: row.try_get("lease_token")?,
         last_error: row.try_get("last_error")?,
+        admission_class: row.try_get("admission_class")?,
+        content_hash: row.try_get("content_hash")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
@@ -86,6 +87,7 @@ fn p2p_outbox_message_from_row(row: &SqliteRow) -> Result<P2pOutboxMessage, sqlx
         retry_until: row.try_get("retry_until")?,
         retry_interval_secs: row.try_get("retry_interval_secs")?,
         ack_peer_id: row.try_get("ack_peer_id")?,
+        publish_count: row.try_get("publish_count")?,
         created_at: row.try_get("created_at")?,
     })
 }
@@ -2016,7 +2018,9 @@ impl<'a> StorageProcessor<'a> {
                 .await?;
 
         if result.rows_affected() == 0 {
-            warn!("Node {peer_id} not found in DB, no rows updated");
+            // Any peer that never announced itself lands here, once per message
+            // burst, so this must not be louder than debug.
+            tracing::debug!("Node {peer_id} not found in DB, no rows updated");
         }
 
         Ok(())
@@ -2059,8 +2063,8 @@ impl<'a> StorageProcessor<'a> {
         let res = sqlx::query!(
             r#"
             INSERT INTO node (peer_id, node_name, actor, goat_addr, btc_pub_key, socket_addr, service_fee_rate, available_peg_btc,
-                              created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                              binding_sig, binding_issued_at, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (peer_id) DO UPDATE SET actor             = excluded.actor,
                                                 node_name         = excluded.node_name,
                                                 goat_addr         = excluded.goat_addr,
@@ -2068,6 +2072,8 @@ impl<'a> StorageProcessor<'a> {
                                                 service_fee_rate       = excluded.service_fee_rate,
                                                 available_peg_btc = excluded.available_peg_btc,
                                                 socket_addr       = excluded.socket_addr,
+                                                binding_sig       = excluded.binding_sig,
+                                                binding_issued_at = excluded.binding_issued_at,
                                                 updated_at        = excluded.updated_at
             "#,
             node.peer_id,
@@ -2078,6 +2084,8 @@ impl<'a> StorageProcessor<'a> {
             node.socket_addr,
             node.service_fee_rate,
             node.available_peg_btc,
+            node.binding_sig,
+            node.binding_issued_at,
             node.created_at,
             node.updated_at,
         )
@@ -2853,11 +2861,17 @@ impl<'a> StorageProcessor<'a> {
         message: &P2pInboxMessage,
     ) -> anyhow::Result<bool> {
         let now = get_current_timestamp_secs();
+        let admission_class = if message.admission_class.is_empty() {
+            P2pInboxAdmissionClass::Unregistered.to_string()
+        } else {
+            message.admission_class.clone()
+        };
         let result = sqlx::query(
             "INSERT INTO p2p_inbox \
                 (message_id, business_id, actor, from_peer, msg_type, content, content_size, \
-                    state, attempt_count, next_retry_at, lease_until, lease_token, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, 'Pending', 0, 0, 0, '', ?, ?) \
+                    state, attempt_count, next_retry_at, lease_until, lease_token, \
+                    admission_class, content_hash, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, 'Pending', 0, 0, 0, '', ?, ?, ?, ?) \
              ON CONFLICT(message_id) DO NOTHING",
         )
         .bind(&message.message_id)
@@ -2867,11 +2881,144 @@ impl<'a> StorageProcessor<'a> {
         .bind(&message.msg_type)
         .bind(&message.content)
         .bind(message.content_size)
+        .bind(admission_class)
+        .bind(&message.content_hash)
         .bind(now)
         .bind(now)
         .execute(self.conn())
         .await?;
         Ok(result.rows_affected() > 0)
+    }
+
+    /// Test oracle for class totals and per-peer usage, including quarantined payloads.
+    #[cfg(test)]
+    async fn p2p_inbox_usage(
+        &mut self,
+        from_peer: &str,
+    ) -> anyhow::Result<Vec<P2pInboxClassUsage>> {
+        let rows = sqlx::query(
+            "SELECT admission_class, \
+                    COUNT(*) AS total_rows, \
+                    COALESCE(SUM(content_size), 0) AS total_bytes, \
+                    COALESCE(SUM(CASE WHEN from_peer = ? THEN 1 ELSE 0 END), 0) AS peer_rows, \
+                    COALESCE(SUM(CASE WHEN from_peer = ? THEN content_size ELSE 0 END), 0) \
+                        AS peer_bytes \
+             FROM p2p_inbox \
+             WHERE state IN ('Pending', 'Processing', 'Quarantined') \
+             GROUP BY admission_class",
+        )
+        .bind(from_peer)
+        .bind(from_peer)
+        .fetch_all(self.conn())
+        .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(P2pInboxClassUsage {
+                    admission_class: row.try_get("admission_class")?,
+                    rows: row.try_get("total_rows")?,
+                    bytes: row.try_get("total_bytes")?,
+                    peer_rows: row.try_get("peer_rows")?,
+                    peer_bytes: row.try_get("peer_bytes")?,
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(Into::into)
+    }
+
+    /// Per-class queued payload totals, without per-peer usage.
+    pub async fn p2p_inbox_class_totals(&mut self) -> anyhow::Result<Vec<P2pInboxClassUsage>> {
+        let rows = sqlx::query(
+            "SELECT admission_class, \
+                    COUNT(*) AS total_rows, \
+                    COALESCE(SUM(content_size), 0) AS total_bytes \
+             FROM p2p_inbox \
+             WHERE state IN ('Pending', 'Processing', 'Quarantined') \
+             GROUP BY admission_class",
+        )
+        .fetch_all(self.conn())
+        .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(P2pInboxClassUsage {
+                    admission_class: row.try_get("admission_class")?,
+                    rows: row.try_get("total_rows")?,
+                    bytes: row.try_get("total_bytes")?,
+                    ..Default::default()
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(Into::into)
+    }
+
+    /// Per-peer payload usage by class; `rows` and `bytes` remain zero.
+    pub async fn p2p_inbox_peer_usage(
+        &mut self,
+        from_peer: &str,
+    ) -> anyhow::Result<Vec<P2pInboxClassUsage>> {
+        let rows = sqlx::query(
+            "SELECT admission_class, \
+                    COUNT(*) AS peer_rows, \
+                    COALESCE(SUM(content_size), 0) AS peer_bytes \
+             FROM p2p_inbox \
+             WHERE state IN ('Pending', 'Processing', 'Quarantined') \
+               AND admission_class IN ('Committee', 'Registered', 'Unregistered') \
+               AND from_peer = ? \
+             GROUP BY admission_class",
+        )
+        .bind(from_peer)
+        .fetch_all(self.conn())
+        .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(P2pInboxClassUsage {
+                    admission_class: row.try_get("admission_class")?,
+                    peer_rows: row.try_get("peer_rows")?,
+                    peer_bytes: row.try_get("peer_bytes")?,
+                    ..Default::default()
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(Into::into)
+    }
+
+    /// Whether the sender already has this payload in a non-terminal row.
+    pub async fn has_queued_p2p_inbox_payload(
+        &mut self,
+        from_peer: &str,
+        content_hash: &[u8],
+    ) -> anyhow::Result<bool> {
+        let row = sqlx::query(
+            "SELECT 1 FROM p2p_inbox \
+             WHERE from_peer = ? AND content_hash = ? AND state IN ('Pending', 'Processing') \
+             LIMIT 1",
+        )
+        .bind(from_peer)
+        .bind(content_hash)
+        .fetch_optional(self.conn())
+        .await?;
+        Ok(row.is_some())
+    }
+
+    /// Expire Pending rows by `created_at`; `None` selects every admission class.
+    pub async fn expire_pending_p2p_inbox_messages(
+        &mut self,
+        admission_class: Option<P2pInboxAdmissionClass>,
+        created_before: i64,
+    ) -> anyhow::Result<u64> {
+        let class_predicate =
+            if admission_class.is_some() { " AND admission_class = ?" } else { "" };
+        let query = format!(
+            "UPDATE p2p_inbox \
+             SET state = 'Failed', content = X'', lease_until = 0, next_retry_at = 0, \
+                 last_error = 'expired: still pending past the inbox retention window', \
+                 updated_at = ? \
+             WHERE state = 'Pending' AND created_at < ?{class_predicate}"
+        );
+        let mut query = sqlx::query(&query).bind(get_current_timestamp_secs()).bind(created_before);
+        if let Some(admission_class) = admission_class {
+            query = query.bind(admission_class.to_string());
+        }
+        Ok(query.execute(self.conn()).await?.rows_affected())
     }
 
     /// Move inbox rows that repeatedly abandoned a claim out of the work set.
@@ -2917,6 +3064,85 @@ impl<'a> StorageProcessor<'a> {
         max_abandons: i64,
         excluded_message_ids: &[String],
     ) -> anyhow::Result<Vec<P2pInboxMessage>> {
+        self.list_claimable_p2p_inbox_messages_in(
+            now,
+            limit,
+            0,
+            max_abandons,
+            excluded_message_ids,
+            "",
+        )
+        .await
+    }
+
+    /// List each class's reserved share, then lend unused capacity in C/R/U order.
+    pub async fn list_claimable_p2p_inbox_messages_by_class(
+        &mut self,
+        now: i64,
+        limit: i64,
+        registered_reserve: i64,
+        unregistered_reserve: i64,
+        max_abandons: i64,
+        excluded_message_ids: &[String],
+    ) -> anyhow::Result<Vec<P2pInboxMessage>> {
+        const COMMITTEE: &str = " AND admission_class = 'Committee'";
+        const REGISTERED: &str = " AND admission_class = 'Registered'";
+        const UNREGISTERED: &str = " AND admission_class NOT IN ('Committee', 'Registered')";
+
+        let limit = limit.max(0);
+        let unregistered_reserve = unregistered_reserve.clamp(0, limit);
+        let registered_reserve = registered_reserve.clamp(0, limit - unregistered_reserve);
+        let shares = [
+            (COMMITTEE, limit - registered_reserve - unregistered_reserve),
+            (REGISTERED, registered_reserve),
+            (UNREGISTERED, unregistered_reserve),
+        ];
+
+        // Guaranteed shares first ...
+        let mut rows: [Vec<P2pInboxMessage>; 3] = Default::default();
+        for (index, (class, share)) in shares.iter().enumerate() {
+            rows[index] = self
+                .list_claimable_p2p_inbox_messages_in(
+                    now,
+                    *share,
+                    0,
+                    max_abandons,
+                    excluded_message_ids,
+                    class,
+                )
+                .await?;
+        }
+        // ... then whatever a class left of its share is lent out, in priority
+        // order, to the classes that have more to claim.
+        for (index, (class, _)) in shares.iter().enumerate() {
+            let free = limit - rows.iter().map(|rows| rows.len() as i64).sum::<i64>();
+            let more = self
+                .list_claimable_p2p_inbox_messages_in(
+                    now,
+                    free,
+                    rows[index].len() as i64,
+                    max_abandons,
+                    excluded_message_ids,
+                    class,
+                )
+                .await?;
+            rows[index].extend(more);
+        }
+        Ok(rows.into_iter().flatten().collect())
+    }
+
+    async fn list_claimable_p2p_inbox_messages_in(
+        &mut self,
+        now: i64,
+        limit: i64,
+        offset: i64,
+        max_abandons: i64,
+        excluded_message_ids: &[String],
+        class_predicate: &'static str,
+    ) -> anyhow::Result<Vec<P2pInboxMessage>> {
+        if limit <= 0 {
+            return Ok(Vec::new());
+        }
         let excluded_predicate = if excluded_message_ids.is_empty() {
             String::new()
         } else {
@@ -2927,15 +3153,15 @@ impl<'a> StorageProcessor<'a> {
              FROM p2p_inbox \
              WHERE ((state = 'Pending' AND next_retry_at <= ?) \
                 OR (state = 'Processing' AND lease_until <= ?)) \
-               AND abandon_count < ?{excluded_predicate} \
-             ORDER BY created_at ASC \
-             LIMIT ?"
+               AND abandon_count < ?{excluded_predicate}{class_predicate} \
+             ORDER BY created_at ASC, message_id ASC \
+             LIMIT ? OFFSET ?"
         );
         let mut query = sqlx::query(&query).bind(now).bind(now).bind(max_abandons);
         for message_id in excluded_message_ids {
             query = query.bind(message_id);
         }
-        let rows = query.bind(limit).fetch_all(self.conn()).await?;
+        let rows = query.bind(limit).bind(offset).fetch_all(self.conn()).await?;
         rows.iter()
             .map(p2p_inbox_message_from_row)
             .collect::<Result<Vec<_>, _>>()
@@ -3137,6 +3363,240 @@ impl<'a> StorageProcessor<'a> {
         Ok(result.rows_affected())
     }
 
+    /// Delete the oldest terminal rows beyond `max_rows`, up to `limit` per call.
+    pub async fn purge_p2p_inbox_over_terminal_cap(
+        &mut self,
+        max_rows: i64,
+        limit: i64,
+    ) -> anyhow::Result<u64> {
+        let result = sqlx::query(
+            "DELETE FROM p2p_inbox WHERE message_id IN ( \
+                 SELECT message_id FROM p2p_inbox \
+                 WHERE state IN ('Processed', 'Failed', 'Quarantined') \
+                 ORDER BY updated_at ASC \
+                 LIMIT MIN(?, MAX( \
+                     (SELECT COUNT(*) FROM p2p_inbox \
+                      WHERE state IN ('Processed', 'Failed', 'Quarantined')) - ?, 0)))",
+        )
+        .bind(limit)
+        .bind(max_rows)
+        .execute(self.conn())
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Clear the oldest Quarantined payloads until retained bytes are within `max_bytes`.
+    pub async fn trim_quarantined_p2p_inbox_payloads(
+        &mut self,
+        max_bytes: i64,
+    ) -> anyhow::Result<u64> {
+        let result = sqlx::query(
+            "UPDATE p2p_inbox SET content = X'', content_size = 0, updated_at = ? \
+             WHERE state = 'Quarantined' AND length(content) > 0 AND message_id IN ( \
+                 SELECT message_id FROM ( \
+                     SELECT message_id, \
+                            SUM(content_size) OVER ( \
+                                ORDER BY updated_at DESC \
+                                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running \
+                     FROM p2p_inbox WHERE state = 'Quarantined' AND length(content) > 0 \
+                 ) WHERE running - content_size >= ?)",
+        )
+        .bind(get_current_timestamp_secs())
+        .bind(max_bytes)
+        .execute(self.conn())
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Load up to `limit` operator bindings, confirmed operators first.
+    /// The caller re-verifies signatures.
+    pub async fn load_p2p_peer_bindings(&mut self, limit: i64) -> anyhow::Result<Vec<Node>> {
+        let rows = sqlx::query_as::<_, Node>(
+            "SELECT * FROM node \
+             WHERE binding_sig != '' AND btc_pub_key != '' AND actor = 'Operator' \
+             ORDER BY peer_id IN (SELECT peer_id FROM p2p_registered_peer \
+                                  WHERE kind = 'Operator') DESC, \
+                      updated_at DESC \
+             LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(self.conn())
+        .await?;
+        Ok(rows)
+    }
+
+    /// Persist confirmed registration; an operator key may belong to only one peer.
+    pub async fn upsert_p2p_registered_peer(
+        &mut self,
+        peer_id: &str,
+        kind: &str,
+        pubkey: &str,
+    ) -> anyhow::Result<()> {
+        if !pubkey.is_empty() {
+            sqlx::query(
+                "DELETE FROM p2p_registered_peer WHERE kind = ? AND pubkey = ? AND peer_id != ?",
+            )
+            .bind(kind)
+            .bind(pubkey)
+            .bind(peer_id)
+            .execute(self.conn())
+            .await?;
+        }
+        sqlx::query(
+            "INSERT INTO p2p_registered_peer (peer_id, kind, pubkey, verified_at) \
+             VALUES (?, ?, ?, ?) \
+             ON CONFLICT (peer_id, kind) DO UPDATE SET pubkey = excluded.pubkey, \
+                                                       verified_at = excluded.verified_at",
+        )
+        .bind(peer_id)
+        .bind(kind)
+        .bind(pubkey)
+        .bind(get_current_timestamp_secs())
+        .execute(self.conn())
+        .await?;
+        Ok(())
+    }
+
+    pub async fn delete_p2p_registered_peer(
+        &mut self,
+        peer_id: &str,
+        kind: &str,
+    ) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM p2p_registered_peer WHERE peer_id = ? AND kind = ?")
+            .bind(peer_id)
+            .bind(kind)
+            .execute(self.conn())
+            .await?;
+        Ok(())
+    }
+
+    /// `(peer_id, kind, pubkey)` of every peer confirmed in an earlier session.
+    pub async fn load_p2p_registered_peers(
+        &mut self,
+    ) -> anyhow::Result<Vec<(String, String, String)>> {
+        let rows = sqlx::query("SELECT peer_id, kind, pubkey FROM p2p_registered_peer")
+            .fetch_all(self.conn())
+            .await?;
+        rows.iter()
+            .map(|row| Ok((row.try_get("peer_id")?, row.try_get("kind")?, row.try_get("pubkey")?)))
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(Into::into)
+    }
+
+    /// Raise the persisted replay marks to `marks` (`peer_id -> highest sequence
+    /// number admitted`). A mark never moves down.
+    pub async fn raise_p2p_replay_marks(&mut self, marks: &[(String, i64)]) -> anyhow::Result<()> {
+        for (peer_id, highest) in marks {
+            sqlx::query(
+                "INSERT INTO p2p_replay_mark (peer_id, highest) VALUES (?, ?) \
+                 ON CONFLICT (peer_id) DO UPDATE SET highest = MAX(highest, excluded.highest)",
+            )
+            .bind(peer_id)
+            .bind(highest)
+            .execute(self.conn())
+            .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn load_p2p_replay_marks(&mut self) -> anyhow::Result<Vec<(String, i64)>> {
+        let rows = sqlx::query("SELECT peer_id, highest FROM p2p_replay_mark")
+            .fetch_all(self.conn())
+            .await?;
+        rows.iter()
+            .map(|row| Ok((row.try_get("peer_id")?, row.try_get("highest")?)))
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(Into::into)
+    }
+
+    /// Remove marks for unregistered peers, retaining verifier peer IDs in `keep`.
+    pub async fn prune_p2p_replay_marks(&mut self, keep: &[String]) -> anyhow::Result<u64> {
+        let keep_predicate = if keep.is_empty() {
+            String::new()
+        } else {
+            format!(" AND peer_id NOT IN ({})", create_place_holders(keep))
+        };
+        let query = format!(
+            "DELETE FROM p2p_replay_mark \
+             WHERE peer_id NOT IN (SELECT peer_id FROM p2p_registered_peer){keep_predicate}"
+        );
+        let mut query = sqlx::query(&query);
+        for peer_id in keep {
+            query = query.bind(peer_id);
+        }
+        Ok(query.execute(self.conn()).await?.rows_affected())
+    }
+
+    /// Allow existing peers or a new unregistered row below `max_rows`.
+    /// At capacity, evict the oldest unregistered row older than `evict_stale_before`.
+    pub async fn node_row_admissible(
+        &mut self,
+        peer_id: &str,
+        max_rows: i64,
+        evict_stale_before: i64,
+        local_peer_id: &str,
+    ) -> anyhow::Result<bool> {
+        let row = sqlx::query(
+            "SELECT EXISTS(SELECT 1 FROM node WHERE peer_id = ?) AS known, \
+                    (SELECT COUNT(*) FROM node \
+                     WHERE peer_id NOT IN (SELECT peer_id FROM p2p_registered_peer)) AS total",
+        )
+        .bind(peer_id)
+        .fetch_one(self.conn())
+        .await?;
+        let known: i64 = row.try_get("known")?;
+        let total: i64 = row.try_get("total")?;
+        if known != 0 || total < max_rows {
+            return Ok(true);
+        }
+        let evicted = sqlx::query(
+            "DELETE FROM node WHERE peer_id = ( \
+                 SELECT peer_id FROM node \
+                 WHERE updated_at < ? AND peer_id != ? \
+                   AND peer_id NOT IN (SELECT peer_id FROM p2p_registered_peer) \
+                 ORDER BY updated_at ASC LIMIT 1)",
+        )
+        .bind(evict_stale_before)
+        .bind(local_peer_id)
+        .execute(self.conn())
+        .await?;
+        Ok(evicted.rows_affected() > 0)
+    }
+
+    /// Drop the persisted replay marks of `peer_ids`.
+    pub async fn delete_p2p_replay_marks(&mut self, peer_ids: &[String]) -> anyhow::Result<u64> {
+        if peer_ids.is_empty() {
+            return Ok(0);
+        }
+        let query = format!(
+            "DELETE FROM p2p_replay_mark WHERE peer_id IN ({})",
+            create_place_holders(peer_ids)
+        );
+        let mut query = sqlx::query(&query);
+        for peer_id in peer_ids {
+            query = query.bind(peer_id);
+        }
+        Ok(query.execute(self.conn()).await?.rows_affected())
+    }
+
+    /// Delete stale node rows except this node and confirmed registered peers.
+    pub async fn purge_stale_unregistered_nodes(
+        &mut self,
+        updated_before: i64,
+        local_peer_id: &str,
+    ) -> anyhow::Result<u64> {
+        let result = sqlx::query(
+            "DELETE FROM node \
+             WHERE updated_at < ? AND peer_id != ? \
+               AND peer_id NOT IN (SELECT peer_id FROM p2p_registered_peer)",
+        )
+        .bind(updated_before)
+        .bind(local_peer_id)
+        .execute(self.conn())
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     pub async fn renew_p2p_inbox_lease(
         &mut self,
         message_id: &str,
@@ -3264,6 +3724,8 @@ impl<'a> StorageProcessor<'a> {
     /// A non-empty `ack_peer_id` is the only ACK that may stop this retry
     /// loop early. Broadcast messages without an authenticated recipient keep
     /// publishing until their window expires.
+    /// `first_publish_at`: first outbox delivery time; zero makes the row immediately due.
+    #[allow(clippy::too_many_arguments)]
     pub async fn enqueue_p2p_outbox_retry_message(
         &mut self,
         message_id: &str,
@@ -3272,17 +3734,19 @@ impl<'a> StorageProcessor<'a> {
         retry_until: i64,
         retry_interval_secs: i64,
         ack_peer_id: Option<&str>,
+        first_publish_at: i64,
     ) -> anyhow::Result<bool> {
         let now = get_current_timestamp_secs();
         let result = sqlx::query(
             "INSERT INTO p2p_outbox \
                 (message_id, msg_type, content, state, attempt_count, next_retry_at, lease_until, retry_until, retry_interval_secs, ack_peer_id, created_at, updated_at) \
-             VALUES (?, ?, ?, 'Pending', 0, 0, 0, ?, ?, ?, ?, ?) \
+             VALUES (?, ?, ?, 'Pending', 0, ?, 0, ?, ?, ?, ?, ?) \
              ON CONFLICT(message_id) DO NOTHING",
         )
         .bind(message_id)
         .bind(msg_type)
         .bind(content)
+        .bind(first_publish_at)
         .bind(retry_until)
         .bind(retry_interval_secs)
         .bind(ack_peer_id.unwrap_or_default())
@@ -3293,6 +3757,7 @@ impl<'a> StorageProcessor<'a> {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Claim due outbox rows in ascending `next_retry_at` order.
     pub async fn claim_p2p_outbox_messages(
         &mut self,
         now: i64,
@@ -3300,12 +3765,12 @@ impl<'a> StorageProcessor<'a> {
         limit: i64,
     ) -> anyhow::Result<Vec<P2pOutboxMessage>> {
         let rows = sqlx::query(
-            "SELECT message_id, msg_type, content, state, attempt_count, next_retry_at, lease_until, last_error, retry_until, retry_interval_secs, ack_peer_id, created_at \
+            "SELECT message_id, msg_type, content, state, attempt_count, next_retry_at, lease_until, last_error, retry_until, retry_interval_secs, ack_peer_id, publish_count, created_at \
              FROM p2p_outbox \
              WHERE ((state = 'Pending' AND next_retry_at <= ?) \
                 OR (state = 'Processing' AND lease_until <= ?) \
              ) AND (retry_until = 0 OR retry_until > ?) \
-             ORDER BY created_at ASC LIMIT ?",
+             ORDER BY next_retry_at ASC, created_at ASC LIMIT ?",
         )
         .bind(now)
         .bind(now)
@@ -3353,13 +3818,15 @@ impl<'a> StorageProcessor<'a> {
         Ok(result.rows_affected())
     }
 
+    /// Record a publish that went through and set when the row is next due.
     pub async fn schedule_p2p_outbox_retry(
         &mut self,
         message_id: &str,
         next_retry_at: i64,
     ) -> anyhow::Result<bool> {
         let result = sqlx::query(
-            "UPDATE p2p_outbox SET state = 'Pending', lease_until = 0, next_retry_at = ?, updated_at = ? \
+            "UPDATE p2p_outbox SET state = 'Pending', lease_until = 0, next_retry_at = ?, \
+                 publish_count = publish_count + 1, updated_at = ? \
              WHERE message_id = ? AND state = 'Processing' AND retry_until > 0",
         )
         .bind(next_retry_at)
@@ -3368,6 +3835,35 @@ impl<'a> StorageProcessor<'a> {
         .execute(self.conn())
         .await?;
         Ok(result.rows_affected() > 0)
+    }
+
+    /// Make a waiting row due at once. For a caller whose own publish of the
+    /// message failed: the row was scheduled on the assumption that it would not.
+    pub async fn expedite_p2p_outbox_message(&mut self, message_id: &str) -> anyhow::Result<bool> {
+        let result = sqlx::query(
+            "UPDATE p2p_outbox SET next_retry_at = 0, updated_at = ? \
+             WHERE message_id = ? AND state = 'Pending' AND next_retry_at > 0",
+        )
+        .bind(get_current_timestamp_secs())
+        .bind(message_id)
+        .execute(self.conn())
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// State and stored payload length of one outbox entry, for diagnostics and
+    /// tests. A terminal entry has dropped its payload.
+    pub async fn p2p_outbox_entry_state(
+        &mut self,
+        message_id: &str,
+    ) -> anyhow::Result<Option<(String, i64)>> {
+        let row = sqlx::query(
+            "SELECT state, length(content) AS content_len FROM p2p_outbox WHERE message_id = ?",
+        )
+        .bind(message_id)
+        .fetch_optional(self.conn())
+        .await?;
+        row.map(|row| Ok((row.try_get("state")?, row.try_get("content_len")?))).transpose()
     }
 
     pub async fn acknowledge_p2p_outbox_message(
@@ -3648,6 +4144,25 @@ impl<'a> StorageProcessor<'a> {
         .await?;
 
         Ok(row)
+    }
+
+    /// Check graph data exists under both IDs without reading the blob.
+    pub async fn has_graph_of_instance(
+        &mut self,
+        instance_id: &Uuid,
+        graph_id: &Uuid,
+    ) -> anyhow::Result<bool> {
+        let row = sqlx::query(
+            "SELECT 1 FROM graph \
+             WHERE graph_id = ? AND instance_id = ? \
+               AND EXISTS (SELECT 1 FROM graph_raw_data WHERE graph_raw_data.graph_id = graph.graph_id) \
+             LIMIT 1",
+        )
+        .bind(graph_id)
+        .bind(instance_id)
+        .fetch_optional(self.conn())
+        .await?;
+        Ok(row.is_some())
     }
 
     pub async fn find_watch_contract(
@@ -5015,9 +5530,534 @@ mod tests {
         assert_eq!(claimed[0].message_id, "hydrate-1");
     }
 
-    /// A message is only charged an abandon when its previous claim never
-    /// reported an outcome. An ordinary deferred retry must not count, otherwise
-    /// a transient outage would drive healthy work into quarantine.
+    fn admission_inbox_message(
+        message_id: &str,
+        from_peer: &str,
+        admission_class: P2pInboxAdmissionClass,
+        content: Vec<u8>,
+    ) -> P2pInboxMessage {
+        P2pInboxMessage {
+            message_id: message_id.to_string(),
+            actor: "Committee".to_string(),
+            from_peer: from_peer.to_string(),
+            msg_type: "KickoffSent".to_string(),
+            content_size: content.len() as i64,
+            content_hash: Some(content.clone()),
+            content,
+            admission_class: admission_class.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// Quota accounting must see what a sender currently makes the node store:
+    /// queued rows only, split by class, with the sender's own share.
+    #[tokio::test]
+    async fn inbox_usage_counts_queued_rows_per_class_and_sender() {
+        use P2pInboxAdmissionClass::{Registered, Unregistered};
+        let db = setup_db().await;
+        let mut s = db.acquire().await.unwrap();
+        for (message_id, from_peer, class, size) in [
+            ("usage-1", "peer-a", Registered, 10),
+            ("usage-2", "peer-a", Unregistered, 20),
+            ("usage-3", "peer-b", Unregistered, 30),
+            ("usage-4", "peer-b", Unregistered, 40),
+        ] {
+            let message = admission_inbox_message(message_id, from_peer, class, vec![7; size]);
+            assert!(s.insert_p2p_inbox_message(&message).await.unwrap());
+        }
+        // A terminal row has dropped its payload and must stop counting.
+        let claimed = s.claim_p2p_inbox_message("usage-4", 100, 200).await.unwrap().unwrap();
+        assert!(s.complete_p2p_inbox_message("usage-4", &claimed.lease_token).await.unwrap());
+        // A claimed row still holds its payload.
+        assert!(s.claim_p2p_inbox_message("usage-3", 100, 200).await.unwrap().is_some());
+
+        let mut usage = s.p2p_inbox_usage("peer-b").await.unwrap();
+        usage.sort_by(|a, b| a.admission_class.cmp(&b.admission_class));
+        assert_eq!(
+            usage,
+            vec![
+                P2pInboxClassUsage {
+                    admission_class: "Registered".to_string(),
+                    rows: 1,
+                    bytes: 10,
+                    peer_rows: 0,
+                    peer_bytes: 0,
+                },
+                P2pInboxClassUsage {
+                    admission_class: "Unregistered".to_string(),
+                    rows: 2,
+                    bytes: 50,
+                    peer_rows: 1,
+                    peer_bytes: 30,
+                },
+            ]
+        );
+    }
+
+    /// The usage query runs for every inbound message; it must be answered from
+    /// the covering index, never by reading rows that carry multi-megabyte blobs.
+    #[tokio::test]
+    async fn inbox_usage_is_answered_from_the_covering_index() {
+        let db = setup_db().await;
+        let mut s = db.acquire().await.unwrap();
+        let plan: Vec<String> = sqlx::query(
+            "EXPLAIN QUERY PLAN \
+             SELECT admission_class, COUNT(*), COALESCE(SUM(content_size), 0), \
+                    COALESCE(SUM(CASE WHEN from_peer = 'p' THEN content_size ELSE 0 END), 0) \
+             FROM p2p_inbox WHERE state IN ('Pending', 'Processing', 'Quarantined') \
+             GROUP BY admission_class",
+        )
+        .fetch_all(s.conn())
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| row.get::<String, _>("detail"))
+        .collect();
+        assert!(
+            plan.iter().any(|step| step.contains("COVERING INDEX idx_p2p_inbox_admission")),
+            "unexpected plan: {plan:?}"
+        );
+    }
+
+    /// A row written without a classification defaults to `Unregistered` rather
+    /// than silently joining the registered pool.
+    #[tokio::test]
+    async fn unclassified_inbox_rows_default_to_unregistered() {
+        let db = setup_db().await;
+        let mut s = db.acquire().await.unwrap();
+        let message = P2pInboxMessage {
+            message_id: "unclassified-1".to_string(),
+            actor: "Operator".to_string(),
+            from_peer: "peer".to_string(),
+            msg_type: "CreateGraph".to_string(),
+            content: vec![1, 2, 3],
+            content_size: 3,
+            ..Default::default()
+        };
+        assert!(s.insert_p2p_inbox_message(&message).await.unwrap());
+        let usage = s.p2p_inbox_usage("peer").await.unwrap();
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].admission_class, "Unregistered");
+        assert!(!s.has_queued_p2p_inbox_payload("peer", &[1, 2, 3]).await.unwrap());
+    }
+
+    /// Verify quota accounting and cleanup of quarantined payloads and terminal rows.
+    #[tokio::test]
+    async fn quarantined_payloads_count_and_are_capped() {
+        use P2pInboxAdmissionClass::Unregistered;
+        let db = setup_db().await;
+        let mut s = db.acquire().await.unwrap();
+        for (message_id, updated_at) in [("q-old", 100), ("q-new", 200)] {
+            let message = admission_inbox_message(message_id, "peer", Unregistered, vec![9; 1000]);
+            assert!(s.insert_p2p_inbox_message(&message).await.unwrap());
+            sqlx::query(
+                "UPDATE p2p_inbox SET state = 'Quarantined', updated_at = ? WHERE message_id = ?",
+            )
+            .bind(updated_at)
+            .bind(message_id)
+            .execute(s.conn())
+            .await
+            .unwrap();
+        }
+        let usage = s.p2p_inbox_usage("peer").await.unwrap();
+        assert_eq!(usage.iter().map(|u| u.bytes).sum::<i64>(), 2000, "quarantine counts");
+
+        // Keep only ~1000 bytes: the oldest quarantined payload is cleared.
+        assert_eq!(s.trim_quarantined_p2p_inbox_payloads(1000).await.unwrap(), 1);
+        let cleared: i64 =
+            sqlx::query("SELECT length(content) AS len FROM p2p_inbox WHERE message_id = 'q-old'")
+                .fetch_one(s.conn())
+                .await
+                .unwrap()
+                .get("len");
+        assert_eq!(cleared, 0, "the oldest payload was cleared");
+        let kept: i64 =
+            sqlx::query("SELECT length(content) AS len FROM p2p_inbox WHERE message_id = 'q-new'")
+                .fetch_one(s.conn())
+                .await
+                .unwrap()
+                .get("len");
+        assert_eq!(kept, 1000, "the newest payload is retained");
+
+        // The row cap deletes the oldest terminal rows beyond the ceiling.
+        assert_eq!(s.purge_p2p_inbox_over_terminal_cap(1, 10).await.unwrap(), 1);
+        let remaining: i64 = sqlx::query("SELECT COUNT(*) AS n FROM p2p_inbox")
+            .fetch_one(s.conn())
+            .await
+            .unwrap()
+            .get("n");
+        assert_eq!(remaining, 1);
+    }
+
+    /// Verify split usage queries match the combined query and use the covering index.
+    #[tokio::test]
+    async fn split_inbox_usage_matches_and_seeks_the_sender() {
+        use P2pInboxAdmissionClass::{Registered, Unregistered};
+        let db = setup_db().await;
+        let mut s = db.acquire().await.unwrap();
+        for (message_id, from_peer, class, size) in [
+            ("split-1", "peer-a", Registered, 10),
+            ("split-2", "peer-a", Unregistered, 20),
+            ("split-3", "peer-b", Unregistered, 30),
+        ] {
+            let message = admission_inbox_message(message_id, from_peer, class, vec![7; size]);
+            assert!(s.insert_p2p_inbox_message(&message).await.unwrap());
+        }
+        let mut combined = s.p2p_inbox_usage("peer-a").await.unwrap();
+        combined.sort_by(|a, b| a.admission_class.cmp(&b.admission_class));
+        let mut totals = s.p2p_inbox_class_totals().await.unwrap();
+        totals.sort_by(|a, b| a.admission_class.cmp(&b.admission_class));
+        for peer in s.p2p_inbox_peer_usage("peer-a").await.unwrap() {
+            let total =
+                totals.iter_mut().find(|t| t.admission_class == peer.admission_class).unwrap();
+            total.peer_rows = peer.peer_rows;
+            total.peer_bytes = peer.peer_bytes;
+        }
+        assert_eq!(totals, combined);
+
+        let plan: Vec<String> = sqlx::query(
+            "EXPLAIN QUERY PLAN \
+             SELECT admission_class, COUNT(*), COALESCE(SUM(content_size), 0) \
+             FROM p2p_inbox \
+             WHERE state IN ('Pending', 'Processing', 'Quarantined') \
+               AND admission_class IN ('Registered', 'Unregistered') \
+               AND from_peer = 'p' \
+             GROUP BY admission_class",
+        )
+        .fetch_all(s.conn())
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| row.get::<String, _>("detail"))
+        .collect();
+        assert!(
+            plan.iter().any(|step| step.contains("COVERING INDEX idx_p2p_inbox_admission")
+                && step.contains("from_peer=?")),
+            "the sender's rows must be reached by an index seek: {plan:?}"
+        );
+    }
+
+    /// Registered rows take the batch ahead of older unregistered ones, but a
+    /// reserved share keeps the unregistered queue moving.
+    #[tokio::test]
+    async fn claimable_listing_drains_registered_rows_first() {
+        use P2pInboxAdmissionClass::{Committee, Registered, Unregistered};
+        let db = setup_db().await;
+        let mut s = db.acquire().await.unwrap();
+        let mut created_at = 100;
+        let mut insert = async |s: &mut StorageProcessor<'_>, id: String, class| {
+            let message = admission_inbox_message(&id, "peer", class, id.clone().into_bytes());
+            assert!(s.insert_p2p_inbox_message(&message).await.unwrap());
+            sqlx::query("UPDATE p2p_inbox SET created_at = ? WHERE message_id = ?")
+                .bind(created_at)
+                .bind(&id)
+                .execute(s.conn())
+                .await
+                .unwrap();
+            created_at += 1;
+        };
+        // The flood arrived first ...
+        for index in 0..8 {
+            insert(&mut s, format!("flood-{index}"), Unregistered).await;
+        }
+        // ... and the registered messages queue up behind it, the committee's
+        // last of all.
+        for index in 0..4 {
+            insert(&mut s, format!("member-{index}"), Registered).await;
+        }
+        for index in 4..6 {
+            insert(&mut s, format!("member-{index}"), Committee).await;
+        }
+        let ids = |rows: Vec<P2pInboxMessage>| -> Vec<String> {
+            rows.into_iter().map(|row| row.message_id).collect()
+        };
+
+        let plain = ids(s.list_claimable_p2p_inbox_messages(1000, 4, 3, &[]).await.unwrap());
+        assert_eq!(plain, ["flood-0", "flood-1", "flood-2", "flood-3"], "oldest first");
+
+        let fair =
+            ids(s.list_claimable_p2p_inbox_messages_by_class(1000, 4, 1, 1, 3, &[]).await.unwrap());
+        assert_eq!(fair, ["member-4", "member-5", "member-0", "flood-0"], "committee first");
+
+        // With fewer registered rows than the batch, the rest goes to the others.
+        let fair = ids(s
+            .list_claimable_p2p_inbox_messages_by_class(1000, 10, 2, 2, 3, &[])
+            .await
+            .unwrap());
+        assert_eq!(fair.len(), 10);
+        assert_eq!(fair.iter().filter(|id| id.starts_with("member-")).count(), 6);
+        assert_eq!(&fair[6..], ["flood-0", "flood-1", "flood-2", "flood-3"]);
+
+        // A committee backlog that would fill every batch does not starve the
+        // other registered senders, nor the unregistered ones.
+        for index in 0..8 {
+            insert(&mut s, format!("committee-backlog-{index}"), Committee).await;
+        }
+        let fair =
+            ids(s.list_claimable_p2p_inbox_messages_by_class(1000, 4, 1, 1, 3, &[]).await.unwrap());
+        assert_eq!(fair, ["member-4", "member-5", "member-0", "flood-0"]);
+
+        // Lend unused reserved capacity to committee first.
+        let fair = ids(s
+            .list_claimable_p2p_inbox_messages_by_class(1000, 16, 6, 4, 3, &[])
+            .await
+            .unwrap());
+        assert_eq!(fair.len(), 16);
+        assert_eq!(fair.iter().filter(|id| id.starts_with("flood-")).count(), 4);
+        assert_eq!(fair.iter().filter(|id| id.starts_with("committee-backlog-")).count(), 6);
+        let mut unique = fair.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            16,
+            "borrowing continues a class's listing, it does not repeat it"
+        );
+    }
+
+    /// Verify confirmed operator bindings are loaded before unconfirmed identities.
+    #[tokio::test]
+    async fn confirmed_operator_bindings_are_loaded_first() {
+        let db = setup_db().await;
+        let mut s = db.acquire().await.unwrap();
+        let operator = |peer_id: &str, updated_at: i64| Node {
+            peer_id: peer_id.to_string(),
+            actor: "Operator".to_string(),
+            btc_pub_key: format!("key-of-{peer_id}"),
+            binding_sig: "sig".to_string(),
+            binding_issued_at: 1,
+            updated_at,
+            created_at: updated_at,
+            ..Default::default()
+        };
+        s.upsert_node(&operator("confirmed", 10)).await.unwrap();
+        for index in 0..4 {
+            s.upsert_node(&operator(&format!("recent-{index}"), 900 + index)).await.unwrap();
+        }
+        // Not an operator, and an operator without a binding: never loaded.
+        s.upsert_node(&Node { actor: "Committee".to_string(), ..operator("member", 999) })
+            .await
+            .unwrap();
+        s.upsert_node(&Node { binding_sig: String::new(), ..operator("unbound", 999) })
+            .await
+            .unwrap();
+        s.upsert_p2p_registered_peer("confirmed", "Operator", "aa").await.unwrap();
+
+        let loaded: Vec<String> = s
+            .load_p2p_peer_bindings(2)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|node| node.peer_id)
+            .collect();
+        assert_eq!(loaded, ["confirmed", "recent-3"]);
+    }
+
+    /// A sync request names both ids. A real graph under another instance's id
+    /// is not a graph this node holds for that request.
+    #[tokio::test]
+    async fn graph_is_held_only_under_its_own_instance() {
+        let db = setup_db().await;
+        let mut s = db.acquire().await.unwrap();
+        let (instance, graph, other) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        sqlx::query(
+            "INSERT INTO graph (graph_id, instance_id, status, created_at, updated_at) \
+             VALUES (?, ?, 'Created', 1, 1)",
+        )
+        .bind(graph)
+        .bind(instance)
+        .execute(s.conn())
+        .await
+        .unwrap();
+        assert!(!s.has_graph_of_instance(&instance, &graph).await.unwrap(), "no data stored yet");
+        sqlx::query("INSERT INTO graph_raw_data (graph_id, raw_data) VALUES (?, 'x')")
+            .bind(graph)
+            .execute(s.conn())
+            .await
+            .unwrap();
+        assert!(s.has_graph_of_instance(&instance, &graph).await.unwrap());
+        assert!(!s.has_graph_of_instance(&other, &graph).await.unwrap(), "wrong instance");
+        assert!(!s.has_graph_of_instance(&instance, &other).await.unwrap(), "unknown graph");
+    }
+
+    #[tokio::test]
+    async fn registered_peers_persist_and_shield_their_node_rows() {
+        let db = setup_db().await;
+        let mut s = db.acquire().await.unwrap();
+        s.upsert_p2p_registered_peer("member", "Committee", "").await.unwrap();
+        s.upsert_p2p_registered_peer("member", "Committee", "").await.unwrap();
+        s.upsert_p2p_registered_peer("other-member", "Committee", "").await.unwrap();
+        s.upsert_p2p_registered_peer("operator", "Operator", "aa").await.unwrap();
+        let load = async |s: &mut StorageProcessor<'_>| {
+            let mut peers = s.load_p2p_registered_peers().await.unwrap();
+            peers.sort();
+            peers
+        };
+        let row = |peer: &str, kind: &str, key: &str| {
+            (peer.to_string(), kind.to_string(), key.to_string())
+        };
+        assert_eq!(
+            load(&mut s).await,
+            [
+                row("member", "Committee", ""),
+                row("operator", "Operator", "aa"),
+                row("other-member", "Committee", "")
+            ],
+            "keyless kinds never displace each other"
+        );
+        // Move the key's registration to the new peer.
+        s.upsert_p2p_registered_peer("operator-moved", "Operator", "aa").await.unwrap();
+        // A peer confirmed for another key keeps one row, for the new key.
+        s.upsert_p2p_registered_peer("operator-moved", "Operator", "bb").await.unwrap();
+        assert_eq!(
+            load(&mut s).await,
+            [
+                row("member", "Committee", ""),
+                row("operator-moved", "Operator", "bb"),
+                row("other-member", "Committee", "")
+            ]
+        );
+        s.delete_p2p_registered_peer("operator-moved", "Operator").await.unwrap();
+        s.delete_p2p_registered_peer("other-member", "Committee").await.unwrap();
+        assert_eq!(load(&mut s).await.len(), 1);
+
+        // Replay marks only move up, and are kept for registered peers and the
+        // verifiers the caller names.
+        s.raise_p2p_replay_marks(&[("member".into(), 50), ("verifier".into(), 7)]).await.unwrap();
+        s.raise_p2p_replay_marks(&[("member".into(), 40), ("gone".into(), 9)]).await.unwrap();
+        assert_eq!(s.prune_p2p_replay_marks(&["verifier".to_string()]).await.unwrap(), 1);
+        let mut marks = s.load_p2p_replay_marks().await.unwrap();
+        marks.sort();
+        assert_eq!(marks, [("member".to_string(), 50), ("verifier".to_string(), 7)]);
+
+        for (peer_id, updated_at) in [("member", 10), ("sybil", 10), ("local", 10), ("live", 900)] {
+            s.upsert_node(&Node {
+                peer_id: peer_id.to_string(),
+                actor: "Operator".to_string(),
+                updated_at,
+                created_at: updated_at,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        }
+        // Only unregistered rows count toward capacity; stale rows may be evicted.
+        assert!(s.node_row_admissible("sybil", 3, 0, "local").await.unwrap());
+        assert!(s.node_row_admissible("newcomer", 4, 0, "local").await.unwrap());
+        assert!(
+            !s.node_row_admissible("newcomer", 3, 5, "local").await.unwrap(),
+            "full, and every row was refreshed after the eviction horizon"
+        );
+        assert!(
+            s.node_row_admissible("newcomer", 3, 500, "local").await.unwrap(),
+            "the stalest unregistered row makes room"
+        );
+        let known = async |s: &mut StorageProcessor<'_>, peer_id: &str| {
+            s.node_row_admissible(peer_id, 0, 0, "local").await.unwrap()
+        };
+        assert!(!known(&mut s, "sybil").await, "evicted: stale, unregistered, not this node");
+        for kept in ["member", "local", "live"] {
+            assert!(known(&mut s, kept).await, "{kept}");
+        }
+
+        s.upsert_node(&Node {
+            peer_id: "left".to_string(),
+            actor: "Watchtower".to_string(),
+            updated_at: 20,
+            created_at: 20,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        assert_eq!(s.purge_stale_unregistered_nodes(500, "local").await.unwrap(), 1);
+        assert!(!known(&mut s, "left").await);
+        assert!(known(&mut s, "member").await && known(&mut s, "local").await);
+
+        s.raise_p2p_replay_marks(&[("locked-out".into(), 99)]).await.unwrap();
+        assert_eq!(s.delete_p2p_replay_marks(&["locked-out".to_string()]).await.unwrap(), 1);
+        assert_eq!(s.delete_p2p_replay_marks(&[]).await.unwrap(), 0);
+    }
+
+    /// Only a copy that is still queued suppresses a re-publish; once it reached
+    /// a terminal state the same payload may be delivered again.
+    #[tokio::test]
+    async fn queued_payload_lookup_ignores_other_senders_and_terminal_rows() {
+        use P2pInboxAdmissionClass::Registered;
+        let db = setup_db().await;
+        let mut s = db.acquire().await.unwrap();
+        let message = admission_inbox_message("dup-1", "peer-a", Registered, vec![9; 8]);
+        assert!(s.insert_p2p_inbox_message(&message).await.unwrap());
+
+        assert!(s.has_queued_p2p_inbox_payload("peer-a", &[9; 8]).await.unwrap());
+        assert!(!s.has_queued_p2p_inbox_payload("peer-b", &[9; 8]).await.unwrap());
+        assert!(!s.has_queued_p2p_inbox_payload("peer-a", &[8; 8]).await.unwrap());
+
+        let claimed = s.claim_p2p_inbox_message("dup-1", 100, 200).await.unwrap().unwrap();
+        assert!(
+            s.has_queued_p2p_inbox_payload("peer-a", &[9; 8]).await.unwrap(),
+            "a claimed row is still in flight"
+        );
+        assert!(s.complete_p2p_inbox_message("dup-1", &claimed.lease_token).await.unwrap());
+        assert!(!s.has_queued_p2p_inbox_payload("peer-a", &[9; 8]).await.unwrap());
+    }
+
+    /// Verify Pending expiry uses `created_at`, not the last retry time.
+    #[tokio::test]
+    async fn pending_inbox_rows_expire_by_class_and_age() {
+        use P2pInboxAdmissionClass::{Registered, Unregistered};
+        let db = setup_db().await;
+        let mut s = db.acquire().await.unwrap();
+        for (message_id, class, created_at) in [
+            ("expire-old-unregistered", Unregistered, 100),
+            ("expire-new-unregistered", Unregistered, 900),
+            ("expire-old-registered", Registered, 100),
+            ("expire-claimed-unregistered", Unregistered, 100),
+        ] {
+            let message = admission_inbox_message(message_id, "peer", class, vec![5; 16]);
+            assert!(s.insert_p2p_inbox_message(&message).await.unwrap());
+            sqlx::query(
+                "UPDATE p2p_inbox SET created_at = ?, updated_at = 5000 WHERE message_id = ?",
+            )
+            .bind(created_at)
+            .bind(message_id)
+            .execute(s.conn())
+            .await
+            .unwrap();
+        }
+        let now = get_current_timestamp_secs();
+        assert!(
+            s.claim_p2p_inbox_message("expire-claimed-unregistered", now, now + 300)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        assert_eq!(s.expire_pending_p2p_inbox_messages(Some(Unregistered), 500).await.unwrap(), 1);
+        let states: Vec<(String, String, i64)> = sqlx::query(
+            "SELECT message_id, state, length(content) AS len FROM p2p_inbox ORDER BY message_id",
+        )
+        .fetch_all(s.conn())
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| (row.get("message_id"), row.get("state"), row.get("len")))
+        .collect();
+        assert_eq!(
+            states,
+            vec![
+                ("expire-claimed-unregistered".to_string(), "Processing".to_string(), 16),
+                ("expire-new-unregistered".to_string(), "Pending".to_string(), 16),
+                ("expire-old-registered".to_string(), "Pending".to_string(), 16),
+                ("expire-old-unregistered".to_string(), "Failed".to_string(), 0),
+            ]
+        );
+
+        // The class-independent ceiling reaches every remaining pending row.
+        assert_eq!(s.expire_pending_p2p_inbox_messages(None, 1000).await.unwrap(), 2);
+        assert_eq!(s.p2p_inbox_usage("peer").await.unwrap().iter().map(|u| u.rows).sum::<i64>(), 1);
+    }
+
+    /// Verify only unfinished claims increment abandon_count.
     #[tokio::test]
     async fn test_inbox_abandon_is_charged_only_for_unfinished_claims() {
         let db = setup_db().await;
@@ -5076,9 +6116,7 @@ mod tests {
         assert_eq!(claimed[0].abandon_count, 0, "a reported outcome resets consecutive abandons");
     }
 
-    /// A payload that keeps taking the node down is quarantined rather than
-    /// dispatched again. Its content remains available for manual requeue until
-    /// terminal-row cleanup removes it.
+    /// Verify repeated abandonment quarantines the retained payload.
     #[tokio::test]
     async fn test_inbox_quarantines_repeatedly_abandoned_message() {
         let db = setup_db().await;
@@ -5131,9 +6169,7 @@ mod tests {
         assert_eq!(requeued[0].abandon_count, 0);
     }
 
-    /// The local queue used to hand out work without writing anything, so a
-    /// handler that panicked left the row immediately claimable again. A claim
-    /// must hold the message for the length of its lease.
+    /// Verify local claims hold a lease.
     #[tokio::test]
     async fn test_local_claim_holds_lease_and_charges_abandon() {
         let db = setup_db().await;

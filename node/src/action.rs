@@ -798,6 +798,8 @@ pub async fn enqueue_graph_setup_outbox_message(
             now + get_p2p_graph_setup_retry_window_secs(),
             get_p2p_graph_setup_retry_interval_secs(),
             ack_peer_id,
+            // Only the outbox ever sends these, so the row is due at once.
+            0,
         )
         .await?;
     Ok(outbox_id)
@@ -1007,6 +1009,61 @@ pub struct NodeInfo {
     pub node_name: String,
     pub service_fee_rate: f64,
     pub available_peg_btc: String,
+    /// Hex master-key Schnorr signature over peer ID, public key and issuance time.
+    #[serde(default)]
+    pub binding_sig: String,
+    /// Unix seconds when the binding was signed. Orders re-bindings so one key
+    /// maps to a single peer id at a time.
+    #[serde(default)]
+    pub binding_issued_at: i64,
+}
+
+const NODE_INFO_BINDING_DOMAIN: &[u8] = b"bitvm2-node/node-info-binding/v1";
+
+fn node_info_binding_message(peer_id: &str, btc_pub_key: &str, issued_at: i64) -> SecpMessage {
+    let mut hasher = Sha256::new();
+    hasher.update(NODE_INFO_BINDING_DOMAIN);
+    hasher.update((peer_id.len() as u32).to_be_bytes());
+    hasher.update(peer_id.as_bytes());
+    hasher.update((btc_pub_key.len() as u32).to_be_bytes());
+    hasher.update(btc_pub_key.as_bytes());
+    hasher.update(issued_at.to_be_bytes());
+    SecpMessage::from_digest(hasher.finalize().into())
+}
+
+/// Sign the binding that proves `master_keypair`'s key authorised `peer_id`.
+pub fn sign_node_info_binding(
+    peer_id: &str,
+    btc_pub_key: &str,
+    issued_at: i64,
+    master_keypair: &Keypair,
+) -> String {
+    let signature = SECP256K1
+        .sign_schnorr(&node_info_binding_message(peer_id, btc_pub_key, issued_at), master_keypair);
+    hex::encode(signature.serialize())
+}
+
+/// Verify the NodeInfo binding and return its parsed public key.
+pub fn verify_node_info_binding(node_info: &NodeInfo) -> Option<XOnlyPublicKey> {
+    if node_info.binding_sig.is_empty() {
+        return None;
+    }
+    let pubkey = PublicKey::from_str(&node_info.btc_pub_key).ok()?;
+    let xonly = XOnlyPublicKey::from(pubkey);
+    let signature_bytes = hex::decode(&node_info.binding_sig).ok()?;
+    let signature = SchnorrSignature::from_slice(&signature_bytes).ok()?;
+    SECP256K1
+        .verify_schnorr(
+            &signature,
+            &node_info_binding_message(
+                &node_info.peer_id,
+                &node_info.btc_pub_key,
+                node_info.binding_issued_at,
+            ),
+            &xonly,
+        )
+        .ok()
+        .map(|()| xonly)
 }
 
 #[derive(Serialize, Deserialize, Clone)]

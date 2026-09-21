@@ -18,6 +18,7 @@ use reqwest::Url;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::time::SystemTime;
 use strum::{Display, EnumString};
 use tracing::{info, warn};
 use util::hex_parse;
@@ -348,6 +349,20 @@ pub fn get_local_node_info() -> NodeInfo {
         addr_op
     };
     let socket_addr = std::env::var(ENV_EXTERNAL_SOCKET_ADDR).unwrap_or("".to_string());
+    // Sign this node's peer ID binding with its master key.
+    let issued_at = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or_default();
+    let binding_sig = match get_bitvm_key() {
+        Ok(keypair) => {
+            crate::action::sign_node_info_binding(&peer_key, &pubkey_str, issued_at, &keypair)
+        }
+        Err(error) => {
+            tracing::error!("failed to sign node info binding: {error}");
+            String::new()
+        }
+    };
     NodeInfo {
         peer_id: peer_key,
         actor: actor.to_string(),
@@ -357,6 +372,8 @@ pub fn get_local_node_info() -> NodeInfo {
         node_name: get_node_name(),
         service_fee_rate: get_operator_node_service_fee_rate(),
         available_peg_btc: "0".to_string(),
+        binding_sig,
+        binding_issued_at: issued_at,
     }
 }
 pub fn get_committee_member_num() -> usize {
