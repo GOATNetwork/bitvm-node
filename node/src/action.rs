@@ -3613,31 +3613,18 @@ pub async fn send_to_peer(
     }
 }
 
-pub async fn push_local_unhandled_messages_with_reason(
+/// Defer the message currently being dispatched, or enqueue a new local task.
+pub async fn defer_or_enqueue_message(
     local_db: &LocalDB,
     message: &GOATMessage,
     delay_secs: usize,
     reason: MessageDeferReason,
     reason_detail: &str,
 ) -> Result<()> {
-    // Keep self-deferral in the original sender-specific inbox row.
-    let deferred_in_inbox = ACTIVE_INBOX_DISPATCH
-        .try_with(|active| {
-            if DispatchFingerprint::of(message.content()) != active.fingerprint {
-                return false;
-            }
-            *active.retry.borrow_mut() = Some(retryable_dispatch_error(
-                RetryableDispatchReason::DependencyPending,
-                Some(delay_secs.max(1) as i64),
-                reason_detail.to_owned(),
-            ));
-            true
-        })
-        .unwrap_or(false);
-    if deferred_in_inbox {
+    if defer_current_inbox(message, delay_secs, reason_detail) {
         return Ok(());
     }
-    let mut storage_processor = local_db.start_immediate_transaction().await?;
+
     let actor = message.actor.clone();
     let content: GOATMessageContent = message.content().clone();
     let key = LocalMessageKey::from_content(actor.clone(), &content)?;
@@ -3647,35 +3634,30 @@ pub async fn push_local_unhandled_messages_with_reason(
     let active_claim = ACTIVE_LOCAL_MESSAGE_CLAIM
         .try_with(|claim| (claim.message_id.clone(), claim.message_version))
         .ok();
-    let claimed_message = if let Some((message_id, _)) = active_claim.as_ref() {
-        storage_processor.find_messages_by_id(message_id).await?
-    } else {
-        None
-    };
-    let owns_requeued_message = claimed_message.as_ref().is_some_and(|existing| {
-        active_claim.as_ref().is_some_and(|(message_id, message_version)| {
-            existing.message_id == message_id.as_str()
-                && existing.message_version == *message_version
-                && existing.business_id == business_id
-                && existing.msg_type == message_type
-        })
-    });
-    let self_deferred = if let Some(existing) = claimed_message.as_ref()
-        && existing.state == MessageState::Processing.to_string()
-        && owns_requeued_message
+    let mut storage_processor = local_db.start_immediate_transaction().await?;
+
+    let queued_message_id = if let Some((message_id, message_version)) =
+        active_claim.filter(|(message_id, _)| message_id == &target_message_id)
     {
-        storage_processor
+        let deferred = storage_processor
             .self_defer_local_message(
-                &existing.message_id,
-                existing.message_version,
+                &message_id,
+                message_version,
                 current_time_secs() + delay_secs as i64,
                 reason_detail,
             )
-            .await?
+            .await?;
+        if !deferred {
+            return Err(retryable_dispatch_error(
+                RetryableDispatchReason::ResourceLocked,
+                Some(delay_secs.max(1) as i64),
+                format!(
+                    "local message {business_id}:{message_type} is no longer owned by this claim"
+                ),
+            ));
+        }
+        message_id
     } else {
-        false
-    };
-    if !self_deferred {
         let upserted = upsert_message(
             &mut storage_processor,
             true,
@@ -3701,20 +3683,11 @@ pub async fn push_local_unhandled_messages_with_reason(
                 ));
             }
         }
-    }
-    let queued_message_id = if self_deferred {
-        claimed_message.as_ref().map(|message| message.message_id.as_str())
-    } else {
-        Some(target_message_id.as_str())
+        target_message_id
     };
-    let persist_result = match queued_message_id {
-        Some(message_id) => {
-            storage_processor
-                .upsert_message_debug_reason(message_id, reason.code(), reason_detail)
-                .await
-        }
-        None => Ok(()),
-    };
+    let persist_result = storage_processor
+        .upsert_message_debug_reason(&queued_message_id, reason.code(), reason_detail)
+        .await;
     if let Err(error) = persist_result {
         tracing::warn!(
             event = "local_message_queue",
@@ -3730,6 +3703,22 @@ pub async fn push_local_unhandled_messages_with_reason(
         metrics_state.record_message_retry();
     }
     Ok(())
+}
+
+fn defer_current_inbox(message: &GOATMessage, delay_secs: usize, reason_detail: &str) -> bool {
+    ACTIVE_INBOX_DISPATCH
+        .try_with(|active| {
+            if DispatchFingerprint::of(message.content()) != active.fingerprint {
+                return false;
+            }
+            *active.retry.borrow_mut() = Some(retryable_dispatch_error(
+                RetryableDispatchReason::DependencyPending,
+                Some(delay_secs.max(1) as i64),
+                reason_detail.to_owned(),
+            ));
+            true
+        })
+        .unwrap_or(false)
 }
 
 /// Helper: try to get graph. If missing, send SyncGraphRequest and defer current handling.
@@ -3763,7 +3752,7 @@ pub(crate) async fn get_graph_or_defer(
                 "submitted"
             };
             let delay_secs: usize = 60; // 1 min default retry
-            if let Err(error) = push_local_unhandled_messages_with_reason(
+            if let Err(error) = defer_or_enqueue_message(
                 local_db,
                 message,
                 delay_secs,
@@ -4238,7 +4227,7 @@ mod tests {
         );
         let mut compensated = false;
         let result = track_inbox_retry(DispatchFingerprint::of(message.content()), async {
-            push_local_unhandled_messages_with_reason(
+            defer_or_enqueue_message(
                 &local_db,
                 &message,
                 30,
@@ -4284,7 +4273,7 @@ mod tests {
         );
 
         let result = track_inbox_retry(DispatchFingerprint::of(dispatched.content()), async {
-            push_local_unhandled_messages_with_reason(
+            defer_or_enqueue_message(
                 &local_db,
                 &other_event,
                 30,
@@ -4292,7 +4281,7 @@ mod tests {
                 "a different event",
             )
             .await?;
-            push_local_unhandled_messages_with_reason(
+            defer_or_enqueue_message(
                 &local_db,
                 &own_copy,
                 45,
@@ -4430,7 +4419,7 @@ mod tests {
             Actor::Operator,
             GOATMessageContent::PostReady(PostReady { instance_id }),
         );
-        push_local_unhandled_messages_with_reason(
+        defer_or_enqueue_message(
             &local_db,
             &message,
             0,
@@ -4455,7 +4444,7 @@ mod tests {
         };
         assert_eq!(claimed.len(), 1);
 
-        let error = push_local_unhandled_messages_with_reason(
+        let error = defer_or_enqueue_message(
             &local_db,
             &message,
             30,
@@ -4563,7 +4552,7 @@ mod tests {
                     message_id: claimed.message_id.clone(),
                     message_version: claimed.message_version,
                 },
-                push_local_unhandled_messages_with_reason(
+                defer_or_enqueue_message(
                     &local_db,
                     &message,
                     30,
@@ -4589,6 +4578,84 @@ mod tests {
         assert_eq!(
             storage.find_messages_by_id(&message_id).await.unwrap().unwrap().abandon_count,
             0
+        );
+    }
+
+    #[tokio::test]
+    async fn local_claim_is_not_deferred_by_another_actor_message() {
+        let local_db = store::create_local_db("sqlite::memory:").await;
+        let instance_id = Uuid::new_v4();
+        let claimed_message = GOATMessage::new(
+            Actor::Operator,
+            GOATMessageContent::PostReady(PostReady { instance_id }),
+        );
+        let other_actor_message =
+            GOATMessage::new(Actor::Committee, claimed_message.content.clone());
+        let claimed_id =
+            LocalMessageKey::from_content(claimed_message.actor.clone(), claimed_message.content())
+                .unwrap()
+                .message_id();
+        let other_id = LocalMessageKey::from_content(
+            other_actor_message.actor.clone(),
+            other_actor_message.content(),
+        )
+        .unwrap()
+        .message_id();
+        {
+            let mut storage = local_db.acquire().await.unwrap();
+            upsert_message(
+                &mut storage,
+                false,
+                SELF_SENDER.to_owned(),
+                claimed_message.actor.clone(),
+                claimed_message.content.clone(),
+                0,
+                0,
+            )
+            .await
+            .unwrap();
+        }
+        let claimed = local_db
+            .acquire()
+            .await
+            .unwrap()
+            .claim_local_messages(
+                current_time_secs() + 1,
+                current_time_secs() + 300,
+                0,
+                1,
+                QUEUE_MAX_ABANDONS,
+            )
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+
+        ACTIVE_LOCAL_MESSAGE_CLAIM
+            .scope(
+                LocalMessageClaim {
+                    message_id: claimed.message_id.clone(),
+                    message_version: claimed.message_version,
+                },
+                defer_or_enqueue_message(
+                    &local_db,
+                    &other_actor_message,
+                    30,
+                    MessageDeferReason::HandlerError,
+                    "other actor",
+                ),
+            )
+            .await
+            .unwrap();
+
+        let mut storage = local_db.acquire().await.unwrap();
+        assert_eq!(
+            storage.find_messages_by_id(&claimed_id).await.unwrap().unwrap().state,
+            MessageState::Processing.to_string()
+        );
+        assert_eq!(
+            storage.find_messages_by_id(&other_id).await.unwrap().unwrap().state,
+            MessageState::Pending.to_string()
         );
     }
 }

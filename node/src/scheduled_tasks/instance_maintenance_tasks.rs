@@ -1,7 +1,7 @@
 use crate::action::{
     ConfirmInstance, GOATMessage, GOATMessageContent, MessageDeferReason, PeginConfirmNonce,
     PeginConfirmNonceConsensus, PeginConfirmPartialSig, PeginRequest, PostReady,
-    RetryableDispatchError, RetryableDispatchReason, push_local_unhandled_messages_with_reason,
+    RetryableDispatchError, RetryableDispatchReason, defer_or_enqueue_message,
 };
 use crate::env::{
     COMMITTEE_INSTANCE_KEYS_DIR, get_bitvm_key, get_committee_instance_key_delete_timelock_blocks,
@@ -625,7 +625,7 @@ pub async fn pegin_confirm_recovery_monitor(
                 }),
             );
             if !finish_recovery_enqueue(
-                push_local_unhandled_messages_with_reason(
+                defer_or_enqueue_message(
                     local_db,
                     &message,
                     0,
@@ -685,7 +685,7 @@ pub async fn pegin_confirm_recovery_monitor(
             }),
         );
         if !finish_recovery_enqueue(
-            push_local_unhandled_messages_with_reason(
+            defer_or_enqueue_message(
                 local_db,
                 &message,
                 0,
@@ -720,7 +720,7 @@ pub async fn pegin_confirm_recovery_monitor(
                 }),
             );
             if !finish_recovery_enqueue(
-                push_local_unhandled_messages_with_reason(
+                defer_or_enqueue_message(
                     local_db,
                     &message,
                     0,
