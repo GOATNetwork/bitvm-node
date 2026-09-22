@@ -2621,7 +2621,64 @@ async fn handle_p2p_outbox_messages(
             "outbound messages reached the end of their retry window: graph-setup messages without the expected ACK, signing-round messages without their round closing"
         );
     }
+    recover_exhausted_setup(local_db).await?;
     drain_p2p_outbox(swarm, local_db, deadline).await
+}
+
+/// Recovery is driven by durable delivery state even when no new gossip arrives.
+async fn recover_exhausted_setup(local_db: &LocalDB) -> Result<()> {
+    let now = current_time_secs();
+    let Some((id, bytes, created_at)) = local_db.acquire().await?.next_exhausted_setup(now).await?
+    else {
+        return Ok(());
+    };
+    let decoded = GOATMessage::deserialize_message(&bytes).await;
+    let mut storage = local_db.start_immediate_transaction().await?;
+    let mut resume = false;
+    let mut canonical = id.clone();
+    if let Ok(message) = decoded
+        && let Some(key) = graph_setup_outbox_id(&message.content)
+        && let BusinessRef::Graph { instance_id, graph_id } = message.content.business_ref()
+    {
+        canonical = key;
+        let instance = storage.find_instance(&instance_id).await?;
+        let graph = storage.find_graph(&graph_id).await?;
+        resume = now - created_at < MESSAGE_EXPIRE_TIME
+            && graph.is_none()
+            && instance.is_some_and(|row| {
+                matches!(
+                    InstanceBridgeInStatus::from_str(&row.status),
+                    Ok(InstanceBridgeInStatus::UserBroadcastPeginPrepare
+                        | InstanceBridgeInStatus::Presigned
+                        | InstanceBridgeInStatus::RelayerL1Broadcasted
+                        | InstanceBridgeInStatus::RelayerL2Minted)
+                )
+            });
+    }
+    storage
+        .recover_setup_delivery(
+            &id,
+            &canonical,
+            now,
+            get_p2p_graph_setup_retry_window_secs(),
+            resume,
+        )
+        .await?;
+    storage.commit().await?;
+    tracing::info!(event = "setup_delivery_recovery", message_id = %id, resume,
+        "settled exhausted setup delivery");
+    Ok(())
+}
+
+fn setup_retry_interval_secs(publish_count: i64, base: i64, id: &str) -> i64 {
+    let base = base.max(1);
+    let delay = base
+        .saturating_mul(1_i64 << publish_count.saturating_sub(1).clamp(0, 20))
+        .min(base.max(60));
+    // Stable jitter keeps retries reproducible across restarts without synchronizing peers.
+    let jitter =
+        id.bytes().fold(publish_count as u64, |n, b| n.wrapping_mul(31).wrapping_add(b as u64)) % 7;
+    delay + jitter as i64
 }
 
 async fn drain_p2p_outbox(
@@ -2698,6 +2755,24 @@ async fn publish_p2p_outbox_row(
             return Ok(OutboxRowOutcome::Closed);
         }
     };
+    if let Some(canonical_id) = graph_setup_outbox_id(&outbound.content)
+        && let BusinessRef::Graph { instance_id, graph_id } = outbound.content.business_ref()
+    {
+        let mut storage = local_db.acquire().await?;
+        let instance = storage.find_instance(&instance_id).await?;
+        let failed = instance.as_ref().is_some_and(|row| {
+            InstanceBridgeInStatus::from_str(&row.status).is_ok_and(|status| {
+                SigningRound::GraphSigning.delivery_finished(None, Some(&status))
+            })
+        });
+        if failed
+            || storage.find_graph(&graph_id).await?.is_some()
+            || current_time_secs() - message.created_at >= MESSAGE_EXPIRE_TIME
+        {
+            storage.cancel_p2p_outbox_message(&canonical_id).await?;
+            return Ok(OutboxRowOutcome::Closed);
+        }
+    }
     let signing_round = if message.message_id.starts_with(PROTOCOL_OUTBOX_PREFIX) {
         let round = SigningRound::of(&outbound.content)
             .filter(|_| outbound.content.business_ref() != BusinessRef::Unscoped);
@@ -2738,7 +2813,11 @@ async fn publish_p2p_outbox_row(
                         message.publish_count + 1,
                         round.retry_ceiling_secs(crate::env::get_p2p_protocol_retry_max_secs()),
                     ),
-                    None => message.retry_interval_secs,
+                    None => setup_retry_interval_secs(
+                        message.publish_count + 1,
+                        message.retry_interval_secs,
+                        &message.message_id,
+                    ),
                 };
                 let next_retry_at = current_time_secs() + interval;
                 storage.schedule_p2p_outbox_retry(&message.message_id, next_retry_at).await?;

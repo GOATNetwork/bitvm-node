@@ -3806,8 +3806,12 @@ impl<'a> StorageProcessor<'a> {
     /// End a bounded-retry message once its delivery window is exhausted.
     pub async fn expire_p2p_outbox_retry_messages(&mut self, now: i64) -> anyhow::Result<u64> {
         let result = sqlx::query(
-            "UPDATE p2p_outbox SET state = 'RetryExhausted', content = X'', lease_until = 0, next_retry_at = 0, \
-                 retry_until = 0, retry_interval_secs = 0, ack_peer_id = '', \
+            "UPDATE p2p_outbox SET state = 'RetryExhausted', \
+                 content = CASE WHEN msg_type IN ('InitGraph','GenCircuits','CutCircuits','SolderingProofReady') THEN content ELSE X'' END, \
+                 lease_until = 0, next_retry_at = 0, \
+                 retry_until = CASE WHEN msg_type IN ('InitGraph','GenCircuits','CutCircuits','SolderingProofReady') THEN retry_until ELSE 0 END, \
+                 retry_interval_secs = CASE WHEN msg_type IN ('InitGraph','GenCircuits','CutCircuits','SolderingProofReady') THEN retry_interval_secs ELSE 0 END, \
+                 ack_peer_id = CASE WHEN msg_type IN ('InitGraph','GenCircuits','CutCircuits','SolderingProofReady') THEN ack_peer_id ELSE '' END, \
                  last_error = 'retry window expired without expected ACK', updated_at = ? \
              WHERE retry_until > 0 AND retry_until <= ? AND state IN ('Pending', 'Processing')",
         )
@@ -3816,6 +3820,45 @@ impl<'a> StorageProcessor<'a> {
         .execute(self.conn())
         .await?;
         Ok(result.rows_affected())
+    }
+
+    /// At most one retained setup payload per pass, oldest recovery first.
+    pub async fn next_exhausted_setup(
+        &mut self,
+        now: i64,
+    ) -> anyhow::Result<Option<(String, Vec<u8>, i64)>> {
+        Ok(sqlx::query_as(
+            "SELECT message_id, content, created_at FROM p2p_outbox \
+             WHERE state = 'RetryExhausted' AND length(content) > 0 \
+               AND msg_type IN ('InitGraph','GenCircuits','CutCircuits','SolderingProofReady') \
+               AND updated_at <= ? ORDER BY updated_at, message_id LIMIT 1",
+        )
+        .bind(now - 60)
+        .fetch_optional(self.conn())
+        .await?)
+    }
+
+    /// Called inside an immediate transaction: transfer bytes, never reopen a terminal row.
+    pub async fn recover_setup_delivery(
+        &mut self,
+        id: &str,
+        canonical_id: &str,
+        now: i64,
+        window: i64,
+        resume: bool,
+    ) -> anyhow::Result<()> {
+        if resume {
+            let next_id = format!("{canonical_id}:recovery:{now}");
+            sqlx::query(
+                "INSERT INTO p2p_outbox (message_id,msg_type,content,state,attempt_count,next_retry_at,lease_until, \
+                 retry_until,retry_interval_secs,ack_peer_id,publish_count,created_at,updated_at) \
+                 SELECT ?,msg_type,content,'Pending',0,?,0,?,retry_interval_secs,ack_peer_id,publish_count,created_at,? \
+                 FROM p2p_outbox WHERE message_id = ? AND state = 'RetryExhausted' AND length(content) > 0",
+            ).bind(next_id).bind(now).bind(now + window).bind(now).bind(id).execute(self.conn()).await?;
+        }
+        sqlx::query("UPDATE p2p_outbox SET content = X'', updated_at = ? WHERE message_id = ? AND state = 'RetryExhausted'")
+            .bind(now).bind(id).execute(self.conn()).await?;
+        Ok(())
     }
 
     /// Record a publish that went through and set when the row is next due.
@@ -3873,10 +3916,13 @@ impl<'a> StorageProcessor<'a> {
     ) -> anyhow::Result<bool> {
         let result = sqlx::query(
             "UPDATE p2p_outbox SET state = 'Processed', content = X'', lease_until = 0, next_retry_at = 0, updated_at = ? \
-             WHERE message_id = ? AND retry_until > 0 AND ack_peer_id = ? \
-               AND state IN ('Pending', 'Processing')",
+             WHERE (message_id = ? OR substr(message_id, 1, length(?) + 10) = ? || ':recovery:') \
+               AND ack_peer_id = ? AND ack_peer_id != '' \
+               AND state IN ('Pending', 'Processing', 'RetryExhausted')",
         )
         .bind(get_current_timestamp_secs())
+        .bind(message_id)
+        .bind(message_id)
         .bind(message_id)
         .bind(peer_id)
         .execute(self.conn())
@@ -3890,9 +3936,12 @@ impl<'a> StorageProcessor<'a> {
         let result = sqlx::query(
             "UPDATE p2p_outbox SET state = 'Cancelled', content = X'', lease_until = 0, next_retry_at = 0, \
                  updated_at = ? \
-             WHERE message_id = ? AND state IN ('Pending', 'Processing')",
+             WHERE (message_id = ? OR substr(message_id, 1, length(?) + 10) = ? || ':recovery:') \
+               AND state IN ('Pending', 'Processing', 'RetryExhausted')",
         )
         .bind(get_current_timestamp_secs())
+        .bind(message_id)
+        .bind(message_id)
         .bind(message_id)
         .execute(self.conn())
         .await?;
