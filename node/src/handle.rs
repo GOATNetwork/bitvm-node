@@ -2027,9 +2027,10 @@ async fn handle_gen_circuits_operator(
     }
     // On every retry, enqueue any CutCircuits still owed by the frozen candidate set.
     let owed = cut_circuits_owed(operator_state, current_time_secs());
+    let sender_peer_id = get_peer_id();
 
     save_babe_setup_state(ctx.local_db, instance_id, graph_id, &state)?;
-    ensure_cut_circuits_outbox(ctx.local_db, instance_id, graph_id, &owed).await?;
+    ensure_cut_circuits_outbox(ctx.local_db, instance_id, graph_id, &owed, &sender_peer_id).await?;
     Ok(())
 }
 
@@ -2061,6 +2062,7 @@ async fn ensure_cut_circuits_outbox(
     instance_id: Uuid,
     graph_id: Uuid,
     owed: &[OperatorVerifierCandidate],
+    sender_peer_id: &str,
 ) -> Result<()> {
     for candidate in owed {
         let message = GOATMessage::new(
@@ -2077,7 +2079,13 @@ async fn ensure_cut_circuits_outbox(
         );
         let ack_peer_id =
             PeerId::from_bytes(&candidate.verifier_peer_id).map(|peer_id| peer_id.to_string()).ok();
-        enqueue_graph_setup_outbox_message(local_db, message, ack_peer_id.as_deref()).await?;
+        enqueue_graph_setup_outbox_message_from_peer(
+            local_db,
+            message,
+            ack_peer_id.as_deref(),
+            sender_peer_id,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -7745,6 +7753,8 @@ mod tests {
     async fn retry_after_a_cut_off_freeze_completes_the_cut_circuits() {
         use bitcoin::secp256k1::{Secp256k1, SecretKey};
 
+        let sender_peer_id = generate_local_key().public().to_peer_id().to_string();
+
         let local_db = store::create_local_db("sqlite::memory:").await;
         let (instance_id, graph_id) = (Uuid::new_v4(), Uuid::new_v4());
         let package = build_setup_package(BABE_M_CC + 1).unwrap();
@@ -7783,7 +7793,9 @@ mod tests {
         // then the handler is cut off.
         let owed = cut_circuits_owed(&state, now);
         assert_eq!(owed.len(), 3);
-        ensure_cut_circuits_outbox(&local_db, instance_id, graph_id, &owed[..1]).await.unwrap();
+        ensure_cut_circuits_outbox(&local_db, instance_id, graph_id, &owed[..1], &sender_peer_id)
+            .await
+            .unwrap();
         // That verifier acknowledges it before the retry comes round.
         let first_peer = PeerId::from_bytes(&owed[0].verifier_peer_id).unwrap().to_string();
         let first_delivery_id = local_db
@@ -7808,7 +7820,9 @@ mod tests {
         // The retry: the set is frozen already, and everything is still owed.
         let owed = cut_circuits_owed(&state, now);
         assert_eq!(owed.len(), 3);
-        ensure_cut_circuits_outbox(&local_db, instance_id, graph_id, &owed).await.unwrap();
+        ensure_cut_circuits_outbox(&local_db, instance_id, graph_id, &owed, &sender_peer_id)
+            .await
+            .unwrap();
         assert_eq!(
             outbox_state(outbox_id(&owed[0])).await,
             Some(("Processed".to_string(), 0)),
@@ -7820,7 +7834,9 @@ mod tests {
             assert!(len > 0, "the missing CutCircuits is now queued for delivery");
         }
         // And again: nothing changes.
-        ensure_cut_circuits_outbox(&local_db, instance_id, graph_id, &owed).await.unwrap();
+        ensure_cut_circuits_outbox(&local_db, instance_id, graph_id, &owed, &sender_peer_id)
+            .await
+            .unwrap();
         assert_eq!(outbox_state(outbox_id(&owed[0])).await, Some(("Processed".to_string(), 0)));
 
         // A candidate that has delivered its proof is owed nothing more ...

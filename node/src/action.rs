@@ -943,10 +943,20 @@ pub async fn enqueue_graph_setup_outbox_message(
     message: GOATMessage,
     ack_peer_id: Option<&str>,
 ) -> Result<String> {
+    let sender_peer_id = crate::env::get_peer_id();
+    enqueue_graph_setup_outbox_message_from_peer(local_db, message, ack_peer_id, &sender_peer_id)
+        .await
+}
+
+pub(crate) async fn enqueue_graph_setup_outbox_message_from_peer(
+    local_db: &LocalDB,
+    message: GOATMessage,
+    ack_peer_id: Option<&str>,
+    sender: &str,
+) -> Result<String> {
     let outbox_id = graph_setup_outbox_id(&message.content)
         .ok_or_else(|| anyhow!("not a graph setup message"))?;
     let serialized = message.serialize_message().await?;
-    let sender = crate::env::get_peer_id();
     let recipient = if graph_setup_ack_required(&message.content) {
         let ack_peer_id = ack_peer_id.context("graph setup ACK requires a recipient peer")?;
         Some(
@@ -958,7 +968,7 @@ pub async fn enqueue_graph_setup_outbox_message(
         None
     };
     let delivery_id = recipient.as_ref().map(|recipient| {
-        graph_setup_delivery_id(&sender, recipient, &graph_setup_payload_hash(&serialized))
+        graph_setup_delivery_id(sender, recipient, &graph_setup_payload_hash(&serialized))
     });
     let now = current_time_secs();
     local_db
