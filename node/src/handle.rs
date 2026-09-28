@@ -227,31 +227,16 @@ fn load_or_create_committee_instance_keypair(
 
 pub async fn dispatch(ctx: &mut HandlerContext<'_>, content: &GOATMessageContent) -> Result<()> {
     match (content, &ctx.actor) {
-        (
-            GOATMessageContent::GraphSetupAck(GraphSetupAck {
-                outbox_id,
-                acknowledger_peer_id,
-                ..
-            }),
-            _,
-        ) => {
-            if acknowledger_peer_id != &ctx.from_peer_id.to_string() {
-                tracing::warn!(
-                    outbox_id,
-                    from_peer_id = %ctx.from_peer_id,
-                    acknowledger_peer_id,
-                    "Ignore GraphSetupAck with mismatched source peer"
-                );
-                return Ok(());
-            }
+        (GOATMessageContent::GraphSetupAck(GraphSetupAck { delivery_id }), _) => {
+            let source_peer_id = ctx.from_peer_id.to_string();
             let acknowledged = ctx
                 .local_db
                 .acquire()
                 .await?
-                .acknowledge_p2p_outbox_message(outbox_id, acknowledger_peer_id)
+                .acknowledge_p2p_outbox_message(delivery_id, &source_peer_id)
                 .await?;
             tracing::debug!(
-                outbox_id,
+                delivery_id,
                 from_peer_id = %ctx.from_peer_id,
                 acknowledged,
                 "processed GraphSetupAck"
@@ -7798,12 +7783,20 @@ mod tests {
         ensure_cut_circuits_outbox(&local_db, instance_id, graph_id, &owed[..1]).await.unwrap();
         // That verifier acknowledges it before the retry comes round.
         let first_peer = PeerId::from_bytes(&owed[0].verifier_peer_id).unwrap().to_string();
+        let first_delivery_id = local_db
+            .acquire()
+            .await
+            .unwrap()
+            .p2p_outbox_delivery_id(&outbox_id(&owed[0]))
+            .await
+            .unwrap()
+            .unwrap();
         assert!(
             local_db
                 .acquire()
                 .await
                 .unwrap()
-                .acknowledge_p2p_outbox_message(&outbox_id(&owed[0]), &first_peer)
+                .acknowledge_p2p_outbox_message(&first_delivery_id, &first_peer)
                 .await
                 .unwrap()
         );

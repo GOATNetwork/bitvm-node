@@ -554,7 +554,7 @@ pub enum GOATMessageContent {
     CutCircuits(CutCircuits),
     #[business_ref(graph)]
     SolderingProofReady(SolderingProofReady),
-    #[business_ref(graph)]
+    #[business_ref(unscoped)]
     GraphSetupAck(GraphSetupAck),
     #[business_ref(graph)]
     VerifierGraphParamsEndorsement(VerifierGraphParamsEndorsement),
@@ -867,20 +867,37 @@ pub struct SolderingProofReady {
     pub total_len: usize,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
-pub enum GraphSetupStage {
-    GenCircuits,
-    CutCircuits,
-    SolderingProofReady,
-}
-
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct GraphSetupAck {
-    pub outbox_id: String,
-    pub instance_id: Uuid,
-    pub graph_id: Uuid,
-    pub stage: GraphSetupStage,
-    pub acknowledger_peer_id: String,
+    pub delivery_id: String,
+}
+
+fn graph_setup_payload_hash(payload: &[u8]) -> [u8; 32] {
+    Sha256::digest(payload).into()
+}
+
+fn graph_setup_delivery_id(
+    sender_peer_id: &str,
+    recipient_peer_id: &str,
+    payload_hash: &[u8; 32],
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"goat/graph-setup-delivery/v2");
+    for field in [sender_peer_id.as_bytes(), recipient_peer_id.as_bytes(), payload_hash.as_slice()]
+    {
+        hasher.update((field.len() as u64).to_be_bytes());
+        hasher.update(field);
+    }
+    format!("graph-setup-v2:{}", hex::encode(hasher.finalize()))
+}
+
+fn graph_setup_ack_required(content: &GOATMessageContent) -> bool {
+    matches!(
+        content,
+        GOATMessageContent::GenCircuits(_)
+            | GOATMessageContent::CutCircuits(_)
+            | GOATMessageContent::SolderingProofReady(_)
+    )
 }
 
 pub fn graph_setup_outbox_id(content: &GOATMessageContent) -> Option<String> {
@@ -904,25 +921,20 @@ pub fn graph_setup_outbox_id(content: &GOATMessageContent) -> Option<String> {
     }
 }
 
-fn graph_setup_ack(content: &GOATMessageContent) -> Option<GraphSetupAck> {
-    let (instance_id, graph_id, stage) = match content {
-        GOATMessageContent::GenCircuits(message) => {
-            (message.instance_id, message.graph_id, GraphSetupStage::GenCircuits)
-        }
-        GOATMessageContent::CutCircuits(message) => {
-            (message.instance_id, message.graph_id, GraphSetupStage::CutCircuits)
-        }
-        GOATMessageContent::SolderingProofReady(message) => {
-            (message.instance_id, message.graph_id, GraphSetupStage::SolderingProofReady)
-        }
-        _ => return None,
-    };
+fn graph_setup_ack(
+    content: &GOATMessageContent,
+    sender_peer_id: &PeerId,
+    payload: &[u8],
+) -> Option<GraphSetupAck> {
+    if !graph_setup_ack_required(content) {
+        return None;
+    }
+    // Bind to the authenticated gossip author, never an identity from the payload.
+    let sender_peer_id = sender_peer_id.to_string();
+    let recipient_peer_id = crate::env::get_peer_id();
+    let payload_hash = graph_setup_payload_hash(payload);
     Some(GraphSetupAck {
-        outbox_id: graph_setup_outbox_id(content)?,
-        instance_id,
-        graph_id,
-        stage,
-        acknowledger_peer_id: crate::env::get_peer_id(),
+        delivery_id: graph_setup_delivery_id(&sender_peer_id, &recipient_peer_id, &payload_hash),
     })
 }
 
@@ -934,17 +946,32 @@ pub async fn enqueue_graph_setup_outbox_message(
     let outbox_id = graph_setup_outbox_id(&message.content)
         .ok_or_else(|| anyhow!("not a graph setup message"))?;
     let serialized = message.serialize_message().await?;
+    let sender = crate::env::get_peer_id();
+    let recipient = if graph_setup_ack_required(&message.content) {
+        let ack_peer_id = ack_peer_id.context("graph setup ACK requires a recipient peer")?;
+        Some(
+            PeerId::from_str(ack_peer_id)
+                .context("invalid graph setup ACK recipient peer id")?
+                .to_string(),
+        )
+    } else {
+        None
+    };
+    let delivery_id = recipient.as_ref().map(|recipient| {
+        graph_setup_delivery_id(&sender, recipient, &graph_setup_payload_hash(&serialized))
+    });
     let now = current_time_secs();
     local_db
         .acquire()
         .await?
         .enqueue_p2p_outbox_retry_message(
             &outbox_id,
+            delivery_id.as_deref(),
             message.content.event_type(),
             &serialized,
             now + get_p2p_graph_setup_retry_window_secs(),
             get_p2p_graph_setup_retry_interval_secs(),
-            ack_peer_id,
+            recipient.as_deref(),
             // Only the outbox ever sends these, so the row is due at once.
             0,
         )
@@ -1392,7 +1419,7 @@ pub async fn handle_inbound_p2p_message(
             report_gossip_validation(swarm, &id, &propagation_source, MessageAcceptance::Accept);
             metrics_state.record_p2p_receive(true);
             refresh_peer_timestamp_throttled(local_db, from_peer_id, now).await;
-            maybe_send_graph_setup_ack(swarm, &decoded, from_peer_id, now).await;
+            maybe_send_graph_setup_ack(swarm, &decoded, from_peer_id, message, now).await;
             Ok(())
         }
         // Forward duplicates with rate-limited ACKs and logs.
@@ -1401,7 +1428,7 @@ pub async fn handle_inbound_p2p_message(
             metrics_state.record_p2p_receive(true);
             p2p_admission::record_drop(p2p_admission::DropReason::DuplicatePayload);
             refresh_peer_timestamp_throttled(local_db, from_peer_id, now).await;
-            maybe_send_graph_setup_ack(swarm, &decoded, from_peer_id, now).await;
+            maybe_send_graph_setup_ack(swarm, &decoded, from_peer_id, message, now).await;
             Ok(())
         }
         InboundVerdict::Immediate(decoded) => {
@@ -1514,18 +1541,18 @@ async fn refresh_peer_timestamp_throttled(local_db: &LocalDB, from_peer_id: Peer
     }
 }
 
-/// Rate-limit graph-setup ACKs by sender and outbox slot.
+/// Rate-limit graph-setup ACKs by delivery identity (including both peers).
 async fn maybe_send_graph_setup_ack(
     swarm: &mut dyn MessagePublisher,
     decoded: &GOATMessage,
     from_peer_id: PeerId,
+    payload: &[u8],
     now: Instant,
 ) {
-    let Some(ack) = graph_setup_ack(&decoded.content) else {
+    let Some(ack) = graph_setup_ack(&decoded.content, &from_peer_id, payload) else {
         return;
     };
-    let key = format!("{from_peer_id}:{}", ack.outbox_id);
-    if !crate::p2p_admission::dedup_ack_gate().allow(&key, now) {
+    if !crate::p2p_admission::dedup_ack_gate().allow(&ack.delivery_id, now) {
         return;
     }
     if let Err(error) =
@@ -3569,6 +3596,7 @@ async fn store_protocol_message(local_db: &LocalDB, message: &GOATMessage) -> Re
         .await?
         .enqueue_p2p_outbox_retry_message(
             &protocol_outbox_id(&message.content),
+            None,
             message.content.event_type(),
             &bytes,
             now + MESSAGE_EXPIRE_TIME,
@@ -4255,6 +4283,7 @@ mod tests {
             .unwrap()
             .enqueue_p2p_outbox_retry_message(
                 "protocol:AggNonceConsensus:graph:corrupt",
+                None,
                 "AggNonceConsensus",
                 b"not a message",
                 now + 600,
