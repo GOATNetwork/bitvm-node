@@ -1963,11 +1963,9 @@ async fn handle_gen_circuits_operator(
         if existing.setup_package != *setup_package {
             bail!("conflicting GenCircuits setup package for verifier {verifier_pubkey}");
         }
-    } else if operator_state
-        .candidates
-        .iter()
-        .any(|candidate| candidate.verifier_pubkey == *verifier_pubkey)
-    {
+    } else if operator_state.candidates.iter().any(|candidate| {
+        XOnlyPublicKey::from(candidate.verifier_pubkey) == XOnlyPublicKey::from(*verifier_pubkey)
+    }) {
         tracing::warn!(
             "Ignore GenCircuits for {instance_id}:{graph_id}: verifier public key {verifier_pubkey} is already bound to another peer"
         );
@@ -3243,6 +3241,12 @@ async fn maybe_vote_and_presign_graph(
             })?;
     }
 
+    // Recheck the persisted bindings at the actual signing boundary, including recovery.
+    let verifier_endorsements =
+        get_verifier_graph_params_endorsements_for_graph(ctx.local_db, instance_id, graph_id)
+            .await?;
+    validate_verifier_graph_params_endorsements(ctx.goat_client, graph, &verifier_endorsements)
+        .await?;
     let (_, sec_nonces, _) =
         committee_master_key.nonces_for_graph_job_with_keypair(&full_graph, instance_keypair)?;
     let committee_partial_sigs =
@@ -3431,9 +3435,7 @@ async fn handle_verifier_graph_params_endorsement_committee(
     signature: &secp256k1::schnorr::Signature,
     content: &GOATMessageContent,
 ) -> Result<()> {
-    if !ctx.is_self_peer
-        && !ctx.goat_client.committee_mana_is_verifier(&ctx.from_peer_id.to_bytes()).await?
-    {
+    if !ctx.goat_client.committee_mana_is_verifier(&ctx.from_peer_id.to_bytes()).await? {
         tracing::warn!(
             "Ignore VerifierGraphParamsEndorsement for {instance_id}:{graph_id}: sender {} is not a registered verifier",
             ctx.from_peer_id
@@ -3487,6 +3489,7 @@ async fn handle_verifier_graph_params_endorsement_committee(
         graph_id,
         *verifier_pubkey,
         verifier_index,
+        &ctx.from_peer_id.to_string(),
         *signature,
     )
     .await?;

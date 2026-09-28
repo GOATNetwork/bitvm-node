@@ -300,7 +300,7 @@ fn validate_graph_policy(parameters: &BitvmGcGraphParameters) -> Result<()> {
 
     let mut verifier_pubkeys = std::collections::HashSet::new();
     for gc_data in &parameters.gc_data {
-        if !verifier_pubkeys.insert(gc_data.verifier_pubkey) {
+        if !verifier_pubkeys.insert(XOnlyPublicKey::from(gc_data.verifier_pubkey)) {
             bail!(SpecialError::InvalidGraph(format!(
                 "duplicate verifier pubkey in GC data: {}",
                 gc_data.verifier_pubkey
@@ -493,9 +493,10 @@ pub async fn validate_operator_stake(
     }
 }
 
-pub fn validate_verifier_graph_params_endorsements(
+pub async fn validate_verifier_graph_params_endorsements(
+    goat_client: &GOATClient,
     graph: &SimplifiedBitvmGcGraph,
-    verifier_endorsements: &[(PublicKey, usize, SchnorrSignature)],
+    verifier_endorsements: &[(PublicKey, usize, String, SchnorrSignature)],
 ) -> Result<()> {
     let expected_verifier_num = graph.parameters.gc_data.len();
     if verifier_endorsements.len() != expected_verifier_num {
@@ -508,7 +509,13 @@ pub fn validate_verifier_graph_params_endorsements(
 
     let mut seen_pubkeys = std::collections::HashSet::new();
     let mut seen_indices = std::collections::HashSet::new();
-    for (verifier_pubkey, verifier_index, signature) in verifier_endorsements {
+    let mut seen_peers = std::collections::HashSet::new();
+    for (verifier_pubkey, verifier_index, verifier_peer_id, signature) in verifier_endorsements {
+        let peer =
+            PeerId::from_str(verifier_peer_id).context("invalid verifier endorsement peer")?;
+        if !seen_peers.insert(peer) {
+            bail!(SpecialError::InvalidGraph("duplicate verifier endorsement peer".into()));
+        }
         if *verifier_index >= expected_verifier_num {
             bail!(SpecialError::InvalidGraph(format!(
                 "verifier params endorsement index {verifier_index} out of range"
@@ -521,7 +528,7 @@ pub fn validate_verifier_graph_params_endorsements(
                 verifier_pubkey
             )));
         }
-        if !seen_pubkeys.insert(*verifier_pubkey) {
+        if !seen_pubkeys.insert(XOnlyPublicKey::from(*verifier_pubkey)) {
             bail!(SpecialError::InvalidGraph(format!(
                 "duplicate verifier params endorsement pubkey: {verifier_pubkey}"
             )));
@@ -539,6 +546,18 @@ pub fn validate_verifier_graph_params_endorsements(
         }
     }
 
+    for (_, _, peer, _) in verifier_endorsements {
+        let peer = PeerId::from_str(peer)?;
+        if !goat_client
+            .committee_mana_is_verifier(&peer.to_bytes())
+            .await
+            .context("recheck verifier registration before committee setup")?
+        {
+            bail!(SpecialError::InvalidGraph(
+                "endorsement peer is not a registered verifier".into()
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -547,11 +566,10 @@ pub async fn validate_init_graph(
     btc_client: &BTCClient,
     goat_client: &GOATClient,
     graph: &SimplifiedBitvmGcGraph,
-    verifier_endorsements: &[(PublicKey, usize, SchnorrSignature)],
+    verifier_endorsements: &[(PublicKey, usize, String, SchnorrSignature)],
 ) -> Result<()> {
     validate_init_graph_base(local_db, btc_client, goat_client, graph).await?;
-    validate_verifier_graph_params_endorsements(graph, verifier_endorsements)?;
-    Ok(())
+    validate_verifier_graph_params_endorsements(goat_client, graph, verifier_endorsements).await
 }
 pub async fn validate_finalized_graph(
     btc_client: &BTCClient,
@@ -4304,6 +4322,7 @@ pub struct GraphProcessDataItem {
     pub endorse_signature: Vec<u8>,
     pub params_endorse_signature: Vec<u8>,
     pub verifier_index: Option<usize>,
+    pub verifier_peer_id: Option<String>,
     pub verifier_params_signature: Option<SchnorrSignature>,
 }
 pub type GraphProcessDataMap = IndexMap<PublicKey, GraphProcessDataItem>;
@@ -5136,12 +5155,9 @@ pub async fn find_pegin_graph_process_data(
     storage_processor: &mut StorageProcessor<'_>,
     graph_id: Uuid,
 ) -> Result<(bool, GraphProcessDataMap)> {
-    if let Ok(Some(data)) = storage_processor.find_pegin_graph_process_data(&graph_id).await
-        && let Ok(process_data) = serde_json::from_str(data.process_data.as_str())
-    {
-        Ok((data.is_endorsed, process_data))
-    } else {
-        Ok((false, IndexMap::new()))
+    match storage_processor.find_pegin_graph_process_data(&graph_id).await? {
+        Some(data) => Ok((data.is_endorsed, serde_json::from_str(&data.process_data)?)),
+        None => Ok((false, IndexMap::new())),
     }
 }
 
@@ -5454,11 +5470,22 @@ pub async fn store_verifier_graph_params_endorsement(
     graph_id: Uuid,
     verifier_pubkey: PublicKey,
     verifier_index: usize,
+    verifier_peer_id: &str,
     signature: SchnorrSignature,
 ) -> Result<()> {
     let mut storage_processor = local_db.acquire().await?;
     let (is_endorsed, mut process_data) =
         find_pegin_graph_process_data(&mut storage_processor, graph_id).await?;
+    for (key, item) in &process_data {
+        if let Some(peer) = &item.verifier_peer_id
+            && ((*key == verifier_pubkey && peer != verifier_peer_id)
+                || (*key != verifier_pubkey
+                    && (peer == verifier_peer_id
+                        || XOnlyPublicKey::from(*key) == XOnlyPublicKey::from(verifier_pubkey))))
+        {
+            bail!(SpecialError::InvalidGraph("conflicting verifier peer/key binding".into()));
+        }
+    }
     if let Some(existing_index) = process_data.get(&verifier_pubkey).and_then(|v| v.verifier_index)
         && existing_index != verifier_index
     {
@@ -5478,10 +5505,12 @@ pub async fn store_verifier_graph_params_endorsement(
         .entry(verifier_pubkey)
         .and_modify(|v| {
             v.verifier_index = Some(verifier_index);
+            v.verifier_peer_id = Some(verifier_peer_id.to_owned());
             v.verifier_params_signature = Some(signature);
         })
         .or_insert_with(|| GraphProcessDataItem {
             verifier_index: Some(verifier_index),
+            verifier_peer_id: Some(verifier_peer_id.to_owned()),
             verifier_params_signature: Some(signature),
             ..Default::default()
         });
@@ -5500,7 +5529,7 @@ pub async fn get_verifier_graph_params_endorsements_for_graph(
     local_db: &LocalDB,
     _instance_id: Uuid,
     graph_id: Uuid,
-) -> Result<Vec<(PublicKey, usize, SchnorrSignature)>> {
+) -> Result<Vec<(PublicKey, usize, String, SchnorrSignature)>> {
     let mut storage_processor = local_db.acquire().await?;
     let (_is_endorsed, process_data) =
         find_pegin_graph_process_data(&mut storage_processor, graph_id).await?;
@@ -5509,7 +5538,8 @@ pub async fn get_verifier_graph_params_endorsements_for_graph(
         .filter_map(|(k, v)| {
             v.verifier_index
                 .zip(v.verifier_params_signature.as_ref())
-                .map(|(index, signature)| (*k, index, *signature))
+                .zip(v.verifier_peer_id.as_ref())
+                .map(|((index, signature), peer)| (*k, index, peer.clone(), *signature))
         })
         .collect())
 }
