@@ -3809,11 +3809,11 @@ impl<'a> StorageProcessor<'a> {
     pub async fn expire_p2p_outbox_retry_messages(&mut self, now: i64) -> anyhow::Result<u64> {
         let result = sqlx::query(
             "UPDATE p2p_outbox SET state = 'RetryExhausted', \
-                 content = CASE WHEN msg_type IN ('InitGraph','GenCircuits','CutCircuits','SolderingProofReady') THEN content ELSE X'' END, \
+                 content = CASE WHEN msg_type IN ('InitGraph','GenCircuits','CutCircuits','SolderingProofReady','CreateGraph') THEN content ELSE X'' END, \
                  lease_until = 0, next_retry_at = 0, \
-                 retry_until = CASE WHEN msg_type IN ('InitGraph','GenCircuits','CutCircuits','SolderingProofReady') THEN retry_until ELSE 0 END, \
-                 retry_interval_secs = CASE WHEN msg_type IN ('InitGraph','GenCircuits','CutCircuits','SolderingProofReady') THEN retry_interval_secs ELSE 0 END, \
-                 ack_peer_id = CASE WHEN msg_type IN ('InitGraph','GenCircuits','CutCircuits','SolderingProofReady') THEN ack_peer_id ELSE '' END, \
+                 retry_until = CASE WHEN msg_type IN ('InitGraph','GenCircuits','CutCircuits','SolderingProofReady','CreateGraph') THEN retry_until ELSE 0 END, \
+                 retry_interval_secs = CASE WHEN msg_type IN ('InitGraph','GenCircuits','CutCircuits','SolderingProofReady','CreateGraph') THEN retry_interval_secs ELSE 0 END, \
+                 ack_peer_id = CASE WHEN msg_type IN ('InitGraph','GenCircuits','CutCircuits','SolderingProofReady','CreateGraph') THEN ack_peer_id ELSE '' END, \
                  last_error = 'retry window expired without expected ACK', updated_at = ? \
              WHERE retry_until > 0 AND retry_until <= ? AND state IN ('Pending', 'Processing')",
         )
@@ -3828,11 +3828,11 @@ impl<'a> StorageProcessor<'a> {
     pub async fn next_exhausted_setup(
         &mut self,
         now: i64,
-    ) -> anyhow::Result<Option<(String, Vec<u8>, i64)>> {
+    ) -> anyhow::Result<Option<(String, Vec<u8>, i64, String)>> {
         Ok(sqlx::query_as(
-            "SELECT message_id, content, created_at FROM p2p_outbox \
+            "SELECT message_id, content, created_at, ack_peer_id FROM p2p_outbox \
              WHERE state = 'RetryExhausted' AND length(content) > 0 \
-               AND msg_type IN ('InitGraph','GenCircuits','CutCircuits','SolderingProofReady') \
+               AND msg_type IN ('InitGraph','GenCircuits','CutCircuits','SolderingProofReady','CreateGraph') \
                AND updated_at <= ? ORDER BY updated_at, message_id LIMIT 1",
         )
         .bind(now - 60)

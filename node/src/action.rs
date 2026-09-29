@@ -43,7 +43,7 @@ use std::str::FromStr;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use store::localdb::LocalDB;
-use store::{GraphStatus, InstanceBridgeInStatus, MessageState, P2pInboxMessage};
+use store::{Graph, GraphStatus, InstanceBridgeInStatus, MessageState, P2pInboxMessage};
 use strum::{Display, EnumDiscriminants, EnumIter, EnumString, IntoStaticStr};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -897,10 +897,14 @@ fn graph_setup_ack_required(content: &GOATMessageContent) -> bool {
         GOATMessageContent::GenCircuits(_)
             | GOATMessageContent::CutCircuits(_)
             | GOATMessageContent::SolderingProofReady(_)
+            | GOATMessageContent::CreateGraph(_)
     )
 }
 
-pub fn graph_setup_outbox_id(content: &GOATMessageContent) -> Option<String> {
+pub fn graph_setup_outbox_id(
+    content: &GOATMessageContent,
+    ack_peer_id: Option<&str>,
+) -> Option<String> {
     match content {
         GOATMessageContent::InitGraph(message) => Some(format!("init-graph:{}", message.graph_id)),
         GOATMessageContent::GenCircuits(message) => Some(format!(
@@ -917,7 +921,24 @@ pub fn graph_setup_outbox_id(content: &GOATMessageContent) -> Option<String> {
             message.candidate_index,
             hex::encode(message.payload_hash),
         )),
+        GOATMessageContent::CreateGraph(message) => {
+            let id = format!("create-graph:{}", message.graph_id);
+            Some(match ack_peer_id.filter(|peer_id| !peer_id.is_empty()) {
+                Some(peer_id) => format!("{id}:{peer_id}"),
+                None => id,
+            })
+        }
         _ => None,
+    }
+}
+
+fn graph_setup_delivery_finished(content: &GOATMessageContent, graph: Option<&Graph>) -> bool {
+    match content {
+        GOATMessageContent::CreateGraph(_) => graph.is_some_and(|graph| {
+            GraphStatus::from_str(&graph.status)
+                .is_ok_and(|status| status != GraphStatus::OperatorPresigned)
+        }),
+        _ => graph.is_some(),
     }
 }
 
@@ -954,8 +975,6 @@ pub(crate) async fn enqueue_graph_setup_outbox_message_from_peer(
     ack_peer_id: Option<&str>,
     sender: &str,
 ) -> Result<String> {
-    let outbox_id = graph_setup_outbox_id(&message.content)
-        .ok_or_else(|| anyhow!("not a graph setup message"))?;
     let serialized = message.serialize_message().await?;
     let recipient = if graph_setup_ack_required(&message.content) {
         let ack_peer_id = ack_peer_id.context("graph setup ACK requires a recipient peer")?;
@@ -967,6 +986,8 @@ pub(crate) async fn enqueue_graph_setup_outbox_message_from_peer(
     } else {
         None
     };
+    let outbox_id = graph_setup_outbox_id(&message.content, recipient.as_deref())
+        .ok_or_else(|| anyhow!("not a graph setup message"))?;
     let delivery_id = recipient.as_ref().map(|recipient| {
         graph_setup_delivery_id(sender, recipient, &graph_setup_payload_hash(&serialized))
     });
@@ -2665,7 +2686,8 @@ async fn handle_p2p_outbox_messages(
 /// Recovery is driven by durable delivery state even when no new gossip arrives.
 async fn recover_exhausted_setup(local_db: &LocalDB) -> Result<()> {
     let now = current_time_secs();
-    let Some((id, bytes, created_at)) = local_db.acquire().await?.next_exhausted_setup(now).await?
+    let Some((id, bytes, created_at, ack_peer_id)) =
+        local_db.acquire().await?.next_exhausted_setup(now).await?
     else {
         return Ok(());
     };
@@ -2674,14 +2696,14 @@ async fn recover_exhausted_setup(local_db: &LocalDB) -> Result<()> {
     let mut resume = false;
     let mut canonical = id.clone();
     if let Ok(message) = decoded
-        && let Some(key) = graph_setup_outbox_id(&message.content)
+        && let Some(key) = graph_setup_outbox_id(&message.content, Some(&ack_peer_id))
         && let BusinessRef::Graph { instance_id, graph_id } = message.content.business_ref()
     {
         canonical = key;
         let instance = storage.find_instance(&instance_id).await?;
         let graph = storage.find_graph(&graph_id).await?;
         resume = now - created_at < MESSAGE_EXPIRE_TIME
-            && graph.is_none()
+            && !graph_setup_delivery_finished(&message.content, graph.as_ref())
             && instance.is_some_and(|row| {
                 matches!(
                     InstanceBridgeInStatus::from_str(&row.status),
@@ -2792,18 +2814,19 @@ async fn publish_p2p_outbox_row(
             return Ok(OutboxRowOutcome::Closed);
         }
     };
-    if let Some(canonical_id) = graph_setup_outbox_id(&outbound.content)
+    if let Some(canonical_id) = graph_setup_outbox_id(&outbound.content, Some(&message.ack_peer_id))
         && let BusinessRef::Graph { instance_id, graph_id } = outbound.content.business_ref()
     {
         let mut storage = local_db.acquire().await?;
         let instance = storage.find_instance(&instance_id).await?;
+        let graph = storage.find_graph(&graph_id).await?;
         let failed = instance.as_ref().is_some_and(|row| {
             InstanceBridgeInStatus::from_str(&row.status).is_ok_and(|status| {
                 SigningRound::GraphSigning.delivery_finished(None, Some(&status))
             })
         });
         if failed
-            || storage.find_graph(&graph_id).await?.is_some()
+            || graph_setup_delivery_finished(&outbound.content, graph.as_ref())
             || current_time_secs() - message.created_at >= MESSAGE_EXPIRE_TIME
         {
             storage.cancel_p2p_outbox_message(&canonical_id).await?;

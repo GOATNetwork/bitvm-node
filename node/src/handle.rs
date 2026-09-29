@@ -2651,6 +2651,19 @@ async fn handle_compact_soldering_proof_operator(
         };
     seal_selected_verifiers(operator_state, selected_verifier_pubkeys)?;
     let bitvm_gc_circuit_datas = selected_gc_data(operator_state)?;
+    let selected_verifier_count = operator_state
+        .selected_verifier_pubkeys
+        .as_ref()
+        .context("selected verifier set is missing after proof collection")?
+        .len();
+    let selected_verifier_peer_ids = (0..selected_verifier_count)
+        .map(|verifier_index| {
+            let candidate = selected_candidate_for_graph_index(operator_state, verifier_index)?;
+            PeerId::from_bytes(&candidate.verifier_peer_id)
+                .context("decode selected verifier peer id for CreateGraph ACK")
+                .map(|peer_id| peer_id.to_string())
+        })
+        .collect::<Result<Vec<_>>>()?;
     let mut obsolete_setup_outbox_ids = vec![format!("init-graph:{graph_id}")];
     obsolete_setup_outbox_ids.extend(operator_state.candidates.iter().map(|candidate| {
         format!("cut-circuits:{instance_id}:{graph_id}:{}", candidate.verifier_pubkey)
@@ -2798,16 +2811,22 @@ async fn handle_compact_soldering_proof_operator(
         Actor::All,
         GOATMessageContent::CreateGraph(CreateGraph { instance_id, graph_id, graph_nonce, graph }),
     );
-    let serialized = message.serialize_message().await?;
-    let outbox_id = format!("create-graph:{graph_id}");
-    let mut storage = context.local_db.acquire().await?;
-    // Idempotent: an entry that exists is left as it is. A graph the committee
-    // has already signed was evidently announced; only the clean-up is left.
+    let mut outbox_ids = Vec::new();
     if !already_finalized {
-        storage
-            .insert_p2p_outbox_message(&outbox_id, message.content.event_type(), &serialized)
-            .await?;
+        for ack_peer_id in &selected_verifier_peer_ids {
+            outbox_ids.push(
+                enqueue_graph_setup_outbox_message(
+                    &context.local_db,
+                    message.clone(),
+                    Some(ack_peer_id),
+                )
+                .await?,
+            );
+        }
     }
+    let mut storage = context.local_db.acquire().await?;
+    // The per-verifier outbox rows retry until each selected verifier ACKs.
+    // A finalized graph was already announced; only the setup cleanup is left.
     let mut cancelled_setup_messages = 0;
     for setup_outbox_id in obsolete_setup_outbox_ids {
         cancelled_setup_messages +=
@@ -2820,9 +2839,9 @@ async fn handle_compact_soldering_proof_operator(
         stage = "create_graph_outbox",
         graph_nonce,
         definition_hash = %definition_hash,
-        outbox_id,
+        outbox_ids = ?outbox_ids,
         cancelled_setup_messages,
-        "enqueued CreateGraph for swarm publication"
+        "enqueued CreateGraph for selected verifier delivery"
     );
 
     // The outbox is durable before this cleanup. A process crash before
