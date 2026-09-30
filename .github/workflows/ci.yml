@@ -49,13 +49,10 @@ jobs:
           mkdir -p ~/.local/share/tlaplus
           curl -sL -o ~/.local/share/tlaplus/tla2tools.jar \
             https://github.com/tlaplus/tlaplus/releases/latest/download/tla2tools.jar
-      # This audit pass proves bugs exist in CURRENT code and proves correct
-      # fix designs for them - the fixes are NOT yet applied to the Rust code
-      # (see node/README.md's "Known gap" sections). These configs model the
-      # verified fix designs (or a baseline that was never buggy) and must
-      # always pass. See root README.md's "Formal verification (TLA+)"
-      # section for what each spec covers.
-      - name: Run baseline + proposed-fix specs (must pass)
+      # These configs model the implemented fixes (or a baseline that was
+      # never buggy) and must always pass. The separate configs below retain
+      # the pre-fix counterexamples as historical regression documentation.
+      - name: Run baseline + fixed specs (must pass)
         working-directory: node/tla
         run: |
           set -e
@@ -152,7 +149,7 @@ jobs:
         run: sudo apt update && sudo apt install protobuf-compiler
       - run: |
           source ~/.zkm-toolchain/env
-          cargo clippy --all-targets -- -D warnings
+          cargo clippy --all-targets --features rpc-debug-endpoints -- -D warnings
   test:
     name: Cargo Test
     needs: tla-plus
@@ -173,4 +170,4 @@ jobs:
         run: |
           set -e
           source ~/.zkm-toolchain/env
-          cargo test -r --all --all-targets
+          cargo test -r --all --all-targets --features rpc-debug-endpoints

@@ -131,6 +131,8 @@ fn seeded_node(
         reward: "0".to_string(),
         service_fee_rate: 0.001,
         available_peg_btc: U256::from(4_700_000_000_000_000_000_000_000_u128).to_string(),
+        binding_sig: String::new(),
+        binding_issued_at: 0,
         updated_at: now,
         created_at: now,
     }
@@ -336,7 +338,7 @@ async fn seed_mock_data(
         tx.upsert_node(&node).await?;
     }
     for instance in [bridge_in_success, bridge_in_pending] {
-        tx.upsert_instance(&instance).await?;
+        tx.insert_instance_if_absent(&instance).await?;
     }
     tx.insert_swap_escrow_if_absent(&swap_escrow).await?;
     for graph in [ready_graph, challenge_graph] {

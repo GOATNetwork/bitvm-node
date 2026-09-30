@@ -3098,6 +3098,7 @@ dependencies = [
  "libp2p-metrics",
  "libp2p-swarm-derive",
  "musig2",
+ "node-macros",
  "once_cell",
  "p3-bn254-fr",
  "p3-field",
@@ -8147,6 +8148,15 @@ name = "no-std-net"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "43794a0ace135be66a25d3ae77d41b91615fb68ae937f904090203e81f755b65"
+
+[[package]]
+name = "node-macros"
+version = "0.4.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
 
 [[package]]
 name = "nohash-hasher"

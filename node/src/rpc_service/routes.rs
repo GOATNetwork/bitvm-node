@@ -20,6 +20,7 @@ pub(crate) mod v1 {
     pub const GRAPHS_TXN_BY_ID: &str = "/v1/graphs/{:id}/txn";
     pub const GRAPHS_NEIGHBOR_IDS: &str = "/v1/graphs/{:id}/neighbor-ids";
     pub const GRAPHS_TX_BY_ID: &str = "/v1/graphs/{:id}/tx";
+    #[cfg(feature = "rpc-debug-endpoints")]
     pub const GRAPHS_SEND_CHALLENGE: &str = "/v1/graphs/{:id}/send-challenge";
     #[cfg(feature = "rpc-debug-endpoints")]
     pub const GRAPHS_SEND_VERIFIER_CHALLENGE: &str = "/v1/graphs/{:id}/send-verifier-challenge";

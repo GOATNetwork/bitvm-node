@@ -166,6 +166,11 @@ pub struct Node {
     pub reward: String,
     pub service_fee_rate: f64,
     pub available_peg_btc: String,
+    /// Hex master-key signature authorizing this peer binding; empty when absent.
+    pub binding_sig: String,
+    /// When the binding was issued. Orders re-bindings so one key maps to a
+    /// single peer id at a time.
+    pub binding_issued_at: i64,
     pub updated_at: i64,
     pub created_at: i64,
 }
@@ -208,15 +213,6 @@ pub enum InstanceBridgeInStatus {
     UserCanceled,               // user broadcast Pegin-cancel tx
     NoEnoughCommitteesAnswered, // no enough committee responsed & window expired
     UserDiscarded,              // pegin prepare tx input uxto been spent in other tx
-
-    // for front end display
-    Initiated,  // UserInited
-    Verified,   // CommitteesAnswered
-    Submitted,  // UserBroadcastPeginPrepare
-    Failed,     // PresignedFailed, RelayerL2MintedFailed, NoEnoughCommitteesAnswered, UserDiscarded
-    Processing, // Presigned, RelayerL1Broadcasted
-    Success,    // RelayerL2Minted
-    Canceled,   // UserCanceled
 }
 
 /// Lifecycle of a swap-based bridge-out escrow.
@@ -325,14 +321,6 @@ pub enum GraphStatus {
     Skipped,
     OperatorTake1,
     OperatorTake2,
-
-    /// frontend use only
-    Created,
-    Presigned,
-    L2Recorded,
-    OperatorKickOffing,
-    Challenging,
-    Disproving,
 }
 
 /// The evidence that authorizes a graph status transition.
@@ -477,8 +465,7 @@ impl GraphStatus {
                 OperatorTake1 => TAKE1,
                 OperatorTake2 | Disprove => TAKE2_OR_DISPROVE,
                 Skipped => SKIPPED,
-                OperatorPresigned | Created | Presigned | L2Recorded | OperatorKickOffing
-                | Challenging | Disproving => &[],
+                OperatorPresigned => &[],
             },
         }
     }
@@ -544,8 +531,15 @@ pub struct GraphBtcTxVoutMonitor {
 #[derive(Clone, Debug, Display, EnumString)]
 pub enum MessageState {
     Pending,
+    /// Claimed by a worker and currently being dispatched. A row left in this
+    /// state past its `lock_time_until` means the attempt never finished, which
+    /// is charged as an abandon rather than a retry.
+    Processing,
     Processed,
     Failed,
+    /// Repeated claims expired without reporting an outcome. Kept separate
+    /// from deterministic handler failures so operators can inspect/requeue it.
+    Quarantined,
     Expired,
     Cancelled,
 }
@@ -562,6 +556,14 @@ pub struct Message {
     pub message_version: i64,
     pub weight: i64,
     pub lock_time_until: i64,
+    /// Dispatch attempts that ended in a handler `Err` and were rescheduled.
+    /// Observability only; this counter never retires a message.
+    pub attempt_count: i64,
+    /// Claims whose previous attempt never reported an outcome, i.e. the worker
+    /// panicked or the process died mid-dispatch. Incremented when an expired
+    /// `Processing` lease is reclaimed.
+    pub abandon_count: i64,
+    pub last_error: Option<String>,
     pub created_at: i64,
 }
 
@@ -569,8 +571,8 @@ pub struct Message {
 ///
 /// Unlike `Message`, which is used for locally generated compensation work,
 /// this row retains the original sender and is consumed before dispatching the
-/// external message. Processed content is cleared, while failed content is
-/// retained for manual requeue and later TTL cleanup.
+/// external message. Processed/failed content is cleared; quarantined content is
+/// retained temporarily so an operator can inspect or manually requeue it.
 #[derive(Clone, FromRow, Debug, Serialize, Deserialize, Default)]
 pub struct P2pInboxMessage {
     pub message_id: String,
@@ -582,12 +584,50 @@ pub struct P2pInboxMessage {
     pub content_size: i64,
     pub state: String,
     pub attempt_count: i64,
+    /// Claims whose attempt never reported an outcome. See `Message::abandon_count`.
+    pub abandon_count: i64,
     pub next_retry_at: i64,
     pub lease_until: i64,
     pub lease_token: String,
     pub last_error: Option<String>,
+    /// How the sender was classified when the row was admitted. See
+    /// [`P2pInboxAdmissionClass`]; empty means the caller did not classify it.
+    pub admission_class: String,
+    /// Digest of `content`, used to collapse an identical payload re-published
+    /// by the same sender while the first copy is still queued.
+    pub content_hash: Option<Vec<u8>>,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+/// Sender classification recorded on an inbox row for quota accounting.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Display, EnumString)]
+pub enum P2pInboxAdmissionClass {
+    /// Committee member registered by peer ID on chain.
+    Committee,
+    /// A verifier (on-chain peer id registry) or an operator (staked master key
+    /// bound to the peer id by a NodeInfo binding proof).
+    Registered,
+    /// Anyone else, including anonymous peers.
+    Unregistered,
+}
+
+impl P2pInboxAdmissionClass {
+    /// Whether the sender's identity is backed by an on-chain registration.
+    pub const fn is_registered(self) -> bool {
+        !matches!(self, Self::Unregistered)
+    }
+}
+
+/// Queued (`Pending` + `Processing` + `Quarantined`) inbox usage for one
+/// admission class, with the share attributable to the sender being admitted.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct P2pInboxClassUsage {
+    pub admission_class: String,
+    pub rows: i64,
+    pub bytes: i64,
+    pub peer_rows: i64,
+    pub peer_bytes: i64,
 }
 
 #[derive(Clone, FromRow, Debug, Serialize, Deserialize, Default)]
@@ -603,6 +643,8 @@ pub struct P2pOutboxMessage {
     pub retry_until: i64,
     pub retry_interval_secs: i64,
     pub ack_peer_id: String,
+    /// Publishes that went through, unlike `attempt_count`, which counts claims.
+    pub publish_count: i64,
     pub created_at: i64,
 }
 
@@ -683,53 +725,6 @@ pub struct PendingGraphInit {
     pub graph_id: Uuid,
     pub updated_at: i64,
     pub created_at: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Display, EnumString)]
-pub enum MessageType {
-    None,
-    PeginRequest,
-    CreateGraph,
-    ConfirmInstance,
-    InitGraph,
-    GenCircuits,
-    CutCircuits,
-    SolderingProof,
-    VerifierGraphParamsEndorsement,
-    NonceGeneration,
-    AggNonceConsensus,
-    CommitteePresign,
-    GraphFinalize,
-    EndorseGraph,
-    PeginConfirmNonce,
-    PeginConfirmNonceConsensus,
-    PeginConfirmPartialSig,
-    PostReady,
-    KickoffReady,
-    KickoffSent,
-    PreKickoffSent,
-    ChallengeSent,
-    WatchtowerChallengeInitSent,
-    WatchtowerChallengeSent,
-    WatchtowerChallengeTimeout,
-    NackReady,
-    OperatorCommitPubinReady,
-    OperatorCommitPubinTimeout,
-    AssertReady,
-    AssertSent,
-    ChallengeAssertSent,
-    WronglyChallengeTimeout,
-    DisproveSent,
-    Take1Ready,
-    Take1Sent,
-    Take2Ready,
-    Take2Sent,
-    RequestNodeInfo,
-    ResponseNodeInfo,
-    SyncGraphRequest,
-    SyncGraph,
-    InstanceDiscarded,
-    Tick,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default, Display, EnumString)]
@@ -975,17 +970,16 @@ mod tests {
 
     #[test]
     fn test_graph_status_from_str() {
-        assert_eq!(GraphStatus::from_str("Created").unwrap(), GraphStatus::Created);
         assert_eq!(
             GraphStatus::from_str("OperatorPresigned").unwrap(),
             GraphStatus::OperatorPresigned
         );
+        assert!(GraphStatus::from_str("Created").is_err());
         assert!(GraphStatus::from_str("Invalid").is_err());
     }
 
     #[test]
     fn test_graph_status_display() {
-        assert_eq!(GraphStatus::Created.to_string(), "Created");
         assert_eq!(GraphStatus::OperatorPresigned.to_string(), "OperatorPresigned");
     }
 
@@ -996,13 +990,6 @@ mod tests {
             InstanceBridgeInStatus::RelayerL2Minted
         );
         assert!(InstanceBridgeInStatus::from_str("Invalid").is_err());
-    }
-
-    #[test]
-    fn test_message_type_from_str() {
-        assert_eq!(MessageType::from_str("PeginRequest").unwrap(), MessageType::PeginRequest);
-        assert_eq!(MessageType::from_str("CreateGraph").unwrap(), MessageType::CreateGraph);
-        assert!(MessageType::from_str("Invalid").is_err());
     }
 
     #[test]

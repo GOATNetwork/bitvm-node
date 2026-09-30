@@ -38,6 +38,7 @@ proof-builder-rpc/*.ckpt
 node/tla/states/
 
 local_docs/
+local_scripts/
 scripts/testnet/
 scripts/devnet/
 *.DS_Store

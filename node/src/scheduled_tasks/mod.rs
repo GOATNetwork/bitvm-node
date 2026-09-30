@@ -6,10 +6,10 @@ mod node_maintenance_tasks;
 mod sequencer_set_hash_monitor_task;
 mod spv_maintenance_tasks;
 
-use crate::action::GOATMessageContent;
 use crate::env::{
-    get_maintenance_run_timeout_secs, get_network, get_node_goat_address, get_node_pubkey,
-    is_enable_babe_setup_state_cleanup, is_enable_update_spv_contract, is_relayer,
+    actor_runs_babe_setup_state_cleanup, get_maintenance_run_timeout_secs, get_network,
+    get_node_goat_address, get_node_pubkey, is_enable_babe_setup_state_cleanup,
+    is_enable_update_spv_contract, is_relayer,
 };
 use crate::metrics_service::MetricsState;
 use crate::rpc_service::current_time_secs;
@@ -33,8 +33,8 @@ pub use sequencer_set_hash_monitor_task::run_sequencer_set_hash_monitor_task;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use store::Graph;
 use store::localdb::{LocalDB, StorageProcessor};
-use store::{Graph, MessageType};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -233,9 +233,7 @@ async fn run(
     let btc_client = btc_client.as_ref();
     let goat_client = goat_client.as_ref();
 
-    if is_enable_babe_setup_state_cleanup()
-        && matches!(&actor, Actor::Verifier | Actor::Operator | Actor::All)
-    {
+    if is_enable_babe_setup_state_cleanup() && actor_runs_babe_setup_state_cleanup(&actor) {
         run_maintenance_subtask(
             metrics_state,
             "babe_setup_state_cleanup_monitor",
@@ -484,64 +482,6 @@ pub async fn run_maintenance_tasks(
                 return Ok("maintenance_shutdown".to_string());
             }
         }
-    }
-}
-
-pub fn get_goat_message_content_type(content: &GOATMessageContent) -> MessageType {
-    match content {
-        GOATMessageContent::PeginRequest(_) => MessageType::PeginRequest,
-        GOATMessageContent::CreateGraph(_) => MessageType::CreateGraph,
-        GOATMessageContent::ConfirmInstance(_) => MessageType::ConfirmInstance,
-        GOATMessageContent::InitGraph(_) => MessageType::InitGraph,
-        GOATMessageContent::GenCircuits(_) => MessageType::GenCircuits,
-        GOATMessageContent::CutCircuits(_) => MessageType::CutCircuits,
-        GOATMessageContent::SolderingProofReady(_) => MessageType::SolderingProof,
-        GOATMessageContent::GraphSetupAck(_) => MessageType::None,
-        GOATMessageContent::VerifierGraphParamsEndorsement(_) => {
-            MessageType::VerifierGraphParamsEndorsement
-        }
-        GOATMessageContent::NonceGeneration(_) => MessageType::NonceGeneration,
-        GOATMessageContent::AggNonceConsensus(_) => MessageType::AggNonceConsensus,
-        GOATMessageContent::CommitteePresign(_) => MessageType::CommitteePresign,
-        GOATMessageContent::GraphFinalize(_) => MessageType::GraphFinalize,
-        GOATMessageContent::EndorseGraph(_) => MessageType::EndorseGraph,
-        GOATMessageContent::PeginConfirmNonce(_) => MessageType::PeginConfirmNonce,
-        GOATMessageContent::PeginConfirmNonceConsensus(_) => {
-            MessageType::PeginConfirmNonceConsensus
-        }
-        GOATMessageContent::PeginConfirmPartialSig(_) => MessageType::PeginConfirmPartialSig,
-        GOATMessageContent::PostReady(_) => MessageType::PostReady,
-        GOATMessageContent::KickoffReady(_) => MessageType::KickoffReady,
-        GOATMessageContent::KickoffSent(_) => MessageType::KickoffSent,
-        GOATMessageContent::PreKickoffSent(_) => MessageType::PreKickoffSent,
-        GOATMessageContent::ChallengeSent(_) => MessageType::ChallengeSent,
-        GOATMessageContent::WatchtowerChallengeInitSent(_) => {
-            MessageType::WatchtowerChallengeInitSent
-        }
-        GOATMessageContent::WatchtowerChallengeSent(_) => MessageType::WatchtowerChallengeSent,
-        GOATMessageContent::WatchtowerChallengeTimeout(_) => {
-            MessageType::WatchtowerChallengeTimeout
-        }
-        GOATMessageContent::NackReady(_) => MessageType::NackReady,
-        GOATMessageContent::OperatorCommitPubinReady(_) => MessageType::OperatorCommitPubinReady,
-        GOATMessageContent::OperatorCommitPubinTimeout(_) => {
-            MessageType::OperatorCommitPubinTimeout
-        }
-        GOATMessageContent::AssertReady(_) => MessageType::AssertReady,
-        GOATMessageContent::AssertSent(_) => MessageType::AssertSent,
-        GOATMessageContent::ChallengeAssertSent(_) => MessageType::ChallengeAssertSent,
-        GOATMessageContent::WronglyChallengeTimeout(_) => MessageType::WronglyChallengeTimeout,
-        GOATMessageContent::DisproveSent(_) => MessageType::DisproveSent,
-        GOATMessageContent::Take1Ready(_) => MessageType::Take1Ready,
-        GOATMessageContent::Take1Sent(_) => MessageType::Take1Sent,
-        GOATMessageContent::Take2Ready(_) => MessageType::Take2Ready,
-        GOATMessageContent::Take2Sent(_) => MessageType::Take2Sent,
-        GOATMessageContent::RequestNodeInfo(_) => MessageType::RequestNodeInfo,
-        GOATMessageContent::ResponseNodeInfo(_) => MessageType::ResponseNodeInfo,
-        GOATMessageContent::SyncGraphRequest(_) => MessageType::SyncGraphRequest,
-        GOATMessageContent::SyncGraph(_) => MessageType::SyncGraph,
-        GOATMessageContent::InstanceDiscarded(_) => MessageType::InstanceDiscarded,
-        GOATMessageContent::Tick => MessageType::Tick,
     }
 }
 

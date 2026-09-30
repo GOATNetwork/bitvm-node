@@ -3,10 +3,10 @@ use crate::{
     BridgeOutGlobalStats, EventWatchMetricsSnapshot, GoatTxRecord, Graph, GraphBtcTxVoutMonitor,
     GraphRawData, GraphStatus, GraphStatusSource, GraphStatusTransitionOutcome, Instance,
     LongRunningTaskProof, Message, MessageDebugOverview, MessageDebugReason, MetricsStateCount,
-    Node, NodeAlertMetricsSnapshot, NodesOverview, OperatorProof, P2pInboxMessage,
-    P2pOutboxMessage, PeginGraphProcessData, PeginInstanceProcessData, PendingGraphInit,
-    SequencerSetHashChange, SequencerSetScanState, SerializableTxid, SwapEscrow, SwapEscrowStatus,
-    WatchContract, WatchtowerProof,
+    Node, NodeAlertMetricsSnapshot, NodesOverview, OperatorProof, P2pInboxAdmissionClass,
+    P2pInboxClassUsage, P2pInboxMessage, P2pOutboxMessage, PeginGraphProcessData,
+    PeginInstanceProcessData, PendingGraphInit, SequencerSetHashChange, SequencerSetScanState,
+    SerializableTxid, SwapEscrow, SwapEscrowStatus, WatchContract, WatchtowerProof,
 };
 
 use indexmap::IndexMap;
@@ -17,11 +17,20 @@ use sqlx::types::Uuid;
 use sqlx::{Row, Sqlite, SqliteConnection, SqlitePool, Transaction, migrate::MigrateDatabase};
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::warn;
 
 fn get_current_timestamp_secs() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64
 }
+
+/// Columns every `message` SELECT must fetch.
+const MESSAGE_COLUMNS: &str = "message_id, business_id, from_peer, actor, msg_type, content, \
+     message_version, state, weight, lock_time_until, attempt_count, abandon_count, last_error, \
+     created_at";
+
+/// Columns every `p2p_inbox` SELECT must fetch.
+const P2P_INBOX_COLUMNS: &str = "message_id, business_id, actor, from_peer, msg_type, content, \
+     content_size, state, attempt_count, abandon_count, next_retry_at, lease_until, lease_token, \
+     last_error, admission_class, content_hash, created_at, updated_at";
 
 fn message_from_row(row: &SqliteRow) -> Result<Message, sqlx::Error> {
     Ok(Message {
@@ -35,6 +44,9 @@ fn message_from_row(row: &SqliteRow) -> Result<Message, sqlx::Error> {
         message_version: row.try_get("message_version")?,
         weight: row.try_get("weight")?,
         lock_time_until: row.try_get("lock_time_until")?,
+        attempt_count: row.try_get("attempt_count")?,
+        abandon_count: row.try_get("abandon_count")?,
+        last_error: row.try_get("last_error")?,
         created_at: row.try_get("created_at")?,
     })
 }
@@ -50,10 +62,13 @@ fn p2p_inbox_message_from_row(row: &SqliteRow) -> Result<P2pInboxMessage, sqlx::
         content_size: row.try_get("content_size")?,
         state: row.try_get("state")?,
         attempt_count: row.try_get("attempt_count")?,
+        abandon_count: row.try_get("abandon_count")?,
         next_retry_at: row.try_get("next_retry_at")?,
         lease_until: row.try_get("lease_until")?,
         lease_token: row.try_get("lease_token")?,
         last_error: row.try_get("last_error")?,
+        admission_class: row.try_get("admission_class")?,
+        content_hash: row.try_get("content_hash")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
@@ -72,6 +87,7 @@ fn p2p_outbox_message_from_row(row: &SqliteRow) -> Result<P2pOutboxMessage, sqlx
         retry_until: row.try_get("retry_until")?,
         retry_interval_secs: row.try_get("retry_interval_secs")?,
         ack_peer_id: row.try_get("ack_peer_id")?,
+        publish_count: row.try_get("publish_count")?,
         created_at: row.try_get("created_at")?,
     })
 }
@@ -959,7 +975,7 @@ impl<'a> StorageProcessor<'a> {
         }
     }
 
-    /// Returns grouped instance, graph, and message state counts for Node metrics.
+    /// Returns grouped instance, graph, and queue state counts for Node metrics.
     pub async fn node_metrics_state_counts(&mut self) -> anyhow::Result<Vec<MetricsStateCount>> {
         let counts = sqlx::query_as::<_, MetricsStateCount>(
             r#"
@@ -997,6 +1013,15 @@ impl<'a> StorageProcessor<'a> {
                 MIN(created_at) AS oldest_created_at,
                 NULL AS last_success_at
             FROM message
+            GROUP BY state
+            UNION ALL
+            SELECT
+                'p2p_inbox' AS category,
+                state,
+                COUNT(*) AS count,
+                MIN(created_at) AS oldest_created_at,
+                NULL AS last_success_at
+            FROM p2p_inbox
             GROUP BY state
             ORDER BY category, state
             "#,
@@ -1108,65 +1133,61 @@ impl<'a> StorageProcessor<'a> {
         Ok(counts)
     }
 
-    /// Insert or update an instance
-    ///
-    /// Performs an INSERT OR REPLACE operation on the instance table.
-    /// If an instance with the same instance_id exists, it will be updated.
-    /// If no instance exists, a new one will be created.
+    /// Insert an instance only when its ID is not already present.
     ///
     /// Parameters:
-    /// - instance: The complete instance data to insert or update
+    /// - instance: The complete instance data to insert
     ///
     /// Returns:
-    /// - Ok(true) if the operation affected at least one row
-    /// - Ok(false) if no rows were affected
+    /// - Ok(true) if the instance was inserted
+    /// - Ok(false) if an instance with the same ID already exists
     /// - Err if the operation failed
-    pub async fn upsert_instance(&mut self, instance: &Instance) -> anyhow::Result<bool> {
+    pub async fn insert_instance_if_absent(&mut self, instance: &Instance) -> anyhow::Result<bool> {
         let committees_answers_json = serde_json::to_string(&instance.committees_answers)?;
-        let res = sqlx::query!(
-            "INSERT OR
-            REPLACE INTO instance (instance_id, network, from_addr, to_addr, amount, fees, input_utxos, status, goat_tx_hash, goat_tx_height,
+        let res = sqlx::query(
+            "INSERT INTO instance (instance_id, network, from_addr, to_addr, amount, fees, input_utxos, status, goat_tx_hash, goat_tx_height,
                         user_xonly_pubkey, user_change_addr, user_refund_addr, btc_txid, pegin_confirm_txid, pegin_cancel_txid, committees_answers,
                        pegin_data_tx_hash, btc_height, parameters, status_updated_at, post_pegin_txhash, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            instance.instance_id,
-            instance.network,
-            instance.from_addr,
-            instance.to_addr,
-            instance.amount,
-            instance.fees,
-            instance.input_utxos,
-            instance.status,
-            instance.goat_tx_hash,
-            instance.goat_tx_height,
-            instance.user_xonly_pubkey,
-            instance.user_change_addr,
-            instance.user_refund_addr,
-            instance.btc_txid,
-            instance.pegin_confirm_txid,
-            instance.pegin_cancel_txid,
-            committees_answers_json,
-            instance.pegin_data_tx_hash,
-            instance.btc_height,
-            instance.parameters,
-            instance.status_updated_at,
-            instance.post_pegin_txhash,
-            instance.created_at,
-            instance.updated_at
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(instance_id) DO NOTHING",
         )
-            .execute(self.conn())
-            .await?;
+        .bind(instance.instance_id)
+        .bind(&instance.network)
+        .bind(&instance.from_addr)
+        .bind(&instance.to_addr)
+        .bind(instance.amount)
+        .bind(instance.fees)
+        .bind(&instance.input_utxos)
+        .bind(&instance.status)
+        .bind(&instance.goat_tx_hash)
+        .bind(instance.goat_tx_height)
+        .bind(instance.user_xonly_pubkey)
+        .bind(&instance.user_change_addr)
+        .bind(&instance.user_refund_addr)
+        .bind(&instance.btc_txid)
+        .bind(&instance.pegin_confirm_txid)
+        .bind(&instance.pegin_cancel_txid)
+        .bind(committees_answers_json)
+        .bind(&instance.pegin_data_tx_hash)
+        .bind(instance.btc_height)
+        .bind(&instance.parameters)
+        .bind(instance.status_updated_at)
+        .bind(&instance.post_pegin_txhash)
+        .bind(instance.created_at)
+        .bind(instance.updated_at)
+        .execute(self.conn())
+        .await?;
         Ok(res.rows_affected() > 0)
     }
 
     /// Create a bridge-in instance from a pegin request, or refresh one that
     /// has not moved past the pegin-request stage yet.
     ///
-    /// `PeginRequest` is a re-deliverable P2P message, so `upsert_instance` is
-    /// unsafe here: its `INSERT OR REPLACE` lets a replayed or forged request
-    /// roll a live instance back to its initial row and clear everything the
-    /// later stages wrote. The write is therefore a compare-and-swap over the
-    /// current status, and it only touches the columns a pegin request owns:
+    /// `PeginRequest` is a re-deliverable P2P message, so a full-row replacement
+    /// would let a replayed or forged request roll a live instance back to its
+    /// initial row and clear everything the later stages wrote. The write is
+    /// therefore a compare-and-swap over the current status, and it only touches
+    /// the columns a pegin request owns:
     /// committee answers, instance parameters and the BTC-side fields are never
     /// overwritten. The caller is responsible for passing canonical request
     /// metadata - `goat_tx_hash`/`goat_tx_height` are refreshed from it, so that
@@ -1301,29 +1322,6 @@ impl<'a> StorageProcessor<'a> {
             count_query.fetch_one(self.conn()).await?.get::<i64, &str>("total_instances"),
         ))
     }
-    /// Get network type by instance ID
-    ///
-    /// Retrieves the network type (e.g., "mainnet", "testnet") for a specific instance.
-    ///
-    /// Parameters:
-    /// - instance_id: The UUID of the instance
-    ///
-    /// Returns:
-    /// - Ok(network_string) if the instance was found
-    /// - Ok("") if no instance with the given ID exists
-    /// - Err if the query failed
-    pub async fn get_network_by_instance(&mut self, instance_id: &Uuid) -> anyhow::Result<String> {
-        if let Some(raw) =
-            sqlx::query!(r#"SELECT network FROM instance WHERE instance_id = ?"#, instance_id)
-                .fetch_optional(self.conn())
-                .await?
-        {
-            Ok(raw.network)
-        } else {
-            Ok("".to_string())
-        }
-    }
-
     /// Insert a swap escrow only when its escrow hash is not already present.
     ///
     /// The chain-event watcher is the sole writer for Initialize records;
@@ -1462,28 +1460,6 @@ impl<'a> StorageProcessor<'a> {
         Ok(row.rows_affected())
     }
 
-    /// Update instance status
-    ///
-    /// A concise method specifically for updating instance status
-    pub async fn update_instance_status(
-        &mut self,
-        instance_id: &Uuid,
-        new_status: &str,
-    ) -> anyhow::Result<bool> {
-        let current_time = get_current_timestamp_secs();
-        let result = sqlx::query!(
-            "UPDATE instance SET status = ?, status_updated_at = ?, updated_at = ? WHERE instance_id = ?",
-            new_status,
-            current_time,
-            current_time,
-            instance_id
-        )
-            .execute(self.conn())
-            .await?;
-
-        Ok(result.rows_affected() > 0)
-    }
-
     /// Transition an instance only when it is still in the expected status.
     pub async fn update_instance_status_if_current(
         &mut self,
@@ -1500,48 +1476,6 @@ impl<'a> StorageProcessor<'a> {
             current_time,
             instance_id,
             current_status,
-        )
-        .execute(self.conn())
-        .await?;
-
-        Ok(result.rows_affected() > 0)
-    }
-
-    /// Update instance pegin confirmation information
-    ///
-    /// Method specifically for updating pegin confirmation transaction ID and fee
-    pub async fn update_instance_pegin_confirm(
-        &mut self,
-        instance_id: &Uuid,
-        pegin_confirm_txid: &str,
-    ) -> anyhow::Result<bool> {
-        let current_time = get_current_timestamp_secs();
-        let result = sqlx::query!(
-            "UPDATE instance SET pegin_confirm_txid = ?, updated_at = ? WHERE instance_id = ?",
-            pegin_confirm_txid,
-            current_time,
-            instance_id
-        )
-        .execute(self.conn())
-        .await?;
-
-        Ok(result.rows_affected() > 0)
-    }
-
-    /// Update instance pegin data transaction ID
-    ///
-    /// Method specifically for updating pegin data transaction ID
-    pub async fn update_instance_pegin_data_txid(
-        &mut self,
-        instance_id: &Uuid,
-        pegin_data_tx_hash: &str,
-    ) -> anyhow::Result<bool> {
-        let current_time = get_current_timestamp_secs();
-        let result = sqlx::query!(
-            "UPDATE instance SET pegin_data_tx_hash = ?, updated_at = ? WHERE instance_id = ?",
-            pegin_data_tx_hash,
-            current_time,
-            instance_id
         )
         .execute(self.conn())
         .await?;
@@ -1591,72 +1525,6 @@ impl<'a> StorageProcessor<'a> {
         .execute(self.conn())
         .await?;
         Ok(result.rows_affected() > 0)
-    }
-
-    /// Remove a committee answer from an instance
-    ///
-    /// This method removes a specific committee's answer from the committees_answers HashMap.
-    pub async fn remove_instance_committee_answer(
-        &mut self,
-        instance_id: &Uuid,
-        committee: &str,
-    ) -> anyhow::Result<bool> {
-        // JSON merge-patch removes object members with a null value, so this
-        // stays atomic with concurrent single-answer additions.
-        let committee_patch =
-            serde_json::json!({ (committee): serde_json::Value::Null }).to_string();
-        let current_time = get_current_timestamp_secs();
-        let result = sqlx::query(
-            "UPDATE instance \
-             SET committees_answers = json_patch(COALESCE(committees_answers, '{}'), json(?)), \
-                 updated_at = ? \
-             WHERE instance_id = ?",
-        )
-        .bind(committee_patch)
-        .bind(current_time)
-        .bind(instance_id)
-        .execute(self.conn())
-        .await?;
-        Ok(result.rows_affected() > 0)
-    }
-
-    /// Get committees answers for an instance
-    ///
-    /// Returns the committees_answers HashMap for a specific instance.
-    pub async fn get_instance_committees_answers(
-        &mut self,
-        instance_id: &Uuid,
-    ) -> anyhow::Result<Option<IndexMap<String, Vec<u8>>>> {
-        let current_instance = self.find_instance(instance_id).await?;
-        if let Some(instance) = current_instance {
-            Ok(Some(instance.committees_answers))
-        } else {
-            Ok(None)
-        }
-    }
-
-    /// Replace the complete committee-answer map.
-    ///
-    /// Callers that add a single answer should use
-    /// `update_instance_committee_answer` instead, which merges atomically.
-    pub async fn update_instance_committees_answers_map(
-        &mut self,
-        instance_id: &Uuid,
-        committees_answers: &IndexMap<String, Vec<u8>>,
-    ) -> anyhow::Result<bool> {
-        let current_time = get_current_timestamp_secs();
-        let committees_answers_json = serde_json::to_string(&committees_answers)?;
-
-        let res = sqlx::query!(
-            "UPDATE instance SET committees_answers = ?, updated_at = ? WHERE instance_id = ?",
-            committees_answers_json,
-            current_time,
-            instance_id
-        )
-        .execute(self.conn())
-        .await?;
-
-        Ok(res.rows_affected() > 0)
     }
 
     pub async fn update_instance_parameters(
@@ -2003,25 +1871,6 @@ impl<'a> StorageProcessor<'a> {
         Ok(row)
     }
 
-    pub async fn get_graph_operator(&mut self, graph_id: &Uuid) -> anyhow::Result<Option<String>> {
-        #[derive(sqlx::FromRow)]
-        struct OperatorRow {
-            operator_pubkey: String,
-        }
-        if let Some(operator_raw) = sqlx::query_as!(
-            OperatorRow,
-            "SELECT  operator_pubkey  FROM graph WHERE  graph_id = ?",
-            graph_id
-        )
-        .fetch_optional(self.conn())
-        .await?
-        {
-            Ok(Some(operator_raw.operator_pubkey))
-        } else {
-            Ok(None)
-        }
-    }
-
     pub async fn find_graphs(&mut self, params: GraphQuery) -> anyhow::Result<(Vec<Graph>, i64)> {
         // Build base query
         let mut count_params = params.clone();
@@ -2150,62 +1999,12 @@ impl<'a> StorageProcessor<'a> {
         Ok(res.map(|v| (v.graph_id, v.instance_id, v.cur_prekickoff_txid, v.next_prekickoff)))
     }
 
-    pub async fn get_graphs_ids_and_operator_by_instance_ids(
-        &mut self,
-        ids: &[Uuid],
-    ) -> anyhow::Result<Vec<(Uuid, Uuid, String)>> {
-        #[derive(sqlx::FromRow)]
-        struct GraphIdRow {
-            pub graph_id: Uuid,
-            pub instance_id: Uuid,
-            pub operator: String,
-        }
-        let query_str = format!(
-            "SELECT graph_id, instance_id, operator
-             FROM graph
-             WHERE hex(instance_id)
-                       COLLATE NOCASE IN ({})",
-            create_place_holders(ids)
-        );
-        let mut update_query = sqlx::query_as::<_, GraphIdRow>(&query_str);
-        for id in ids {
-            update_query = update_query.bind(hex::encode(id));
-        }
-        let graph_ids = update_query.fetch_all(self.conn()).await?;
-        Ok(graph_ids.into_iter().map(|v| (v.graph_id, v.instance_id, v.operator)).collect())
-    }
-
     pub async fn get_operator_graphs(&mut self, params: GraphQuery) -> anyhow::Result<Vec<Graph>> {
         let graph_query_builder = params.get_query_builder("SELECT * FROM graph");
         let operator_graph_sql = graph_query_builder.get_sql();
         let mut operator_graphs_query = sqlx::query_as::<_, Graph>(&operator_graph_sql);
         operator_graphs_query = graph_query_builder.query_as(operator_graphs_query);
         Ok(operator_graphs_query.fetch_all(self.conn()).await?)
-    }
-
-    pub async fn get_operator_max_kickoff_index(
-        &mut self,
-        operator_pubkey: &str,
-    ) -> anyhow::Result<(Option<Uuid>, i64)> {
-        #[derive(sqlx::FromRow)]
-        struct MaxPreKickoffIndexRow {
-            pub graph_id: Uuid,
-            pub kickoff_index: i64,
-        }
-
-        let record = sqlx::query_as!(
-            MaxPreKickoffIndexRow,
-            "SELECT graph_id AS  \"graph_id:Uuid\", kickoff_index
-                    FROM graph
-                    WHERE operator_pubkey = ?
-                    ORDER BY kickoff_index DESC
-                    limit 1",
-            operator_pubkey
-        )
-        .fetch_optional(self.conn())
-        .await?;
-
-        Ok(record.map_or((None, 0), |v| (Some(v.graph_id), v.kickoff_index)))
     }
 
     pub async fn update_node_timestamp(
@@ -2219,7 +2018,9 @@ impl<'a> StorageProcessor<'a> {
                 .await?;
 
         if result.rows_affected() == 0 {
-            warn!("Node {peer_id} not found in DB, no rows updated");
+            // Any peer that never announced itself lands here, once per message
+            // burst, so this must not be louder than debug.
+            tracing::debug!("Node {peer_id} not found in DB, no rows updated");
         }
 
         Ok(())
@@ -2262,8 +2063,8 @@ impl<'a> StorageProcessor<'a> {
         let res = sqlx::query!(
             r#"
             INSERT INTO node (peer_id, node_name, actor, goat_addr, btc_pub_key, socket_addr, service_fee_rate, available_peg_btc,
-                              created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                              binding_sig, binding_issued_at, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (peer_id) DO UPDATE SET actor             = excluded.actor,
                                                 node_name         = excluded.node_name,
                                                 goat_addr         = excluded.goat_addr,
@@ -2271,6 +2072,8 @@ impl<'a> StorageProcessor<'a> {
                                                 service_fee_rate       = excluded.service_fee_rate,
                                                 available_peg_btc = excluded.available_peg_btc,
                                                 socket_addr       = excluded.socket_addr,
+                                                binding_sig       = excluded.binding_sig,
+                                                binding_issued_at = excluded.binding_issued_at,
                                                 updated_at        = excluded.updated_at
             "#,
             node.peer_id,
@@ -2281,6 +2084,8 @@ impl<'a> StorageProcessor<'a> {
             node.socket_addr,
             node.service_fee_rate,
             node.available_peg_btc,
+            node.binding_sig,
+            node.binding_issued_at,
             node.created_at,
             node.updated_at,
         )
@@ -2442,19 +2247,19 @@ impl<'a> StorageProcessor<'a> {
         Ok((total, alive))
     }
 
-    pub async fn update_messages_state(
+    /// Complete the exact local queue claim handed to a worker.
+    pub async fn complete_local_message(
         &mut self,
         message_id: &str,
         message_version: i64,
-        state: String,
     ) -> anyhow::Result<bool> {
         let current_time = get_current_timestamp_secs();
         let res = sqlx::query(
             "UPDATE message \
-             SET state = ?, updated_at = ? \
-             WHERE message_id = ? AND message_version = ? AND state != 'Cancelled'",
+             SET state = 'Processed', content = X'', lock_time_until = 0, \
+                 abandon_count = 0, last_error = NULL, updated_at = ? \
+             WHERE message_id = ? AND message_version = ? AND state = 'Processing'",
         )
-        .bind(state)
         .bind(current_time)
         .bind(message_id)
         .bind(message_version)
@@ -2464,63 +2269,42 @@ impl<'a> StorageProcessor<'a> {
         Ok(res.rows_affected() > 0)
     }
 
-    pub async fn update_messages_state_by_business_id(
+    /// Cancel queued local work for a business object, including work which has
+    /// already been claimed. Claim completion/defer writes require `Processing`,
+    /// so an in-flight worker cannot overwrite the terminal cancellation.
+    pub async fn cancel_messages_by_business_id(
         &mut self,
         business_id: &Uuid,
         msg_type: Option<String>,
-        old_state: String,
-        new_state: String,
-    ) -> anyhow::Result<bool> {
+    ) -> anyhow::Result<u64> {
         let current_time = get_current_timestamp_secs();
         let res = match msg_type {
             Some(msg_type) => {
                 sqlx::query(
                     "UPDATE message \
-                     SET state = ?, updated_at = ? \
-                     WHERE business_id = ? AND msg_type = ? AND state = ? AND state != 'Cancelled'",
+                     SET state = 'Cancelled', lock_time_until = 0, updated_at = ? \
+                     WHERE business_id = ? AND msg_type = ? \
+                       AND state IN ('Pending', 'Processing')",
                 )
-                .bind(new_state)
                 .bind(current_time)
                 .bind(business_id)
                 .bind(msg_type)
-                .bind(old_state)
                 .execute(self.conn())
                 .await?
             }
             None => {
                 sqlx::query(
                     "UPDATE message \
-                     SET state = ?, updated_at = ? \
-                     WHERE business_id = ? AND state = ? AND state != 'Cancelled'",
+                     SET state = 'Cancelled', lock_time_until = 0, updated_at = ? \
+                     WHERE business_id = ? AND state IN ('Pending', 'Processing')",
                 )
-                .bind(new_state)
                 .bind(current_time)
                 .bind(business_id)
-                .bind(old_state)
                 .execute(self.conn())
                 .await?
             }
         };
-        Ok(res.rows_affected() > 0)
-    }
-
-    pub async fn update_messages_lock_time_until(
-        &mut self,
-        message_id: &str,
-        message_version: i64,
-        lock_time_until: i64,
-    ) -> anyhow::Result<bool> {
-        let current_time = get_current_timestamp_secs();
-        let res = sqlx::query!(
-            "Update  message Set lock_time_until = ?, updated_at = ? WHERE message_id = ? AND  message_version = ?",
-            lock_time_until,
-            current_time,
-            message_id,
-            message_version
-
-        ).execute(self.conn()).await?;
-
-        Ok(res.rows_affected() > 0)
+        Ok(res.rows_affected())
     }
 
     pub async fn set_messages_expired(&mut self, expired: i64) -> anyhow::Result<()> {
@@ -2548,21 +2332,9 @@ impl<'a> StorageProcessor<'a> {
         business_id: &Uuid,
         msg_type: &str,
     ) -> anyhow::Result<Option<Message>> {
-        let row = sqlx::query(
-            "SELECT message_id,
-                    business_id,
-                    from_peer,
-                    actor,
-                    msg_type,
-                    content,
-                    message_version,
-                    state,
-                    weight,
-                    lock_time_until,
-                    created_at
-             FROM message
-             WHERE business_id = ? AND msg_type = ?",
-        )
+        let row = sqlx::query(&format!(
+            "SELECT {MESSAGE_COLUMNS} FROM message WHERE business_id = ? AND msg_type = ?"
+        ))
         .bind(business_id)
         .bind(msg_type)
         .fetch_optional(self.conn())
@@ -2573,68 +2345,329 @@ impl<'a> StorageProcessor<'a> {
         &mut self,
         message_id: &str,
     ) -> anyhow::Result<Option<Message>> {
-        let row = sqlx::query(
-            "SELECT message_id,
-                    business_id,
-                    from_peer,
-                    actor,
-                    msg_type,
-                    content,
-                    message_version,
-                    state,
-                    weight,
-                    lock_time_until,
-                    created_at
-             FROM message
-             WHERE message_id = ?",
+        let row =
+            sqlx::query(&format!("SELECT {MESSAGE_COLUMNS} FROM message WHERE message_id = ?"))
+                .bind(message_id)
+                .fetch_optional(self.conn())
+                .await?;
+        Ok(row.map(|row| message_from_row(&row)).transpose()?)
+    }
+
+    /// Retire local messages whose claims keep failing to report an outcome.
+    ///
+    /// A surviving `message` row makes the producer treat the work as already
+    /// created, so retiring on repeated handler errors would strand it until the
+    /// reaper; repeated abandons mean the node went down mid-dispatch on this
+    /// payload, which retrying cannot fix.
+    pub async fn quarantine_local_messages(
+        &mut self,
+        now: i64,
+        max_abandons: i64,
+    ) -> anyhow::Result<u64> {
+        let result = sqlx::query(
+            "UPDATE message \
+             SET state = 'Quarantined', \
+                 abandon_count = abandon_count + CASE WHEN state = 'Processing' THEN 1 ELSE 0 END, \
+                 lock_time_until = 0, \
+                 last_error = ?, updated_at = ? \
+             WHERE state IN ('Pending', 'Processing') \
+               AND lock_time_until <= ? \
+               AND abandon_count + CASE WHEN state = 'Processing' THEN 1 ELSE 0 END >= ?",
         )
+        .bind(format!("quarantined: exceeded max abandoned claims ({max_abandons})"))
+        .bind(now)
+        .bind(now)
+        .bind(max_abandons)
+        .execute(self.conn())
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Rows the local dispatcher may attempt right now, oldest first.
+    ///
+    /// Nothing is written here: the dispatcher claims each row with
+    /// [`Self::claim_local_message`] immediately before dispatching it. Claiming
+    /// a whole batch up front meant that an abort or kill mid-dispatch charged
+    /// an unfinished attempt to every row in the batch, so healthy messages
+    /// followed the poison message into quarantine.
+    pub async fn list_claimable_local_messages(
+        &mut self,
+        now: i64,
+        expired: i64,
+        limit: i64,
+        max_abandons: i64,
+    ) -> anyhow::Result<Vec<Message>> {
+        let rows = sqlx::query(&format!(
+            "SELECT {MESSAGE_COLUMNS} FROM message \
+             WHERE state IN ('Pending', 'Processing') \
+               AND lock_time_until <= ? \
+               AND updated_at >= ? \
+               AND abandon_count < ? \
+             ORDER BY created_at ASC \
+             LIMIT ?"
+        ))
+        .bind(now)
+        .bind(expired)
+        .bind(max_abandons)
+        .bind(limit)
+        .fetch_all(self.conn())
+        .await?;
+        rows.iter().map(message_from_row).collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Claim exactly one local message for dispatch.
+    ///
+    /// Without a durable claim, a handler that panicked left the row `Pending`
+    /// with its lock untouched, so the very next tick re-read it and panicked
+    /// again with no backoff at all. Charging the claim before dispatch means
+    /// the record survives an abort or a kill, not just an unwinding panic.
+    ///
+    /// Re-claiming a row that is still `Processing` means the previous attempt
+    /// never reported an outcome, which is charged as an abandon.
+    /// `message_version` is deliberately left alone: callers guard their
+    /// completion writes with the version they were handed, and bumping it here
+    /// would make every one of those writes miss. Returns `None` when the row
+    /// is no longer claimable: cancelled, re-armed under a new version, or
+    /// locked since it was listed.
+    pub async fn claim_local_message(
+        &mut self,
+        message_id: &str,
+        message_version: i64,
+        now: i64,
+        lease_until: i64,
+    ) -> anyhow::Result<Option<Message>> {
+        let row = sqlx::query(&format!(
+            "UPDATE message \
+             SET state = 'Processing', \
+                 abandon_count = abandon_count + CASE WHEN state = 'Processing' THEN 1 ELSE 0 END, \
+                 lock_time_until = ?, updated_at = ? \
+             WHERE message_id = ? AND message_version = ? \
+               AND state IN ('Pending', 'Processing') \
+               AND lock_time_until <= ? \
+             RETURNING {MESSAGE_COLUMNS}"
+        ))
+        .bind(lease_until)
+        .bind(now)
         .bind(message_id)
+        .bind(message_version)
+        .bind(now)
         .fetch_optional(self.conn())
         .await?;
         Ok(row.map(|row| message_from_row(&row)).transpose()?)
     }
 
-    pub async fn filter_messages(
+    /// List and claim up to `limit` rows in one call.
+    ///
+    /// Production dispatchers claim one row at a time; this convenience exists
+    /// for tests and tooling that need a whole batch held under a lease.
+    pub async fn claim_local_messages(
         &mut self,
-        state: String,
-        weight: i64,
-        lock_time_until: i64,
+        now: i64,
+        lease_until: i64,
         expired: i64,
         limit: i64,
-        offset: i64,
+        max_abandons: i64,
     ) -> anyhow::Result<Vec<Message>> {
-        let rows = sqlx::query(
-            "SELECT message_id,
-                    business_id,
-                    from_peer,
-                    actor,
-                    msg_type,
-                    content,
-                    message_version,
-                    state,
-                    weight,
-                    lock_time_until,
-                    created_at
-             FROM message
-             WHERE state = ?
-               AND weight >= ?
-               AND lock_time_until <= ?
-               AND updated_at >= ?
-             ORDER BY created_at ASC
-             LIMIT ? OFFSET ?",
+        let candidates =
+            self.list_claimable_local_messages(now, expired, limit, max_abandons).await?;
+        let mut claimed = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            if let Some(message) = self
+                .claim_local_message(
+                    &candidate.message_id,
+                    candidate.message_version,
+                    now,
+                    lease_until,
+                )
+                .await?
+            {
+                claimed.push(message);
+            }
+        }
+        Ok(claimed)
+    }
+
+    /// Record a failed dispatch attempt and reschedule it with backoff.
+    ///
+    /// `attempt_count` is observability only. Only an unfinished claim increments
+    /// `abandon_count` and contributes to quarantine. This is for a handler
+    /// error reported to the dispatcher, which is a completed attempt; a handler
+    /// rescheduling its own row uses [`Self::self_defer_local_message`].
+    pub async fn defer_local_message(
+        &mut self,
+        message_id: &str,
+        message_version: i64,
+        lock_time_until: i64,
+        error: &str,
+    ) -> anyhow::Result<bool> {
+        let result = sqlx::query(
+            "UPDATE message \
+             SET state = 'Pending', attempt_count = attempt_count + 1, \
+                 abandon_count = 0, lock_time_until = ?, last_error = ?, updated_at = ? \
+             WHERE message_id = ? AND message_version = ? AND state = 'Processing'",
         )
-        .bind(state)
-        .bind(weight)
         .bind(lock_time_until)
-        .bind(expired)
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(self.conn())
+        .bind(error.chars().take(1024).collect::<String>())
+        .bind(get_current_timestamp_secs())
+        .bind(message_id)
+        .bind(message_version)
+        .execute(self.conn())
         .await?;
-        rows.into_iter()
-            .map(|row| message_from_row(&row))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(Into::into)
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Reschedule the row a handler is currently running, at that handler's
+    /// own request.
+    ///
+    /// Unlike [`Self::defer_local_message`], the consecutive-abandon counter is
+    /// left untouched: the handler is still running and may yet panic, and
+    /// resetting here let a handler that reschedules itself and then panics
+    /// start every round from zero, so it never reached quarantine. The
+    /// dispatcher resets the counter with
+    /// [`Self::confirm_local_message_self_defer`] once the handler returned.
+    pub async fn self_defer_local_message(
+        &mut self,
+        message_id: &str,
+        message_version: i64,
+        lock_time_until: i64,
+        reason: &str,
+    ) -> anyhow::Result<bool> {
+        let result = sqlx::query(
+            "UPDATE message \
+             SET state = 'Pending', attempt_count = attempt_count + 1, \
+                 lock_time_until = ?, last_error = ?, updated_at = ? \
+             WHERE message_id = ? AND message_version = ? AND state = 'Processing'",
+        )
+        .bind(lock_time_until)
+        .bind(reason.chars().take(1024).collect::<String>())
+        .bind(get_current_timestamp_secs())
+        .bind(message_id)
+        .bind(message_version)
+        .execute(self.conn())
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Acknowledge a self-deferred row once its handler has returned.
+    ///
+    /// Only at this point is the attempt known to have reported an outcome, so
+    /// only here does the consecutive-abandon counter reset. Returns `false`
+    /// when the row is not `Pending` under this claim version, which means it
+    /// was not self-deferred by the caller.
+    pub async fn confirm_local_message_self_defer(
+        &mut self,
+        message_id: &str,
+        message_version: i64,
+    ) -> anyhow::Result<bool> {
+        let result = sqlx::query(
+            "UPDATE message SET abandon_count = 0, updated_at = ? \
+             WHERE message_id = ? AND message_version = ? AND state = 'Pending'",
+        )
+        .bind(get_current_timestamp_secs())
+        .bind(message_id)
+        .bind(message_version)
+        .execute(self.conn())
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Record a handler panic before shutting down the process. Unlike a normal
+    /// defer, this increments the consecutive unfinished-attempt counter and
+    /// pushes the next attempt out by `backoff_secs` per recorded abandon, so a
+    /// supervisor restart cannot replay the payload at full speed.
+    ///
+    /// A handler may reschedule its own row and then panic, leaving the row
+    /// `Pending` already. The version guard still identifies the claim, so the
+    /// abandon is charged either way and the longer of the two delays wins.
+    pub async fn abandon_local_message(
+        &mut self,
+        message_id: &str,
+        message_version: i64,
+        now: i64,
+        backoff_secs: i64,
+        error: &str,
+    ) -> anyhow::Result<bool> {
+        let result = sqlx::query(
+            "UPDATE message \
+             SET state = 'Pending', abandon_count = abandon_count + 1, \
+                 lock_time_until = MAX(lock_time_until, ? + ? * (abandon_count + 1)), \
+                 last_error = ?, updated_at = ? \
+             WHERE message_id = ? AND message_version = ? \
+               AND state IN ('Processing', 'Pending')",
+        )
+        .bind(now)
+        .bind(backoff_secs)
+        .bind(error.chars().take(1024).collect::<String>())
+        .bind(now)
+        .bind(message_id)
+        .bind(message_version)
+        .execute(self.conn())
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Terminally drop a local message whose payload the node can never process.
+    pub async fn fail_local_message(
+        &mut self,
+        message_id: &str,
+        message_version: i64,
+        error: &str,
+    ) -> anyhow::Result<bool> {
+        let result = sqlx::query(
+            "UPDATE message \
+             SET state = 'Failed', content = X'', lock_time_until = 0, \
+                 last_error = ?, updated_at = ? \
+             WHERE message_id = ? AND message_version = ? AND state = 'Processing'",
+        )
+        .bind(error.chars().take(1024).collect::<String>())
+        .bind(get_current_timestamp_secs())
+        .bind(message_id)
+        .bind(message_version)
+        .execute(self.conn())
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Release local claims during a graceful process shutdown. The database is
+    /// process-local, so every `Processing` row belongs to this node process.
+    pub async fn release_processing_local_messages(&mut self) -> anyhow::Result<u64> {
+        let result = sqlx::query(
+            "UPDATE message \
+             SET state = 'Pending', lock_time_until = 0, updated_at = ? \
+             WHERE state = 'Processing'",
+        )
+        .bind(get_current_timestamp_secs())
+        .execute(self.conn())
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Startup sweep for claims left behind by a process that no longer exists.
+    ///
+    /// The database is process-local, so at startup every `Processing` row is
+    /// an attempt that never reported an outcome. Charging it now, rather than
+    /// when the lease lapses, keeps the row from sitting locked for the whole
+    /// lease while every producer that touches it backs off with
+    /// ResourceLocked. The same per-abandon backoff as a panic applies.
+    pub async fn reclaim_processing_local_messages(
+        &mut self,
+        now: i64,
+        backoff_secs: i64,
+    ) -> anyhow::Result<u64> {
+        let result = sqlx::query(
+            "UPDATE message \
+             SET state = 'Pending', abandon_count = abandon_count + 1, \
+                 lock_time_until = ? + ? * (abandon_count + 1), \
+                 last_error = 'reclaimed at startup: previous process exited mid-dispatch', \
+                 updated_at = ? \
+             WHERE state = 'Processing'",
+        )
+        .bind(now)
+        .bind(backoff_secs)
+        .bind(now)
+        .execute(self.conn())
+        .await?;
+        Ok(result.rows_affected())
     }
 
     pub async fn get_message_queue_stats(
@@ -2646,7 +2679,7 @@ impl<'a> StorageProcessor<'a> {
             r#"SELECT
                     COALESCE(SUM(CASE WHEN state = 'Pending' AND lock_time_until <= ? THEN 1 ELSE 0 END), 0) AS pending_ready,
                     COALESCE(SUM(CASE WHEN state = 'Pending' AND lock_time_until > ? THEN 1 ELSE 0 END), 0) AS pending_locked,
-                    COALESCE(SUM(CASE WHEN state = 'Failed' THEN 1 ELSE 0 END), 0) AS failed,
+                    COALESCE(SUM(CASE WHEN state IN ('Failed', 'Quarantined') THEN 1 ELSE 0 END), 0) AS failed,
                     MIN(CASE WHEN state = 'Pending' THEN created_at END) AS oldest_pending_at
                FROM message
                WHERE actor = ?"#,
@@ -2778,6 +2811,13 @@ impl<'a> StorageProcessor<'a> {
         Ok(())
     }
 
+    /// Insert a local message, or refresh an existing one.
+    ///
+    /// Terminal states are excluded so a retired row stays retired.
+    /// [`Self::fail_local_message`] and [`Self::quarantine_local_messages`]
+    /// both mean the payload must not run again automatically;
+    /// without the exclusion a periodic producer re-upserting the same
+    /// deterministic message_id would resurrect it on every tick.
     pub async fn upsert_message(&mut self, msg: Message) -> anyhow::Result<bool> {
         let current_time = get_current_timestamp_secs();
         let res = sqlx::query(
@@ -2792,8 +2832,9 @@ impl<'a> StorageProcessor<'a> {
                                                     message_version = message.message_version + 1,
                                                     lock_time_until = excluded.lock_time_until,
                                                     weight = excluded.weight,
+                                                    last_error = NULL,
                                                     updated_at = excluded.updated_at
-             WHERE message.state != 'Cancelled'"#,
+             WHERE message.state NOT IN ('Processing', 'Cancelled', 'Failed', 'Quarantined')"#,
         )
         .bind(msg.message_id)
         .bind(msg.business_id)
@@ -2820,11 +2861,17 @@ impl<'a> StorageProcessor<'a> {
         message: &P2pInboxMessage,
     ) -> anyhow::Result<bool> {
         let now = get_current_timestamp_secs();
+        let admission_class = if message.admission_class.is_empty() {
+            P2pInboxAdmissionClass::Unregistered.to_string()
+        } else {
+            message.admission_class.clone()
+        };
         let result = sqlx::query(
             "INSERT INTO p2p_inbox \
                 (message_id, business_id, actor, from_peer, msg_type, content, content_size, \
-                    state, attempt_count, next_retry_at, lease_until, lease_token, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, 'Pending', 0, 0, 0, '', ?, ?) \
+                    state, attempt_count, next_retry_at, lease_until, lease_token, \
+                    admission_class, content_hash, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, 'Pending', 0, 0, 0, '', ?, ?, ?, ?) \
              ON CONFLICT(message_id) DO NOTHING",
         )
         .bind(&message.message_id)
@@ -2834,6 +2881,8 @@ impl<'a> StorageProcessor<'a> {
         .bind(&message.msg_type)
         .bind(&message.content)
         .bind(message.content_size)
+        .bind(admission_class)
+        .bind(&message.content_hash)
         .bind(now)
         .bind(now)
         .execute(self.conn())
@@ -2841,60 +2890,337 @@ impl<'a> StorageProcessor<'a> {
         Ok(result.rows_affected() > 0)
     }
 
-    /// Claim ready work with a lease. The state predicate on the update keeps
-    /// this safe when more than one worker observes the same pending rows.
-    pub async fn claim_p2p_inbox_messages(
+    /// Test oracle for class totals and per-peer usage, including quarantined payloads.
+    #[cfg(test)]
+    async fn p2p_inbox_usage(
+        &mut self,
+        from_peer: &str,
+    ) -> anyhow::Result<Vec<P2pInboxClassUsage>> {
+        let rows = sqlx::query(
+            "SELECT admission_class, \
+                    COUNT(*) AS total_rows, \
+                    COALESCE(SUM(content_size), 0) AS total_bytes, \
+                    COALESCE(SUM(CASE WHEN from_peer = ? THEN 1 ELSE 0 END), 0) AS peer_rows, \
+                    COALESCE(SUM(CASE WHEN from_peer = ? THEN content_size ELSE 0 END), 0) \
+                        AS peer_bytes \
+             FROM p2p_inbox \
+             WHERE state IN ('Pending', 'Processing', 'Quarantined') \
+             GROUP BY admission_class",
+        )
+        .bind(from_peer)
+        .bind(from_peer)
+        .fetch_all(self.conn())
+        .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(P2pInboxClassUsage {
+                    admission_class: row.try_get("admission_class")?,
+                    rows: row.try_get("total_rows")?,
+                    bytes: row.try_get("total_bytes")?,
+                    peer_rows: row.try_get("peer_rows")?,
+                    peer_bytes: row.try_get("peer_bytes")?,
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(Into::into)
+    }
+
+    /// Per-class queued payload totals, without per-peer usage.
+    pub async fn p2p_inbox_class_totals(&mut self) -> anyhow::Result<Vec<P2pInboxClassUsage>> {
+        let rows = sqlx::query(
+            "SELECT admission_class, \
+                    COUNT(*) AS total_rows, \
+                    COALESCE(SUM(content_size), 0) AS total_bytes \
+             FROM p2p_inbox \
+             WHERE state IN ('Pending', 'Processing', 'Quarantined') \
+             GROUP BY admission_class",
+        )
+        .fetch_all(self.conn())
+        .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(P2pInboxClassUsage {
+                    admission_class: row.try_get("admission_class")?,
+                    rows: row.try_get("total_rows")?,
+                    bytes: row.try_get("total_bytes")?,
+                    ..Default::default()
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(Into::into)
+    }
+
+    /// Per-peer payload usage by class; `rows` and `bytes` remain zero.
+    pub async fn p2p_inbox_peer_usage(
+        &mut self,
+        from_peer: &str,
+    ) -> anyhow::Result<Vec<P2pInboxClassUsage>> {
+        let rows = sqlx::query(
+            "SELECT admission_class, \
+                    COUNT(*) AS peer_rows, \
+                    COALESCE(SUM(content_size), 0) AS peer_bytes \
+             FROM p2p_inbox \
+             WHERE state IN ('Pending', 'Processing', 'Quarantined') \
+               AND admission_class IN ('Committee', 'Registered', 'Unregistered') \
+               AND from_peer = ? \
+             GROUP BY admission_class",
+        )
+        .bind(from_peer)
+        .fetch_all(self.conn())
+        .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(P2pInboxClassUsage {
+                    admission_class: row.try_get("admission_class")?,
+                    peer_rows: row.try_get("peer_rows")?,
+                    peer_bytes: row.try_get("peer_bytes")?,
+                    ..Default::default()
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(Into::into)
+    }
+
+    /// Whether the sender already has this payload in a non-terminal row.
+    pub async fn has_queued_p2p_inbox_payload(
+        &mut self,
+        from_peer: &str,
+        content_hash: &[u8],
+    ) -> anyhow::Result<bool> {
+        let row = sqlx::query(
+            "SELECT 1 FROM p2p_inbox \
+             WHERE from_peer = ? AND content_hash = ? AND state IN ('Pending', 'Processing') \
+             LIMIT 1",
+        )
+        .bind(from_peer)
+        .bind(content_hash)
+        .fetch_optional(self.conn())
+        .await?;
+        Ok(row.is_some())
+    }
+
+    /// Expire Pending rows by `created_at`; `None` selects every admission class.
+    pub async fn expire_pending_p2p_inbox_messages(
+        &mut self,
+        admission_class: Option<P2pInboxAdmissionClass>,
+        created_before: i64,
+    ) -> anyhow::Result<u64> {
+        let class_predicate =
+            if admission_class.is_some() { " AND admission_class = ?" } else { "" };
+        let query = format!(
+            "UPDATE p2p_inbox \
+             SET state = 'Failed', content = X'', lease_until = 0, next_retry_at = 0, \
+                 last_error = 'expired: still pending past the inbox retention window', \
+                 updated_at = ? \
+             WHERE state = 'Pending' AND created_at < ?{class_predicate}"
+        );
+        let mut query = sqlx::query(&query).bind(get_current_timestamp_secs()).bind(created_before);
+        if let Some(admission_class) = admission_class {
+            query = query.bind(admission_class.to_string());
+        }
+        Ok(query.execute(self.conn()).await?.rows_affected())
+    }
+
+    /// Move inbox rows that repeatedly abandoned a claim out of the work set.
+    ///
+    /// `attempt_count` remains a pure diagnostic counter. Only `abandon_count`
+    /// is a poison-message signal: the claim
+    /// charge is committed before dispatch, so it is recorded even when the
+    /// process is aborted or killed rather than unwinding.
+    ///
+    /// Content is retained until the terminal-row TTL so an operator can inspect
+    /// and manually requeue the message.
+    pub async fn quarantine_p2p_inbox_messages(
         &mut self,
         now: i64,
-        lease_until: i64,
+        max_abandons: i64,
+    ) -> anyhow::Result<u64> {
+        let result = sqlx::query(
+            "UPDATE p2p_inbox \
+             SET state = 'Quarantined', \
+                 abandon_count = abandon_count + CASE WHEN state = 'Processing' THEN 1 ELSE 0 END, \
+                 lease_until = 0, next_retry_at = 0, \
+                 last_error = ?, updated_at = ? \
+             WHERE state IN ('Pending', 'Processing') \
+               AND lease_until <= ? \
+               AND abandon_count + CASE WHEN state = 'Processing' THEN 1 ELSE 0 END >= ?",
+        )
+        .bind(format!("quarantined: exceeded max abandoned claims ({max_abandons})"))
+        .bind(now)
+        .bind(now)
+        .bind(max_abandons)
+        .execute(self.conn())
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Inbox rows the dispatcher may attempt right now, oldest first. Nothing
+    /// is written; see [`Self::list_claimable_local_messages`] for why rows are
+    /// claimed one at a time instead of as a batch.
+    pub async fn list_claimable_p2p_inbox_messages(
+        &mut self,
+        now: i64,
         limit: i64,
+        max_abandons: i64,
         excluded_message_ids: &[String],
     ) -> anyhow::Result<Vec<P2pInboxMessage>> {
+        self.list_claimable_p2p_inbox_messages_in(
+            now,
+            limit,
+            0,
+            max_abandons,
+            excluded_message_ids,
+            "",
+        )
+        .await
+    }
+
+    /// List each class's reserved share, then lend unused capacity in C/R/U order.
+    pub async fn list_claimable_p2p_inbox_messages_by_class(
+        &mut self,
+        now: i64,
+        limit: i64,
+        registered_reserve: i64,
+        unregistered_reserve: i64,
+        max_abandons: i64,
+        excluded_message_ids: &[String],
+    ) -> anyhow::Result<Vec<P2pInboxMessage>> {
+        const COMMITTEE: &str = " AND admission_class = 'Committee'";
+        const REGISTERED: &str = " AND admission_class = 'Registered'";
+        const UNREGISTERED: &str = " AND admission_class NOT IN ('Committee', 'Registered')";
+
+        let limit = limit.max(0);
+        let unregistered_reserve = unregistered_reserve.clamp(0, limit);
+        let registered_reserve = registered_reserve.clamp(0, limit - unregistered_reserve);
+        let shares = [
+            (COMMITTEE, limit - registered_reserve - unregistered_reserve),
+            (REGISTERED, registered_reserve),
+            (UNREGISTERED, unregistered_reserve),
+        ];
+
+        // Guaranteed shares first ...
+        let mut rows: [Vec<P2pInboxMessage>; 3] = Default::default();
+        for (index, (class, share)) in shares.iter().enumerate() {
+            rows[index] = self
+                .list_claimable_p2p_inbox_messages_in(
+                    now,
+                    *share,
+                    0,
+                    max_abandons,
+                    excluded_message_ids,
+                    class,
+                )
+                .await?;
+        }
+        // ... then whatever a class left of its share is lent out, in priority
+        // order, to the classes that have more to claim.
+        for (index, (class, _)) in shares.iter().enumerate() {
+            let free = limit - rows.iter().map(|rows| rows.len() as i64).sum::<i64>();
+            let more = self
+                .list_claimable_p2p_inbox_messages_in(
+                    now,
+                    free,
+                    rows[index].len() as i64,
+                    max_abandons,
+                    excluded_message_ids,
+                    class,
+                )
+                .await?;
+            rows[index].extend(more);
+        }
+        Ok(rows.into_iter().flatten().collect())
+    }
+
+    async fn list_claimable_p2p_inbox_messages_in(
+        &mut self,
+        now: i64,
+        limit: i64,
+        offset: i64,
+        max_abandons: i64,
+        excluded_message_ids: &[String],
+        class_predicate: &'static str,
+    ) -> anyhow::Result<Vec<P2pInboxMessage>> {
+        if limit <= 0 {
+            return Ok(Vec::new());
+        }
         let excluded_predicate = if excluded_message_ids.is_empty() {
             String::new()
         } else {
             format!(" AND message_id NOT IN ({})", create_place_holders(excluded_message_ids))
         };
         let query = format!(
-            "SELECT message_id, business_id, actor, from_peer, msg_type, content, content_size, \
-                    state, attempt_count, next_retry_at, lease_until, lease_token, last_error, created_at, updated_at \
+            "SELECT {P2P_INBOX_COLUMNS} \
              FROM p2p_inbox \
              WHERE ((state = 'Pending' AND next_retry_at <= ?) \
-                OR (state = 'Processing' AND lease_until <= ?)){excluded_predicate} \
-             ORDER BY created_at ASC \
-             LIMIT ?"
+                OR (state = 'Processing' AND lease_until <= ?)) \
+               AND abandon_count < ?{excluded_predicate}{class_predicate} \
+             ORDER BY created_at ASC, message_id ASC \
+             LIMIT ? OFFSET ?"
         );
-        let mut query = sqlx::query(&query).bind(now).bind(now);
+        let mut query = sqlx::query(&query).bind(now).bind(now).bind(max_abandons);
         for message_id in excluded_message_ids {
             query = query.bind(message_id);
         }
-        let rows = query.bind(limit).fetch_all(self.conn()).await?;
+        let rows = query.bind(limit).bind(offset).fetch_all(self.conn()).await?;
+        rows.iter()
+            .map(p2p_inbox_message_from_row)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
 
-        let mut claimed = Vec::with_capacity(rows.len());
-        for row in rows {
-            let mut message = p2p_inbox_message_from_row(&row)?;
-            let lease_token = Uuid::new_v4().to_string();
-            let result = sqlx::query(
-                "UPDATE p2p_inbox \
-                 SET state = 'Processing', attempt_count = attempt_count + 1, lease_until = ?, lease_token = ?, updated_at = ? \
-                 WHERE message_id = ? \
-                   AND ((state = 'Pending' AND next_retry_at <= ?) \
-                     OR (state = 'Processing' AND lease_until <= ?))",
-            )
-            .bind(lease_until)
-            .bind(&lease_token)
-            .bind(now)
-            .bind(&message.message_id)
-            .bind(now)
-            .bind(now)
-            .execute(self.conn())
+    /// Claim exactly one inbox row under a fresh lease token.
+    ///
+    /// Re-claiming a row that is still `Processing` means the previous attempt
+    /// never reported an outcome: the worker panicked, the process died, or it
+    /// hung past the lease. That is charged separately from an ordinary handler
+    /// error so that a transient outage cannot push healthy messages toward
+    /// quarantine. Returns `None` when the row is no longer claimable.
+    pub async fn claim_p2p_inbox_message(
+        &mut self,
+        message_id: &str,
+        now: i64,
+        lease_until: i64,
+    ) -> anyhow::Result<Option<P2pInboxMessage>> {
+        let lease_token = Uuid::new_v4().to_string();
+        let row = sqlx::query(&format!(
+            "UPDATE p2p_inbox \
+             SET state = 'Processing', attempt_count = attempt_count + 1, \
+                 abandon_count = abandon_count + CASE WHEN state = 'Processing' THEN 1 ELSE 0 END, \
+                 lease_until = ?, lease_token = ?, updated_at = ? \
+             WHERE message_id = ? \
+               AND ((state = 'Pending' AND next_retry_at <= ?) \
+                 OR (state = 'Processing' AND lease_until <= ?)) \
+             RETURNING {P2P_INBOX_COLUMNS}"
+        ))
+        .bind(lease_until)
+        .bind(&lease_token)
+        .bind(now)
+        .bind(message_id)
+        .bind(now)
+        .bind(now)
+        .fetch_optional(self.conn())
+        .await?;
+        Ok(row.map(|row| p2p_inbox_message_from_row(&row)).transpose()?)
+    }
+
+    /// List and claim up to `limit` inbox rows in one call. Production
+    /// dispatchers claim one row at a time; this is for tests and tooling.
+    pub async fn claim_p2p_inbox_messages(
+        &mut self,
+        now: i64,
+        lease_until: i64,
+        limit: i64,
+        max_abandons: i64,
+        excluded_message_ids: &[String],
+    ) -> anyhow::Result<Vec<P2pInboxMessage>> {
+        let candidates = self
+            .list_claimable_p2p_inbox_messages(now, limit, max_abandons, excluded_message_ids)
             .await?;
-            if result.rows_affected() > 0 {
-                message.state = "Processing".to_owned();
-                message.attempt_count += 1;
-                message.lease_until = lease_until;
-                message.lease_token = lease_token;
-                message.updated_at = now;
+        let mut claimed = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            if let Some(message) =
+                self.claim_p2p_inbox_message(&candidate.message_id, now, lease_until).await?
+            {
                 claimed.push(message);
             }
         }
@@ -2929,12 +3255,42 @@ impl<'a> StorageProcessor<'a> {
     ) -> anyhow::Result<bool> {
         let result = sqlx::query(
             "UPDATE p2p_inbox \
-             SET state = 'Pending', lease_until = 0, next_retry_at = ?, last_error = ?, updated_at = ? \
+             SET state = 'Pending', abandon_count = 0, lease_until = 0, \
+                 next_retry_at = ?, last_error = ?, updated_at = ? \
              WHERE message_id = ? AND state = 'Processing' AND lease_token = ?",
         )
         .bind(next_retry_at)
         .bind(error.chars().take(1024).collect::<String>())
         .bind(get_current_timestamp_secs())
+        .bind(message_id)
+        .bind(lease_token)
+        .execute(self.conn())
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Record a panic from the current lease before terminating the process.
+    /// The next attempt is pushed out by `backoff_secs` per recorded abandon so
+    /// a supervisor restart cannot replay the payload at full speed.
+    pub async fn abandon_p2p_inbox_message(
+        &mut self,
+        message_id: &str,
+        lease_token: &str,
+        now: i64,
+        backoff_secs: i64,
+        error: &str,
+    ) -> anyhow::Result<bool> {
+        let result = sqlx::query(
+            "UPDATE p2p_inbox \
+             SET state = 'Pending', abandon_count = abandon_count + 1, lease_until = 0, \
+                 lease_token = '', next_retry_at = ? + ? * (abandon_count + 1), \
+                 last_error = ?, updated_at = ? \
+             WHERE message_id = ? AND state = 'Processing' AND lease_token = ?",
+        )
+        .bind(now)
+        .bind(backoff_secs)
+        .bind(error.chars().take(1024).collect::<String>())
+        .bind(now)
         .bind(message_id)
         .bind(lease_token)
         .execute(self.conn())
@@ -2975,7 +3331,7 @@ impl<'a> StorageProcessor<'a> {
     ) -> anyhow::Result<bool> {
         let result = sqlx::query(
             "UPDATE p2p_inbox \
-             SET state = 'Failed', lease_until = 0, next_retry_at = 0, \
+             SET state = 'Failed', content = X'', lease_until = 0, next_retry_at = 0, \
                  last_error = ?, updated_at = ? \
              WHERE message_id = ? AND state = 'Processing' AND lease_token = ?",
         )
@@ -2986,6 +3342,259 @@ impl<'a> StorageProcessor<'a> {
         .execute(self.conn())
         .await?;
         Ok(result.rows_affected() > 0)
+    }
+
+    /// Drop terminal inbox rows once they are older than `expired_before`.
+    ///
+    /// Processed/failed payloads are already released. Quarantined payloads are
+    /// retained only for this bounded inspection/requeue window. Anything still
+    /// claimable is left alone.
+    pub async fn purge_terminal_p2p_inbox_messages(
+        &mut self,
+        expired_before: i64,
+    ) -> anyhow::Result<u64> {
+        let result = sqlx::query(
+            "DELETE FROM p2p_inbox \
+             WHERE state IN ('Processed', 'Failed', 'Quarantined') AND updated_at < ?",
+        )
+        .bind(expired_before)
+        .execute(self.conn())
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Delete the oldest terminal rows beyond `max_rows`, up to `limit` per call.
+    pub async fn purge_p2p_inbox_over_terminal_cap(
+        &mut self,
+        max_rows: i64,
+        limit: i64,
+    ) -> anyhow::Result<u64> {
+        let result = sqlx::query(
+            "DELETE FROM p2p_inbox WHERE message_id IN ( \
+                 SELECT message_id FROM p2p_inbox \
+                 WHERE state IN ('Processed', 'Failed', 'Quarantined') \
+                 ORDER BY updated_at ASC \
+                 LIMIT MIN(?, MAX( \
+                     (SELECT COUNT(*) FROM p2p_inbox \
+                      WHERE state IN ('Processed', 'Failed', 'Quarantined')) - ?, 0)))",
+        )
+        .bind(limit)
+        .bind(max_rows)
+        .execute(self.conn())
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Clear the oldest Quarantined payloads until retained bytes are within `max_bytes`.
+    pub async fn trim_quarantined_p2p_inbox_payloads(
+        &mut self,
+        max_bytes: i64,
+    ) -> anyhow::Result<u64> {
+        let result = sqlx::query(
+            "UPDATE p2p_inbox SET content = X'', content_size = 0, updated_at = ? \
+             WHERE state = 'Quarantined' AND length(content) > 0 AND message_id IN ( \
+                 SELECT message_id FROM ( \
+                     SELECT message_id, \
+                            SUM(content_size) OVER ( \
+                                ORDER BY updated_at DESC \
+                                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running \
+                     FROM p2p_inbox WHERE state = 'Quarantined' AND length(content) > 0 \
+                 ) WHERE running - content_size >= ?)",
+        )
+        .bind(get_current_timestamp_secs())
+        .bind(max_bytes)
+        .execute(self.conn())
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Load up to `limit` operator bindings, confirmed operators first.
+    /// The caller re-verifies signatures.
+    pub async fn load_p2p_peer_bindings(&mut self, limit: i64) -> anyhow::Result<Vec<Node>> {
+        let rows = sqlx::query_as::<_, Node>(
+            "SELECT * FROM node \
+             WHERE binding_sig != '' AND btc_pub_key != '' AND actor = 'Operator' \
+             ORDER BY peer_id IN (SELECT peer_id FROM p2p_registered_peer \
+                                  WHERE kind = 'Operator') DESC, \
+                      updated_at DESC \
+             LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(self.conn())
+        .await?;
+        Ok(rows)
+    }
+
+    /// Persist confirmed registration; an operator key may belong to only one peer.
+    pub async fn upsert_p2p_registered_peer(
+        &mut self,
+        peer_id: &str,
+        kind: &str,
+        pubkey: &str,
+    ) -> anyhow::Result<()> {
+        if !pubkey.is_empty() {
+            sqlx::query(
+                "DELETE FROM p2p_registered_peer WHERE kind = ? AND pubkey = ? AND peer_id != ?",
+            )
+            .bind(kind)
+            .bind(pubkey)
+            .bind(peer_id)
+            .execute(self.conn())
+            .await?;
+        }
+        sqlx::query(
+            "INSERT INTO p2p_registered_peer (peer_id, kind, pubkey, verified_at) \
+             VALUES (?, ?, ?, ?) \
+             ON CONFLICT (peer_id, kind) DO UPDATE SET pubkey = excluded.pubkey, \
+                                                       verified_at = excluded.verified_at",
+        )
+        .bind(peer_id)
+        .bind(kind)
+        .bind(pubkey)
+        .bind(get_current_timestamp_secs())
+        .execute(self.conn())
+        .await?;
+        Ok(())
+    }
+
+    pub async fn delete_p2p_registered_peer(
+        &mut self,
+        peer_id: &str,
+        kind: &str,
+    ) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM p2p_registered_peer WHERE peer_id = ? AND kind = ?")
+            .bind(peer_id)
+            .bind(kind)
+            .execute(self.conn())
+            .await?;
+        Ok(())
+    }
+
+    /// `(peer_id, kind, pubkey)` of every peer confirmed in an earlier session.
+    pub async fn load_p2p_registered_peers(
+        &mut self,
+    ) -> anyhow::Result<Vec<(String, String, String)>> {
+        let rows = sqlx::query("SELECT peer_id, kind, pubkey FROM p2p_registered_peer")
+            .fetch_all(self.conn())
+            .await?;
+        rows.iter()
+            .map(|row| Ok((row.try_get("peer_id")?, row.try_get("kind")?, row.try_get("pubkey")?)))
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(Into::into)
+    }
+
+    /// Raise the persisted replay marks to `marks` (`peer_id -> highest sequence
+    /// number admitted`). A mark never moves down.
+    pub async fn raise_p2p_replay_marks(&mut self, marks: &[(String, i64)]) -> anyhow::Result<()> {
+        for (peer_id, highest) in marks {
+            sqlx::query(
+                "INSERT INTO p2p_replay_mark (peer_id, highest) VALUES (?, ?) \
+                 ON CONFLICT (peer_id) DO UPDATE SET highest = MAX(highest, excluded.highest)",
+            )
+            .bind(peer_id)
+            .bind(highest)
+            .execute(self.conn())
+            .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn load_p2p_replay_marks(&mut self) -> anyhow::Result<Vec<(String, i64)>> {
+        let rows = sqlx::query("SELECT peer_id, highest FROM p2p_replay_mark")
+            .fetch_all(self.conn())
+            .await?;
+        rows.iter()
+            .map(|row| Ok((row.try_get("peer_id")?, row.try_get("highest")?)))
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(Into::into)
+    }
+
+    /// Remove marks for unregistered peers, retaining verifier peer IDs in `keep`.
+    pub async fn prune_p2p_replay_marks(&mut self, keep: &[String]) -> anyhow::Result<u64> {
+        let keep_predicate = if keep.is_empty() {
+            String::new()
+        } else {
+            format!(" AND peer_id NOT IN ({})", create_place_holders(keep))
+        };
+        let query = format!(
+            "DELETE FROM p2p_replay_mark \
+             WHERE peer_id NOT IN (SELECT peer_id FROM p2p_registered_peer){keep_predicate}"
+        );
+        let mut query = sqlx::query(&query);
+        for peer_id in keep {
+            query = query.bind(peer_id);
+        }
+        Ok(query.execute(self.conn()).await?.rows_affected())
+    }
+
+    /// Allow existing peers or a new unregistered row below `max_rows`.
+    /// At capacity, evict the oldest unregistered row older than `evict_stale_before`.
+    pub async fn node_row_admissible(
+        &mut self,
+        peer_id: &str,
+        max_rows: i64,
+        evict_stale_before: i64,
+        local_peer_id: &str,
+    ) -> anyhow::Result<bool> {
+        let row = sqlx::query(
+            "SELECT EXISTS(SELECT 1 FROM node WHERE peer_id = ?) AS known, \
+                    (SELECT COUNT(*) FROM node \
+                     WHERE peer_id NOT IN (SELECT peer_id FROM p2p_registered_peer)) AS total",
+        )
+        .bind(peer_id)
+        .fetch_one(self.conn())
+        .await?;
+        let known: i64 = row.try_get("known")?;
+        let total: i64 = row.try_get("total")?;
+        if known != 0 || total < max_rows {
+            return Ok(true);
+        }
+        let evicted = sqlx::query(
+            "DELETE FROM node WHERE peer_id = ( \
+                 SELECT peer_id FROM node \
+                 WHERE updated_at < ? AND peer_id != ? \
+                   AND peer_id NOT IN (SELECT peer_id FROM p2p_registered_peer) \
+                 ORDER BY updated_at ASC LIMIT 1)",
+        )
+        .bind(evict_stale_before)
+        .bind(local_peer_id)
+        .execute(self.conn())
+        .await?;
+        Ok(evicted.rows_affected() > 0)
+    }
+
+    /// Drop the persisted replay marks of `peer_ids`.
+    pub async fn delete_p2p_replay_marks(&mut self, peer_ids: &[String]) -> anyhow::Result<u64> {
+        if peer_ids.is_empty() {
+            return Ok(0);
+        }
+        let query = format!(
+            "DELETE FROM p2p_replay_mark WHERE peer_id IN ({})",
+            create_place_holders(peer_ids)
+        );
+        let mut query = sqlx::query(&query);
+        for peer_id in peer_ids {
+            query = query.bind(peer_id);
+        }
+        Ok(query.execute(self.conn()).await?.rows_affected())
+    }
+
+    /// Delete stale node rows except this node and confirmed registered peers.
+    pub async fn purge_stale_unregistered_nodes(
+        &mut self,
+        updated_before: i64,
+        local_peer_id: &str,
+    ) -> anyhow::Result<u64> {
+        let result = sqlx::query(
+            "DELETE FROM node \
+             WHERE updated_at < ? AND peer_id != ? \
+               AND peer_id NOT IN (SELECT peer_id FROM p2p_registered_peer)",
+        )
+        .bind(updated_before)
+        .bind(local_peer_id)
+        .execute(self.conn())
+        .await?;
+        Ok(result.rows_affected())
     }
 
     pub async fn renew_p2p_inbox_lease(
@@ -3007,12 +3616,50 @@ impl<'a> StorageProcessor<'a> {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Release inbox claims during a graceful process shutdown without charging
+    /// them as abandoned executions.
+    pub async fn release_processing_p2p_inbox_messages(&mut self) -> anyhow::Result<u64> {
+        let result = sqlx::query(
+            "UPDATE p2p_inbox \
+             SET state = 'Pending', lease_until = 0, lease_token = '', \
+                 next_retry_at = 0, updated_at = ? \
+             WHERE state = 'Processing'",
+        )
+        .bind(get_current_timestamp_secs())
+        .execute(self.conn())
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Startup sweep for inbox claims left behind by a process that no longer
+    /// exists. See [`Self::reclaim_processing_local_messages`].
+    pub async fn reclaim_processing_p2p_inbox_messages(
+        &mut self,
+        now: i64,
+        backoff_secs: i64,
+    ) -> anyhow::Result<u64> {
+        let result = sqlx::query(
+            "UPDATE p2p_inbox \
+             SET state = 'Pending', abandon_count = abandon_count + 1, lease_until = 0, \
+                 lease_token = '', next_retry_at = ? + ? * (abandon_count + 1), \
+                 last_error = 'reclaimed at startup: previous process exited mid-dispatch', \
+                 updated_at = ? \
+             WHERE state = 'Processing'",
+        )
+        .bind(now)
+        .bind(backoff_secs)
+        .bind(now)
+        .execute(self.conn())
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     pub async fn requeue_p2p_inbox_message(&mut self, message_id: &str) -> anyhow::Result<bool> {
         let result = sqlx::query(
             "UPDATE p2p_inbox \
-             SET state = 'Pending', attempt_count = 0, next_retry_at = 0, lease_until = 0, \
+             SET state = 'Pending', abandon_count = 0, next_retry_at = 0, lease_until = 0, \
                  lease_token = '', last_error = NULL, updated_at = ? \
-             WHERE message_id = ? AND state = 'Failed' AND length(content) > 0",
+             WHERE message_id = ? AND state = 'Quarantined' AND length(content) > 0",
         )
         .bind(get_current_timestamp_secs())
         .bind(message_id)
@@ -3077,25 +3724,31 @@ impl<'a> StorageProcessor<'a> {
     /// A non-empty `ack_peer_id` is the only ACK that may stop this retry
     /// loop early. Broadcast messages without an authenticated recipient keep
     /// publishing until their window expires.
+    /// `first_publish_at`: first outbox delivery time; zero makes the row immediately due.
+    #[allow(clippy::too_many_arguments)]
     pub async fn enqueue_p2p_outbox_retry_message(
         &mut self,
         message_id: &str,
+        delivery_id: Option<&str>,
         msg_type: &str,
         content: &[u8],
         retry_until: i64,
         retry_interval_secs: i64,
         ack_peer_id: Option<&str>,
+        first_publish_at: i64,
     ) -> anyhow::Result<bool> {
         let now = get_current_timestamp_secs();
         let result = sqlx::query(
             "INSERT INTO p2p_outbox \
-                (message_id, msg_type, content, state, attempt_count, next_retry_at, lease_until, retry_until, retry_interval_secs, ack_peer_id, created_at, updated_at) \
-             VALUES (?, ?, ?, 'Pending', 0, 0, 0, ?, ?, ?, ?, ?) \
+                (message_id, delivery_id, msg_type, content, state, attempt_count, next_retry_at, lease_until, retry_until, retry_interval_secs, ack_peer_id, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, 'Pending', 0, ?, 0, ?, ?, ?, ?, ?) \
              ON CONFLICT(message_id) DO NOTHING",
         )
         .bind(message_id)
+        .bind(delivery_id.unwrap_or_default())
         .bind(msg_type)
         .bind(content)
+        .bind(first_publish_at)
         .bind(retry_until)
         .bind(retry_interval_secs)
         .bind(ack_peer_id.unwrap_or_default())
@@ -3106,6 +3759,7 @@ impl<'a> StorageProcessor<'a> {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Claim due outbox rows in ascending `next_retry_at` order.
     pub async fn claim_p2p_outbox_messages(
         &mut self,
         now: i64,
@@ -3113,12 +3767,12 @@ impl<'a> StorageProcessor<'a> {
         limit: i64,
     ) -> anyhow::Result<Vec<P2pOutboxMessage>> {
         let rows = sqlx::query(
-            "SELECT message_id, msg_type, content, state, attempt_count, next_retry_at, lease_until, last_error, retry_until, retry_interval_secs, ack_peer_id, created_at \
+            "SELECT message_id, msg_type, content, state, attempt_count, next_retry_at, lease_until, last_error, retry_until, retry_interval_secs, ack_peer_id, publish_count, created_at \
              FROM p2p_outbox \
              WHERE ((state = 'Pending' AND next_retry_at <= ?) \
                 OR (state = 'Processing' AND lease_until <= ?) \
              ) AND (retry_until = 0 OR retry_until > ?) \
-             ORDER BY created_at ASC LIMIT ?",
+             ORDER BY next_retry_at ASC, created_at ASC LIMIT ?",
         )
         .bind(now)
         .bind(now)
@@ -3154,8 +3808,12 @@ impl<'a> StorageProcessor<'a> {
     /// End a bounded-retry message once its delivery window is exhausted.
     pub async fn expire_p2p_outbox_retry_messages(&mut self, now: i64) -> anyhow::Result<u64> {
         let result = sqlx::query(
-            "UPDATE p2p_outbox SET state = 'RetryExhausted', content = X'', lease_until = 0, next_retry_at = 0, \
-                 retry_until = 0, retry_interval_secs = 0, ack_peer_id = '', \
+            "UPDATE p2p_outbox SET state = 'RetryExhausted', \
+                 content = CASE WHEN msg_type IN ('InitGraph','GenCircuits','CutCircuits','SolderingProofReady','CreateGraph') THEN content ELSE X'' END, \
+                 lease_until = 0, next_retry_at = 0, \
+                 retry_until = CASE WHEN msg_type IN ('InitGraph','GenCircuits','CutCircuits','SolderingProofReady','CreateGraph') THEN retry_until ELSE 0 END, \
+                 retry_interval_secs = CASE WHEN msg_type IN ('InitGraph','GenCircuits','CutCircuits','SolderingProofReady','CreateGraph') THEN retry_interval_secs ELSE 0 END, \
+                 ack_peer_id = CASE WHEN msg_type IN ('InitGraph','GenCircuits','CutCircuits','SolderingProofReady','CreateGraph') THEN ack_peer_id ELSE '' END, \
                  last_error = 'retry window expired without expected ACK', updated_at = ? \
              WHERE retry_until > 0 AND retry_until <= ? AND state IN ('Pending', 'Processing')",
         )
@@ -3166,13 +3824,54 @@ impl<'a> StorageProcessor<'a> {
         Ok(result.rows_affected())
     }
 
+    /// At most one retained setup payload per pass, oldest recovery first.
+    pub async fn next_exhausted_setup(
+        &mut self,
+        now: i64,
+    ) -> anyhow::Result<Option<(String, Vec<u8>, i64, String)>> {
+        Ok(sqlx::query_as(
+            "SELECT message_id, content, created_at, ack_peer_id FROM p2p_outbox \
+             WHERE state = 'RetryExhausted' AND length(content) > 0 \
+               AND msg_type IN ('InitGraph','GenCircuits','CutCircuits','SolderingProofReady','CreateGraph') \
+               AND updated_at <= ? ORDER BY updated_at, message_id LIMIT 1",
+        )
+        .bind(now - 60)
+        .fetch_optional(self.conn())
+        .await?)
+    }
+
+    /// Called inside an immediate transaction: transfer bytes, never reopen a terminal row.
+    pub async fn recover_setup_delivery(
+        &mut self,
+        id: &str,
+        canonical_id: &str,
+        now: i64,
+        window: i64,
+        resume: bool,
+    ) -> anyhow::Result<()> {
+        if resume {
+            let next_id = format!("{canonical_id}:recovery:{now}");
+            sqlx::query(
+                "INSERT INTO p2p_outbox (message_id,delivery_id,msg_type,content,state,attempt_count,next_retry_at,lease_until, \
+                 retry_until,retry_interval_secs,ack_peer_id,publish_count,created_at,updated_at) \
+                 SELECT ?,delivery_id,msg_type,content,'Pending',0,?,0,?,retry_interval_secs,ack_peer_id,publish_count,created_at,? \
+                 FROM p2p_outbox WHERE message_id = ? AND state = 'RetryExhausted' AND length(content) > 0",
+            ).bind(next_id).bind(now).bind(now + window).bind(now).bind(id).execute(self.conn()).await?;
+        }
+        sqlx::query("UPDATE p2p_outbox SET content = X'', updated_at = ? WHERE message_id = ? AND state = 'RetryExhausted'")
+            .bind(now).bind(id).execute(self.conn()).await?;
+        Ok(())
+    }
+
+    /// Record a publish that went through and set when the row is next due.
     pub async fn schedule_p2p_outbox_retry(
         &mut self,
         message_id: &str,
         next_retry_at: i64,
     ) -> anyhow::Result<bool> {
         let result = sqlx::query(
-            "UPDATE p2p_outbox SET state = 'Pending', lease_until = 0, next_retry_at = ?, updated_at = ? \
+            "UPDATE p2p_outbox SET state = 'Pending', lease_until = 0, next_retry_at = ?, \
+                 publish_count = publish_count + 1, updated_at = ? \
              WHERE message_id = ? AND state = 'Processing' AND retry_until > 0",
         )
         .bind(next_retry_at)
@@ -3183,18 +3882,57 @@ impl<'a> StorageProcessor<'a> {
         Ok(result.rows_affected() > 0)
     }
 
-    pub async fn acknowledge_p2p_outbox_message(
+    /// Make a waiting row due at once. For a caller whose own publish of the
+    /// message failed: the row was scheduled on the assumption that it would not.
+    pub async fn expedite_p2p_outbox_message(&mut self, message_id: &str) -> anyhow::Result<bool> {
+        let result = sqlx::query(
+            "UPDATE p2p_outbox SET next_retry_at = 0, updated_at = ? \
+             WHERE message_id = ? AND state = 'Pending' AND next_retry_at > 0",
+        )
+        .bind(get_current_timestamp_secs())
+        .bind(message_id)
+        .execute(self.conn())
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// State and stored payload length of one outbox entry, for diagnostics and
+    /// tests. A terminal entry has dropped its payload.
+    pub async fn p2p_outbox_entry_state(
         &mut self,
         message_id: &str,
+    ) -> anyhow::Result<Option<(String, i64)>> {
+        let row = sqlx::query(
+            "SELECT state, length(content) AS content_len FROM p2p_outbox WHERE message_id = ?",
+        )
+        .bind(message_id)
+        .fetch_optional(self.conn())
+        .await?;
+        row.map(|row| Ok((row.try_get("state")?, row.try_get("content_len")?))).transpose()
+    }
+
+    pub async fn p2p_outbox_delivery_id(
+        &mut self,
+        message_id: &str,
+    ) -> anyhow::Result<Option<String>> {
+        Ok(sqlx::query_scalar("SELECT delivery_id FROM p2p_outbox WHERE message_id = ?")
+            .bind(message_id)
+            .fetch_optional(self.conn())
+            .await?)
+    }
+
+    pub async fn acknowledge_p2p_outbox_message(
+        &mut self,
+        delivery_id: &str,
         peer_id: &str,
     ) -> anyhow::Result<bool> {
         let result = sqlx::query(
             "UPDATE p2p_outbox SET state = 'Processed', content = X'', lease_until = 0, next_retry_at = 0, updated_at = ? \
-             WHERE message_id = ? AND retry_until > 0 AND ack_peer_id = ? \
-               AND state IN ('Pending', 'Processing')",
+             WHERE delivery_id = ? AND delivery_id != '' AND ack_peer_id = ? AND ack_peer_id != '' \
+               AND state IN ('Pending', 'Processing', 'RetryExhausted')",
         )
         .bind(get_current_timestamp_secs())
-        .bind(message_id)
+        .bind(delivery_id)
         .bind(peer_id)
         .execute(self.conn())
         .await?;
@@ -3207,9 +3945,12 @@ impl<'a> StorageProcessor<'a> {
         let result = sqlx::query(
             "UPDATE p2p_outbox SET state = 'Cancelled', content = X'', lease_until = 0, next_retry_at = 0, \
                  updated_at = ? \
-             WHERE message_id = ? AND state IN ('Pending', 'Processing')",
+             WHERE (message_id = ? OR substr(message_id, 1, length(?) + 10) = ? || ':recovery:') \
+               AND state IN ('Pending', 'Processing', 'RetryExhausted')",
         )
         .bind(get_current_timestamp_secs())
+        .bind(message_id)
+        .bind(message_id)
         .bind(message_id)
         .execute(self.conn())
         .await?;
@@ -3286,22 +4027,6 @@ impl<'a> StorageProcessor<'a> {
         .execute(self.conn())
         .await?;
         Ok(result.rows_affected() > 0)
-    }
-
-    pub async fn has_graph_compensation_marker(
-        &mut self,
-        graph_id: Uuid,
-        message_id: &str,
-    ) -> anyhow::Result<bool> {
-        let exists: i64 = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM graph_compensation_marker \
-             WHERE graph_id = ? AND message_id = ?)",
-        )
-        .bind(graph_id)
-        .bind(message_id)
-        .fetch_one(self.conn())
-        .await?;
-        Ok(exists != 0)
     }
 
     pub async fn upsert_pegin_instance_process_data(
@@ -3392,23 +4117,6 @@ impl<'a> StorageProcessor<'a> {
         Ok(row)
     }
 
-    pub async fn update_pegin_graph_endorsed(
-        &mut self,
-        graph_id: &Uuid,
-        is_endorsed: bool,
-    ) -> anyhow::Result<()> {
-        sqlx::query!(
-            r#"UPDATE
-                    pegin_graph_process_data
-               SET  is_endorsed = ?
-               WHERE graph_id = ?"#,
-            is_endorsed,
-            graph_id
-        )
-        .execute(self.conn())
-        .await?;
-        Ok(())
-    }
     pub async fn get_pegin_graph_endorsed_len_by_instance_id(
         &mut self,
         instance_id: &Uuid,
@@ -3494,6 +4202,25 @@ impl<'a> StorageProcessor<'a> {
         .await?;
 
         Ok(row)
+    }
+
+    /// Check graph data exists under both IDs without reading the blob.
+    pub async fn has_graph_of_instance(
+        &mut self,
+        instance_id: &Uuid,
+        graph_id: &Uuid,
+    ) -> anyhow::Result<bool> {
+        let row = sqlx::query(
+            "SELECT 1 FROM graph \
+             WHERE graph_id = ? AND instance_id = ? \
+               AND EXISTS (SELECT 1 FROM graph_raw_data WHERE graph_raw_data.graph_id = graph.graph_id) \
+             LIMIT 1",
+        )
+        .bind(graph_id)
+        .bind(instance_id)
+        .fetch_optional(self.conn())
+        .await?;
+        Ok(row.is_some())
     }
 
     pub async fn find_watch_contract(
@@ -3742,28 +4469,6 @@ impl<'a> StorageProcessor<'a> {
         .await?;
 
         Ok(row)
-    }
-
-    pub async fn update_graph_btc_tx_vout_monitor_data(
-        &mut self,
-        graph_id: &Uuid,
-        txid: &SerializableTxid,
-        monitor_data: String,
-    ) -> anyhow::Result<u64> {
-        let current_time = get_current_timestamp_secs();
-        let res = sqlx::query!(
-            "UPDATE graph_btc_tx_vout_monitor
-             SET monitor_data = ?,
-                 updated_at   = ?
-             WHERE graph_id = ? AND txid = ?",
-            monitor_data,
-            current_time,
-            graph_id,
-            txid
-        )
-        .execute(self.conn())
-        .await?;
-        Ok(res.rows_affected())
     }
 
     pub async fn create_long_running_task_proof(
@@ -4074,26 +4779,6 @@ impl<'a> StorageProcessor<'a> {
             instance_id,
             graph_id,
             old_proof_state
-        )
-        .execute(self.conn())
-        .await?;
-        Ok(res.rows_affected())
-    }
-
-    pub async fn update_operator_proof_state(
-        &mut self,
-        id: i64,
-        proof_state: i64,
-    ) -> anyhow::Result<u64> {
-        let current_time = get_current_timestamp_secs();
-        let res = sqlx::query!(
-            "UPDATE operator_proof
-             SET proof_state = ?,
-                 updated_at = ?
-             WHERE id = ?",
-            proof_state,
-            current_time,
-            id,
         )
         .execute(self.conn())
         .await?;
@@ -4483,6 +5168,7 @@ pub async fn create_local_db(db_path: &str) -> LocalDB {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::MessageState;
 
     async fn setup_db() -> LocalDB {
         create_local_db("sqlite::memory:").await
@@ -4516,7 +5202,7 @@ mod tests {
         let mut initing = pegin_instance(instance_id, "UserIniting");
         initing.to_addr = "0xuser".to_string();
         initing.from_addr = "bcrt1quser".to_string();
-        assert!(s.upsert_instance(&initing).await.unwrap());
+        assert!(s.insert_instance_if_absent(&initing).await.unwrap());
 
         let mut request = pegin_instance(instance_id, "UserInited");
         request.to_addr = "0xuser".to_string();
@@ -4553,7 +5239,7 @@ mod tests {
         inited.goat_tx_height = 500;
         inited.committees_answers = IndexMap::from([("0xcommittee".to_string(), vec![1u8, 2, 3])]);
         inited.parameters = Some("{}".to_string());
-        assert!(s.upsert_instance(&inited).await.unwrap());
+        assert!(s.insert_instance_if_absent(&inited).await.unwrap());
 
         // A re-delivered request refreshes the row in place; everything the
         // instance accrued after the request must survive it.
@@ -4578,7 +5264,7 @@ mod tests {
         minted.goat_tx_height = 500;
         minted.parameters = Some("{}".to_string());
         minted.post_pegin_txhash = Some("0xmint".to_string());
-        assert!(s.upsert_instance(&minted).await.unwrap());
+        assert!(s.insert_instance_if_absent(&minted).await.unwrap());
 
         // Once the instance moves on, a re-delivered request may not pull it back.
         let replay = pegin_instance(instance_id, "UserInited");
@@ -4593,20 +5279,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_upsert_pegin_request_instance_rejects_bridge_out_collision() {
+    async fn test_upsert_pegin_request_instance_rejects_progressed_instance() {
         let db = setup_db().await;
         let mut s = db.acquire().await.unwrap();
         let instance_id = Uuid::new_v4();
 
-        let bridge_out = pegin_instance(instance_id, "Initialize");
-        assert!(s.upsert_instance(&bridge_out).await.unwrap());
+        let progressed = pegin_instance(instance_id, "CommitteesAnswered");
+        assert!(s.insert_instance_if_absent(&progressed).await.unwrap());
 
         let request = pegin_instance(instance_id, "UserInited");
         assert!(
             !s.upsert_pegin_request_instance(&request, &pegin_request_statuses()).await.unwrap()
         );
         let stored = s.find_instance(&instance_id).await.unwrap().unwrap();
-        assert_eq!(stored.status, "Initialize");
+        assert_eq!(stored.status, "CommitteesAnswered");
+    }
+
+    #[tokio::test]
+    async fn test_instance_update_rejects_stale_status_transition() {
+        let db = setup_db().await;
+        let instance_id = Uuid::new_v4();
+        let mut storage = db.acquire().await.unwrap();
+        assert!(
+            storage
+                .insert_instance_if_absent(&pegin_instance(instance_id, "RelayerL2Minted"))
+                .await
+                .unwrap()
+        );
+
+        let updated = storage
+            .update_instance(
+                &InstanceUpdate::new_with_instance_id(instance_id)
+                    .with_status("Timeout".to_string())
+                    .with_only_if_status_in(vec!["Presigned".to_string()]),
+            )
+            .await
+            .unwrap();
+        assert!(!updated);
+        assert_eq!(
+            storage.find_instance(&instance_id).await.unwrap().unwrap().status,
+            "RelayerL2Minted"
+        );
     }
 
     #[tokio::test]
@@ -4673,6 +5386,1240 @@ mod tests {
                 .unwrap()
                 .count,
             1
+        );
+    }
+
+    /// A retired row must stay retired: a periodic producer re-upserting the same
+    /// deterministic message_id would otherwise resurrect it on every tick.
+    #[tokio::test]
+    async fn upsert_does_not_resurrect_a_retired_message() {
+        let db = setup_db().await;
+        let mut s = db.acquire().await.unwrap();
+        let business_id = Uuid::new_v4();
+        let msg = Message {
+            message_id: "retired-1".to_string(),
+            business_id,
+            actor: "Operator".to_string(),
+            from_peer: "self".to_string(),
+            msg_type: "AssertReady".to_string(),
+            content: vec![1, 2],
+            state: MessageState::Pending.to_string(),
+            ..Default::default()
+        };
+        assert!(s.upsert_message(msg.clone()).await.unwrap());
+
+        let claimed = s.claim_local_messages(100, 200, 0, 10, 3).await.unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert!(
+            s.fail_local_message("retired-1", claimed[0].message_version, "handler panicked")
+                .await
+                .unwrap()
+        );
+
+        // The producer tries again with the same deterministic id.
+        assert!(!s.upsert_message(msg).await.unwrap(), "a retired row must not be revived");
+        let row = s.find_messages_by_id("retired-1").await.unwrap().unwrap();
+        assert_eq!(row.state, "Failed");
+        assert!(row.content.is_empty(), "the retired payload must stay released");
+    }
+
+    #[tokio::test]
+    async fn upsert_does_not_replace_an_active_local_claim() {
+        let db = setup_db().await;
+        let mut s = db.acquire().await.unwrap();
+        let business_id = Uuid::new_v4();
+        let mut message = Message {
+            message_id: "active-1".to_owned(),
+            business_id,
+            actor: "Operator".to_owned(),
+            from_peer: "self".to_owned(),
+            msg_type: "AssertReady".to_owned(),
+            content: vec![1, 2],
+            state: MessageState::Pending.to_string(),
+            ..Default::default()
+        };
+        assert!(s.upsert_message(message.clone()).await.unwrap());
+        let claimed = s.claim_local_messages(100, 200, 0, 10, 3).await.unwrap();
+        assert_eq!(claimed.len(), 1);
+
+        message.content = vec![9, 9];
+        assert!(!s.upsert_message(message).await.unwrap());
+        let stored = s.find_messages_by_id("active-1").await.unwrap().unwrap();
+        assert_eq!(stored.state, "Processing");
+        assert_eq!(stored.content, vec![1, 2]);
+        assert_eq!(stored.message_version, claimed[0].message_version);
+    }
+
+    #[tokio::test]
+    async fn producer_replay_does_not_forgive_an_abandoned_local_claim() {
+        let db = setup_db().await;
+        let mut s = db.acquire().await.unwrap();
+        let message = Message {
+            message_id: "abandoned-replay-1".to_owned(),
+            business_id: Uuid::new_v4(),
+            actor: "Operator".to_owned(),
+            from_peer: "self".to_owned(),
+            msg_type: "AssertReady".to_owned(),
+            content: vec![1, 2],
+            state: MessageState::Pending.to_string(),
+            ..Default::default()
+        };
+        assert!(s.upsert_message(message.clone()).await.unwrap());
+        sqlx::query("UPDATE message SET abandon_count = 2 WHERE message_id = ?")
+            .bind(&message.message_id)
+            .execute(s.conn())
+            .await
+            .unwrap();
+
+        assert!(s.upsert_message(message.clone()).await.unwrap());
+        let stored = s.find_messages_by_id(&message.message_id).await.unwrap().unwrap();
+        assert_eq!(stored.abandon_count, 2);
+    }
+
+    #[tokio::test]
+    async fn self_defer_cannot_be_overwritten_by_stale_completion() {
+        let db = setup_db().await;
+        let mut s = db.acquire().await.unwrap();
+        let business_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO message (message_id, business_id, actor, msg_type, content, state, lock_time_until, created_at, updated_at) \
+             VALUES ('self-defer-1', ?, 'Operator', 'AssertReady', X'0102', 'Pending', 0, 10, 10)",
+        )
+        .bind(business_id)
+        .execute(s.conn())
+        .await
+        .unwrap();
+        let claimed = s.claim_local_messages(100, 200, 0, 10, 3).await.unwrap();
+        assert!(
+            s.self_defer_local_message(
+                "self-defer-1",
+                claimed[0].message_version,
+                150,
+                "not ready"
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            !s.complete_local_message("self-defer-1", claimed[0].message_version).await.unwrap()
+        );
+        let stored = s.find_messages_by_id("self-defer-1").await.unwrap().unwrap();
+        assert_eq!(stored.state, "Pending");
+        assert_eq!(stored.attempt_count, 1);
+    }
+
+    #[tokio::test]
+    async fn cancellation_reaches_pending_and_processing_local_messages() {
+        let db = setup_db().await;
+        let mut s = db.acquire().await.unwrap();
+        let business_id = Uuid::new_v4();
+        for (message_id, msg_type, state, lock_time_until) in [
+            ("cancel-processing", "AssertReady", "Processing", 500),
+            ("cancel-pending", "PostReady", "Pending", 400),
+            ("keep-processed", "KickoffReady", "Processed", 0),
+        ] {
+            sqlx::query(
+                "INSERT INTO message \
+                 (message_id, business_id, actor, msg_type, content, state, lock_time_until, created_at, updated_at) \
+                 VALUES (?, ?, 'Operator', ?, X'01', ?, ?, 10, 10)",
+            )
+            .bind(message_id)
+            .bind(business_id)
+            .bind(msg_type)
+            .bind(state)
+            .bind(lock_time_until)
+            .execute(s.conn())
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(
+            s.cancel_messages_by_business_id(&business_id, Some("AssertReady".to_owned()))
+                .await
+                .unwrap(),
+            1
+        );
+        let processing = s.find_messages_by_id("cancel-processing").await.unwrap().unwrap();
+        assert_eq!(processing.state, "Cancelled");
+        assert_eq!(processing.lock_time_until, 0);
+        assert_eq!(s.cancel_messages_by_business_id(&business_id, None).await.unwrap(), 1);
+        assert_eq!(
+            s.find_messages_by_id("cancel-pending").await.unwrap().unwrap().state,
+            "Cancelled"
+        );
+        assert_eq!(
+            s.find_messages_by_id("keep-processed").await.unwrap().unwrap().state,
+            "Processed"
+        );
+    }
+
+    /// Every `message` SELECT must fetch the full column set `message_from_row`
+    /// reads. Adding a column and updating only some of the hand-written SELECT
+    /// lists fails at runtime, not at compile time, so pin all of them here.
+    #[tokio::test]
+    async fn every_message_query_hydrates_the_full_row() {
+        let db = setup_db().await;
+        let mut s = db.acquire().await.unwrap();
+        let business_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO message (message_id, business_id, actor, msg_type, content, state, lock_time_until, created_at, updated_at) \
+             VALUES (?, ?, 'Operator', 'AssertReady', X'0102', 'Pending', 0, 10, 10)",
+        )
+        .bind("hydrate-1")
+        .bind(business_id)
+        .execute(s.conn())
+        .await
+        .unwrap();
+
+        let by_id = s.find_messages_by_id("hydrate-1").await.unwrap().expect("row by id");
+        assert_eq!(by_id.attempt_count, 0);
+        assert_eq!(by_id.abandon_count, 0);
+        assert!(by_id.last_error.is_none());
+
+        let by_business = s
+            .find_message_by_business_id(&business_id, "AssertReady")
+            .await
+            .unwrap()
+            .expect("row by business id");
+        assert_eq!(by_business.message_id, "hydrate-1");
+
+        let claimed = s.claim_local_messages(100, 200, 0, 10, 3).await.unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].message_id, "hydrate-1");
+    }
+
+    fn admission_inbox_message(
+        message_id: &str,
+        from_peer: &str,
+        admission_class: P2pInboxAdmissionClass,
+        content: Vec<u8>,
+    ) -> P2pInboxMessage {
+        P2pInboxMessage {
+            message_id: message_id.to_string(),
+            actor: "Committee".to_string(),
+            from_peer: from_peer.to_string(),
+            msg_type: "KickoffSent".to_string(),
+            content_size: content.len() as i64,
+            content_hash: Some(content.clone()),
+            content,
+            admission_class: admission_class.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// Quota accounting must see what a sender currently makes the node store:
+    /// queued rows only, split by class, with the sender's own share.
+    #[tokio::test]
+    async fn inbox_usage_counts_queued_rows_per_class_and_sender() {
+        use P2pInboxAdmissionClass::{Registered, Unregistered};
+        let db = setup_db().await;
+        let mut s = db.acquire().await.unwrap();
+        for (message_id, from_peer, class, size) in [
+            ("usage-1", "peer-a", Registered, 10),
+            ("usage-2", "peer-a", Unregistered, 20),
+            ("usage-3", "peer-b", Unregistered, 30),
+            ("usage-4", "peer-b", Unregistered, 40),
+        ] {
+            let message = admission_inbox_message(message_id, from_peer, class, vec![7; size]);
+            assert!(s.insert_p2p_inbox_message(&message).await.unwrap());
+        }
+        // A terminal row has dropped its payload and must stop counting.
+        let claimed = s.claim_p2p_inbox_message("usage-4", 100, 200).await.unwrap().unwrap();
+        assert!(s.complete_p2p_inbox_message("usage-4", &claimed.lease_token).await.unwrap());
+        // A claimed row still holds its payload.
+        assert!(s.claim_p2p_inbox_message("usage-3", 100, 200).await.unwrap().is_some());
+
+        let mut usage = s.p2p_inbox_usage("peer-b").await.unwrap();
+        usage.sort_by(|a, b| a.admission_class.cmp(&b.admission_class));
+        assert_eq!(
+            usage,
+            vec![
+                P2pInboxClassUsage {
+                    admission_class: "Registered".to_string(),
+                    rows: 1,
+                    bytes: 10,
+                    peer_rows: 0,
+                    peer_bytes: 0,
+                },
+                P2pInboxClassUsage {
+                    admission_class: "Unregistered".to_string(),
+                    rows: 2,
+                    bytes: 50,
+                    peer_rows: 1,
+                    peer_bytes: 30,
+                },
+            ]
+        );
+    }
+
+    /// The usage query runs for every inbound message; it must be answered from
+    /// the covering index, never by reading rows that carry multi-megabyte blobs.
+    #[tokio::test]
+    async fn inbox_usage_is_answered_from_the_covering_index() {
+        let db = setup_db().await;
+        let mut s = db.acquire().await.unwrap();
+        let plan: Vec<String> = sqlx::query(
+            "EXPLAIN QUERY PLAN \
+             SELECT admission_class, COUNT(*), COALESCE(SUM(content_size), 0), \
+                    COALESCE(SUM(CASE WHEN from_peer = 'p' THEN content_size ELSE 0 END), 0) \
+             FROM p2p_inbox WHERE state IN ('Pending', 'Processing', 'Quarantined') \
+             GROUP BY admission_class",
+        )
+        .fetch_all(s.conn())
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| row.get::<String, _>("detail"))
+        .collect();
+        assert!(
+            plan.iter().any(|step| step.contains("COVERING INDEX idx_p2p_inbox_admission")),
+            "unexpected plan: {plan:?}"
+        );
+    }
+
+    /// A row written without a classification defaults to `Unregistered` rather
+    /// than silently joining the registered pool.
+    #[tokio::test]
+    async fn unclassified_inbox_rows_default_to_unregistered() {
+        let db = setup_db().await;
+        let mut s = db.acquire().await.unwrap();
+        let message = P2pInboxMessage {
+            message_id: "unclassified-1".to_string(),
+            actor: "Operator".to_string(),
+            from_peer: "peer".to_string(),
+            msg_type: "CreateGraph".to_string(),
+            content: vec![1, 2, 3],
+            content_size: 3,
+            ..Default::default()
+        };
+        assert!(s.insert_p2p_inbox_message(&message).await.unwrap());
+        let usage = s.p2p_inbox_usage("peer").await.unwrap();
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].admission_class, "Unregistered");
+        assert!(!s.has_queued_p2p_inbox_payload("peer", &[1, 2, 3]).await.unwrap());
+    }
+
+    /// Verify quota accounting and cleanup of quarantined payloads and terminal rows.
+    #[tokio::test]
+    async fn quarantined_payloads_count_and_are_capped() {
+        use P2pInboxAdmissionClass::Unregistered;
+        let db = setup_db().await;
+        let mut s = db.acquire().await.unwrap();
+        for (message_id, updated_at) in [("q-old", 100), ("q-new", 200)] {
+            let message = admission_inbox_message(message_id, "peer", Unregistered, vec![9; 1000]);
+            assert!(s.insert_p2p_inbox_message(&message).await.unwrap());
+            sqlx::query(
+                "UPDATE p2p_inbox SET state = 'Quarantined', updated_at = ? WHERE message_id = ?",
+            )
+            .bind(updated_at)
+            .bind(message_id)
+            .execute(s.conn())
+            .await
+            .unwrap();
+        }
+        let usage = s.p2p_inbox_usage("peer").await.unwrap();
+        assert_eq!(usage.iter().map(|u| u.bytes).sum::<i64>(), 2000, "quarantine counts");
+
+        // Keep only ~1000 bytes: the oldest quarantined payload is cleared.
+        assert_eq!(s.trim_quarantined_p2p_inbox_payloads(1000).await.unwrap(), 1);
+        let cleared: i64 =
+            sqlx::query("SELECT length(content) AS len FROM p2p_inbox WHERE message_id = 'q-old'")
+                .fetch_one(s.conn())
+                .await
+                .unwrap()
+                .get("len");
+        assert_eq!(cleared, 0, "the oldest payload was cleared");
+        let kept: i64 =
+            sqlx::query("SELECT length(content) AS len FROM p2p_inbox WHERE message_id = 'q-new'")
+                .fetch_one(s.conn())
+                .await
+                .unwrap()
+                .get("len");
+        assert_eq!(kept, 1000, "the newest payload is retained");
+
+        // The row cap deletes the oldest terminal rows beyond the ceiling.
+        assert_eq!(s.purge_p2p_inbox_over_terminal_cap(1, 10).await.unwrap(), 1);
+        let remaining: i64 = sqlx::query("SELECT COUNT(*) AS n FROM p2p_inbox")
+            .fetch_one(s.conn())
+            .await
+            .unwrap()
+            .get("n");
+        assert_eq!(remaining, 1);
+    }
+
+    /// Verify split usage queries match the combined query and use the covering index.
+    #[tokio::test]
+    async fn split_inbox_usage_matches_and_seeks_the_sender() {
+        use P2pInboxAdmissionClass::{Registered, Unregistered};
+        let db = setup_db().await;
+        let mut s = db.acquire().await.unwrap();
+        for (message_id, from_peer, class, size) in [
+            ("split-1", "peer-a", Registered, 10),
+            ("split-2", "peer-a", Unregistered, 20),
+            ("split-3", "peer-b", Unregistered, 30),
+        ] {
+            let message = admission_inbox_message(message_id, from_peer, class, vec![7; size]);
+            assert!(s.insert_p2p_inbox_message(&message).await.unwrap());
+        }
+        let mut combined = s.p2p_inbox_usage("peer-a").await.unwrap();
+        combined.sort_by(|a, b| a.admission_class.cmp(&b.admission_class));
+        let mut totals = s.p2p_inbox_class_totals().await.unwrap();
+        totals.sort_by(|a, b| a.admission_class.cmp(&b.admission_class));
+        for peer in s.p2p_inbox_peer_usage("peer-a").await.unwrap() {
+            let total =
+                totals.iter_mut().find(|t| t.admission_class == peer.admission_class).unwrap();
+            total.peer_rows = peer.peer_rows;
+            total.peer_bytes = peer.peer_bytes;
+        }
+        assert_eq!(totals, combined);
+
+        let plan: Vec<String> = sqlx::query(
+            "EXPLAIN QUERY PLAN \
+             SELECT admission_class, COUNT(*), COALESCE(SUM(content_size), 0) \
+             FROM p2p_inbox \
+             WHERE state IN ('Pending', 'Processing', 'Quarantined') \
+               AND admission_class IN ('Registered', 'Unregistered') \
+               AND from_peer = 'p' \
+             GROUP BY admission_class",
+        )
+        .fetch_all(s.conn())
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| row.get::<String, _>("detail"))
+        .collect();
+        assert!(
+            plan.iter().any(|step| step.contains("COVERING INDEX idx_p2p_inbox_admission")
+                && step.contains("from_peer=?")),
+            "the sender's rows must be reached by an index seek: {plan:?}"
+        );
+    }
+
+    /// Registered rows take the batch ahead of older unregistered ones, but a
+    /// reserved share keeps the unregistered queue moving.
+    #[tokio::test]
+    async fn claimable_listing_drains_registered_rows_first() {
+        use P2pInboxAdmissionClass::{Committee, Registered, Unregistered};
+        let db = setup_db().await;
+        let mut s = db.acquire().await.unwrap();
+        let mut created_at = 100;
+        let mut insert = async |s: &mut StorageProcessor<'_>, id: String, class| {
+            let message = admission_inbox_message(&id, "peer", class, id.clone().into_bytes());
+            assert!(s.insert_p2p_inbox_message(&message).await.unwrap());
+            sqlx::query("UPDATE p2p_inbox SET created_at = ? WHERE message_id = ?")
+                .bind(created_at)
+                .bind(&id)
+                .execute(s.conn())
+                .await
+                .unwrap();
+            created_at += 1;
+        };
+        // The flood arrived first ...
+        for index in 0..8 {
+            insert(&mut s, format!("flood-{index}"), Unregistered).await;
+        }
+        // ... and the registered messages queue up behind it, the committee's
+        // last of all.
+        for index in 0..4 {
+            insert(&mut s, format!("member-{index}"), Registered).await;
+        }
+        for index in 4..6 {
+            insert(&mut s, format!("member-{index}"), Committee).await;
+        }
+        let ids = |rows: Vec<P2pInboxMessage>| -> Vec<String> {
+            rows.into_iter().map(|row| row.message_id).collect()
+        };
+
+        let plain = ids(s.list_claimable_p2p_inbox_messages(1000, 4, 3, &[]).await.unwrap());
+        assert_eq!(plain, ["flood-0", "flood-1", "flood-2", "flood-3"], "oldest first");
+
+        let fair =
+            ids(s.list_claimable_p2p_inbox_messages_by_class(1000, 4, 1, 1, 3, &[]).await.unwrap());
+        assert_eq!(fair, ["member-4", "member-5", "member-0", "flood-0"], "committee first");
+
+        // With fewer registered rows than the batch, the rest goes to the others.
+        let fair = ids(s
+            .list_claimable_p2p_inbox_messages_by_class(1000, 10, 2, 2, 3, &[])
+            .await
+            .unwrap());
+        assert_eq!(fair.len(), 10);
+        assert_eq!(fair.iter().filter(|id| id.starts_with("member-")).count(), 6);
+        assert_eq!(&fair[6..], ["flood-0", "flood-1", "flood-2", "flood-3"]);
+
+        // A committee backlog that would fill every batch does not starve the
+        // other registered senders, nor the unregistered ones.
+        for index in 0..8 {
+            insert(&mut s, format!("committee-backlog-{index}"), Committee).await;
+        }
+        let fair =
+            ids(s.list_claimable_p2p_inbox_messages_by_class(1000, 4, 1, 1, 3, &[]).await.unwrap());
+        assert_eq!(fair, ["member-4", "member-5", "member-0", "flood-0"]);
+
+        // Lend unused reserved capacity to committee first.
+        let fair = ids(s
+            .list_claimable_p2p_inbox_messages_by_class(1000, 16, 6, 4, 3, &[])
+            .await
+            .unwrap());
+        assert_eq!(fair.len(), 16);
+        assert_eq!(fair.iter().filter(|id| id.starts_with("flood-")).count(), 4);
+        assert_eq!(fair.iter().filter(|id| id.starts_with("committee-backlog-")).count(), 6);
+        let mut unique = fair.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            16,
+            "borrowing continues a class's listing, it does not repeat it"
+        );
+    }
+
+    /// Verify confirmed operator bindings are loaded before unconfirmed identities.
+    #[tokio::test]
+    async fn confirmed_operator_bindings_are_loaded_first() {
+        let db = setup_db().await;
+        let mut s = db.acquire().await.unwrap();
+        let operator = |peer_id: &str, updated_at: i64| Node {
+            peer_id: peer_id.to_string(),
+            actor: "Operator".to_string(),
+            btc_pub_key: format!("key-of-{peer_id}"),
+            binding_sig: "sig".to_string(),
+            binding_issued_at: 1,
+            updated_at,
+            created_at: updated_at,
+            ..Default::default()
+        };
+        s.upsert_node(&operator("confirmed", 10)).await.unwrap();
+        for index in 0..4 {
+            s.upsert_node(&operator(&format!("recent-{index}"), 900 + index)).await.unwrap();
+        }
+        // Not an operator, and an operator without a binding: never loaded.
+        s.upsert_node(&Node { actor: "Committee".to_string(), ..operator("member", 999) })
+            .await
+            .unwrap();
+        s.upsert_node(&Node { binding_sig: String::new(), ..operator("unbound", 999) })
+            .await
+            .unwrap();
+        s.upsert_p2p_registered_peer("confirmed", "Operator", "aa").await.unwrap();
+
+        let loaded: Vec<String> = s
+            .load_p2p_peer_bindings(2)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|node| node.peer_id)
+            .collect();
+        assert_eq!(loaded, ["confirmed", "recent-3"]);
+    }
+
+    /// A sync request names both ids. A real graph under another instance's id
+    /// is not a graph this node holds for that request.
+    #[tokio::test]
+    async fn graph_is_held_only_under_its_own_instance() {
+        let db = setup_db().await;
+        let mut s = db.acquire().await.unwrap();
+        let (instance, graph, other) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        sqlx::query(
+            "INSERT INTO graph (graph_id, instance_id, status, created_at, updated_at) \
+             VALUES (?, ?, 'Created', 1, 1)",
+        )
+        .bind(graph)
+        .bind(instance)
+        .execute(s.conn())
+        .await
+        .unwrap();
+        assert!(!s.has_graph_of_instance(&instance, &graph).await.unwrap(), "no data stored yet");
+        sqlx::query("INSERT INTO graph_raw_data (graph_id, raw_data) VALUES (?, 'x')")
+            .bind(graph)
+            .execute(s.conn())
+            .await
+            .unwrap();
+        assert!(s.has_graph_of_instance(&instance, &graph).await.unwrap());
+        assert!(!s.has_graph_of_instance(&other, &graph).await.unwrap(), "wrong instance");
+        assert!(!s.has_graph_of_instance(&instance, &other).await.unwrap(), "unknown graph");
+    }
+
+    #[tokio::test]
+    async fn registered_peers_persist_and_shield_their_node_rows() {
+        let db = setup_db().await;
+        let mut s = db.acquire().await.unwrap();
+        s.upsert_p2p_registered_peer("member", "Committee", "").await.unwrap();
+        s.upsert_p2p_registered_peer("member", "Committee", "").await.unwrap();
+        s.upsert_p2p_registered_peer("other-member", "Committee", "").await.unwrap();
+        s.upsert_p2p_registered_peer("operator", "Operator", "aa").await.unwrap();
+        let load = async |s: &mut StorageProcessor<'_>| {
+            let mut peers = s.load_p2p_registered_peers().await.unwrap();
+            peers.sort();
+            peers
+        };
+        let row = |peer: &str, kind: &str, key: &str| {
+            (peer.to_string(), kind.to_string(), key.to_string())
+        };
+        assert_eq!(
+            load(&mut s).await,
+            [
+                row("member", "Committee", ""),
+                row("operator", "Operator", "aa"),
+                row("other-member", "Committee", "")
+            ],
+            "keyless kinds never displace each other"
+        );
+        // Move the key's registration to the new peer.
+        s.upsert_p2p_registered_peer("operator-moved", "Operator", "aa").await.unwrap();
+        // A peer confirmed for another key keeps one row, for the new key.
+        s.upsert_p2p_registered_peer("operator-moved", "Operator", "bb").await.unwrap();
+        assert_eq!(
+            load(&mut s).await,
+            [
+                row("member", "Committee", ""),
+                row("operator-moved", "Operator", "bb"),
+                row("other-member", "Committee", "")
+            ]
+        );
+        s.delete_p2p_registered_peer("operator-moved", "Operator").await.unwrap();
+        s.delete_p2p_registered_peer("other-member", "Committee").await.unwrap();
+        assert_eq!(load(&mut s).await.len(), 1);
+
+        // Replay marks only move up, and are kept for registered peers and the
+        // verifiers the caller names.
+        s.raise_p2p_replay_marks(&[("member".into(), 50), ("verifier".into(), 7)]).await.unwrap();
+        s.raise_p2p_replay_marks(&[("member".into(), 40), ("gone".into(), 9)]).await.unwrap();
+        assert_eq!(s.prune_p2p_replay_marks(&["verifier".to_string()]).await.unwrap(), 1);
+        let mut marks = s.load_p2p_replay_marks().await.unwrap();
+        marks.sort();
+        assert_eq!(marks, [("member".to_string(), 50), ("verifier".to_string(), 7)]);
+
+        for (peer_id, updated_at) in [("member", 10), ("sybil", 10), ("local", 10), ("live", 900)] {
+            s.upsert_node(&Node {
+                peer_id: peer_id.to_string(),
+                actor: "Operator".to_string(),
+                updated_at,
+                created_at: updated_at,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        }
+        // Only unregistered rows count toward capacity; stale rows may be evicted.
+        assert!(s.node_row_admissible("sybil", 3, 0, "local").await.unwrap());
+        assert!(s.node_row_admissible("newcomer", 4, 0, "local").await.unwrap());
+        assert!(
+            !s.node_row_admissible("newcomer", 3, 5, "local").await.unwrap(),
+            "full, and every row was refreshed after the eviction horizon"
+        );
+        assert!(
+            s.node_row_admissible("newcomer", 3, 500, "local").await.unwrap(),
+            "the stalest unregistered row makes room"
+        );
+        let known = async |s: &mut StorageProcessor<'_>, peer_id: &str| {
+            s.node_row_admissible(peer_id, 0, 0, "local").await.unwrap()
+        };
+        assert!(!known(&mut s, "sybil").await, "evicted: stale, unregistered, not this node");
+        for kept in ["member", "local", "live"] {
+            assert!(known(&mut s, kept).await, "{kept}");
+        }
+
+        s.upsert_node(&Node {
+            peer_id: "left".to_string(),
+            actor: "Watchtower".to_string(),
+            updated_at: 20,
+            created_at: 20,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        assert_eq!(s.purge_stale_unregistered_nodes(500, "local").await.unwrap(), 1);
+        assert!(!known(&mut s, "left").await);
+        assert!(known(&mut s, "member").await && known(&mut s, "local").await);
+
+        s.raise_p2p_replay_marks(&[("locked-out".into(), 99)]).await.unwrap();
+        assert_eq!(s.delete_p2p_replay_marks(&["locked-out".to_string()]).await.unwrap(), 1);
+        assert_eq!(s.delete_p2p_replay_marks(&[]).await.unwrap(), 0);
+    }
+
+    /// Only a copy that is still queued suppresses a re-publish; once it reached
+    /// a terminal state the same payload may be delivered again.
+    #[tokio::test]
+    async fn queued_payload_lookup_ignores_other_senders_and_terminal_rows() {
+        use P2pInboxAdmissionClass::Registered;
+        let db = setup_db().await;
+        let mut s = db.acquire().await.unwrap();
+        let message = admission_inbox_message("dup-1", "peer-a", Registered, vec![9; 8]);
+        assert!(s.insert_p2p_inbox_message(&message).await.unwrap());
+
+        assert!(s.has_queued_p2p_inbox_payload("peer-a", &[9; 8]).await.unwrap());
+        assert!(!s.has_queued_p2p_inbox_payload("peer-b", &[9; 8]).await.unwrap());
+        assert!(!s.has_queued_p2p_inbox_payload("peer-a", &[8; 8]).await.unwrap());
+
+        let claimed = s.claim_p2p_inbox_message("dup-1", 100, 200).await.unwrap().unwrap();
+        assert!(
+            s.has_queued_p2p_inbox_payload("peer-a", &[9; 8]).await.unwrap(),
+            "a claimed row is still in flight"
+        );
+        assert!(s.complete_p2p_inbox_message("dup-1", &claimed.lease_token).await.unwrap());
+        assert!(!s.has_queued_p2p_inbox_payload("peer-a", &[9; 8]).await.unwrap());
+    }
+
+    /// Verify Pending expiry uses `created_at`, not the last retry time.
+    #[tokio::test]
+    async fn pending_inbox_rows_expire_by_class_and_age() {
+        use P2pInboxAdmissionClass::{Registered, Unregistered};
+        let db = setup_db().await;
+        let mut s = db.acquire().await.unwrap();
+        for (message_id, class, created_at) in [
+            ("expire-old-unregistered", Unregistered, 100),
+            ("expire-new-unregistered", Unregistered, 900),
+            ("expire-old-registered", Registered, 100),
+            ("expire-claimed-unregistered", Unregistered, 100),
+        ] {
+            let message = admission_inbox_message(message_id, "peer", class, vec![5; 16]);
+            assert!(s.insert_p2p_inbox_message(&message).await.unwrap());
+            sqlx::query(
+                "UPDATE p2p_inbox SET created_at = ?, updated_at = 5000 WHERE message_id = ?",
+            )
+            .bind(created_at)
+            .bind(message_id)
+            .execute(s.conn())
+            .await
+            .unwrap();
+        }
+        let now = get_current_timestamp_secs();
+        assert!(
+            s.claim_p2p_inbox_message("expire-claimed-unregistered", now, now + 300)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        assert_eq!(s.expire_pending_p2p_inbox_messages(Some(Unregistered), 500).await.unwrap(), 1);
+        let states: Vec<(String, String, i64)> = sqlx::query(
+            "SELECT message_id, state, length(content) AS len FROM p2p_inbox ORDER BY message_id",
+        )
+        .fetch_all(s.conn())
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| (row.get("message_id"), row.get("state"), row.get("len")))
+        .collect();
+        assert_eq!(
+            states,
+            vec![
+                ("expire-claimed-unregistered".to_string(), "Processing".to_string(), 16),
+                ("expire-new-unregistered".to_string(), "Pending".to_string(), 16),
+                ("expire-old-registered".to_string(), "Pending".to_string(), 16),
+                ("expire-old-unregistered".to_string(), "Failed".to_string(), 0),
+            ]
+        );
+
+        // The class-independent ceiling reaches every remaining pending row.
+        assert_eq!(s.expire_pending_p2p_inbox_messages(None, 1000).await.unwrap(), 2);
+        assert_eq!(s.p2p_inbox_usage("peer").await.unwrap().iter().map(|u| u.rows).sum::<i64>(), 1);
+    }
+
+    /// Verify only unfinished claims increment abandon_count.
+    #[tokio::test]
+    async fn test_inbox_abandon_is_charged_only_for_unfinished_claims() {
+        let db = setup_db().await;
+        let mut s = db.acquire().await.unwrap();
+        let message = P2pInboxMessage {
+            message_id: "inbox-abandon-1".to_string(),
+            actor: "Operator".to_string(),
+            from_peer: "peer".to_string(),
+            msg_type: "CreateGraph".to_string(),
+            content: vec![1, 2, 3],
+            content_size: 3,
+            ..Default::default()
+        };
+        assert!(s.insert_p2p_inbox_message(&message).await.unwrap());
+
+        // First claim of a Pending row: a retry attempt, not an abandon.
+        let claimed = s.claim_p2p_inbox_messages(100, 200, 10, 3, &[]).await.unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].attempt_count, 1);
+        assert_eq!(claimed[0].abandon_count, 0);
+
+        // The handler returned a retryable error and the row went back to Pending.
+        assert!(
+            s.retry_p2p_inbox_message(
+                &message.message_id,
+                &claimed[0].lease_token,
+                150,
+                "storage busy"
+            )
+            .await
+            .unwrap()
+        );
+        let claimed = s.claim_p2p_inbox_messages(160, 260, 10, 3, &[]).await.unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].attempt_count, 2, "a retry is recorded");
+        assert_eq!(claimed[0].abandon_count, 0, "a retry must not charge the abandon budget");
+
+        // Now simulate a worker that died mid-dispatch: the row is still
+        // Processing and its lease has expired.
+        let claimed = s.claim_p2p_inbox_messages(400, 500, 10, 3, &[]).await.unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].attempt_count, 3);
+        assert_eq!(claimed[0].abandon_count, 1, "an unfinished claim charges the abandon budget");
+
+        assert!(
+            s.retry_p2p_inbox_message(
+                &message.message_id,
+                &claimed[0].lease_token,
+                450,
+                "dependency pending",
+            )
+            .await
+            .unwrap()
+        );
+        let claimed = s.claim_p2p_inbox_messages(460, 560, 10, 3, &[]).await.unwrap();
+        assert_eq!(claimed[0].abandon_count, 0, "a reported outcome resets consecutive abandons");
+    }
+
+    /// Verify repeated abandonment quarantines the retained payload.
+    #[tokio::test]
+    async fn test_inbox_quarantines_repeatedly_abandoned_message() {
+        let db = setup_db().await;
+        let mut s = db.acquire().await.unwrap();
+        let message = P2pInboxMessage {
+            message_id: "inbox-poison-1".to_string(),
+            actor: "Operator".to_string(),
+            from_peer: "peer".to_string(),
+            msg_type: "GraphFinalize".to_string(),
+            content: vec![9; 64],
+            content_size: 64,
+            ..Default::default()
+        };
+        assert!(s.insert_p2p_inbox_message(&message).await.unwrap());
+
+        // Claims that never report an outcome, each one lease apart. On the
+        // sweep after the third expired claim, that final abandon is recorded
+        // as part of the quarantine transition.
+        let mut now = 100;
+        for attempt in 1..=3 {
+            let claimed = s.claim_p2p_inbox_messages(now, now + 10, 10, 3, &[]).await.unwrap();
+            assert_eq!(claimed.len(), 1, "claim {attempt} should still be served");
+            assert_eq!(
+                claimed[0].abandon_count,
+                attempt - 1,
+                "claim {attempt} charges one abandon per unfinished predecessor"
+            );
+            now += 100;
+        }
+
+        let quarantined = s.quarantine_p2p_inbox_messages(now, 3).await.unwrap();
+        assert_eq!(quarantined, 1);
+
+        let claimed = s.claim_p2p_inbox_messages(now, now + 10, 10, 3, &[]).await.unwrap();
+        assert!(claimed.is_empty(), "a quarantined message must not be claimed again");
+
+        let row =
+            sqlx::query("SELECT state, content, last_error FROM p2p_inbox WHERE message_id = ?")
+                .bind(&message.message_id)
+                .fetch_one(s.conn())
+                .await
+                .unwrap();
+        assert_eq!(row.get::<String, _>("state"), "Quarantined");
+        assert_eq!(row.get::<Vec<u8>, _>("content"), message.content);
+        assert!(row.get::<Option<String>, _>("last_error").is_some());
+
+        assert!(s.requeue_p2p_inbox_message(&message.message_id).await.unwrap());
+        let requeued = s.claim_p2p_inbox_messages(now, now + 10, 10, 3, &[]).await.unwrap();
+        assert_eq!(requeued.len(), 1);
+        assert_eq!(requeued[0].abandon_count, 0);
+    }
+
+    /// Verify local claims hold a lease.
+    #[tokio::test]
+    async fn test_local_claim_holds_lease_and_charges_abandon() {
+        let db = setup_db().await;
+        let mut s = db.acquire().await.unwrap();
+        let business_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO message (message_id, business_id, actor, msg_type, content, state, lock_time_until, created_at, updated_at) \
+             VALUES (?, ?, 'Operator', 'AssertReady', X'0102', 'Pending', 0, 10, 10)",
+        )
+        .bind("local-claim-1")
+        .bind(business_id)
+        .execute(s.conn())
+        .await
+        .unwrap();
+
+        let claimed = s.claim_local_messages(100, 200, 0, 10, 3).await.unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].abandon_count, 0);
+
+        // Still inside the lease: the message must not be handed out again.
+        let claimed_again = s.claim_local_messages(150, 250, 0, 10, 3).await.unwrap();
+        assert!(claimed_again.is_empty(), "a leased message must not be re-claimed");
+
+        // Lease expired with no outcome reported: that is an abandon.
+        let reclaimed = s.claim_local_messages(300, 400, 0, 10, 3).await.unwrap();
+        assert_eq!(reclaimed.len(), 1);
+        assert_eq!(reclaimed[0].abandon_count, 1);
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_releases_claims_without_charging_abandon() {
+        let db = setup_db().await;
+        let mut s = db.acquire().await.unwrap();
+        let business_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO message (message_id, business_id, actor, msg_type, content, state, lock_time_until, created_at, updated_at) \
+             VALUES ('shutdown-local', ?, 'Operator', 'AssertReady', X'01', 'Pending', 0, 10, 10)",
+        )
+        .bind(business_id)
+        .execute(s.conn())
+        .await
+        .unwrap();
+        let inbox = P2pInboxMessage {
+            message_id: "shutdown-inbox".to_owned(),
+            actor: "Operator".to_owned(),
+            from_peer: "peer".to_owned(),
+            msg_type: "CreateGraph".to_owned(),
+            content: vec![1],
+            content_size: 1,
+            ..Default::default()
+        };
+        assert!(s.insert_p2p_inbox_message(&inbox).await.unwrap());
+        assert_eq!(s.claim_local_messages(100, 200, 0, 10, 3).await.unwrap().len(), 1);
+        assert_eq!(s.claim_p2p_inbox_messages(100, 200, 10, 3, &[]).await.unwrap().len(), 1);
+
+        assert_eq!(s.release_processing_local_messages().await.unwrap(), 1);
+        assert_eq!(s.release_processing_p2p_inbox_messages().await.unwrap(), 1);
+
+        let local = s.find_messages_by_id("shutdown-local").await.unwrap().unwrap();
+        assert_eq!(local.state, "Pending");
+        assert_eq!(local.abandon_count, 0);
+        let inbox = sqlx::query(
+            "SELECT state, abandon_count, lease_token FROM p2p_inbox WHERE message_id = ?",
+        )
+        .bind("shutdown-inbox")
+        .fetch_one(s.conn())
+        .await
+        .unwrap();
+        assert_eq!(inbox.get::<String, _>("state"), "Pending");
+        assert_eq!(inbox.get::<i64, _>("abandon_count"), 0);
+        assert!(inbox.get::<String, _>("lease_token").is_empty());
+    }
+
+    /// Deferring a local message records the retry, but only abandoned claims
+    /// contribute to quarantine.
+    #[tokio::test]
+    async fn test_local_defer_charges_attempts_but_only_abandons_quarantine() {
+        let db = setup_db().await;
+        let mut s = db.acquire().await.unwrap();
+        let business_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO message (message_id, business_id, actor, msg_type, content, state, lock_time_until, created_at, updated_at) \
+             VALUES (?, ?, 'Operator', 'AssertReady', X'0102', 'Pending', 0, 10, 10)",
+        )
+        .bind("local-defer-1")
+        .bind(business_id)
+        .execute(s.conn())
+        .await
+        .unwrap();
+
+        let claimed = s.claim_local_messages(100, 200, 0, 10, 3).await.unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert!(
+            s.defer_local_message(&claimed[0].message_id, claimed[0].message_version, 150, "boom")
+                .await
+                .unwrap()
+        );
+
+        let reclaimed = s.claim_local_messages(160, 260, 0, 10, 3).await.unwrap();
+        assert_eq!(reclaimed.len(), 1);
+        assert_eq!(reclaimed[0].attempt_count, 1, "defer records the attempt");
+        assert_eq!(reclaimed[0].abandon_count, 0, "defer must not charge the abandon budget");
+
+        // A deferred message is NOT quarantined however many times it errors:
+        // the local queue has no error budget, because a surviving row makes the
+        // producer treat the work as already created.
+        assert_eq!(s.quarantine_local_messages(300, 3).await.unwrap(), 0);
+
+        // Abandoned claims are what retires it. The quarantine sweep counts the
+        // final expired Processing lease.
+        let mut now = 400;
+        for _ in 0..3 {
+            s.claim_local_messages(now, now + 10, 0, 10, 3).await.unwrap();
+            now += 100;
+        }
+        assert_eq!(s.quarantine_local_messages(now, 3).await.unwrap(), 1);
+        let row = sqlx::query("SELECT state, content FROM message WHERE message_id = ?")
+            .bind("local-defer-1")
+            .fetch_one(s.conn())
+            .await
+            .unwrap();
+        assert_eq!(row.get::<String, _>("state"), "Quarantined");
+        assert_eq!(row.get::<Vec<u8>, _>("content"), vec![1, 2]);
+    }
+
+    /// Rows are claimed one at a time immediately before dispatch, so an abort
+    /// mid-dispatch charges only the row that was actually running.
+    #[tokio::test]
+    async fn local_claims_are_taken_per_message_not_per_batch() {
+        let db = setup_db().await;
+        let mut s = db.acquire().await.unwrap();
+        let business_id = Uuid::new_v4();
+        for (message_id, created_at) in [("first", 10), ("second", 20)] {
+            sqlx::query(
+                "INSERT INTO message (message_id, business_id, actor, msg_type, content, state, lock_time_until, created_at, updated_at) \
+                 VALUES (?, ?, 'Operator', 'AssertReady', X'01', 'Pending', 0, ?, ?)",
+            )
+            .bind(message_id)
+            .bind(business_id)
+            .bind(created_at)
+            .bind(created_at)
+            .execute(s.conn())
+            .await
+            .unwrap();
+        }
+
+        let candidates = s.list_claimable_local_messages(100, 0, 10, 3).await.unwrap();
+        assert_eq!(
+            candidates.iter().map(|message| message.message_id.as_str()).collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+        assert!(
+            candidates.iter().all(|message| message.state == "Pending"),
+            "listing must not write"
+        );
+
+        let claimed = s
+            .claim_local_message("first", candidates[0].message_version, 100, 200)
+            .await
+            .unwrap()
+            .expect("first claim");
+        assert_eq!(claimed.state, "Processing");
+        assert_eq!(claimed.lock_time_until, 200);
+        assert_eq!(s.find_messages_by_id("second").await.unwrap().unwrap().state, "Pending");
+
+        // Inside the lease the same row is not claimable again.
+        assert!(
+            s.claim_local_message("first", claimed.message_version, 150, 250)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // A row re-armed under a new version since it was listed is skipped too.
+        assert!(
+            s.claim_local_message("second", candidates[1].message_version + 1, 100, 200)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // Once the lease lapses, the reclaim charges the unfinished attempt.
+        let reclaimed = s
+            .claim_local_message("first", claimed.message_version, 300, 400)
+            .await
+            .unwrap()
+            .expect("reclaim");
+        assert_eq!(reclaimed.abandon_count, 1);
+    }
+
+    #[tokio::test]
+    async fn inbox_claims_are_taken_per_message_not_per_batch() {
+        let db = setup_db().await;
+        let mut s = db.acquire().await.unwrap();
+        for message_id in ["inbox-first", "inbox-second"] {
+            let message = P2pInboxMessage {
+                message_id: message_id.to_owned(),
+                actor: "Operator".to_owned(),
+                from_peer: "peer".to_owned(),
+                msg_type: "CreateGraph".to_owned(),
+                content: vec![1],
+                content_size: 1,
+                ..Default::default()
+            };
+            assert!(s.insert_p2p_inbox_message(&message).await.unwrap());
+        }
+        let candidates = s.list_claimable_p2p_inbox_messages(100, 10, 3, &[]).await.unwrap();
+        assert_eq!(candidates.len(), 2);
+        assert!(
+            candidates
+                .iter()
+                .all(|message| message.state == "Pending" && message.lease_token.is_empty()),
+            "listing must not write"
+        );
+
+        let claimed =
+            s.claim_p2p_inbox_message("inbox-first", 100, 200).await.unwrap().expect("claim");
+        assert_eq!(claimed.state, "Processing");
+        assert_eq!(claimed.attempt_count, 1);
+        assert_eq!(claimed.lease_until, 200);
+        assert!(!claimed.lease_token.is_empty());
+        assert!(s.claim_p2p_inbox_message("inbox-first", 150, 250).await.unwrap().is_none());
+        let second = sqlx::query("SELECT state FROM p2p_inbox WHERE message_id = 'inbox-second'")
+            .fetch_one(s.conn())
+            .await
+            .unwrap();
+        assert_eq!(second.get::<String, _>("state"), "Pending");
+    }
+
+    /// An unclean exit leaves claims behind. At startup they are provably
+    /// abandoned, so they are charged and released immediately with a backoff
+    /// instead of sitting locked until the lease lapses.
+    #[tokio::test]
+    async fn startup_reclaim_charges_abandon_and_applies_backoff() {
+        let db = setup_db().await;
+        let mut s = db.acquire().await.unwrap();
+        let business_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO message (message_id, business_id, actor, msg_type, content, state, lock_time_until, created_at, updated_at) \
+             VALUES ('startup-local', ?, 'Operator', 'AssertReady', X'01', 'Pending', 0, 10, 10)",
+        )
+        .bind(business_id)
+        .execute(s.conn())
+        .await
+        .unwrap();
+        let inbox = P2pInboxMessage {
+            message_id: "startup-inbox".to_owned(),
+            actor: "Operator".to_owned(),
+            from_peer: "peer".to_owned(),
+            msg_type: "CreateGraph".to_owned(),
+            content: vec![1],
+            content_size: 1,
+            ..Default::default()
+        };
+        assert!(s.insert_p2p_inbox_message(&inbox).await.unwrap());
+        assert_eq!(s.claim_local_messages(100, 700, 0, 10, 3).await.unwrap().len(), 1);
+        assert_eq!(s.claim_p2p_inbox_messages(100, 400, 10, 3, &[]).await.unwrap().len(), 1);
+
+        assert_eq!(s.reclaim_processing_local_messages(1000, 60).await.unwrap(), 1);
+        assert_eq!(s.reclaim_processing_p2p_inbox_messages(1000, 60).await.unwrap(), 1);
+
+        let local = s.find_messages_by_id("startup-local").await.unwrap().unwrap();
+        assert_eq!(local.state, "Pending");
+        assert_eq!(local.abandon_count, 1);
+        assert_eq!(local.lock_time_until, 1060, "the first abandon backs off by one interval");
+        let inbox_row = sqlx::query(
+            "SELECT state, abandon_count, next_retry_at, lease_token FROM p2p_inbox WHERE message_id = 'startup-inbox'",
+        )
+        .fetch_one(s.conn())
+        .await
+        .unwrap();
+        assert_eq!(inbox_row.get::<String, _>("state"), "Pending");
+        assert_eq!(inbox_row.get::<i64, _>("abandon_count"), 1);
+        assert_eq!(inbox_row.get::<i64, _>("next_retry_at"), 1060);
+        assert!(inbox_row.get::<String, _>("lease_token").is_empty());
+
+        // Nothing is claimable until the backoff has passed.
+        assert!(s.list_claimable_local_messages(1030, 0, 10, 3).await.unwrap().is_empty());
+        assert_eq!(s.list_claimable_local_messages(1060, 0, 10, 3).await.unwrap().len(), 1);
+        assert!(s.list_claimable_p2p_inbox_messages(1030, 10, 3, &[]).await.unwrap().is_empty());
+        assert_eq!(s.list_claimable_p2p_inbox_messages(1060, 10, 3, &[]).await.unwrap().len(), 1);
+    }
+
+    /// A handler that reschedules its own row and then panics must accumulate
+    /// abandons across restarts. The self-defer must not reset the counter,
+    /// because the handler is still running when it happens; only the
+    /// dispatcher's confirmation after a normal return may reset it.
+    #[tokio::test]
+    async fn panic_after_self_defer_accumulates_abandons_until_quarantine() {
+        let db = setup_db().await;
+        let mut s = db.acquire().await.unwrap();
+        let business_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO message (message_id, business_id, actor, msg_type, content, state, lock_time_until, created_at, updated_at) \
+             VALUES ('panic-local', ?, 'Operator', 'AssertReady', X'01', 'Pending', 0, 10, 10)",
+        )
+        .bind(business_id)
+        .execute(s.conn())
+        .await
+        .unwrap();
+
+        let mut now = 100;
+        for round in 1..=3 {
+            // The row is Pending, so the restart's reclaim sweep leaves it alone
+            // and the next tick claims it without a charge.
+            let candidate = s.find_messages_by_id("panic-local").await.unwrap().unwrap();
+            let claimed = s
+                .claim_local_message("panic-local", candidate.message_version, now, now + 600)
+                .await
+                .unwrap()
+                .expect("claim");
+            assert_eq!(claimed.abandon_count, round - 1);
+            // The handler reschedules itself, then panics.
+            assert!(
+                s.self_defer_local_message(
+                    "panic-local",
+                    claimed.message_version,
+                    now + 5,
+                    "not ready"
+                )
+                .await
+                .unwrap()
+            );
+            assert!(
+                s.abandon_local_message(
+                    "panic-local",
+                    claimed.message_version,
+                    now,
+                    60,
+                    "panicked"
+                )
+                .await
+                .unwrap()
+            );
+            let row = s.find_messages_by_id("panic-local").await.unwrap().unwrap();
+            assert_eq!(row.state, "Pending");
+            assert_eq!(row.abandon_count, round, "round {round} adds to the preserved count");
+            assert_eq!(row.lock_time_until, now + 60 * round, "backoff grows with the count");
+            now = row.lock_time_until + 1;
+        }
+
+        // The sweep on the next tick retires it instead of dispatching again.
+        assert_eq!(s.quarantine_local_messages(now, 3).await.unwrap(), 1);
+        assert_eq!(
+            s.find_messages_by_id("panic-local").await.unwrap().unwrap().state,
+            "Quarantined"
+        );
+    }
+
+    /// A self-defer is only a reported outcome once the handler has returned,
+    /// so the counter survives the self-defer and resets on confirmation.
+    #[tokio::test]
+    async fn self_defer_keeps_abandons_until_the_dispatcher_confirms_it() {
+        let db = setup_db().await;
+        let mut s = db.acquire().await.unwrap();
+        let business_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO message (message_id, business_id, actor, msg_type, content, state, lock_time_until, abandon_count, created_at, updated_at) \
+             VALUES ('confirm-local', ?, 'Operator', 'AssertReady', X'01', 'Pending', 0, 2, 10, 10)",
+        )
+        .bind(business_id)
+        .execute(s.conn())
+        .await
+        .unwrap();
+        let candidate = s.find_messages_by_id("confirm-local").await.unwrap().unwrap();
+        let claimed = s
+            .claim_local_message("confirm-local", candidate.message_version, 100, 700)
+            .await
+            .unwrap()
+            .expect("claim");
+        assert_eq!(claimed.abandon_count, 2, "a claim from Pending is not charged");
+
+        assert!(
+            s.self_defer_local_message("confirm-local", claimed.message_version, 150, "not ready")
+                .await
+                .unwrap()
+        );
+        let row = s.find_messages_by_id("confirm-local").await.unwrap().unwrap();
+        assert_eq!(row.state, "Pending");
+        assert_eq!(row.attempt_count, 1);
+        assert_eq!(row.abandon_count, 2, "the self-defer must not reset the counter");
+
+        // The dispatcher confirms once the handler returned normally.
+        assert!(
+            s.confirm_local_message_self_defer("confirm-local", claimed.message_version)
+                .await
+                .unwrap()
+        );
+        assert_eq!(s.find_messages_by_id("confirm-local").await.unwrap().unwrap().abandon_count, 0);
+        // A different claim generation, or a row that is not Pending, is not confirmed.
+        assert!(
+            !s.confirm_local_message_self_defer("confirm-local", claimed.message_version + 1)
+                .await
+                .unwrap()
         );
     }
 

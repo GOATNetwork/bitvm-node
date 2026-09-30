@@ -66,16 +66,11 @@ pub struct ChallengeSubStatus {
 struct DetectedGraphMessage {
     actor: Actor,
     content: GOATMessageContent,
-    sub_type: Option<String>,
 }
 
 impl DetectedGraphMessage {
     fn new(actor: Actor, content: GOATMessageContent) -> Self {
-        Self { actor, content, sub_type: None }
-    }
-
-    fn with_sub_type(actor: Actor, content: GOATMessageContent, sub_type: String) -> Self {
-        Self { actor, content, sub_type: Some(sub_type) }
+        Self { actor, content }
     }
 }
 
@@ -115,7 +110,6 @@ impl ChallengeSubStatus {
 
 async fn upsert_detected_messages(
     local_db: &LocalDB,
-    graph_id: Uuid,
     messages: Vec<DetectedGraphMessage>,
 ) -> anyhow::Result<()> {
     if messages.is_empty() {
@@ -127,8 +121,6 @@ async fn upsert_detected_messages(
         upsert_message(
             &mut storage_processor,
             false,
-            graph_id,
-            message.sub_type,
             SELF_SENDER.to_string(),
             message.actor,
             message.content,
@@ -189,7 +181,7 @@ async fn detect_watchtower_flow_disprove(
 ) -> anyhow::Result<Option<DetectedGraphMessage>> {
     for (index, txid) in graph.operator_challenge_nack_txids.iter().enumerate() {
         if btc_client.get_tx_status(&txid.0).await?.confirmed {
-            return Ok(Some(DetectedGraphMessage::with_sub_type(
+            return Ok(Some(DetectedGraphMessage::new(
                 Actor::Committee,
                 GOATMessageContent::DisproveSent(DisproveSent {
                     instance_id: graph.instance_id,
@@ -199,7 +191,6 @@ async fn detect_watchtower_flow_disprove(
                     challenge_start_txid: None,
                     challenge_finish_txid: txid.0,
                 }),
-                index.to_string(),
             )));
         }
     }
@@ -260,8 +251,6 @@ pub async fn detect_init_withdraw_call(local_db: &LocalDB) -> anyhow::Result<()>
             upsert_message(
                 &mut tx,
                 false,
-                graph_id,
-                None,
                 SELF_SENDER.to_string(),
                 Actor::Operator,
                 GOATMessageContent::KickoffReady(KickoffReady { instance_id, graph_id }),
@@ -291,8 +280,6 @@ async fn enqueue_kickoff_sent(local_db: &LocalDB, graph: &Graph) -> anyhow::Resu
     upsert_message(
         &mut storage_processor,
         false,
-        graph.graph_id,
-        None,
         SELF_SENDER.to_string(),
         Actor::All,
         GOATMessageContent::KickoffSent(KickoffSent {
@@ -303,6 +290,7 @@ async fn enqueue_kickoff_sent(local_db: &LocalDB, graph: &Graph) -> anyhow::Resu
         0,
     )
     .await
+    .map(|_| ())
 }
 
 async fn enqueue_prekickoff_sent(local_db: &LocalDB, graph: &Graph) -> anyhow::Result<()> {
@@ -310,8 +298,6 @@ async fn enqueue_prekickoff_sent(local_db: &LocalDB, graph: &Graph) -> anyhow::R
     upsert_message(
         &mut storage_processor,
         false,
-        graph.graph_id,
-        None,
         SELF_SENDER.to_string(),
         Actor::Verifier,
         GOATMessageContent::PreKickoffSent(PreKickoffSent {
@@ -322,6 +308,7 @@ async fn enqueue_prekickoff_sent(local_db: &LocalDB, graph: &Graph) -> anyhow::R
         0,
     )
     .await
+    .map(|_| ())
 }
 
 fn is_kickoff_pending_status(status: &str) -> bool {
@@ -533,8 +520,6 @@ async fn detect_take1_or_challenge_for_graph(
         upsert_message(
             &mut storage_processor,
             false,
-            graph.graph_id,
-            None,
             SELF_SENDER.to_string(),
             actor,
             message_content,
@@ -588,7 +573,7 @@ async fn process_graph_challenge_for_graph(
             "process_graph_challenge detected {} watchtower/pubin flow messages",
             watchtower_flow_messages.len()
         );
-        upsert_detected_messages(local_db, graph.graph_id, watchtower_flow_messages).await?;
+        upsert_detected_messages(local_db, watchtower_flow_messages).await?;
     }
 
     let assert_sent_messages = detect_assert_sent_flow(btc_client, local_db, &graph).await?;
@@ -597,10 +582,10 @@ async fn process_graph_challenge_for_graph(
             "process_graph_challenge detected {} assert/challenge-assert messages",
             assert_sent_messages.len()
         );
-        upsert_detected_messages(local_db, graph.graph_id, assert_sent_messages).await?;
+        upsert_detected_messages(local_db, assert_sent_messages).await?;
     }
 
-    if let Some((actor, message_content, sub_type)) =
+    if let Some((actor, message_content)) =
         detect_assert_disprove_ready(btc_client, local_db, &graph, current_height).await?
     {
         info!("process_graph_challenge detect assert disprove ready");
@@ -608,8 +593,6 @@ async fn process_graph_challenge_for_graph(
         upsert_message(
             &mut storage_processor,
             false,
-            graph.graph_id,
-            sub_type,
             SELF_SENDER.to_string(),
             actor,
             message_content,
@@ -628,8 +611,6 @@ async fn process_graph_challenge_for_graph(
         upsert_message(
             &mut storage_processor,
             false,
-            graph.graph_id,
-            None,
             SELF_SENDER.to_string(),
             actor,
             message_content,
@@ -757,14 +738,13 @@ async fn detect_watchtower_flow(
                 all_watchtower_branches_resolved = false;
             }
             Some(_) if !watchtower_timeout_spent => {
-                messages.push(DetectedGraphMessage::with_sub_type(
+                messages.push(DetectedGraphMessage::new(
                     Actor::Operator,
                     GOATMessageContent::WatchtowerChallengeSent(WatchtowerChallengeSent {
                         instance_id: graph.instance_id,
                         graph_id: graph.graph_id,
                         watchtower_index,
                     }),
-                    watchtower_index.to_string(),
                 ));
 
                 if !ack_spend_confirmed {
@@ -920,7 +900,7 @@ async fn detect_assert_sent_flow(
             continue;
         };
 
-        messages.push(DetectedGraphMessage::with_sub_type(
+        messages.push(DetectedGraphMessage::new(
             Actor::Operator,
             GOATMessageContent::ChallengeAssertSent(ChallengeAssertSent {
                 instance_id: graph.instance_id,
@@ -928,7 +908,6 @@ async fn detect_assert_sent_flow(
                 challenge_assert_txid,
                 verifier_index,
             }),
-            verifier_index.to_string(),
         ));
     }
 
@@ -941,7 +920,7 @@ async fn detect_assert_disprove_ready(
     local_db: &LocalDB,
     graph: &Graph,
     current_height: i64,
-) -> anyhow::Result<Option<(Actor, GOATMessageContent, Option<String>)>> {
+) -> anyhow::Result<Option<(Actor, GOATMessageContent)>> {
     let operator_assert_txid = match graph.operator_assert_txid.clone() {
         Some(operator_assert_txid) => operator_assert_txid.into(),
         None => {
@@ -1024,7 +1003,6 @@ async fn detect_assert_disprove_ready(
                     challenge_assert_txid: verifier_assert_txid,
                     verifier_index: index,
                 }),
-                Some(index.to_string()),
             )));
         }
     }
@@ -1249,8 +1227,6 @@ async fn detect_kickoff_ref_disprove_tx(
         upsert_message(
             &mut storage_processor,
             false,
-            graph.graph_id,
-            None,
             SELF_SENDER.to_string(),
             Actor::Committee,
             GOATMessageContent::DisproveSent(DisproveSent {
@@ -1451,8 +1427,6 @@ async fn check_pre_kickoff_sent(
             upsert_message(
                 &mut storage_processor,
                 false,
-                graph_id,
-                None,
                 SELF_SENDER.to_string(),
                 Actor::Verifier,
                 GOATMessageContent::PreKickoffSent(PreKickoffSent { instance_id, graph_id }),

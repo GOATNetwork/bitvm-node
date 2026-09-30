@@ -155,6 +155,7 @@ pub fn validate_timelock_config(network: Network, config: &TimelockConfig) -> Re
         ("operator_commit", config.operator_commit),
         ("connector_f", config.connector_f),
     ] {
+        ensure_bip68_height_based_sequence(name, value)?;
         if value < budget.reaction_blocks {
             bail!(
                 "timelock_config.{name} must be at least {} reaction blocks, got {value}",
@@ -207,6 +208,17 @@ pub fn validate_timelock_config(network: Network, config: &TimelockConfig) -> Re
         budget.confirmed_action_window(),
     )?;
 
+    Ok(())
+}
+
+const BIP68_BLOCKS_MASK: u32 = 0x0000_ffff;
+
+fn ensure_bip68_height_based_sequence(name: &str, value: u32) -> Result<()> {
+    if value & !BIP68_BLOCKS_MASK != 0 {
+        bail!(
+            "timelock_config.{name} must use a BIP68 height-based sequence value, got {value:#010x}"
+        );
+    }
     Ok(())
 }
 
@@ -289,6 +301,16 @@ mod tests {
         ] {
             assert_eq!(default_timelock_config(network), config);
             validate_timelock_config(network, &config).unwrap();
+        }
+    }
+
+    #[test]
+    fn rejects_non_height_based_bip68_sequences() {
+        assert!(ensure_bip68_height_based_sequence("test", BIP68_BLOCKS_MASK).is_ok());
+
+        for invalid in [1 << 16, 1 << 22, 1 << 31] {
+            let error = ensure_bip68_height_based_sequence("test", invalid).unwrap_err();
+            assert!(error.to_string().contains("BIP68 height-based sequence"));
         }
     }
 }

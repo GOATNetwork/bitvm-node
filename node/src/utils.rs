@@ -1,6 +1,7 @@
 use crate::action::{
-    ChallengeSent, DisproveSent, GOATMessage, GOATMessageContent, KickoffSent, NodeInfo,
-    PreKickoffSent, SolderingProofReady, Take1Sent, Take2Sent, send_to_peer,
+    BusinessRef, ChallengeSent, DisproveSent, GOATMessage, GOATMessageContent, HasBusinessRef,
+    KickoffSent, LocalMessageKey, MessageKind, NodeInfo, PreKickoffSent, SolderingProofReady,
+    Take1Sent, Take2Sent, send_to_peer,
 };
 use crate::env::*;
 use crate::error::SpecialError;
@@ -78,7 +79,6 @@ use crate::rpc_service::routes::v1::{
     NODES_OPERATOR_BASE, NODES_WATCHTOWER_BASE, PROOFS_WATCHTOWER_PROOF_TIMEOUT,
 };
 
-use crate::scheduled_tasks::get_goat_message_content_type;
 use crate::scheduled_tasks::graph_maintenance_tasks::{
     ChallengeSubStatus, VerifierChallengeStatus,
 };
@@ -98,9 +98,8 @@ use proof_builder::{
 };
 use store::{
     BridgeOutGlobalStats, ByteArray32, Graph, GraphRawData, GraphStatus, GraphStatusSource,
-    GraphStatusTransitionOutcome, Instance, InstanceBridgeInStatus, Message, MessageState,
-    MessageType, Node, PeginGraphProcessData, PeginInstanceProcessData, SerializableTxid,
-    UInt64Array3,
+    GraphStatusTransitionOutcome, Instance, InstanceBridgeInStatus, Message, MessageState, Node,
+    PeginGraphProcessData, PeginInstanceProcessData, SerializableTxid, UInt64Array3,
 };
 use stun_client::{Attribute, Class, Client};
 use tracing::{error, info, warn};
@@ -230,12 +229,9 @@ pub async fn validate_graph_instance_parameters(
     goat_client: &GOATClient,
     parameters: &BitvmGcInstanceParameters,
 ) -> Result<()> {
-    let expected =
-        read_instance_info_from_goat(goat_client, parameters.instance_id).await.map_err(|e| {
-            SpecialError::InvalidGraph(format!(
-                "failed to load instance parameters from GoatChain: {e}"
-            ))
-        })?;
+    let expected = read_instance_info_from_goat(goat_client, parameters.instance_id)
+        .await
+        .context("failed to load instance parameters from GoatChain")?;
     if parameters != &expected {
         bail!(SpecialError::InvalidGraph(
             "instance parameters mismatch with GoatChain peg-in data".to_string()
@@ -243,11 +239,8 @@ pub async fn validate_graph_instance_parameters(
     }
 
     for input in &expected.user_info.inputs {
-        let funding_tx = btc_client.get_tx(&input.outpoint.txid).await.map_err(|e| {
-            SpecialError::InvalidGraph(format!(
-                "failed to load peg-in funding transaction {}: {e}",
-                input.outpoint.txid
-            ))
+        let funding_tx = btc_client.get_tx(&input.outpoint.txid).await.with_context(|| {
+            format!("failed to load peg-in funding transaction {}", input.outpoint.txid)
         })?;
         let Some(funding_tx) = funding_tx else {
             bail!(SpecialError::InvalidGraph(format!(
@@ -284,11 +277,7 @@ pub async fn validate_graph_instance_parameters(
     if btc_client
         .get_tx(&pegin_deposit_txid)
         .await
-        .map_err(|e| {
-            SpecialError::InvalidGraph(format!(
-                "failed to load peg-in deposit transaction {pegin_deposit_txid}: {e}"
-            ))
-        })?
+        .with_context(|| format!("failed to load peg-in deposit transaction {pegin_deposit_txid}"))?
         .is_none()
     {
         bail!(SpecialError::InvalidGraph(format!(
@@ -311,7 +300,7 @@ fn validate_graph_policy(parameters: &BitvmGcGraphParameters) -> Result<()> {
 
     let mut verifier_pubkeys = std::collections::HashSet::new();
     for gc_data in &parameters.gc_data {
-        if !verifier_pubkeys.insert(gc_data.verifier_pubkey) {
+        if !verifier_pubkeys.insert(XOnlyPublicKey::from(gc_data.verifier_pubkey)) {
             bail!(SpecialError::InvalidGraph(format!(
                 "duplicate verifier pubkey in GC data: {}",
                 gc_data.verifier_pubkey
@@ -456,20 +445,25 @@ pub async fn validate_init_graph_base(
     Ok(())
 }
 
-/// Verify the stake conditions required for an operator to create a graph.
-/// This mirrors the Gateway graph-posting requirement and is shared by graph
-/// validation and the early InitGraph admission check.
-pub async fn validate_operator_stake(
+/// Operator stake verdict; RPC failures are returned as errors.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OperatorStakeStatus {
+    Staked,
+    NotRegistered,
+    Insufficient { locked: u64, min: u64 },
+}
+
+pub async fn operator_stake_status(
     goat_client: &GOATClient,
     operator_pubkey: &PublicKey,
-) -> Result<()> {
+) -> Result<OperatorStakeStatus> {
     let operator_xonly_pubkey = XOnlyPublicKey::from(*operator_pubkey).serialize();
     let operator_addr = goat_client
         .stake_mana_pubkey_to_address(&operator_xonly_pubkey)
         .await
         .context("query operator address")?;
     if operator_addr == [0; 20] {
-        bail!("operator not registered");
+        return Ok(OperatorStakeStatus::NotRegistered);
     }
     let min_stake_amount =
         goat_client.gateway_get_min_stake_amount().await.context("query minimum operator stake")?;
@@ -478,14 +472,31 @@ pub async fn validate_operator_stake(
         .await
         .context("query operator locked stake")?;
     if locked_stake < min_stake_amount {
-        bail!("insufficient operator stake: locked={locked_stake}, min={min_stake_amount}");
+        return Ok(OperatorStakeStatus::Insufficient {
+            locked: locked_stake,
+            min: min_stake_amount,
+        });
     }
-    Ok(())
+    Ok(OperatorStakeStatus::Staked)
 }
 
-pub fn validate_verifier_graph_params_endorsements(
+pub async fn validate_operator_stake(
+    goat_client: &GOATClient,
+    operator_pubkey: &PublicKey,
+) -> Result<()> {
+    match operator_stake_status(goat_client, operator_pubkey).await? {
+        OperatorStakeStatus::Staked => Ok(()),
+        OperatorStakeStatus::NotRegistered => bail!("operator not registered"),
+        OperatorStakeStatus::Insufficient { locked, min } => {
+            bail!("insufficient operator stake: locked={locked}, min={min}")
+        }
+    }
+}
+
+pub async fn validate_verifier_graph_params_endorsements(
+    goat_client: &GOATClient,
     graph: &SimplifiedBitvmGcGraph,
-    verifier_endorsements: &[(PublicKey, usize, SchnorrSignature)],
+    verifier_endorsements: &[(PublicKey, usize, String, SchnorrSignature)],
 ) -> Result<()> {
     let expected_verifier_num = graph.parameters.gc_data.len();
     if verifier_endorsements.len() != expected_verifier_num {
@@ -498,7 +509,13 @@ pub fn validate_verifier_graph_params_endorsements(
 
     let mut seen_pubkeys = std::collections::HashSet::new();
     let mut seen_indices = std::collections::HashSet::new();
-    for (verifier_pubkey, verifier_index, signature) in verifier_endorsements {
+    let mut seen_peers = std::collections::HashSet::new();
+    for (verifier_pubkey, verifier_index, verifier_peer_id, signature) in verifier_endorsements {
+        let peer =
+            PeerId::from_str(verifier_peer_id).context("invalid verifier endorsement peer")?;
+        if !seen_peers.insert(peer) {
+            bail!(SpecialError::InvalidGraph("duplicate verifier endorsement peer".into()));
+        }
         if *verifier_index >= expected_verifier_num {
             bail!(SpecialError::InvalidGraph(format!(
                 "verifier params endorsement index {verifier_index} out of range"
@@ -511,7 +528,7 @@ pub fn validate_verifier_graph_params_endorsements(
                 verifier_pubkey
             )));
         }
-        if !seen_pubkeys.insert(*verifier_pubkey) {
+        if !seen_pubkeys.insert(XOnlyPublicKey::from(*verifier_pubkey)) {
             bail!(SpecialError::InvalidGraph(format!(
                 "duplicate verifier params endorsement pubkey: {verifier_pubkey}"
             )));
@@ -529,6 +546,18 @@ pub fn validate_verifier_graph_params_endorsements(
         }
     }
 
+    for (_, _, peer, _) in verifier_endorsements {
+        let peer = PeerId::from_str(peer)?;
+        if !goat_client
+            .committee_mana_is_verifier(&peer.to_bytes())
+            .await
+            .context("recheck verifier registration before committee setup")?
+        {
+            bail!(SpecialError::InvalidGraph(
+                "endorsement peer is not a registered verifier".into()
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -537,11 +566,10 @@ pub async fn validate_init_graph(
     btc_client: &BTCClient,
     goat_client: &GOATClient,
     graph: &SimplifiedBitvmGcGraph,
-    verifier_endorsements: &[(PublicKey, usize, SchnorrSignature)],
+    verifier_endorsements: &[(PublicKey, usize, String, SchnorrSignature)],
 ) -> Result<()> {
     validate_init_graph_base(local_db, btc_client, goat_client, graph).await?;
-    validate_verifier_graph_params_endorsements(graph, verifier_endorsements)?;
-    Ok(())
+    validate_verifier_graph_params_endorsements(goat_client, graph, verifier_endorsements).await
 }
 pub async fn validate_finalized_graph(
     btc_client: &BTCClient,
@@ -713,8 +741,8 @@ pub fn challenge_amount() -> Amount {
     Amount::from_sat(20000)
 }
 pub fn prekickoff_fee_amount(replenish_fee_inputs_num: usize) -> Amount {
-    let tx_vbytes =
-        PRE_KICKOFF_BASE_VBYTES + (replenish_fee_inputs_num as u64 * CHEKSIG_P2WSH_INPUT_VBYTES);
+    let tx_vbytes = PRE_KICKOFF_BASE_VBYTES
+        + (replenish_fee_inputs_num as u64 * CHECKSIG_P2WSH_INPUT_VBYTES_ESTIMATE);
     Amount::from_sat(tx_vbytes)
 }
 pub mod evm_swap_utils {
@@ -1754,8 +1782,7 @@ fn compensation_previous_status(status: GraphStatus) -> Option<GraphStatus> {
         OperatorKickOff => Some(PreKickoff),
         OperatorTake1 | Challenge => Some(OperatorKickOff),
         Disprove | OperatorTake2 => Some(Challenge),
-        OperatorPresigned | Created | Presigned | L2Recorded | OperatorKickOffing | Challenging
-        | Disproving => None,
+        OperatorPresigned => None,
     }
 }
 
@@ -1789,13 +1816,15 @@ fn compensation_events_from(
 
 async fn upsert_graph_compensate_message(
     local_db: &LocalDB,
-    graph_id: Uuid,
-    sub_type: Option<String>,
     actor: Actor,
     message_content: GOATMessageContent,
 ) -> Result<()> {
-    let message_type = get_goat_message_content_type(&message_content);
-    let message_id = generate_message_id(graph_id, message_type.to_string(), sub_type.clone());
+    let key = LocalMessageKey::from_content(actor.clone(), &message_content)?;
+    let graph_id = match message_content.business_ref() {
+        BusinessRef::Graph { graph_id, .. } => graph_id,
+        _ => bail!("graph compensation message must be graph-scoped"),
+    };
+    let message_id = key.message_id();
     let mut storage_processor = local_db.start_transaction().await?;
     if !storage_processor.insert_graph_compensation_marker(graph_id, &message_id).await? {
         storage_processor.commit().await?;
@@ -1805,8 +1834,6 @@ async fn upsert_graph_compensate_message(
     upsert_message(
         &mut storage_processor,
         false,
-        graph_id,
-        sub_type,
         SELF_SENDER.to_string(),
         actor,
         message_content,
@@ -1819,14 +1846,13 @@ async fn upsert_graph_compensate_message(
 
 async fn push_graph_compensate_message(
     local_db: &LocalDB,
-    graph_id: Uuid,
     actor: Actor,
     message_content: GOATMessageContent,
 ) -> Result<()> {
     // Unlike an action retry, an inferred chain event must not reset an
     // existing queued message. This makes compensation safe to retry when the
     // status write committed before the message was persisted.
-    upsert_graph_compensate_message(local_db, graph_id, None, actor, message_content).await
+    upsert_graph_compensate_message(local_db, actor, message_content).await
 }
 
 #[allow(dead_code)]
@@ -1875,7 +1901,6 @@ pub(crate) async fn compensate_graph_events(
             GraphCompensateEventKind::PreKickoffSent => {
                 push_graph_compensate_message(
                     local_db,
-                    graph_id,
                     Actor::Verifier,
                     GOATMessageContent::PreKickoffSent(PreKickoffSent { instance_id, graph_id }),
                 )
@@ -1884,7 +1909,6 @@ pub(crate) async fn compensate_graph_events(
             GraphCompensateEventKind::KickoffSent => {
                 push_graph_compensate_message(
                     local_db,
-                    graph_id,
                     Actor::All,
                     GOATMessageContent::KickoffSent(KickoffSent { instance_id, graph_id }),
                 )
@@ -1893,7 +1917,6 @@ pub(crate) async fn compensate_graph_events(
             GraphCompensateEventKind::Take1Sent => {
                 push_graph_compensate_message(
                     local_db,
-                    graph_id,
                     Actor::Committee,
                     GOATMessageContent::Take1Sent(Take1Sent { instance_id, graph_id }),
                 )
@@ -1903,7 +1926,6 @@ pub(crate) async fn compensate_graph_events(
                 if let Some(challenge_txid) = scan.challenge_txid {
                     push_graph_compensate_message(
                         local_db,
-                        graph_id,
                         Actor::Operator,
                         GOATMessageContent::ChallengeSent(ChallengeSent {
                             instance_id,
@@ -1922,8 +1944,6 @@ pub(crate) async fn compensate_graph_events(
                 })?;
                 upsert_graph_compensate_message(
                     local_db,
-                    graph_id,
-                    Some(disprove.index.to_string()),
                     Actor::Committee,
                     GOATMessageContent::DisproveSent(DisproveSent {
                         instance_id,
@@ -1939,7 +1959,6 @@ pub(crate) async fn compensate_graph_events(
             GraphCompensateEventKind::Take2Sent => {
                 push_graph_compensate_message(
                     local_db,
-                    graph_id,
                     Actor::Committee,
                     GOATMessageContent::Take2Sent(Take2Sent { instance_id, graph_id }),
                 )
@@ -3066,7 +3085,7 @@ pub async fn get_proper_utxo_set(
     fn estimate_tx_vbytes(base_vbytes: u64, extra_inputs: usize, extra_outputs: usize) -> u64 {
         // p2wsh inputs/outputs
         base_vbytes
-            + (extra_inputs as u64 * CHEKSIG_P2WSH_INPUT_VBYTES)
+            + (extra_inputs as u64 * CHECKSIG_P2WSH_INPUT_VBYTES_ESTIMATE)
             + (extra_outputs as u64 * P2WSH_OUTPUT_VBYTES)
     }
     fn to_input(utxos: Vec<Utxo>) -> Vec<Input> {
@@ -3172,8 +3191,9 @@ pub async fn get_proper_utxo_sets(
 
             let n_inputs = tx_ins.len() as u64;
             let n_outputs = base_outputs.len() as u64 + 1;
-            let est_vbytes =
-                100u64 + n_inputs * CHEKSIG_P2WSH_INPUT_VBYTES + n_outputs * P2WSH_OUTPUT_VBYTES;
+            let est_vbytes = 100u64
+                + n_inputs * CHECKSIG_P2WSH_INPUT_VBYTES_ESTIMATE
+                + n_outputs * P2WSH_OUTPUT_VBYTES;
             let est_fee_sat = (est_vbytes as f64 * fee_rate).ceil() as u64;
 
             if total_available_sat < total_target_sat + est_fee_sat {
@@ -3257,16 +3277,13 @@ pub async fn build_genesis_prekickoff_tx(
     let next_kickoff_connector = KickoffConnector::new(network, &operator_taproot_public_key);
     let next_prekickoff_connector = PrekickoffConnector::new(network, &operator_taproot_public_key);
     let init_amount = prekickoff_replenishment_amount();
-    let cur_prekickoff_connector_input = Input {
-        outpoint: fund_address(
-            btc_client,
-            node_keypair,
-            cur_prekickoff_connector.generate_taproot_address(),
-            init_amount,
-        )
-        .await?,
-        amount: init_amount,
-    };
+    let cur_prekickoff_connector_input = genesis_funding_input(
+        btc_client,
+        node_keypair,
+        cur_prekickoff_connector.generate_taproot_address(),
+        init_amount,
+    )
+    .await?;
     let fee_amount = prekickoff_fee_amount(0);
     PrekickoffTransaction::new_for_validation(
         &cur_prekickoff_connector,
@@ -3281,6 +3298,26 @@ pub async fn build_genesis_prekickoff_tx(
         verifier_num,
     )
     .map_err(|e| anyhow::anyhow!("failed to create pre-kickoff txn: {e}"))
+}
+
+/// Reuse a matching unspent output, or fund the genesis address.
+async fn genesis_funding_input(
+    btc_client: &BTCClient,
+    node_keypair: Keypair,
+    address: Address,
+    amount: Amount,
+) -> Result<Input> {
+    let existing = btc_client
+        .get_address_utxo(address.clone())
+        .await?
+        .into_iter()
+        .filter(|utxo| utxo.value == amount)
+        .min_by_key(|utxo| (utxo.txid, utxo.vout));
+    let outpoint = match existing {
+        Some(utxo) => OutPoint { txid: utxo.txid, vout: utxo.vout },
+        None => fund_address(btc_client, node_keypair, address, amount).await?,
+    };
+    Ok(Input { outpoint, amount })
 }
 
 pub async fn build_prekickoff_params(
@@ -3751,39 +3788,29 @@ pub async fn outpoint_spent_txin(
     }
 }
 
-fn generate_message_id(business_id: Uuid, msg_type: String, sub_type: Option<String>) -> String {
-    match sub_type {
-        Some(sub_type) => {
-            format!("{business_id}_{msg_type}_{sub_type}")
-        }
-        None => format!("{business_id}_{msg_type}"),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
 pub async fn upsert_message(
     storage_processor: &mut StorageProcessor<'_>,
     is_update: bool,
-    business_id: Uuid,
-    sub_type: Option<String>,
     from_peer: String,
     actor: Actor,
     message_content: GOATMessageContent,
     weight: i64,
     lock_time: i64,
-) -> Result<()> {
+) -> Result<bool> {
+    let key = LocalMessageKey::from_content(actor.clone(), &message_content)?;
+    let business_id = key.business_id();
+    let message_id = key.message_id();
+    let msg_type = message_content.kind();
     let message = GOATMessage::new(actor.clone(), message_content.clone());
-    let msg_type = get_goat_message_content_type(&message_content);
-    let message_id = generate_message_id(business_id, msg_type.to_string().clone(), sub_type);
     if is_update || storage_processor.find_messages_by_id(&message_id).await?.is_none() {
         if let Some(cancel_msg_type) = match msg_type {
-            MessageType::AssertSent => Some(MessageType::WatchtowerChallengeInitSent),
+            MessageKind::AssertSent => Some(MessageKind::WatchtowerChallengeInitSent),
             _ => None,
         } {
             notify_to_cancel_proof_task(storage_processor, business_id, cancel_msg_type).await?;
         }
 
-        storage_processor
+        return storage_processor
             .upsert_message(Message {
                 message_id,
                 business_id,
@@ -3795,23 +3822,26 @@ pub async fn upsert_message(
                 lock_time_until: current_time_secs() + lock_time,
                 state: MessageState::Pending.to_string(),
                 message_version: 0,
+                attempt_count: 0,
+                abandon_count: 0,
+                last_error: None,
                 created_at: 0,
             })
-            .await?;
+            .await;
     } else {
         info!("{message_id} is already created for create action");
     }
 
-    Ok(())
+    Ok(false)
 }
 
 pub async fn notify_to_cancel_proof_task(
     storage_processor: &mut StorageProcessor<'_>,
     business_id: Uuid,
-    msg_type: MessageType,
+    msg_type: MessageKind,
 ) -> Result<()> {
     // AssertInitSent is removed; update related logic if needed;
-    if !matches!(msg_type, MessageType::WatchtowerChallengeInitSent) {
+    if !matches!(msg_type, MessageKind::WatchtowerChallengeInitSent) {
         warn!("notify_to_cancel_proof_task: input wrong message type:{msg_type}");
         return Ok(());
     }
@@ -3831,7 +3861,7 @@ pub async fn notify_to_cancel_proof_task(
         storage_processor.find_message_by_business_id(&business_id, &msg_type.to_string()).await?
         && let Some(graph) = storage_processor.find_graph(&business_id).await?
     {
-        if MessageState::Pending.to_string() != message.state {
+        if !matches!(message.state.as_str(), "Pending" | "Processing") {
             warn!(
                 "message {business_id}, msg_type: {msg_type} no need to cancel.as state is {}",
                 message.state
@@ -3842,7 +3872,7 @@ pub async fn notify_to_cancel_proof_task(
         // It will only be called a few times under limited conditions, so we just create a new object
         let http_client = HttpAsyncClient::new(None);
         let notify_result = match msg_type {
-            MessageType::WatchtowerChallengeInitSent => {
+            MessageKind::WatchtowerChallengeInitSent => {
                 let url = host.join(PROOFS_WATCHTOWER_PROOF_TIMEOUT)?;
                 let payload = WatchtowerProofTimeoutUpdateRequest {
                     instance_id: graph.instance_id.to_string(),
@@ -3873,12 +3903,7 @@ pub async fn notify_to_cancel_proof_task(
         if notify_result {
             // cancel unfinished p2p message; when notify success!
             storage_processor
-                .update_messages_state_by_business_id(
-                    &business_id,
-                    Some(msg_type.to_string()),
-                    MessageState::Pending.to_string(),
-                    MessageState::Cancelled.to_string(),
-                )
+                .cancel_messages_by_business_id(&business_id, Some(msg_type.to_string()))
                 .await?;
         }
     } else {
@@ -4093,10 +4118,11 @@ fn validate_node_socket_addr(socket_addr: &str) -> std::result::Result<(), Strin
 }
 
 pub async fn save_node_info(local_db: &LocalDB, node_info: &NodeInfo) -> Result<()> {
-    info!("save_node_info for {}", node_info.peer_id);
+    // Reachable once per announcement from any peer: not louder than debug.
+    tracing::debug!("save_node_info for {}", node_info.peer_id);
     let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
     let mut storage_process = local_db.acquire().await?;
-    let _ = storage_process
+    storage_process
         .upsert_node(&Node {
             peer_id: node_info.peer_id.clone(),
             actor: node_info.actor.clone(),
@@ -4107,10 +4133,12 @@ pub async fn save_node_info(local_db: &LocalDB, node_info: &NodeInfo) -> Result<
             reward: "0".to_string(),
             service_fee_rate: node_info.service_fee_rate,
             available_peg_btc: node_info.available_peg_btc.clone(),
+            binding_sig: node_info.binding_sig.clone(),
+            binding_issued_at: node_info.binding_issued_at,
             updated_at: current_time,
             created_at: current_time,
         })
-        .await;
+        .await?;
     Ok(())
 }
 
@@ -4131,7 +4159,7 @@ pub async fn save_local_info(local_db: &LocalDB) {
 }
 
 pub async fn update_node_timestamp(local_db: &LocalDB, peer_id: &str) -> Result<()> {
-    tracing::info!("update timestamp for {peer_id}");
+    tracing::debug!("update timestamp for {peer_id}");
     let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
     let mut storage_process = local_db.acquire().await?;
     match storage_process.update_node_timestamp(peer_id, current_time).await {
@@ -4230,29 +4258,27 @@ pub fn reflect_goat_address(addr_op: Option<String>) -> (bool, Option<String>) {
     (false, None)
 }
 
-pub async fn pop_batch_local_unhandle_msg(
+/// Sweep the local queue and list the messages the dispatcher may attempt now.
+///
+/// Returns `(candidates, quarantined)`. Nothing returned here is claimed yet:
+/// the dispatcher claims each row immediately before dispatching it, so a
+/// crash mid-dispatch is charged to that one row rather than to the whole
+/// batch. Expired rows are retired and exhausted rows quarantined first.
+pub async fn list_batch_local_msg(
     local_db: &LocalDB,
-    _actor: Actor,
-    lock_time_until: i64,
-    offset: i64,
+    max_abandons: i64,
     limit: i64,
-) -> Result<Vec<Message>> {
+) -> Result<(Vec<Message>, u64)> {
     let mut tx = local_db.start_transaction().await?;
     let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
-    tx.set_messages_expired(current_time - MESSAGE_EXPIRE_TIME).await?;
-    tx.delete_old_messages(current_time - MESSAGE_EXPIRE_TIME).await?;
-    let messages = tx
-        .filter_messages(
-            MessageState::Pending.to_string(),
-            0,
-            lock_time_until,
-            current_time - MESSAGE_EXPIRE_TIME,
-            limit,
-            offset,
-        )
-        .await?;
+    let expired_before = current_time - MESSAGE_EXPIRE_TIME;
+    tx.set_messages_expired(expired_before).await?;
+    tx.delete_old_messages(expired_before).await?;
+    let quarantined = tx.quarantine_local_messages(current_time, max_abandons).await?;
+    let messages =
+        tx.list_claimable_local_messages(current_time, expired_before, limit, max_abandons).await?;
     tx.commit().await?;
-    Ok(messages)
+    Ok((messages, quarantined))
 }
 
 pub async fn operator_scan_ready_proof(
@@ -4296,6 +4322,7 @@ pub struct GraphProcessDataItem {
     pub endorse_signature: Vec<u8>,
     pub params_endorse_signature: Vec<u8>,
     pub verifier_index: Option<usize>,
+    pub verifier_peer_id: Option<String>,
     pub verifier_params_signature: Option<SchnorrSignature>,
 }
 pub type GraphProcessDataMap = IndexMap<PublicKey, GraphProcessDataItem>;
@@ -4499,15 +4526,19 @@ pub async fn get_instance_parameters(
     instance_id: Uuid,
 ) -> Result<Option<BitvmGcInstanceParameters>> {
     let mut storage_processor = local_db.acquire().await?;
-    if let Some(instance) = storage_processor.find_instance(&instance_id).await? {
-        Ok(if let Some(parameters) = instance.parameters {
-            Some(serde_json::from_str(&parameters)?)
-        } else {
-            gen_instance_parameters_local(&instance).ok()
-        })
-    } else {
-        Ok(None)
+    let Some(instance) = storage_processor.find_instance(&instance_id).await? else {
+        return Ok(None);
+    };
+
+    if let Some(parameters) = instance.parameters {
+        return Ok(Some(serde_json::from_str(&parameters)?));
     }
+
+    Ok(Some(
+        gen_instance_parameters_local(&instance).with_context(|| {
+            format!("failed to reconstruct parameters for instance {instance_id}")
+        })?,
+    ))
 }
 
 fn convert_graph(
@@ -5124,12 +5155,9 @@ pub async fn find_pegin_graph_process_data(
     storage_processor: &mut StorageProcessor<'_>,
     graph_id: Uuid,
 ) -> Result<(bool, GraphProcessDataMap)> {
-    if let Ok(Some(data)) = storage_processor.find_pegin_graph_process_data(&graph_id).await
-        && let Ok(process_data) = serde_json::from_str(data.process_data.as_str())
-    {
-        Ok((data.is_endorsed, process_data))
-    } else {
-        Ok((false, IndexMap::new()))
+    match storage_processor.find_pegin_graph_process_data(&graph_id).await? {
+        Some(data) => Ok((data.is_endorsed, serde_json::from_str(&data.process_data)?)),
+        None => Ok((false, IndexMap::new())),
     }
 }
 
@@ -5442,11 +5470,22 @@ pub async fn store_verifier_graph_params_endorsement(
     graph_id: Uuid,
     verifier_pubkey: PublicKey,
     verifier_index: usize,
+    verifier_peer_id: &str,
     signature: SchnorrSignature,
 ) -> Result<()> {
     let mut storage_processor = local_db.acquire().await?;
     let (is_endorsed, mut process_data) =
         find_pegin_graph_process_data(&mut storage_processor, graph_id).await?;
+    for (key, item) in &process_data {
+        if let Some(peer) = &item.verifier_peer_id
+            && ((*key == verifier_pubkey && peer != verifier_peer_id)
+                || (*key != verifier_pubkey
+                    && (peer == verifier_peer_id
+                        || XOnlyPublicKey::from(*key) == XOnlyPublicKey::from(verifier_pubkey))))
+        {
+            bail!(SpecialError::InvalidGraph("conflicting verifier peer/key binding".into()));
+        }
+    }
     if let Some(existing_index) = process_data.get(&verifier_pubkey).and_then(|v| v.verifier_index)
         && existing_index != verifier_index
     {
@@ -5466,10 +5505,12 @@ pub async fn store_verifier_graph_params_endorsement(
         .entry(verifier_pubkey)
         .and_modify(|v| {
             v.verifier_index = Some(verifier_index);
+            v.verifier_peer_id = Some(verifier_peer_id.to_owned());
             v.verifier_params_signature = Some(signature);
         })
         .or_insert_with(|| GraphProcessDataItem {
             verifier_index: Some(verifier_index),
+            verifier_peer_id: Some(verifier_peer_id.to_owned()),
             verifier_params_signature: Some(signature),
             ..Default::default()
         });
@@ -5488,7 +5529,7 @@ pub async fn get_verifier_graph_params_endorsements_for_graph(
     local_db: &LocalDB,
     _instance_id: Uuid,
     graph_id: Uuid,
-) -> Result<Vec<(PublicKey, usize, SchnorrSignature)>> {
+) -> Result<Vec<(PublicKey, usize, String, SchnorrSignature)>> {
     let mut storage_processor = local_db.acquire().await?;
     let (_is_endorsed, process_data) =
         find_pegin_graph_process_data(&mut storage_processor, graph_id).await?;
@@ -5497,7 +5538,8 @@ pub async fn get_verifier_graph_params_endorsements_for_graph(
         .filter_map(|(k, v)| {
             v.verifier_index
                 .zip(v.verifier_params_signature.as_ref())
-                .map(|(index, signature)| (*k, index, *signature))
+                .zip(v.verifier_peer_id.as_ref())
+                .map(|((index, signature), peer)| (*k, index, peer.clone(), *signature))
         })
         .collect())
 }
@@ -5852,14 +5894,7 @@ pub(crate) async fn obsolete_graph(
     // `None` means no message-type filter: cancel every durable pending message
     // for this terminal graph so stale retries cannot consume queue capacity or
     // trigger a later graph action.
-    storage_processor
-        .update_messages_state_by_business_id(
-            &graph_id,
-            None,
-            MessageState::Pending.to_string(),
-            MessageState::Cancelled.to_string(),
-        )
-        .await?;
+    storage_processor.cancel_messages_by_business_id(&graph_id, None).await?;
     Ok(true)
 }
 
@@ -5903,8 +5938,15 @@ pub fn gen_instance_parameters_local(
     let committee_pubkeys: Vec<PublicKey> = instance
         .committees_answers
         .iter()
-        .map(|(_k, v)| PublicKey::from_slice(v).unwrap())
-        .collect();
+        .map(|(committee, pubkey)| {
+            PublicKey::from_slice(pubkey).with_context(|| {
+                format!(
+                    "invalid committee public key for committee {committee} in instance {}",
+                    instance.instance_id
+                )
+            })
+        })
+        .collect::<anyhow::Result<_>>()?;
 
     let committee_agg_pubkey = generate_n_of_n_public_key(&committee_pubkeys).0;
     let utxos: Vec<client::Utxo> = serde_json::from_str(&instance.input_utxos)?;
@@ -6033,7 +6075,12 @@ pub async fn get_largest_watchtower_challenge_block(
                 if let Some(block_height) = tx_status.block_height {
                     if block_height > largest_watchtower_challenge_block_height {
                         largest_watchtower_challenge_block_height = block_height;
-                        largest_watchtower_challenge_block_hash = tx_status.block_hash.unwrap();
+                        largest_watchtower_challenge_block_hash = tx_status.block_hash.ok_or_else(|| {
+                            anyhow!(
+                                "Watchtower challenge tx {txid} for graph {}, index: {watchtower_index} is confirmed at height {block_height} without a block hash",
+                                graph.parameters.graph_id
+                            )
+                        })?;
                     }
                 } else {
                     anyhow::bail!(
@@ -6580,6 +6627,7 @@ mod node_info_tests {
             node_name: "zkm".to_string(),
             service_fee_rate: 0.001,
             available_peg_btc: "1000".to_string(),
+            ..Default::default()
         }
     }
 

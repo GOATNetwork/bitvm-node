@@ -17,12 +17,12 @@ use crate::rpc_service::handler::{
     get_chain_proof_desc, get_graph, get_graph_neighbor_ids, get_graph_tx, get_graph_txn,
     get_graphs, get_instance, get_instances, get_instances_overview, get_node, get_nodes,
     get_nodes_overview, get_operator_proof_desc, get_ready_to_kickoff_graph, get_swap, get_swaps,
-    get_unsigned_pegin_txn, instance_settings, pegout, send_challenge,
+    get_unsigned_pegin_txn, instance_settings, pegout,
 };
 #[cfg(feature = "rpc-debug-endpoints")]
 use crate::rpc_service::handler::{
     get_debug_message_details, get_debug_status, get_graph_debug_messages,
-    get_instance_debug_messages, send_verifier_challenge,
+    get_instance_debug_messages, send_challenge, send_verifier_challenge,
 };
 use anyhow::Context;
 use axum::body::Body;
@@ -172,12 +172,11 @@ pub(crate) fn build_business_router(app_state: Arc<AppState>) -> Router {
         .route(routes::v1::DEBUG_INSTANCE_MESSAGES, get(get_instance_debug_messages))
         .route(routes::v1::DEBUG_MESSAGE_DETAILS, get(get_debug_message_details));
 
-    let signed_routes = Router::new()
-        .route(routes::v1::GRAPHS_SEND_CHALLENGE, post(send_challenge))
-        .route(routes::v1::PEGOUT, post(pegout));
+    let signed_routes = Router::new().route(routes::v1::PEGOUT, post(pegout));
 
     #[cfg(feature = "rpc-debug-endpoints")]
     let signed_routes = signed_routes
+        .route(routes::v1::GRAPHS_SEND_CHALLENGE, post(send_challenge))
         .route(routes::v1::GRAPHS_SEND_VERIFIER_CHALLENGE, post(send_verifier_challenge));
 
     let signed_routes = signed_routes
@@ -188,6 +187,17 @@ pub(crate) fn build_business_router(app_state: Arc<AppState>) -> Router {
 
 pub async fn serve_with_app_state(
     addr: String,
+    app_state: Arc<AppState>,
+    cancellation_token: CancellationToken,
+) -> anyhow::Result<String> {
+    let listener = TcpListener::bind(&addr)
+        .await
+        .with_context(|| format!("failed to bind RPC listener to {addr}"))?;
+    serve_with_listener(listener, app_state, cancellation_token).await
+}
+
+async fn serve_with_listener(
+    listener: TcpListener,
     app_state: Arc<AppState>,
     cancellation_token: CancellationToken,
 ) -> anyhow::Result<String> {
@@ -236,9 +246,6 @@ pub async fn serve_with_app_state(
         )
         .layer(middleware::from_fn_with_state(app_state, metrics_middleware));
 
-    let listener = TcpListener::bind(&addr)
-        .await
-        .with_context(|| format!("failed to bind RPC listener to {addr}"))?;
     let listening_addr =
         listener.local_addr().context("failed to determine RPC listener address")?;
     tracing::info!(
@@ -361,7 +368,7 @@ mod tests {
         InstanceListResponse, InstanceOverviewResponse, InstanceSettingResponse,
     };
     use crate::rpc_service::node::{NodeListResponse, NodeOverViewResponse};
-    use crate::rpc_service::{self, Actor, current_time_secs, routes};
+    use crate::rpc_service::{self, Actor, AppState, current_time_secs, routes};
     use crate::utils::{
         generate_local_key, generate_random_bytes, get_rand_btc_address_p2wpkh,
         get_rand_goat_address, temp_sqlite_db_path,
@@ -381,7 +388,7 @@ mod tests {
         Graph, GraphStatus, GraphStatusSource, Instance, InstanceBridgeInStatus, Node,
         create_local_db,
     };
-    use tokio::time::sleep;
+    use tokio::{net::TcpListener, time::sleep};
     use tokio_util::sync::CancellationToken;
     use tracing::{error, info};
     use tracing_subscriber::EnvFilter;
@@ -472,11 +479,6 @@ mod tests {
         let _ = tracing_subscriber::fmt().with_env_filter(EnvFilter::from_default_env()).try_init();
     }
 
-    fn available_addr() -> String {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.local_addr().unwrap().to_string()
-    }
-
     async fn spawn_metrics_listener(
         app_state: Arc<rpc_service::AppState>,
         metrics_path: &str,
@@ -536,8 +538,7 @@ mod tests {
         let keypair = set_test_auth_key();
         let cancellation_token = CancellationToken::new();
         let (addr, server) = spawn_business_listener(cancellation_token.clone()).await?;
-        let graph_id = Uuid::new_v4();
-        let request_target = format!("/v1/graphs/{graph_id}/send-challenge");
+        let request_target = routes::v1::PEGOUT.to_owned();
         let url = format!("http://{addr}{request_target}");
         let (timestamp, nonce, signature) =
             sign_request_auth(&keypair, &Method::POST, &request_target, &[]);
@@ -550,7 +551,7 @@ mod tests {
             .header(AUTH_SIGNATURE_HEADER, &signature)
             .send()
             .await?;
-        assert_eq!(first.status().as_u16(), 500);
+        assert_ne!(first.status().as_u16(), 409);
 
         let replay = client
             .post(&url)
@@ -612,11 +613,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn metrics_are_served_only_by_the_dedicated_listener()
     -> Result<(), Box<dyn std::error::Error>> {
-        let addr = available_addr();
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?.to_string();
         let app_state = mock_app_state().await?;
         let cancellation_token = CancellationToken::new();
-        let server = tokio::spawn(rpc_service::serve_with_app_state(
-            addr.clone(),
+        let server = tokio::spawn(rpc_service::serve_with_listener(
+            listener,
             app_state.clone(),
             cancellation_token.clone(),
         ));
@@ -787,7 +789,7 @@ mod tests {
     ) -> anyhow::Result<()> {
         let mut tx = local_db.start_transaction().await?;
         for instance in instances {
-            tx.upsert_instance(instance).await?;
+            tx.insert_instance_if_absent(instance).await?;
         }
         for graph in graphs {
             seed_graph_runtime(&mut tx, graph).await?;
@@ -799,7 +801,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_nodes_api() -> Result<(), Box<dyn std::error::Error>> {
         init(None);
-        let addr = available_addr();
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?.to_string();
         let mut nodes = Vec::<Node>::new();
         let (_, public_key) = Secp256k1::new().generate_keypair(&mut rand::thread_rng());
         let pub_key = public_key.to_string();
@@ -818,6 +821,8 @@ mod tests {
                 .to_string(),
             updated_at: current_time_secs(),
             created_at: current_time_secs(),
+            binding_sig: String::new(),
+            binding_issued_at: 0,
         });
         let goat_addr = get_rand_goat_address();
         nodes.push(Node {
@@ -834,16 +839,21 @@ mod tests {
                 .to_string(),
             updated_at: current_time_secs(),
             created_at: current_time_secs(),
+            binding_sig: String::new(),
+            binding_issued_at: 0,
         });
 
         let local_db = create_local_db(&temp_sqlite_db_path()).await;
         init_nodes_data(&local_db, &nodes).await?;
-        tokio::spawn(rpc_service::serve(
-            addr.clone(),
-            local_db,
-            Actor::Verifier,
-            generate_local_key().public().to_peer_id().to_string(),
-            MetricsState::new(Arc::new(Mutex::new(Registry::default()))),
+        tokio::spawn(rpc_service::serve_with_listener(
+            listener,
+            AppState::create_arc_app_state(
+                local_db.clone(),
+                Actor::Verifier,
+                generate_local_key().public().to_peer_id().to_string(),
+                MetricsState::new(Arc::new(Mutex::new(Registry::default()))),
+            )
+            .await?,
             CancellationToken::new(),
         ));
         sleep(Duration::from_secs(3)).await;
@@ -883,7 +893,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_bitvm_api() -> Result<(), Box<dyn std::error::Error>> {
         init(None);
-        let addr = available_addr();
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?.to_string();
         let actor = Actor::Verifier;
         let local_key = generate_local_key();
         let peer_id = local_key.public().to_peer_id().to_string();
@@ -1033,12 +1044,15 @@ mod tests {
 
         init_instance_graph_data(&local_db, &instances, &graphs).await?;
 
-        tokio::spawn(rpc_service::serve(
-            addr.clone(),
-            local_db.clone(),
-            actor.clone(),
-            peer_id.clone(),
-            MetricsState::new(Arc::new(Mutex::new(Registry::default()))),
+        tokio::spawn(rpc_service::serve_with_listener(
+            listener,
+            AppState::create_arc_app_state(
+                local_db.clone(),
+                actor.clone(),
+                peer_id.clone(),
+                MetricsState::new(Arc::new(Mutex::new(Registry::default()))),
+            )
+            .await?,
             CancellationToken::new(),
         ));
         sleep(Duration::from_secs(3)).await;
@@ -1153,17 +1167,21 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_proof_api() -> Result<(), Box<dyn std::error::Error>> {
         init(None);
-        let addr = available_addr();
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?.to_string();
         info!("Start api server");
         let committee = Actor::Committee;
         let committee_peer_id = generate_local_key().public().to_peer_id().to_string();
         let local_db = create_local_db(&temp_sqlite_db_path()).await;
-        tokio::spawn(rpc_service::serve(
-            addr.clone(),
-            local_db,
-            committee,
-            committee_peer_id,
-            MetricsState::new(Arc::new(Mutex::new(Registry::default()))),
+        tokio::spawn(rpc_service::serve_with_listener(
+            listener,
+            AppState::create_arc_app_state(
+                local_db,
+                committee,
+                committee_peer_id,
+                MetricsState::new(Arc::new(Mutex::new(Registry::default()))),
+            )
+            .await?,
             CancellationToken::new(),
         ));
         sleep(Duration::from_secs(3)).await;

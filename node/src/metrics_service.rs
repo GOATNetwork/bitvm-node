@@ -131,6 +131,8 @@ pub struct MetricsState {
     graphs: Family<StatusLabels, Gauge>,
     messages: Family<StatusLabels, Gauge>,
     oldest_pending_message_age_seconds: Gauge,
+    p2p_inbox_messages: Family<StatusLabels, Gauge>,
+    oldest_pending_p2p_inbox_age_seconds: Gauge,
     ready: Gauge,
     db_busy_retries_total: Counter,
     db_errors_total: Counter,
@@ -191,6 +193,8 @@ impl MetricsState {
         let graphs = Family::default();
         let messages = Family::default();
         let oldest_pending_message_age_seconds = Gauge::default();
+        let p2p_inbox_messages = Family::default();
+        let oldest_pending_p2p_inbox_age_seconds = Gauge::default();
         let ready = Gauge::default();
         let db_busy_retries_total = Counter::default();
         let db_errors_total = Counter::default();
@@ -283,6 +287,16 @@ impl MetricsState {
                 "bitvm_node_oldest_pending_message_age_seconds",
                 "Age in seconds of the oldest pending message",
                 oldest_pending_message_age_seconds.clone(),
+            );
+            registry.register(
+                "bitvm_node_p2p_inbox_messages",
+                "Number of durable P2P inbox messages by state",
+                p2p_inbox_messages.clone(),
+            );
+            registry.register(
+                "bitvm_node_oldest_pending_p2p_inbox_age_seconds",
+                "Age in seconds of the oldest pending durable P2P inbox message",
+                oldest_pending_p2p_inbox_age_seconds.clone(),
             );
             registry.register(
                 "bitvm_node_ready",
@@ -459,6 +473,8 @@ impl MetricsState {
             graphs,
             messages,
             oldest_pending_message_age_seconds,
+            p2p_inbox_messages,
+            oldest_pending_p2p_inbox_age_seconds,
             ready,
             db_busy_retries_total,
             db_errors_total,
@@ -685,6 +701,8 @@ impl MetricsState {
         self.graphs.clear();
         self.messages.clear();
         self.oldest_pending_message_age_seconds.set(0);
+        self.p2p_inbox_messages.clear();
+        self.oldest_pending_p2p_inbox_age_seconds.set(0);
         let now = current_time_secs();
 
         for count in counts {
@@ -712,6 +730,19 @@ impl MetricsState {
                         .inc_by(count.count);
                     if status == "Pending" {
                         self.oldest_pending_message_age_seconds.set(
+                            count
+                                .oldest_created_at
+                                .map_or(0, |created_at| now.saturating_sub(created_at).max(0)),
+                        );
+                    }
+                }
+                "p2p_inbox" => {
+                    let status = known_status::<MessageState>(&count.state);
+                    self.p2p_inbox_messages
+                        .get_or_create(&StatusLabels { status: status.clone() })
+                        .inc_by(count.count);
+                    if status == "Pending" {
+                        self.oldest_pending_p2p_inbox_age_seconds.set(
                             count
                                 .oldest_created_at
                                 .map_or(0, |created_at| now.saturating_sub(created_at).max(0)),
@@ -875,6 +906,13 @@ mod tests {
                 oldest_created_at: None,
                 last_success_at: None,
             },
+            store::MetricsStateCount {
+                category: "p2p_inbox".to_string(),
+                state: "Pending".to_string(),
+                count: 4,
+                oldest_created_at: Some(current_time_secs() - 30),
+                last_success_at: None,
+            },
         ]);
 
         let output = encoded(&state);
@@ -885,6 +923,8 @@ mod tests {
         assert!(!output.contains("bitvm_node_graphs{status=\"OperatorPresigned\"}"));
         assert!(!output.contains("unexpected-id-like-value"));
         assert!(!output.contains("another-unexpected-value"));
+        assert!(output.contains("bitvm_node_p2p_inbox_messages{status=\"Pending\"} 4"));
+        assert!(output.contains("bitvm_node_oldest_pending_p2p_inbox_age_seconds 30"));
     }
 
     #[test]

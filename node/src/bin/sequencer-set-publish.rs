@@ -759,6 +759,107 @@ async fn update_sequencer_set_on_goat(
     Ok(())
 }
 
+/// Collect the threshold signatures for the update connector in redeem-script order.
+///
+/// Witnesses are permissionlessly appended on Goat, so every field must be treated as
+/// untrusted. Invalid, stale, duplicate, or unauthorized witnesses are ignored rather
+/// than allowing one entry to abort publishing for the whole height.
+fn collect_ordered_publisher_signatures(
+    witnesses: &[SequencerSetUpdateWitness],
+    btc_public_keys: &[secp256k1::PublicKey],
+    expected_sighash: [u8; 32],
+    threshold: usize,
+    goat_block_number: u64,
+) -> anyhow::Result<Vec<Vec<u8>>> {
+    let secp = Secp256k1::verification_only();
+    let message = Message::from_digest_slice(&expected_sighash)
+        .expect("a Bitcoin sighash is always exactly 32 bytes");
+    let mut signatures_by_member = vec![None; btc_public_keys.len()];
+
+    for (witness_index, witness) in witnesses.iter().enumerate() {
+        let public_key = match secp256k1::PublicKey::from_slice(&witness.btc_pub_key) {
+            Ok(public_key) => public_key,
+            Err(error) => {
+                tracing::warn!(
+                    goat_block_number,
+                    witness_index,
+                    error = %error,
+                    "Skipping sequencer set witness with an invalid Bitcoin public key"
+                );
+                continue;
+            }
+        };
+
+        let Some(member_index) = btc_public_keys.iter().position(|key| key == &public_key) else {
+            tracing::warn!(
+                goat_block_number,
+                witness_index,
+                public_key = %public_key,
+                "Skipping sequencer set witness from an unauthorized Bitcoin public key"
+            );
+            continue;
+        };
+
+        if witness.sig_hash != expected_sighash {
+            tracing::warn!(
+                goat_block_number,
+                witness_index,
+                public_key = %public_key,
+                "Skipping sequencer set witness for a different transaction sighash"
+            );
+            continue;
+        }
+
+        let signature = match secp256k1::ecdsa::Signature::from_compact(&witness.btc_sig) {
+            Ok(signature) => signature,
+            Err(error) => {
+                tracing::warn!(
+                    goat_block_number,
+                    witness_index,
+                    public_key = %public_key,
+                    error = %error,
+                    "Skipping sequencer set witness with an invalid compact signature"
+                );
+                continue;
+            }
+        };
+
+        if let Err(error) = secp.verify_ecdsa(&message, &signature, &public_key) {
+            tracing::warn!(
+                goat_block_number,
+                witness_index,
+                public_key = %public_key,
+                error = %error,
+                "Skipping sequencer set witness with a signature that does not match the transaction"
+            );
+            continue;
+        }
+
+        if signatures_by_member[member_index].is_some() {
+            tracing::warn!(
+                goat_block_number,
+                witness_index,
+                public_key = %public_key,
+                "Skipping duplicate sequencer set witness"
+            );
+            continue;
+        }
+
+        let mut signature_bytes = signature.serialize_der().to_vec();
+        signature_bytes.push(EcdsaSighashType::AllPlusAnyoneCanPay as u8);
+        signatures_by_member[member_index] = Some(signature_bytes);
+    }
+
+    let mut signatures: Vec<_> = signatures_by_member.into_iter().flatten().collect();
+    anyhow::ensure!(
+        signatures.len() >= threshold,
+        "only {} valid publisher signatures for Goat height {goat_block_number}; need {threshold}",
+        signatures.len()
+    );
+    signatures.truncate(threshold);
+    Ok(signatures)
+}
+
 /// Submit sequencer set commitment
 #[allow(clippy::too_many_arguments)]
 async fn action_push_sequencer_set_update(
@@ -778,22 +879,8 @@ async fn action_push_sequencer_set_update(
     output_file: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let witnesses = goat_client.ss_get_sequencer_set_update_witness(goat_block_number).await?;
-    let mut sigs: Vec<_> = witnesses
-        .iter()
-        .filter(|x| {
-            btc_public_keys.contains(&secp256k1::PublicKey::from_slice(&x.btc_pub_key).unwrap())
-        })
-        .map(|x| {
-            let sig = secp256k1::ecdsa::Signature::from_compact(&x.btc_sig).expect("Invalid sig");
-            let mut sig_bytes = sig.serialize_der().to_vec();
-            sig_bytes.push(EcdsaSighashType::AllPlusAnyoneCanPay as u8);
-            sig_bytes
-        })
-        .collect();
     let total = btc_public_keys.len();
     let threshold = (2 * total).div_ceil(3);
-
-    sigs.resize(threshold, vec![]);
 
     let total = next_btc_public_keys.len();
     let next_threshold = (2 * total).div_ceil(3);
@@ -801,8 +888,6 @@ async fn action_push_sequencer_set_update(
     let redeem_script = create_sequencer_update_script(&btc_public_keys, threshold);
     let next_redeem_script = create_sequencer_update_script(&next_btc_public_keys, next_threshold);
     let next_update_connector_address = Address::p2wsh(&next_redeem_script, btc_client.network());
-
-    println!("sigs: {sigs:?}");
 
     // update the sequencer set publish tx with multisig signatures
     let (update_connector, update_connector_value) = match &update_connector_outpoint {
@@ -850,6 +935,24 @@ async fn action_push_sequencer_set_update(
         Amount::from_sat(RELAYER_FEE),
     )?;
 
+    let publisher_sigs = if let Some(update_connector_value) = update_connector_value {
+        let sighash = SighashCache::new(&mut sequencer_set_publish_tx).p2wsh_signature_hash(
+            0,
+            &redeem_script,
+            update_connector_value,
+            EcdsaSighashType::AllPlusAnyoneCanPay,
+        )?;
+        collect_ordered_publisher_signatures(
+            &witnesses,
+            &btc_public_keys,
+            sighash.to_byte_array(),
+            threshold,
+            goat_block_number,
+        )?
+    } else {
+        Vec::new()
+    };
+
     let secp = secp256k1::Secp256k1::new();
     let owner_private_key = PrivateKey::from_wif(owner_btc_key_wif.as_ref().unwrap())?;
     let owner_p2wpkh = Address::p2wpkh(
@@ -865,7 +968,7 @@ async fn action_push_sequencer_set_update(
         btc_client,
         &mut sequencer_set_publish_tx,
         &redeem_script,
-        sigs,
+        publisher_sigs,
     )
     .await?;
 
@@ -1118,4 +1221,107 @@ async fn fund_publishers(
         "Funding tx not confirmed"
     );
     Ok((tx.compute_txid(), current_tx_vout as u32))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::secp256k1::SecretKey;
+
+    const SIGHASH: [u8; 32] = [42; 32];
+
+    fn secret_key(value: u8) -> SecretKey {
+        SecretKey::from_slice(&[value; 32]).expect("valid test secret key")
+    }
+
+    fn public_key(secret_key: &SecretKey) -> secp256k1::PublicKey {
+        secp256k1::PublicKey::from_secret_key(&Secp256k1::new(), secret_key)
+    }
+
+    fn signed_witness(secret_key: &SecretKey, sighash: [u8; 32]) -> SequencerSetUpdateWitness {
+        let secp = Secp256k1::new();
+        let signature = secp.sign_ecdsa(
+            &Message::from_digest_slice(&sighash).expect("test sighash is 32 bytes"),
+            secret_key,
+        );
+        SequencerSetUpdateWitness {
+            sig_hash: sighash,
+            btc_pub_key: public_key(secret_key).serialize().to_vec(),
+            btc_sig: signature.serialize_compact().to_vec(),
+        }
+    }
+
+    fn expected_signature(secret_key: &SecretKey) -> Vec<u8> {
+        let secp = Secp256k1::new();
+        let signature = secp.sign_ecdsa(
+            &Message::from_digest_slice(&SIGHASH).expect("test sighash is 32 bytes"),
+            secret_key,
+        );
+        let mut encoded = signature.serialize_der().to_vec();
+        encoded.push(EcdsaSighashType::AllPlusAnyoneCanPay as u8);
+        encoded
+    }
+
+    #[test]
+    fn publisher_witnesses_are_filtered_deduplicated_and_reordered() {
+        let first = secret_key(1);
+        let second = secret_key(2);
+        let third = secret_key(3);
+        let stranger = secret_key(4);
+        let publishers = vec![public_key(&first), public_key(&second), public_key(&third)];
+
+        let mut malformed_key = signed_witness(&first, SIGHASH);
+        malformed_key.btc_pub_key[0] = 0x01;
+        let mut malformed_signature = signed_witness(&second, SIGHASH);
+        malformed_signature.btc_sig.clear();
+
+        let witnesses = vec![
+            malformed_key,
+            signed_witness(&stranger, SIGHASH),
+            malformed_signature,
+            signed_witness(&third, SIGHASH),
+            signed_witness(&first, SIGHASH),
+            signed_witness(&first, SIGHASH),
+        ];
+
+        let signatures =
+            collect_ordered_publisher_signatures(&witnesses, &publishers, SIGHASH, 2, 123)
+                .expect("two valid publisher signatures");
+
+        assert_eq!(signatures, vec![expected_signature(&first), expected_signature(&third)]);
+    }
+
+    #[test]
+    fn publisher_witnesses_keep_exactly_threshold_signatures_in_script_order() {
+        let first = secret_key(1);
+        let second = secret_key(2);
+        let third = secret_key(3);
+        let publishers = vec![public_key(&first), public_key(&second), public_key(&third)];
+        let witnesses = vec![
+            signed_witness(&third, SIGHASH),
+            signed_witness(&second, SIGHASH),
+            signed_witness(&first, SIGHASH),
+        ];
+
+        let signatures =
+            collect_ordered_publisher_signatures(&witnesses, &publishers, SIGHASH, 2, 123)
+                .expect("three valid signatures meet the threshold of two");
+
+        assert_eq!(signatures.len(), 2);
+        assert_eq!(signatures, vec![expected_signature(&first), expected_signature(&second)]);
+    }
+
+    #[test]
+    fn publisher_witnesses_require_a_valid_threshold() {
+        let first = secret_key(1);
+        let second = secret_key(2);
+        let third = secret_key(3);
+        let publishers = vec![public_key(&first), public_key(&second), public_key(&third)];
+
+        let witnesses = vec![signed_witness(&first, SIGHASH), signed_witness(&second, [7; 32])];
+
+        let error = collect_ordered_publisher_signatures(&witnesses, &publishers, SIGHASH, 2, 123)
+            .expect_err("one valid signature is below threshold");
+        assert!(error.to_string().contains("only 1 valid publisher signatures"));
+    }
 }

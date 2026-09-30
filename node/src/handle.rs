@@ -6,7 +6,7 @@ use crate::env::{
 };
 use crate::error::SpecialError;
 use crate::metrics_service::MetricsState;
-use crate::middleware::AllBehaviours;
+use crate::middleware::publisher::MessagePublisher;
 use crate::rpc_service::current_time_secs;
 use crate::scheduled_tasks::graph_maintenance_tasks::ChallengeSubStatus;
 use crate::soldering_payload_store::{
@@ -42,8 +42,8 @@ use goat::transactions::base::output_topology;
 use goat::transactions::pre_signed::PreSignedTransaction;
 use goat::transactions::pre_signed_musig2::verify_public_nonce;
 use goat::wots::{Wots, Wots96};
+use libp2p::PeerId;
 use libp2p::gossipsub::MessageId;
-use libp2p::{PeerId, Swarm};
 use secp256k1::{Message as SecpMessage, SECP256K1};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -53,7 +53,7 @@ use store::{GoatTxType, GraphStatus, SerializableTxid};
 use uuid::Uuid;
 
 pub struct HandlerContext<'a> {
-    pub swarm: &'a mut Swarm<AllBehaviours>,
+    pub swarm: &'a mut dyn MessagePublisher,
     pub local_db: &'a LocalDB,
     pub btc_client: &'a Arc<BTCClient>,
     pub goat_client: &'a Arc<GOATClient>,
@@ -95,15 +95,6 @@ impl HeavyTask {
         }
     }
 
-    pub(crate) fn message_type(&self) -> &'static str {
-        match self {
-            Self::GenerateVerifierSetup(_) => "InitGraph",
-            Self::GenerateSolderingProof(_) => "CutCircuits",
-            Self::ValidateVerifierGraph(_) => "CreateGraph",
-            Self::VerifySolderingProof(_) => "SolderingProofReady",
-        }
-    }
-
     pub(crate) fn graph_id(&self) -> Uuid {
         match self {
             Self::GenerateVerifierSetup(message) => message.graph_id,
@@ -133,15 +124,6 @@ pub(crate) fn heavy_task_from_content(
         }
         _ => None,
     }
-}
-
-pub(crate) fn is_heavy_task_message_type(message_type: &str, actor: &Actor) -> bool {
-    matches!(
-        (message_type, actor),
-        ("SolderingProofReady", Actor::Operator)
-            | ("InitGraph" | "CutCircuits", Actor::Verifier)
-            | ("CreateGraph", Actor::Verifier)
-    )
 }
 
 pub(crate) async fn run_heavy_task(context: &HeavyTaskContext, task: HeavyTask) -> Result<()> {
@@ -245,31 +227,16 @@ fn load_or_create_committee_instance_keypair(
 
 pub async fn dispatch(ctx: &mut HandlerContext<'_>, content: &GOATMessageContent) -> Result<()> {
     match (content, &ctx.actor) {
-        (
-            GOATMessageContent::GraphSetupAck(GraphSetupAck {
-                outbox_id,
-                acknowledger_peer_id,
-                ..
-            }),
-            _,
-        ) => {
-            if acknowledger_peer_id != &ctx.from_peer_id.to_string() {
-                tracing::warn!(
-                    outbox_id,
-                    from_peer_id = %ctx.from_peer_id,
-                    acknowledger_peer_id,
-                    "Ignore GraphSetupAck with mismatched source peer"
-                );
-                return Ok(());
-            }
+        (GOATMessageContent::GraphSetupAck(GraphSetupAck { delivery_id }), _) => {
+            let source_peer_id = ctx.from_peer_id.to_string();
             let acknowledged = ctx
                 .local_db
                 .acquire()
                 .await?
-                .acknowledge_p2p_outbox_message(outbox_id, acknowledger_peer_id)
+                .acknowledge_p2p_outbox_message(delivery_id, &source_peer_id)
                 .await?;
             tracing::debug!(
-                outbox_id,
+                delivery_id,
                 from_peer_id = %ctx.from_peer_id,
                 acknowledged,
                 "processed GraphSetupAck"
@@ -810,6 +777,73 @@ pub async fn dispatch(ctx: &mut HandlerContext<'_>, content: &GOATMessageContent
         }
         _ => Ok(()),
     }
+}
+
+/// Apply the business-key cooldown to stored-value recovery.
+async fn publish_stored(
+    ctx: &mut HandlerContext<'_>,
+    gate_key: &str,
+    target: Actor,
+    content: GOATMessageContent,
+    origin: StoredValue,
+) -> Result<()> {
+    let now = std::time::Instant::now();
+    let gate = crate::p2p_admission::protocol_republish_gate();
+    let message = GOATMessage::new(target, content);
+    if origin == StoredValue::Found && gate.is_cooling(gate_key, now) {
+        return Ok(());
+    }
+    send_protocol_message(ctx.swarm, ctx.local_db, message, origin).await?;
+    gate.allow(gate_key, now);
+    Ok(())
+}
+
+/// Check local graph-signing completion; missing, foreign and Obsoleted rows are not complete.
+async fn graph_signing_round_is_over(
+    local_db: &LocalDB,
+    instance_id: Uuid,
+    graph_id: Uuid,
+) -> Result<bool> {
+    let Some(row) = local_db.acquire().await?.find_graph(&graph_id).await? else {
+        return Ok(false);
+    };
+    if row.instance_id != instance_id {
+        return Ok(false);
+    }
+    Ok(GraphStatus::from_str(&row.status).is_ok_and(|status| match status {
+        GraphStatus::OperatorPresigned | GraphStatus::Obsoleted => false,
+        GraphStatus::CommitteePresigned
+        | GraphStatus::OperatorDataPushed
+        | GraphStatus::PreKickoff
+        | GraphStatus::OperatorKickOff
+        | GraphStatus::Challenge
+        | GraphStatus::Disprove
+        | GraphStatus::Skipped
+        | GraphStatus::OperatorTake1
+        | GraphStatus::OperatorTake2 => true,
+    }))
+}
+
+/// The committee key this node signs with for `instance_id`.
+fn local_committee_pubkey(instance_id: Uuid) -> Result<PublicKey> {
+    let committee_master_key = CommitteeMasterKey::new(get_bitvm_key()?);
+    Ok(load_committee_instance_keypair(&committee_master_key, instance_id)?.public_key().into())
+}
+
+/// Recover this node's own PeginConfirm value; leave live outbox rows on their retry schedule.
+async fn redeliver_own_pegin_confirm_value(
+    ctx: &mut HandlerContext<'_>,
+    instance_id: Uuid,
+    gate_key: &str,
+    sender: &PublicKey,
+    content: &GOATMessageContent,
+) -> Result<()> {
+    if ctx.id != GOATMessage::default_message_id()
+        || *sender != local_committee_pubkey(instance_id)?
+    {
+        return Ok(());
+    }
+    publish_stored(ctx, gate_key, Actor::Committee, content.clone(), StoredValue::Found).await
 }
 
 fn make_message(ctx: &HandlerContext<'_>, content: &GOATMessageContent) -> GOATMessage {
@@ -1542,9 +1576,8 @@ async fn defer_confirm_instance_until_previous_graph_presigned(
     let Some((previous_instance_id, previous_graph_id)) =
         get_graph_id_by_nonce(ctx.local_db, previous_nonce, operator_pubkey).await?
     else {
-        push_local_unhandled_messages_with_reason(
+        defer_or_enqueue_message(
             ctx.local_db,
-            instance_id,
             &retry_message,
             60,
             MessageDeferReason::PreviousGraphPending,
@@ -1571,9 +1604,8 @@ async fn defer_confirm_instance_until_previous_graph_presigned(
                 "Failed to send SyncGraphRequest for previous graph {previous_instance_id}:{previous_graph_id}: {error}"
             );
         }
-        push_local_unhandled_messages_with_reason(
+        defer_or_enqueue_message(
             ctx.local_db,
-            instance_id,
             &retry_message,
             60,
             MessageDeferReason::PreviousGraphPending,
@@ -1589,9 +1621,8 @@ async fn defer_confirm_instance_until_previous_graph_presigned(
         return Ok(false);
     }
 
-    push_local_unhandled_messages_with_reason(
+    defer_or_enqueue_message(
         ctx.local_db,
-        instance_id,
         &retry_message,
         60,
         MessageDeferReason::PreviousGraphPending,
@@ -1604,7 +1635,13 @@ async fn defer_confirm_instance_until_previous_graph_presigned(
         graph_nonce: previous_graph.parameters.graph_nonce,
         graph: previous_graph,
     });
-    send_to_peer(ctx.swarm, GOATMessage::new(Actor::All, message_content)).await?;
+    send_protocol_message(
+        ctx.swarm,
+        ctx.local_db,
+        GOATMessage::new(Actor::All, message_content),
+        StoredValue::Fresh,
+    )
+    .await?;
     tracing::info!(
         "Defer ConfirmInstance for {instance_id}: re-broadcast previous CreateGraph {previous_instance_id}:{previous_graph_id} until it is committee pre-signed"
     );
@@ -1646,7 +1683,7 @@ async fn handle_confirm_instance_operator(
             graph,
         });
         let msg = GOATMessage::new(Actor::All, message_content);
-        send_to_peer(ctx.swarm, msg).await?;
+        send_protocol_message(ctx.swarm, ctx.local_db, msg, StoredValue::Fresh).await?;
         return Ok(());
     }
 
@@ -1765,12 +1802,20 @@ async fn handle_init_graph_verifier(context: &HeavyTaskContext, message: InitGra
         );
         return Ok(());
     }
-    if let Err(error) = validate_operator_stake(&context.goat_client, operator_pubkey).await {
+    if !matches!(
+        operator_stake_status(&context.goat_client, operator_pubkey).await.map_err(|error| {
+            retryable_dispatch_error(
+                RetryableDispatchReason::ExternalRpcUnavailable,
+                None,
+                format!("InitGraph operator stake lookup failed: {error:#}"),
+            )
+        })?,
+        OperatorStakeStatus::Staked
+    ) {
         tracing::warn!(
             instance_id = %instance_id,
             graph_id = %graph_id,
             operator_pubkey = %operator_pubkey,
-            error = %error,
             "Ignore InitGraph from an operator that does not meet stake requirements"
         );
         return Ok(());
@@ -1918,11 +1963,9 @@ async fn handle_gen_circuits_operator(
         if existing.setup_package != *setup_package {
             bail!("conflicting GenCircuits setup package for verifier {verifier_pubkey}");
         }
-    } else if operator_state
-        .candidates
-        .iter()
-        .any(|candidate| candidate.verifier_pubkey == *verifier_pubkey)
-    {
+    } else if operator_state.candidates.iter().any(|candidate| {
+        XOnlyPublicKey::from(candidate.verifier_pubkey) == XOnlyPublicKey::from(*verifier_pubkey)
+    }) {
         tracing::warn!(
             "Ignore GenCircuits for {instance_id}:{graph_id}: verifier public key {verifier_pubkey} is already bound to another peer"
         );
@@ -1982,10 +2025,46 @@ async fn handle_gen_circuits_operator(
     if operator_state.candidate_verifier_pubkeys.is_none() {
         freeze_operator_candidates(operator_state)?;
     }
-    let cut_candidates = if was_frozen { Vec::new() } else { operator_state.candidates.clone() };
+    // On every retry, enqueue any CutCircuits still owed by the frozen candidate set.
+    let owed = cut_circuits_owed(operator_state, current_time_secs());
+    let sender_peer_id = get_peer_id();
 
     save_babe_setup_state(ctx.local_db, instance_id, graph_id, &state)?;
-    for candidate in cut_candidates {
+    ensure_cut_circuits_outbox(ctx.local_db, instance_id, graph_id, &owed, &sender_peer_id).await?;
+    Ok(())
+}
+
+/// Candidates still owed CutCircuits, excluding delivered proofs and closed selections.
+fn cut_circuits_owed(state: &OperatorBabeSetupState, now: i64) -> Vec<OperatorVerifierCandidate> {
+    if state.candidate_verifier_pubkeys.is_none() || state.selected_verifier_pubkeys.is_some() {
+        return Vec::new();
+    }
+    let delivered = state.candidates.iter().filter(|candidate| candidate.gc_data.is_some()).count();
+    let window_over = state.proof_collection_started_at.is_some_and(|started_at| {
+        now - started_at >= get_verifier_candidate_collection_window_secs()
+    });
+    if window_over && delivered >= min_required_verifier() {
+        return Vec::new();
+    }
+    state
+        .candidates
+        .iter()
+        .filter(|candidate| {
+            candidate.gc_data.is_none() && candidate.soldering_proof_ready.is_none()
+        })
+        .cloned()
+        .collect()
+}
+
+/// Create missing CutCircuits outbox entries; leave all existing entries unchanged.
+async fn ensure_cut_circuits_outbox(
+    local_db: &LocalDB,
+    instance_id: Uuid,
+    graph_id: Uuid,
+    owed: &[OperatorVerifierCandidate],
+    sender_peer_id: &str,
+) -> Result<()> {
+    for candidate in owed {
         let message = GOATMessage::new(
             Actor::Verifier,
             GOATMessageContent::CutCircuits(CutCircuits {
@@ -1994,13 +2073,19 @@ async fn handle_gen_circuits_operator(
                 verifier_pubkey: candidate.verifier_pubkey,
                 candidate_index: candidate
                     .candidate_index
-                    .expect("candidate slot assigned before CutCircuits"),
-                selected_circuit_indexes: candidate.selected_circuit_indexes,
+                    .context("frozen candidate has no slot assigned")?,
+                selected_circuit_indexes: candidate.selected_circuit_indexes.clone(),
             }),
         );
         let ack_peer_id =
             PeerId::from_bytes(&candidate.verifier_peer_id).map(|peer_id| peer_id.to_string()).ok();
-        enqueue_graph_setup_outbox_message(ctx.local_db, message, ack_peer_id.as_deref()).await?;
+        enqueue_graph_setup_outbox_message_from_peer(
+            local_db,
+            message,
+            ack_peer_id.as_deref(),
+            sender_peer_id,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -2566,6 +2651,19 @@ async fn handle_compact_soldering_proof_operator(
         };
     seal_selected_verifiers(operator_state, selected_verifier_pubkeys)?;
     let bitvm_gc_circuit_datas = selected_gc_data(operator_state)?;
+    let selected_verifier_count = operator_state
+        .selected_verifier_pubkeys
+        .as_ref()
+        .context("selected verifier set is missing after proof collection")?
+        .len();
+    let selected_verifier_peer_ids = (0..selected_verifier_count)
+        .map(|verifier_index| {
+            let candidate = selected_candidate_for_graph_index(operator_state, verifier_index)?;
+            PeerId::from_bytes(&candidate.verifier_peer_id)
+                .context("decode selected verifier peer id for CreateGraph ACK")
+                .map(|peer_id| peer_id.to_string())
+        })
+        .collect::<Result<Vec<_>>>()?;
     let mut obsolete_setup_outbox_ids = vec![format!("init-graph:{graph_id}")];
     obsolete_setup_outbox_ids.extend(operator_state.candidates.iter().map(|candidate| {
         format!("cut-circuits:{instance_id}:{graph_id}:{}", candidate.verifier_pubkey)
@@ -2588,103 +2686,147 @@ async fn handle_compact_soldering_proof_operator(
         "all verifier soldering proofs are ready to build the graph"
     );
 
-    let instance_params = get_instance_parameters(&context.local_db, instance_id)
-        .await?
-        .ok_or_else(|| anyhow!("Instance parameters not found for {instance_id}"))?;
-
-    let (graph_nonce, cur_prekickoff_txn) =
-        match get_current_prekickoff_tx(&context.local_db, &local_operator_pubkey).await? {
-            Some((graph_nonce, prekickoff_tx)) => (graph_nonce, prekickoff_tx),
-            None => {
-                (0, build_genesis_prekickoff_tx(&context.btc_client, &context.goat_client).await?)
-            }
-        };
-    let prekickoff_params =
-        build_prekickoff_params(&context.btc_client, graph_nonce, cur_prekickoff_txn).await?;
-
-    let graph_build_started_at = Instant::now();
-    tracing::info!(
-        event = "operator_soldering_proof",
-        stage = "graph_build",
-        outcome = "started",
-        verifier_slots = bitvm_gc_circuit_datas.len(),
-        graph_nonce,
-        "building graph parameters from verified soldering proofs"
-    );
-    let mut graph_params = build_graph_params(
+    // Reuse an existing graph for this ID and resume CreateGraph delivery.
+    let (graph_nonce, graph, definition_hash, already_finalized) = match get_graph(
         &context.local_db,
-        &context.goat_client,
-        instance_params,
-        prekickoff_params,
-        bitvm_gc_circuit_datas,
-        graph_nonce,
+        instance_id,
         graph_id,
     )
-    .await?;
+    .await?
+    {
+        Some(stored) => {
+            let graph_nonce = stored.parameters.graph_nonce;
+            let definition_hash = hex::encode(stored.parameters_hash()?);
+            let already_finalized = BitvmGcGraph::from_simplified(&stored)?.committee_pre_signed();
+            tracing::info!(
+                event = "operator_graph_creation",
+                outcome = "resumed",
+                stage = "definition_store",
+                graph_nonce,
+                definition_hash = %definition_hash,
+                already_finalized,
+                "graph was stored by an earlier run; resuming at the CreateGraph outbox"
+            );
+            (graph_nonce, stored, definition_hash, already_finalized)
+        }
+        None => {
+            let instance_params = get_instance_parameters(&context.local_db, instance_id)
+                .await?
+                .ok_or_else(|| anyhow!("Instance parameters not found for {instance_id}"))?;
 
-    let challenge_init_txid = generate_bitvm_graph(graph_params.clone())?
-        .watchtower_challenge_init
-        .tx()
-        .compute_txid()
-        .to_byte_array();
-    graph_params.pubin_disprove_constant =
-        get_guest_constant_value(graph_id, challenge_init_txid, &graph_params.watchtower_pubkeys)?;
-    let mut graph = generate_bitvm_graph(graph_params)?;
-    anyhow::ensure!(
-        graph.watchtower_challenge_init.tx().compute_txid().to_byte_array() == challenge_init_txid,
-        "Operator constant unexpectedly changes the watchtower challenge init transaction"
-    );
-    operator_pre_sign(operator_master_key.master_keypair(), &mut graph)?;
+            let (graph_nonce, cur_prekickoff_txn) =
+                match get_current_prekickoff_tx(&context.local_db, &local_operator_pubkey).await? {
+                    Some((graph_nonce, prekickoff_tx)) => (graph_nonce, prekickoff_tx),
+                    None => (
+                        0,
+                        build_genesis_prekickoff_tx(&context.btc_client, &context.goat_client)
+                            .await?,
+                    ),
+                };
+            let prekickoff_params =
+                build_prekickoff_params(&context.btc_client, graph_nonce, cur_prekickoff_txn)
+                    .await?;
 
-    let graph = graph.to_simplified()?;
-    tracing::info!(
-        event = "operator_soldering_proof",
-        stage = "graph_build",
-        outcome = "completed",
-        graph_nonce,
-        elapsed_ms = graph_build_started_at.elapsed().as_millis(),
-        "built operator-pre-signed graph"
-    );
-    let definition_hash = hex::encode(graph.parameters_hash()?);
-    tracing::info!(
-        event = "operator_graph_creation",
-        outcome = "started",
-        stage = "definition_store",
-        graph_nonce,
-        definition_hash = %definition_hash,
-        "storing operator-pre-signed graph definition"
-    );
-    if let Err(error) = store_operator_presigned_graph(&context.local_db, &graph).await {
-        tracing::error!(
-            event = "operator_graph_creation",
-            outcome = "failed",
-            stage = "definition_store",
-            graph_nonce,
-            definition_hash = %definition_hash,
-            error = %error,
-            "failed to store operator-pre-signed graph definition"
-        );
-        return Err(error).context("store operator-pre-signed graph definition");
-    }
-    tracing::info!(
-        event = "operator_graph_creation",
-        outcome = "committed",
-        stage = "definition_store",
-        graph_nonce,
-        definition_hash = %definition_hash,
-        "stored operator-pre-signed graph definition"
-    );
+            let graph_build_started_at = Instant::now();
+            tracing::info!(
+                event = "operator_soldering_proof",
+                stage = "graph_build",
+                outcome = "started",
+                verifier_slots = bitvm_gc_circuit_datas.len(),
+                graph_nonce,
+                "building graph parameters from verified soldering proofs"
+            );
+            let mut graph_params = build_graph_params(
+                &context.local_db,
+                &context.goat_client,
+                instance_params,
+                prekickoff_params,
+                bitvm_gc_circuit_datas,
+                graph_nonce,
+                graph_id,
+            )
+            .await?;
+
+            let challenge_init_txid = generate_bitvm_graph(graph_params.clone())?
+                .watchtower_challenge_init
+                .tx()
+                .compute_txid()
+                .to_byte_array();
+            graph_params.pubin_disprove_constant = get_guest_constant_value(
+                graph_id,
+                challenge_init_txid,
+                &graph_params.watchtower_pubkeys,
+            )?;
+            let mut graph = generate_bitvm_graph(graph_params)?;
+            anyhow::ensure!(
+                graph.watchtower_challenge_init.tx().compute_txid().to_byte_array()
+                    == challenge_init_txid,
+                "Operator constant unexpectedly changes the watchtower challenge init transaction"
+            );
+            operator_pre_sign(operator_master_key.master_keypair(), &mut graph)?;
+
+            let graph = graph.to_simplified()?;
+            tracing::info!(
+                event = "operator_soldering_proof",
+                stage = "graph_build",
+                outcome = "completed",
+                graph_nonce,
+                elapsed_ms = graph_build_started_at.elapsed().as_millis(),
+                "built operator-pre-signed graph"
+            );
+            let definition_hash = hex::encode(graph.parameters_hash()?);
+            tracing::info!(
+                event = "operator_graph_creation",
+                outcome = "started",
+                stage = "definition_store",
+                graph_nonce,
+                definition_hash = %definition_hash,
+                "storing operator-pre-signed graph definition"
+            );
+            if let Err(error) = store_operator_presigned_graph(&context.local_db, &graph).await {
+                tracing::error!(
+                    event = "operator_graph_creation",
+                    outcome = "failed",
+                    stage = "definition_store",
+                    graph_nonce,
+                    definition_hash = %definition_hash,
+                    error = %error,
+                    "failed to store operator-pre-signed graph definition"
+                );
+                return Err(error).context("store operator-pre-signed graph definition");
+            }
+            tracing::info!(
+                event = "operator_graph_creation",
+                outcome = "committed",
+                stage = "definition_store",
+                graph_nonce,
+                definition_hash = %definition_hash,
+                "stored operator-pre-signed graph definition"
+            );
+            (graph_nonce, graph, definition_hash, false)
+        }
+    };
 
     let message = GOATMessage::new(
         Actor::All,
         GOATMessageContent::CreateGraph(CreateGraph { instance_id, graph_id, graph_nonce, graph }),
     );
-    let serialized = message.serialize_message().await?;
-    let outbox_id = format!("create-graph:{graph_id}");
+    let mut outbox_ids = Vec::new();
+    if !already_finalized {
+        for ack_peer_id in &selected_verifier_peer_ids {
+            outbox_ids.push(
+                enqueue_graph_setup_outbox_message(
+                    &context.local_db,
+                    message.clone(),
+                    Some(ack_peer_id),
+                )
+                .await?,
+            );
+        }
+    }
     let mut storage = context.local_db.acquire().await?;
-    storage
-        .insert_p2p_outbox_message(&outbox_id, message.content.event_type(), &serialized)
-        .await?;
+    // The per-verifier outbox rows retry until each selected verifier ACKs.
+    // A finalized graph was already announced; only the setup cleanup is left.
     let mut cancelled_setup_messages = 0;
     for setup_outbox_id in obsolete_setup_outbox_ids {
         cancelled_setup_messages +=
@@ -2697,9 +2839,9 @@ async fn handle_compact_soldering_proof_operator(
         stage = "create_graph_outbox",
         graph_nonce,
         definition_hash = %definition_hash,
-        outbox_id,
+        outbox_ids = ?outbox_ids,
         cancelled_setup_messages,
-        "enqueued CreateGraph for swarm publication"
+        "enqueued CreateGraph for selected verifier delivery"
     );
 
     // The outbox is durable before this cleanup. A process crash before
@@ -2944,7 +3086,13 @@ async fn try_start_graph_committee_setup(
         pub_nonces: pub_nonces.clone(),
         nonce_sigs,
     });
-    send_to_peer(ctx.swarm, GOATMessage::new(Actor::All, message_content)).await?;
+    send_protocol_message(
+        ctx.swarm,
+        ctx.local_db,
+        GOATMessage::new(Actor::All, message_content),
+        StoredValue::Fresh,
+    )
+    .await?;
     store_committee_pub_nonces_for_graph(
         ctx.local_db,
         instance_id,
@@ -3005,15 +3153,29 @@ async fn maybe_vote_and_presign_graph(
     let committee_master_key = CommitteeMasterKey::new(get_bitvm_key()?);
     let instance_keypair = load_committee_instance_keypair(&committee_master_key, instance_id)?;
     let local_committee_pubkey = instance_keypair.public_key().into();
-    if get_committee_partial_sigs_for_graph_member(
+    if let Some(stored_partial_sigs) = get_committee_partial_sigs_for_graph_member(
         ctx.local_db,
         instance_id,
         graph_id,
         &local_committee_pubkey,
     )
     .await?
-    .is_some()
     {
+        // Publish stored partial signatures without signing again.
+        publish_stored(
+            ctx,
+            &format!("committee-presign:{graph_id}"),
+            Actor::All,
+            GOATMessageContent::CommitteePresign(CommitteePresign {
+                instance_id,
+                graph_id,
+                committee_pubkey: local_committee_pubkey,
+                committee_partial_sigs: stored_partial_sigs,
+                agg_nonces,
+            }),
+            StoredValue::Found,
+        )
+        .await?;
         return endorse_graph_if_presigned(ctx, instance_id, graph_id, &full_graph).await;
     }
 
@@ -3028,30 +3190,42 @@ async fn maybe_vote_and_presign_graph(
             "local committee agg nonce consensus differs for graph {graph_id}"
         )));
     }
-    if !consensus_votes
+    // Recover delivery of the stored vote.
+    let local_vote = consensus_votes
         .iter()
-        .any(|(committee_pubkey, _, _)| *committee_pubkey == local_committee_pubkey)
-    {
-        let signature =
-            SECP256K1.sign_schnorr(&SecpMessage::from_digest(consensus_hash), &instance_keypair);
-        store_committee_agg_nonce_consensus_for_graph(
-            ctx.local_db,
-            instance_id,
-            graph_id,
-            local_committee_pubkey,
-            consensus_hash,
-            signature,
-        )
-        .await?;
-        let message_content = GOATMessageContent::AggNonceConsensus(AggNonceConsensus {
+        .find(|(committee_pubkey, _, _)| *committee_pubkey == local_committee_pubkey)
+        .map(|(_, _, signature)| *signature);
+    let (signature, origin) = match local_vote {
+        Some(signature) => (signature, StoredValue::Found),
+        None => {
+            let signature = SECP256K1
+                .sign_schnorr(&SecpMessage::from_digest(consensus_hash), &instance_keypair);
+            store_committee_agg_nonce_consensus_for_graph(
+                ctx.local_db,
+                instance_id,
+                graph_id,
+                local_committee_pubkey,
+                consensus_hash,
+                signature,
+            )
+            .await?;
+            (signature, StoredValue::Fresh)
+        }
+    };
+    publish_stored(
+        ctx,
+        &format!("agg-nonce-consensus:{graph_id}"),
+        Actor::Committee,
+        GOATMessageContent::AggNonceConsensus(AggNonceConsensus {
             instance_id,
             graph_id,
             committee_pubkey: local_committee_pubkey,
             consensus_hash,
             signature,
-        });
-        send_to_peer(ctx.swarm, GOATMessage::new(Actor::Committee, message_content)).await?;
-    }
+        }),
+        origin,
+    )
+    .await?;
 
     let consensus_votes =
         get_committee_agg_nonce_consensus_for_graph(ctx.local_db, instance_id, graph_id).await?;
@@ -3094,6 +3268,12 @@ async fn maybe_vote_and_presign_graph(
             })?;
     }
 
+    // Recheck the persisted bindings at the actual signing boundary, including recovery.
+    let verifier_endorsements =
+        get_verifier_graph_params_endorsements_for_graph(ctx.local_db, instance_id, graph_id)
+            .await?;
+    validate_verifier_graph_params_endorsements(ctx.goat_client, graph, &verifier_endorsements)
+        .await?;
     let (_, sec_nonces, _) =
         committee_master_key.nonces_for_graph_job_with_keypair(&full_graph, instance_keypair)?;
     let committee_partial_sigs =
@@ -3106,14 +3286,20 @@ async fn maybe_vote_and_presign_graph(
         committee_partial_sigs.clone(),
     )
     .await?;
-    let message_content = GOATMessageContent::CommitteePresign(CommitteePresign {
-        instance_id,
-        graph_id,
-        committee_pubkey: local_committee_pubkey,
-        committee_partial_sigs,
-        agg_nonces,
-    });
-    send_to_peer(ctx.swarm, GOATMessage::new(Actor::All, message_content)).await?;
+    publish_stored(
+        ctx,
+        &format!("committee-presign:{graph_id}"),
+        Actor::All,
+        GOATMessageContent::CommitteePresign(CommitteePresign {
+            instance_id,
+            graph_id,
+            committee_pubkey: local_committee_pubkey,
+            committee_partial_sigs,
+            agg_nonces,
+        }),
+        StoredValue::Fresh,
+    )
+    .await?;
     endorse_graph_if_presigned(ctx, instance_id, graph_id, &full_graph).await
 }
 
@@ -3127,6 +3313,13 @@ async fn endorse_graph_if_presigned(
     let committee_partial_sigs =
         get_committee_partial_sigs_for_graph(ctx.local_db, instance_id, graph_id).await?;
     if committee_partial_sigs.len() != committee_pubkeys.len() {
+        return Ok(());
+    }
+    // Check the recovery gate before signing the endorsement.
+    let gate_key = format!("endorse-graph:{graph_id}");
+    if crate::p2p_admission::protocol_republish_gate()
+        .is_cooling(&gate_key, std::time::Instant::now())
+    {
         return Ok(());
     }
 
@@ -3145,8 +3338,9 @@ async fn endorse_graph_if_presigned(
         committee_sig_for_params: committee_sig_for_params.as_bytes().to_vec(),
         committee_evm_address,
     });
-    send_to_peer(ctx.swarm, GOATMessage::new(Actor::All, message_content)).await?;
-    Ok(())
+    // `Found`: whether this is the first endorsement or a repeat is exactly what
+    // the outbox row records, and a repeat must not be published past it.
+    publish_stored(ctx, &gate_key, Actor::All, message_content, StoredValue::Found).await
 }
 
 #[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
@@ -3193,9 +3387,8 @@ async fn handle_create_graph_committee(
                         );
                     }
                     let message = make_message(ctx, content);
-                    push_local_unhandled_messages_with_reason(
+                    defer_or_enqueue_message(
                         ctx.local_db,
-                        graph_id,
                         &message,
                         60,
                         MessageDeferReason::PreviousGraphPending,
@@ -3209,9 +3402,8 @@ async fn handle_create_graph_committee(
                 };
                 if !previous_graph.committee_pre_signed() {
                     let message = make_message(ctx, content);
-                    push_local_unhandled_messages_with_reason(
+                    defer_or_enqueue_message(
                         ctx.local_db,
-                        graph_id,
                         &message,
                         60,
                         MessageDeferReason::PreviousGraphPending,
@@ -3226,9 +3418,8 @@ async fn handle_create_graph_committee(
             }
             None => {
                 let message = make_message(ctx, content);
-                push_local_unhandled_messages_with_reason(
+                defer_or_enqueue_message(
                     ctx.local_db,
-                    graph_id,
                     &message,
                     60,
                     MessageDeferReason::PreviousGraphPending,
@@ -3271,9 +3462,7 @@ async fn handle_verifier_graph_params_endorsement_committee(
     signature: &secp256k1::schnorr::Signature,
     content: &GOATMessageContent,
 ) -> Result<()> {
-    if !ctx.is_self_peer
-        && !ctx.goat_client.committee_mana_is_verifier(&ctx.from_peer_id.to_bytes()).await?
-    {
+    if !ctx.goat_client.committee_mana_is_verifier(&ctx.from_peer_id.to_bytes()).await? {
         tracing::warn!(
             "Ignore VerifierGraphParamsEndorsement for {instance_id}:{graph_id}: sender {} is not a registered verifier",
             ctx.from_peer_id
@@ -3327,6 +3516,7 @@ async fn handle_verifier_graph_params_endorsement_committee(
         graph_id,
         *verifier_pubkey,
         verifier_index,
+        &ctx.from_peer_id.to_string(),
         *signature,
     )
     .await?;
@@ -3343,6 +3533,12 @@ async fn handle_nonce_generation_committee(
     nonce_sigs: &CommitteeNonceSignatures,
     content: &GOATMessageContent,
 ) -> Result<()> {
+    if graph_signing_round_is_over(ctx.local_db, instance_id, graph_id).await? {
+        tracing::debug!(
+            "Ignore NonceGeneration for {instance_id}:{graph_id}: signing round is over"
+        );
+        return Ok(());
+    }
     // received from Committee members
     if !ensure_self_or_valid_committee(
         ctx,
@@ -3408,6 +3604,12 @@ async fn handle_agg_nonce_consensus_committee(
     signature: &secp256k1::schnorr::Signature,
     content: &GOATMessageContent,
 ) -> Result<()> {
+    if graph_signing_round_is_over(ctx.local_db, instance_id, graph_id).await? {
+        tracing::debug!(
+            "Ignore AggNonceConsensus for {instance_id}:{graph_id}: signing round is over"
+        );
+        return Ok(());
+    }
     if !ensure_self_or_valid_committee(
         ctx,
         instance_id,
@@ -3437,9 +3639,8 @@ async fn handle_agg_nonce_consensus_committee(
     let Some((_, _, _, expected_consensus_hash)) =
         graph_nonce_consensus_context(ctx, instance_id, graph_id, &graph).await?
     else {
-        push_local_unhandled_messages_with_reason(
+        defer_or_enqueue_message(
             ctx.local_db,
-            graph_id,
             &message,
             30,
             MessageDeferReason::CommitteeNoncesPending,
@@ -3595,9 +3796,8 @@ async fn validate_committee_presign_for_graph(
     let pub_nonces_unchecked =
         get_committee_pub_nonces_for_graph(ctx.local_db, instance_id, graph_id).await?;
     if pub_nonces_unchecked.len() != committee_pubkeys.len() {
-        push_local_unhandled_messages_with_reason(
+        defer_or_enqueue_message(
             ctx.local_db,
-            graph_id,
             &message,
             30,
             MessageDeferReason::CommitteeNoncesPending,
@@ -3672,6 +3872,12 @@ async fn handle_committee_presign_committee(
     _agg_nonces: &CommitteeAggNonces,
     content: &GOATMessageContent,
 ) -> Result<()> {
+    if graph_signing_round_is_over(ctx.local_db, instance_id, graph_id).await? {
+        tracing::debug!(
+            "Ignore CommitteePresign for {instance_id}:{graph_id}: signing round is over"
+        );
+        return Ok(());
+    }
     // received from Committee members
     if !ensure_self_or_valid_committee(
         ctx,
@@ -3978,9 +4184,38 @@ async fn handle_graph_finalize_committee(
                     pub_nonce,
                 )
                 .await?;
-                send_to_peer(ctx.swarm, GOATMessage::new(Actor::Committee, message_content))
-                    .await?;
+                send_protocol_message(
+                    ctx.swarm,
+                    ctx.local_db,
+                    GOATMessage::new(Actor::Committee, message_content),
+                    StoredValue::Fresh,
+                )
+                .await?;
             }
+        }
+        if let Some(pub_nonce) = stored_pub_nonce {
+            // Recover the stored nonce proof after Presigned without recomputing MuSig signatures.
+            let (_, expected_nonce, nonce_sig) = committee_master_key
+                .nonce_for_instance_job_with_keypair(
+                    &graph.parameters.instance_parameters,
+                    instance_keypair,
+                )?;
+            if expected_nonce != pub_nonce {
+                bail!("stored pegin public nonce differs from deterministic nonce");
+            }
+            publish_stored(
+                ctx,
+                &format!("pegin-nonce:{instance_id}"),
+                Actor::Committee,
+                GOATMessageContent::PeginConfirmNonce(PeginConfirmNonce {
+                    instance_id,
+                    committee_pubkey: local_committee_pubkey,
+                    pub_nonce,
+                    nonce_sig,
+                }),
+                StoredValue::Found,
+            )
+            .await?;
         }
         maybe_vote_and_sign_pegin_confirm(ctx, instance_id).await?;
     }
@@ -4196,10 +4431,47 @@ async fn maybe_vote_and_sign_pegin_confirm(
     let committee_master_key = CommitteeMasterKey::new(get_bitvm_key()?);
     let instance_keypair = load_committee_instance_keypair(&committee_master_key, instance_id)?;
     let local_committee_pubkey = instance_keypair.public_key().into();
-    if get_committee_partial_sig_for_instance(ctx.local_db, instance_id, &local_committee_pubkey)
-        .await?
-        .is_some()
+    if let Some(stored_partial_sig) =
+        get_committee_partial_sig_for_instance(ctx.local_db, instance_id, &local_committee_pubkey)
+            .await?
     {
+        // Recreate a missing endorsement while preserving the stored partial signature.
+        let stored_endorse_sig = get_committee_endorse_sigs_for_pegin(ctx.local_db, instance_id)
+            .await?
+            .into_iter()
+            .find(|(committee_pubkey, _)| *committee_pubkey == local_committee_pubkey)
+            .map(|(_, endorse_sig)| endorse_sig);
+        let endorse_sig = match stored_endorse_sig {
+            Some(endorse_sig) => endorse_sig,
+            None => {
+                let pegin_txid = instance_parameters.build_pegin_tx()?.1.tx().compute_txid();
+                let endorse_sig = endorse_pegin(ctx.goat_client, instance_id, &pegin_txid)
+                    .await?
+                    .as_bytes()
+                    .to_vec();
+                store_committee_endorse_sig_for_pegin(
+                    ctx.local_db,
+                    instance_id,
+                    local_committee_pubkey,
+                    endorse_sig.clone(),
+                )
+                .await?;
+                endorse_sig
+            }
+        };
+        publish_stored(
+            ctx,
+            &format!("pegin-confirm-partial-sig:{instance_id}"),
+            Actor::Committee,
+            GOATMessageContent::PeginConfirmPartialSig(PeginConfirmPartialSig {
+                instance_id,
+                committee_pubkey: local_committee_pubkey,
+                partial_sig: stored_partial_sig,
+                endorse_sig,
+            }),
+            StoredValue::Found,
+        )
+        .await?;
         return broadcast_pegin_confirm_if_presigned(
             ctx,
             instance_id,
@@ -4220,29 +4492,41 @@ async fn maybe_vote_and_sign_pegin_confirm(
             "local PeginConfirm nonce consensus differs for instance {instance_id}"
         )));
     }
-    if !consensus_votes
+    // Stored, then published: see the same step for graphs in
+    // `maybe_vote_and_presign_graph`.
+    let local_vote = consensus_votes
         .iter()
-        .any(|(committee_pubkey, _, _)| *committee_pubkey == local_committee_pubkey)
-    {
-        let signature =
-            SECP256K1.sign_schnorr(&SecpMessage::from_digest(consensus_hash), &instance_keypair);
-        store_committee_agg_nonce_consensus_for_instance(
-            ctx.local_db,
-            instance_id,
-            local_committee_pubkey,
-            consensus_hash,
-            signature,
-        )
-        .await?;
-        let message_content =
-            GOATMessageContent::PeginConfirmNonceConsensus(PeginConfirmNonceConsensus {
+        .find(|(committee_pubkey, _, _)| *committee_pubkey == local_committee_pubkey)
+        .map(|(_, _, signature)| *signature);
+    let (signature, origin) = match local_vote {
+        Some(signature) => (signature, StoredValue::Found),
+        None => {
+            let signature = SECP256K1
+                .sign_schnorr(&SecpMessage::from_digest(consensus_hash), &instance_keypair);
+            store_committee_agg_nonce_consensus_for_instance(
+                ctx.local_db,
                 instance_id,
-                committee_pubkey: local_committee_pubkey,
+                local_committee_pubkey,
                 consensus_hash,
                 signature,
-            });
-        send_to_peer(ctx.swarm, GOATMessage::new(Actor::Committee, message_content)).await?;
-    }
+            )
+            .await?;
+            (signature, StoredValue::Fresh)
+        }
+    };
+    publish_stored(
+        ctx,
+        &format!("pegin-confirm-nonce-consensus:{instance_id}"),
+        Actor::Committee,
+        GOATMessageContent::PeginConfirmNonceConsensus(PeginConfirmNonceConsensus {
+            instance_id,
+            committee_pubkey: local_committee_pubkey,
+            consensus_hash,
+            signature,
+        }),
+        origin,
+    )
+    .await?;
     if !has_complete_pegin_confirm_nonce_consensus(
         ctx,
         instance_id,
@@ -4280,13 +4564,19 @@ async fn maybe_vote_and_sign_pegin_confirm(
         endorse_sig.as_bytes().to_vec(),
     )
     .await?;
-    let message_content = GOATMessageContent::PeginConfirmPartialSig(PeginConfirmPartialSig {
-        instance_id,
-        committee_pubkey: local_committee_pubkey,
-        partial_sig,
-        endorse_sig: endorse_sig.as_bytes().to_vec(),
-    });
-    send_to_peer(ctx.swarm, GOATMessage::new(Actor::Committee, message_content)).await?;
+    publish_stored(
+        ctx,
+        &format!("pegin-confirm-partial-sig:{instance_id}"),
+        Actor::Committee,
+        GOATMessageContent::PeginConfirmPartialSig(PeginConfirmPartialSig {
+            instance_id,
+            committee_pubkey: local_committee_pubkey,
+            partial_sig,
+            endorse_sig: endorse_sig.as_bytes().to_vec(),
+        }),
+        StoredValue::Fresh,
+    )
+    .await?;
     broadcast_pegin_confirm_if_presigned(ctx, instance_id, &instance_parameters, &committee_pubkeys)
         .await
 }
@@ -4329,9 +4619,14 @@ async fn handle_pegin_confirm_nonce_committee(
         pub_nonce.clone(),
     )
     .await?;
-    if ctx.id == GOATMessage::default_message_id() {
-        send_to_peer(ctx.swarm, GOATMessage::new(Actor::Committee, content.clone())).await?;
-    }
+    redeliver_own_pegin_confirm_value(
+        ctx,
+        instance_id,
+        &format!("pegin-nonce:{instance_id}"),
+        received_committee_pubkey,
+        content,
+    )
+    .await?;
     // 3. Agree on the full nonce transcript before generating a partial signature.
     maybe_vote_and_sign_pegin_confirm(ctx, instance_id).await
 }
@@ -4360,9 +4655,8 @@ async fn handle_pegin_confirm_nonce_consensus_committee(
     let Some((_, _, _, _, expected_consensus_hash)) =
         pegin_confirm_nonce_consensus_context(ctx, instance_id).await?
     else {
-        push_local_unhandled_messages_with_reason(
+        defer_or_enqueue_message(
             ctx.local_db,
-            instance_id,
             &message,
             30,
             MessageDeferReason::CommitteeNoncesPending,
@@ -4403,6 +4697,16 @@ async fn handle_pegin_confirm_nonce_consensus_committee(
         *signature,
     )
     .await?;
+    // A locally queued copy is the recovery monitor re-delivering this node's own
+    // stored vote, as the nonce and partial-signature handlers do for theirs.
+    redeliver_own_pegin_confirm_value(
+        ctx,
+        instance_id,
+        &format!("pegin-confirm-nonce-consensus:{instance_id}"),
+        received_committee_pubkey,
+        content,
+    )
+    .await?;
     maybe_vote_and_sign_pegin_confirm(ctx, instance_id).await
 }
 
@@ -4432,9 +4736,8 @@ async fn handle_pegin_confirm_partial_sig_committee(
     let pub_nonces_unchecked =
         get_committee_pub_nonces_for_instance(ctx.local_db, instance_id).await?;
     if pub_nonces_unchecked.len() != committee_pubkeys.len() {
-        push_local_unhandled_messages_with_reason(
+        defer_or_enqueue_message(
             ctx.local_db,
-            instance_id,
             &message,
             30,
             MessageDeferReason::CommitteeNoncesPending,
@@ -4488,9 +4791,8 @@ async fn handle_pegin_confirm_partial_sig_committee(
     )
     .await?
     {
-        push_local_unhandled_messages_with_reason(
+        defer_or_enqueue_message(
             ctx.local_db,
-            instance_id,
             &message,
             30,
             MessageDeferReason::CommitteeNonceConsensusPending,
@@ -4536,9 +4838,8 @@ async fn handle_pegin_confirm_partial_sig_committee(
             return Ok(());
         }
         Err(e) => {
-            push_local_unhandled_messages_with_reason(
+            defer_or_enqueue_message(
                 ctx.local_db,
-                instance_id,
                 &message,
                 30,
                 MessageDeferReason::ValidationRetry,
@@ -4567,9 +4868,14 @@ async fn handle_pegin_confirm_partial_sig_committee(
         endorse_sig.to_owned(),
     )
     .await?;
-    if ctx.id == GOATMessage::default_message_id() {
-        send_to_peer(ctx.swarm, GOATMessage::new(Actor::Committee, content.clone())).await?;
-    }
+    redeliver_own_pegin_confirm_value(
+        ctx,
+        instance_id,
+        &format!("pegin-confirm-partial-sig:{instance_id}"),
+        received_committee_pubkey,
+        content,
+    )
+    .await?;
     broadcast_pegin_confirm_if_presigned(ctx, instance_id, &instance_params, &committee_pubkeys)
         .await
 }
@@ -4600,9 +4906,8 @@ async fn handle_post_ready(ctx: &mut HandlerContext<'_>, instance_id: Uuid) -> R
                     ctx.actor.clone(),
                     GOATMessageContent::PostReady(PostReady { instance_id }),
                 );
-                push_local_unhandled_messages_with_reason(
+                defer_or_enqueue_message(
                     ctx.local_db,
-                    instance_id,
                     &message,
                     delay_secs as usize,
                     MessageDeferReason::BitcoinTransactionPending,
@@ -4626,9 +4931,8 @@ async fn handle_post_ready(ctx: &mut HandlerContext<'_>, instance_id: Uuid) -> R
                 ctx.actor.clone(),
                 GOATMessageContent::PostReady(PostReady { instance_id }),
             );
-            push_local_unhandled_messages_with_reason(
+            defer_or_enqueue_message(
                 ctx.local_db,
-                instance_id,
                 &message,
                 delay_secs as usize,
                 MessageDeferReason::CommitteeEndorsementsPending,
@@ -4649,9 +4953,8 @@ async fn handle_post_ready(ctx: &mut HandlerContext<'_>, instance_id: Uuid) -> R
                     ctx.actor.clone(),
                     GOATMessageContent::PostReady(PostReady { instance_id }),
                 );
-                push_local_unhandled_messages_with_reason(
+                defer_or_enqueue_message(
                     ctx.local_db,
-                    instance_id,
                     &message,
                     delay_secs as usize,
                     MessageDeferReason::BitcoinConfirmationPending,
@@ -4672,9 +4975,8 @@ async fn handle_post_ready(ctx: &mut HandlerContext<'_>, instance_id: Uuid) -> R
                 ctx.actor.clone(),
                 GOATMessageContent::PostReady(PostReady { instance_id }),
             );
-            push_local_unhandled_messages_with_reason(
+            defer_or_enqueue_message(
                 ctx.local_db,
-                instance_id,
                 &message,
                 delay_secs as usize,
                 MessageDeferReason::GoatSpvPending,
@@ -4733,9 +5035,8 @@ async fn handle_post_ready(ctx: &mut HandlerContext<'_>, instance_id: Uuid) -> R
             ctx.actor.clone(),
             GOATMessageContent::PostReady(PostReady { instance_id }),
         );
-        push_local_unhandled_messages_with_reason(
+        defer_or_enqueue_message(
             ctx.local_db,
-            instance_id,
             &message,
             delay_secs as usize,
             MessageDeferReason::CommitteeEndorsementsPending,
@@ -4864,9 +5165,8 @@ async fn handle_kickoff_ready_operator(
             ) as u64
                 * avg_block_time_secs(ctx.btc_client.network());
             let delay_secs = min_pegout_time_secs * nonce_interval;
-            push_local_unhandled_messages_with_reason(
+            defer_or_enqueue_message(
                 ctx.local_db,
-                graph_id,
                 &message,
                 delay_secs as usize,
                 MessageDeferReason::PreviousGraphPending,
@@ -4880,9 +5180,8 @@ async fn handle_kickoff_ready_operator(
                 "Operator {operator_pubkey} skipped obsoleted graph {current_instance_id}:{current_graph_id}"
             );
             let delay_secs = avg_block_time_secs(ctx.btc_client.network()); // wait for 1 blocks
-            push_local_unhandled_messages_with_reason(
+            defer_or_enqueue_message(
                 ctx.local_db,
-                graph_id,
                 &message,
                 delay_secs as usize,
                 MessageDeferReason::ChainStatePending,
@@ -4905,9 +5204,8 @@ async fn handle_kickoff_ready_operator(
                 ) as u64
                     * avg_block_time_secs(ctx.btc_client.network());
                 let delay_secs = min_pegout_time_secs * nonce_interval;
-                push_local_unhandled_messages_with_reason(
+                defer_or_enqueue_message(
                     ctx.local_db,
-                    graph_id,
                     &message,
                     delay_secs as usize,
                     MessageDeferReason::PreviousGraphPending,
@@ -4921,9 +5219,8 @@ async fn handle_kickoff_ready_operator(
                     "Operator {operator_pubkey} skipped non-posted graph {current_instance_id}:{current_graph_id}"
                 );
                 let delay_secs = avg_block_time_secs(ctx.btc_client.network()); // wait for 1 blocks
-                push_local_unhandled_messages_with_reason(
+                defer_or_enqueue_message(
                     ctx.local_db,
-                    graph_id,
                     &message,
                     delay_secs as usize,
                     MessageDeferReason::ChainStatePending,
@@ -4981,9 +5278,8 @@ async fn handle_kickoff_sent_committee(
         None => {
             let delay_secs = avg_block_time_secs(ctx.btc_client.network());
             let message = make_message(ctx, content);
-            push_local_unhandled_messages_with_reason(
+            defer_or_enqueue_message(
                 ctx.local_db,
-                graph_id,
                 &message,
                 delay_secs as usize,
                 MessageDeferReason::BitcoinConfirmationPending,
@@ -5001,9 +5297,8 @@ async fn handle_kickoff_sent_committee(
         let delay_secs = avg_block_time_secs(ctx.btc_client.network())
             * (kickoff_height - goat_confirmed_btc_height);
         let message = make_message(ctx, content);
-        push_local_unhandled_messages_with_reason(
+        defer_or_enqueue_message(
             ctx.local_db,
-            graph_id,
             &message,
             delay_secs as usize,
             MessageDeferReason::GoatSpvPending,
@@ -5045,8 +5340,18 @@ async fn handle_kickoff_sent_verifier(
     let kickoff_height = match ctx.btc_client.get_tx_status(&kickoff_txid).await?.block_height {
         Some(height) => height,
         None => {
-            tracing::warn!(
-                "Ignore KickoffSent for {instance_id}:{graph_id}: kickoff tx not confirmed yet"
+            // Retry after Bitcoin confirmation.
+            let delay_secs = avg_block_time_secs(ctx.btc_client.network());
+            defer_or_enqueue_message(
+                ctx.local_db,
+                &message,
+                delay_secs as usize,
+                MessageDeferReason::BitcoinConfirmationPending,
+                "kickoff transaction is not confirmed on Bitcoin",
+            )
+            .await?;
+            tracing::info!(
+                "Retry KickoffSent later for {instance_id}:{graph_id}: kickoff tx not confirmed yet"
             );
             return Ok(());
         }
@@ -5075,9 +5380,8 @@ async fn handle_kickoff_sent_verifier(
         if kickoff_height >= goat_confirmed_btc_height {
             let delay_secs = avg_block_time_secs(ctx.btc_client.network())
                 * (kickoff_height - goat_confirmed_btc_height) as u64;
-            push_local_unhandled_messages_with_reason(
+            defer_or_enqueue_message(
                 ctx.local_db,
-                graph_id,
                 &message,
                 delay_secs as usize,
                 MessageDeferReason::GoatSpvPending,
@@ -5400,9 +5704,8 @@ async fn handle_watchtower_challenge_init_sent_watchtower(
             tracing::warn!(
                 "Retry WatchtowerChallengeInitSent for {instance_id}:{graph_id} later: watchtower proof not ready, retry after {wait_secs} seconds"
             );
-            push_local_unhandled_messages_with_reason(
+            defer_or_enqueue_message(
                 ctx.local_db,
-                graph_id,
                 &message,
                 wait_secs,
                 MessageDeferReason::ProofPending,
@@ -5422,9 +5725,18 @@ async fn handle_watchtower_challenge_init_sent_watchtower(
     {
         Ok(txid) => txid,
         Err(e) => {
+            // Retry broadcast failures until the connector is spent.
             tracing::warn!(
-                "Ignore WatchtowerChallengeInitSent for {instance_id}:{graph_id}: failed to send watchtower challenge tx: {e}"
+                "Retry WatchtowerChallengeInitSent for {instance_id}:{graph_id} later: failed to send watchtower challenge tx: {e}"
             );
+            defer_or_enqueue_message(
+                ctx.local_db,
+                &message,
+                30,
+                MessageDeferReason::BitcoinTransactionPending,
+                "watchtower challenge transaction could not be broadcast",
+            )
+            .await?;
             return Ok(());
         }
     };
@@ -5719,9 +6031,8 @@ async fn handle_operator_commit_pubin_ready_operator(
             tracing::info!(
                 "Retry OperatorCommitPubinReady later for {instance_id}:{graph_id}: challenge info is not ready: {e}"
             );
-            push_local_unhandled_messages_with_reason(
+            defer_or_enqueue_message(
                 ctx.local_db,
-                graph_id,
                 &message,
                 wait_secs,
                 MessageDeferReason::ProtocolInputsPending,
@@ -5744,9 +6055,8 @@ async fn handle_operator_commit_pubin_ready_operator(
                 tracing::info!(
                     "Retry OperatorCommitPubinReady later for {instance_id}:{graph_id}: operator pubin inputs are not ready: {e}"
                 );
-                push_local_unhandled_messages_with_reason(
+                defer_or_enqueue_message(
                     ctx.local_db,
-                    graph_id,
                     &message,
                     wait_secs,
                     MessageDeferReason::ProtocolInputsPending,
@@ -5875,9 +6185,8 @@ async fn handle_assert_ready_operator(
         tracing::info!(
             "Retry AssertReady later for {instance_id}:{graph_id}: operator proof is not ready"
         );
-        push_local_unhandled_messages_with_reason(
+        defer_or_enqueue_message(
             ctx.local_db,
-            graph_id,
             &message,
             wait_secs,
             MessageDeferReason::ProofPending,
@@ -6040,9 +6349,8 @@ async fn handle_assert_sent_verifier(
     else {
         let delay_secs = avg_block_time_secs(ctx.btc_client.network());
         let message = make_message(ctx, content);
-        push_local_unhandled_messages_with_reason(
+        defer_or_enqueue_message(
             ctx.local_db,
-            graph_id,
             &message,
             delay_secs as usize,
             MessageDeferReason::ProtocolInputsPending,
@@ -6060,9 +6368,8 @@ async fn handle_assert_sent_verifier(
         if !ctx.btc_client.get_tx_status(&connector_e_spent_txid).await?.confirmed {
             let delay_secs = avg_block_time_secs(ctx.btc_client.network());
             let message = make_message(ctx, content);
-            push_local_unhandled_messages_with_reason(
+            defer_or_enqueue_message(
                 ctx.local_db,
-                graph_id,
                 &message,
                 delay_secs as usize,
                 MessageDeferReason::ProtocolInputsPending,
@@ -6074,9 +6381,8 @@ async fn handle_assert_sent_verifier(
         let Some(commit_pubin_tx) = ctx.btc_client.get_tx(&connector_e_spent_txid).await? else {
             let delay_secs = avg_block_time_secs(ctx.btc_client.network());
             let message = make_message(ctx, content);
-            push_local_unhandled_messages_with_reason(
+            defer_or_enqueue_message(
                 ctx.local_db,
-                graph_id,
                 &message,
                 delay_secs as usize,
                 MessageDeferReason::ProtocolInputsPending,
@@ -6105,9 +6411,8 @@ async fn handle_assert_sent_verifier(
                 Err(error) => {
                     let delay_secs = avg_block_time_secs(ctx.btc_client.network());
                     let message = make_message(ctx, content);
-                    push_local_unhandled_messages_with_reason(
+                    defer_or_enqueue_message(
                         ctx.local_db,
-                        graph_id,
                         &message,
                         delay_secs as usize,
                         MessageDeferReason::ProtocolInputsPending,
@@ -6316,9 +6621,8 @@ async fn handle_challenge_assert_sent_operator(
     let Some(challenge_assert_tx) = ctx.btc_client.get_tx(&challenge_assert_txid).await? else {
         let delay_secs = avg_block_time_secs(ctx.btc_client.network());
         let message = make_message(ctx, content);
-        push_local_unhandled_messages_with_reason(
+        defer_or_enqueue_message(
             ctx.local_db,
-            graph_id,
             &message,
             delay_secs as usize,
             MessageDeferReason::BitcoinTransactionPending,
@@ -6484,9 +6788,8 @@ async fn handle_wrongly_challenge_timeout_verifier(
     let delay_secs = avg_block_time_secs(ctx.btc_client.network());
     let message = make_message(ctx, content);
     if ctx.btc_client.get_tx(&challenge_assert_txid).await?.is_none() {
-        push_local_unhandled_messages_with_reason(
+        defer_or_enqueue_message(
             ctx.local_db,
-            graph_id,
             &message,
             delay_secs as usize,
             MessageDeferReason::BitcoinTransactionPending,
@@ -6507,9 +6810,8 @@ async fn handle_wrongly_challenge_timeout_verifier(
     {
         Some(height) => height as u64,
         None => {
-            push_local_unhandled_messages_with_reason(
+            defer_or_enqueue_message(
                 ctx.local_db,
-                graph_id,
                 &message,
                 delay_secs as usize,
                 MessageDeferReason::BitcoinConfirmationPending,
@@ -6532,9 +6834,8 @@ async fn handle_wrongly_challenge_timeout_verifier(
     if bitcoin_height < disprove_height {
         let retry_secs =
             avg_block_time_secs(ctx.btc_client.network()) * (disprove_height - bitcoin_height);
-        push_local_unhandled_messages_with_reason(
+        defer_or_enqueue_message(
             ctx.local_db,
-            graph_id,
             &message,
             retry_secs as usize,
             MessageDeferReason::TimelockPending,
@@ -6633,9 +6934,8 @@ async fn handle_disprove_sent_committee(
         Some(height) => height as u64,
         None => {
             let delay_secs = avg_block_time_secs(ctx.btc_client.network());
-            push_local_unhandled_messages_with_reason(
+            defer_or_enqueue_message(
                 ctx.local_db,
-                graph_id,
                 &message,
                 delay_secs as usize,
                 MessageDeferReason::BitcoinConfirmationPending,
@@ -6652,9 +6952,8 @@ async fn handle_disprove_sent_committee(
     if goat_confirmed_height < challenge_finish_height {
         let delay_secs = avg_block_time_secs(ctx.btc_client.network())
             * (challenge_finish_height - goat_confirmed_height);
-        push_local_unhandled_messages_with_reason(
+        defer_or_enqueue_message(
             ctx.local_db,
-            graph_id,
             &message,
             delay_secs as usize,
             MessageDeferReason::GoatSpvPending,
@@ -6800,9 +7099,8 @@ async fn handle_take1_sent_committee(
     if withdraw_status == WithdrawStatus::Initialized {
         // Kickoff not posted yet, wait for it
         let delay_secs = avg_block_time_secs(ctx.btc_client.network()) * 6; // wait for 6 blocks
-        push_local_unhandled_messages_with_reason(
+        defer_or_enqueue_message(
             ctx.local_db,
-            graph_id,
             &message,
             delay_secs as usize,
             MessageDeferReason::WithdrawKickoffPending,
@@ -6824,9 +7122,8 @@ async fn handle_take1_sent_committee(
         Some(height) => height as u64,
         None => {
             let delay_secs = avg_block_time_secs(ctx.btc_client.network()); // wait for 1 block
-            push_local_unhandled_messages_with_reason(
+            defer_or_enqueue_message(
                 ctx.local_db,
-                graph_id,
                 &message,
                 delay_secs as usize,
                 MessageDeferReason::BitcoinConfirmationPending,
@@ -6843,9 +7140,8 @@ async fn handle_take1_sent_committee(
     if goat_confirmed_height < take1_height {
         let delay_secs =
             avg_block_time_secs(ctx.btc_client.network()) * (take1_height - goat_confirmed_height);
-        push_local_unhandled_messages_with_reason(
+        defer_or_enqueue_message(
             ctx.local_db,
-            graph_id,
             &message,
             delay_secs as usize,
             MessageDeferReason::GoatSpvPending,
@@ -7015,9 +7311,8 @@ async fn handle_take2_sent_committee(
     if withdraw_status == WithdrawStatus::Initialized {
         // Kickoff not posted yet, wait for it
         let delay_secs = avg_block_time_secs(ctx.btc_client.network()) * 6; // wait for 6 blocks
-        push_local_unhandled_messages_with_reason(
+        defer_or_enqueue_message(
             ctx.local_db,
-            graph_id,
             &message,
             delay_secs as usize,
             MessageDeferReason::WithdrawKickoffPending,
@@ -7039,9 +7334,8 @@ async fn handle_take2_sent_committee(
         Some(height) => height as u64,
         None => {
             let delay_secs = avg_block_time_secs(ctx.btc_client.network()); // wait for 1 block
-            push_local_unhandled_messages_with_reason(
+            defer_or_enqueue_message(
                 ctx.local_db,
-                graph_id,
                 &message,
                 delay_secs as usize,
                 MessageDeferReason::BitcoinConfirmationPending,
@@ -7058,9 +7352,8 @@ async fn handle_take2_sent_committee(
     if goat_confirmed_height < take2_height {
         let delay_secs =
             avg_block_time_secs(ctx.btc_client.network()) * (take2_height - goat_confirmed_height);
-        push_local_unhandled_messages_with_reason(
+        defer_or_enqueue_message(
             ctx.local_db,
-            graph_id,
             &message,
             delay_secs as usize,
             MessageDeferReason::GoatSpvPending,
@@ -7100,18 +7393,45 @@ async fn handle_sync_graph_request(
     // sent by other nodes when they find a graph is missing locally
     // 1. (Relayer) send SyncGraph response if have the graph
     if !is_relayer() {
-        tracing::warn!("Ignore SyncGraphRequest for {instance_id}:{graph_id}: not a relayer node");
+        tracing::debug!("Ignore SyncGraphRequest for {instance_id}:{graph_id}: not a relayer node");
         return Ok(());
     }
-    if let Some(graph) = get_graph(ctx.local_db, instance_id, graph_id).await? {
-        let message_content =
-            GOATMessageContent::SyncGraph(SyncGraph { instance_id, graph_id, graph });
-        let message = GOATMessage::new(Actor::All, message_content);
-        send_to_peer(ctx.swarm, message).await?;
-    } else {
-        // TODO: if no relayer has the graph, how to recover?
-        tracing::warn!("Graph not found for SyncGraphRequest {instance_id}:{graph_id}");
+    // Check graph ownership before charging the response budget or recording cooldown.
+    let now = std::time::Instant::now();
+    let graph_key = graph_id.to_string();
+    if crate::p2p_admission::sync_graph_response_gate().is_cooling(&graph_key, now) {
+        return Ok(());
     }
+    // Require the graph to belong to the requested instance.
+    if !ctx.local_db.acquire().await?.has_graph_of_instance(&instance_id, &graph_id).await? {
+        tracing::debug!("Graph not found for SyncGraphRequest {instance_id}:{graph_id}");
+        return Ok(());
+    }
+    let requester_registered =
+        crate::p2p_admission::peer_registry().sender_class(&ctx.from_peer_id, now).is_registered();
+    if !crate::p2p_admission::sync_graph_response_budget(requester_registered).allow(now) {
+        tracing::debug!(
+            "Defer SyncGraphRequest for {instance_id}:{graph_id}: sync-graph response budget spent"
+        );
+        return Ok(());
+    }
+    let Some(graph) = get_graph(ctx.local_db, instance_id, graph_id).await? else {
+        // TODO: if no relayer has the graph, how to recover?
+        tracing::warn!("Graph not loadable for SyncGraphRequest {instance_id}:{graph_id}");
+        return Ok(());
+    };
+    // The cooldown is taken only for a response that is actually going out.
+    if !crate::p2p_admission::sync_graph_response_gate().allow(&graph_key, now) {
+        return Ok(());
+    }
+    let message_content = GOATMessageContent::SyncGraph(SyncGraph { instance_id, graph_id, graph });
+    send_protocol_message(
+        ctx.swarm,
+        ctx.local_db,
+        GOATMessage::new(Actor::All, message_content),
+        StoredValue::Fresh,
+    )
+    .await?;
     Ok(())
 }
 
@@ -7122,24 +7442,40 @@ async fn handle_sync_graph(
     graph_id: Uuid,
     graph: &SimplifiedBitvmGcGraph,
 ) -> Result<()> {
-    // sent by relayer nodes in response to SyncGraphRequest
-    if !ctx
-        .goat_client
-        .committee_mana_is_validate_peer_id(&ctx.from_peer_id.to_bytes())
-        .await
-        .with_context(|| {
-            format!(
-                "failed to validate SyncGraph sender {} against the committee registry",
-                ctx.from_peer_id
-            )
-        })?
+    // Accept only responses to a recorded local request.
+    if !crate::p2p_admission::requested_graphs()
+        .contains(&graph_id.to_string(), std::time::Instant::now())
     {
-        tracing::warn!(
-            "Ignore SyncGraph for {instance_id}:{graph_id}: sender {} is not a registered committee peer",
+        tracing::debug!(
+            "Ignore SyncGraph for {instance_id}:{graph_id}: no matching local sync request"
+        );
+        return Ok(());
+    }
+    // Require a cached committee identity for the relayer.
+    if !crate::p2p_admission::peer_registry()
+        .is_committee(&ctx.from_peer_id, std::time::Instant::now())
+    {
+        tracing::debug!(
+            "Ignore SyncGraph for {instance_id}:{graph_id}: sender {} is not a committee peer",
             ctx.from_peer_id
         );
         return Ok(());
     }
+    // Apply rejection cooldown per graph and sender; RPC failures leave the gate open.
+    let gate_key = format!("{graph_id}:{}", ctx.from_peer_id);
+    if crate::p2p_admission::sync_graph_validation_gate()
+        .is_cooling(&gate_key, std::time::Instant::now())
+    {
+        tracing::debug!(
+            "Ignore SyncGraph for {instance_id}:{graph_id}: this sender's graph was rejected recently"
+        );
+        return Ok(());
+    }
+    let reject = |why: String| {
+        crate::p2p_admission::sync_graph_validation_gate()
+            .allow(&gate_key, std::time::Instant::now());
+        tracing::warn!("Ignore SyncGraph for {instance_id}:{graph_id}: {why}");
+    };
 
     if !message_identity_matches(
         "SyncGraph",
@@ -7150,13 +7486,12 @@ async fn handle_sync_graph(
         graph.parameters.graph_id,
         graph.parameters.graph_nonce,
     ) {
+        reject("envelope and graph parameters name different graphs".to_string());
         return Ok(());
     }
 
-    validate_graph_id_on_goat(ctx.goat_client, instance_id, graph_id).await.map_err(|e| {
-        anyhow!(
-            "Failed to validate graph_id on GoatChain for SyncGraph {instance_id}:{graph_id}: {e}"
-        )
+    validate_graph_id_on_goat(ctx.goat_client, instance_id, graph_id).await.with_context(|| {
+        format!("Failed to validate graph_id on GoatChain for SyncGraph {instance_id}:{graph_id}")
     })?;
     let validation = validate_graph_instance_parameters(
         ctx.btc_client,
@@ -7166,37 +7501,37 @@ async fn handle_sync_graph(
     .await;
     ctx.metrics_state.record_graph_validation(validation.is_ok());
     if let Err(e) = validation {
-        tracing::warn!(
-            "Ignore SyncGraph for {instance_id}:{graph_id}: invalid instance parameters: {e}"
-        );
+        // This check talks to both chains. "Could not ask" is not a verdict on
+        // the graph: let the inbox retry instead of rejecting a good answer.
+        if crate::action::is_retryable_external_rpc_error(&e) {
+            return Err(e).context("validate SyncGraph instance parameters");
+        }
+        reject(format!("invalid instance parameters: {e}"));
         return Ok(());
     }
     let graph = BitvmGcGraph::from_simplified(graph)?;
     let graph_data = build_graph_data(&graph)?;
     let graph_data_on_goat = ctx.goat_client.gateway_get_graph_data(&graph_id).await?;
     if graph_data != graph_data_on_goat {
-        tracing::warn!(
-            "Ignore SyncGraph for {instance_id}:{graph_id}: reconstructed graph data does not match GoatChain"
-        );
+        reject("reconstructed graph data does not match GoatChain".to_string());
         return Ok(());
     }
 
     if let Err(e) = verify_graph_operator_pre_signatures(&graph) {
-        tracing::warn!(
-            "Ignore SyncGraph for {instance_id}:{graph_id}: invalid operator pre-signatures: {e}"
-        );
+        reject(format!("invalid operator pre-signatures: {e}"));
         return Ok(());
     }
     if let Err(e) = verify_graph_committee_pre_signatures(&graph) {
-        tracing::warn!(
-            "Ignore SyncGraph for {instance_id}:{graph_id}: invalid committee pre-signatures: {e}"
-        );
+        reject(format!("invalid committee pre-signatures: {e}"));
         return Ok(());
     }
     let simplified_graph = graph.to_simplified()?;
     let _ = store_finalized_graph_if_needed(ctx.local_db, &simplified_graph).await?;
     refresh_and_compensate(ctx, instance_id, graph_id, &graph, GraphStatus::OperatorPresigned)
         .await?;
+    // Close only after compensation succeeds. Otherwise a transient refresh
+    // failure would make this inbox row's retry look unsolicited and drop it.
+    crate::p2p_admission::requested_graphs().remove(&graph_id.to_string());
     Ok(())
 }
 
@@ -7204,19 +7539,104 @@ async fn handle_sync_graph(
 /// sender's own record: the registry is keyed by `peer_id`, and without this
 /// check any peer could overwrite any other node's row.
 fn accept_node_info(ctx: &HandlerContext<'_>, node_info: &NodeInfo, message_kind: &str) -> bool {
-    if !node_info_matches_sender(node_info, &ctx.from_peer_id) {
-        tracing::warn!(
-            "Ignore {message_kind} from {}: payload claims peer_id {}",
-            ctx.from_peer_id,
-            node_info.peer_id
-        );
-        return false;
-    }
-    if let Err(reason) = validate_node_info_payload(node_info) {
+    let Err(reason) = check_node_info(ctx, node_info) else {
+        return true;
+    };
+    // Log registered-peer failures individually and aggregate unregistered-peer failures.
+    let registered = crate::p2p_admission::peer_registry()
+        .sender_class(&ctx.from_peer_id, std::time::Instant::now())
+        .is_registered();
+    if registered {
         tracing::warn!("Ignore {message_kind} from {}: {reason}", ctx.from_peer_id);
-        return false;
+    } else {
+        crate::p2p_admission::record_drop(crate::p2p_admission::DropReason::NodeInfoRejected);
+        tracing::debug!("Ignore {message_kind} from {}: {reason}", ctx.from_peer_id);
     }
-    true
+    false
+}
+
+fn check_node_info(
+    ctx: &HandlerContext<'_>,
+    node_info: &NodeInfo,
+) -> std::result::Result<(), String> {
+    if !node_info_matches_sender(node_info, &ctx.from_peer_id) {
+        return Err(format!("payload claims peer_id {}", node_info.peer_id));
+    }
+    validate_node_info_payload(node_info)?;
+    if node_info.binding_sig.is_empty() {
+        return Ok(());
+    }
+    // A present-but-invalid binding is a forgery attempt (claiming another key's
+    // authorisation), not a benign omission, so reject the whole payload.
+    if crate::action::verify_node_info_binding(node_info).is_none() {
+        return Err("node info binding signature is invalid".to_string());
+    }
+    // `binding_issued_at` orders re-bindings, newest winning. One dated far ahead
+    // would win against every honest re-binding until that date.
+    if node_info.binding_issued_at
+        > current_time_secs() + crate::action::NODE_INFO_BINDING_MAX_FUTURE_SECS
+    {
+        return Err("node info binding is dated in the future".to_string());
+    }
+    Ok(())
+}
+
+/// Record verified operator bindings by x-only key; confirm stake asynchronously.
+async fn learn_node_info_binding(
+    local_db: &LocalDB,
+    goat_client: &Arc<GOATClient>,
+    node_info: &NodeInfo,
+) {
+    if node_info.actor != Actor::Operator.to_string() {
+        return;
+    }
+    let Some(operator_key) = crate::action::verify_node_info_binding(node_info) else {
+        return;
+    };
+    let operator_key = crate::p2p_admission::operator_key(&operator_key);
+    if let Ok(peer_id) = PeerId::from_str(&node_info.peer_id) {
+        let released_confirmed_key = crate::p2p_admission::peer_registry()
+            .observe_operator_binding(&peer_id, &operator_key, node_info.binding_issued_at);
+        if released_confirmed_key {
+            // The peer moved to another key: what was confirmed for the old one
+            // must not be there to be restored after a restart.
+            crate::p2p_admission::revoke_persisted_operator(local_db, &peer_id).await;
+        }
+        crate::p2p_admission::refresh_operator_binding_in_background(
+            local_db,
+            goat_client,
+            peer_id,
+            operator_key,
+        );
+    }
+}
+
+/// Store accepted NodeInfo within the unregistered-row limit and learn its binding.
+async fn record_node_info(ctx: &HandlerContext<'_>, node_info: &NodeInfo) -> Result<()> {
+    let registered = crate::p2p_admission::peer_registry()
+        .sender_class(&ctx.from_peer_id, std::time::Instant::now())
+        .is_registered();
+    let admissible = registered
+        || ctx
+            .local_db
+            .acquire()
+            .await?
+            .node_row_admissible(
+                &node_info.peer_id,
+                crate::action::NODE_TABLE_MAX_UNREGISTERED_ROWS,
+                current_time_secs() - crate::action::NODE_TABLE_EVICTABLE_AFTER_SECS,
+                &crate::env::get_peer_id(),
+            )
+            .await?;
+    if admissible {
+        save_node_info(ctx.local_db, node_info).await?;
+    } else {
+        crate::p2p_admission::record_drop(crate::p2p_admission::DropReason::NodeTableFull);
+    }
+    // The binding is learned either way: it lives in the bounded registry, and
+    // an operator must be able to become registered while the table is full.
+    learn_node_info_binding(ctx.local_db, ctx.goat_client, node_info).await;
+    Ok(())
 }
 
 async fn handle_request_node_info(
@@ -7224,13 +7644,37 @@ async fn handle_request_node_info(
     node_info: &NodeInfo,
 ) -> Result<()> {
     if accept_node_info(ctx, node_info, "RequestNodeInfo") {
-        save_node_info(ctx.local_db, node_info).await?;
+        record_node_info(ctx, node_info).await?;
     }
     // Answer regardless: the response only carries this node's own public info,
     // and staying silent would break discovery for a misconfigured peer.
-    let message_content = GOATMessageContent::ResponseNodeInfo(crate::env::get_local_node_info());
-    send_to_peer(ctx.swarm, GOATMessage::new(Actor::All, message_content)).await?;
+    // Coalesce recent requests into one broadcast response.
+    if crate::p2p_admission::node_info_response_gate().try_respond(std::time::Instant::now()) {
+        publish_node_info_response(ctx.swarm).await?;
+    }
     Ok(())
+}
+
+async fn publish_node_info_response(swarm: &mut dyn MessagePublisher) -> Result<()> {
+    let message_content = GOATMessageContent::ResponseNodeInfo(crate::env::get_local_node_info());
+    send_to_peer(swarm, GOATMessage::new(Actor::All, message_content)).await?;
+    Ok(())
+}
+
+/// Answer the `RequestNodeInfo`s that arrived while the previous response was
+/// still cooling down. Called from the regular tick.
+pub async fn flush_deferred_node_info_response(swarm: &mut dyn MessagePublisher) {
+    if !crate::p2p_admission::node_info_response_gate().take_pending(std::time::Instant::now()) {
+        return;
+    }
+    if let Err(error) = publish_node_info_response(swarm).await {
+        tracing::debug!(
+            event = "p2p_node_info",
+            outcome = "deferred_response_failed",
+            error = %error,
+            "failed to publish the deferred node info response; peers will ask again"
+        );
+    }
 }
 
 async fn handle_response_node_info(
@@ -7238,7 +7682,7 @@ async fn handle_response_node_info(
     node_info: &NodeInfo,
 ) -> Result<()> {
     if accept_node_info(ctx, node_info, "ResponseNodeInfo") {
-        save_node_info(ctx.local_db, node_info).await?;
+        record_node_info(ctx, node_info).await?;
     }
     Ok(())
 }
@@ -7321,6 +7765,114 @@ mod tests {
             selected_verifier_pubkeys: None,
             asserted_operator_proof: None,
         }
+    }
+
+    /// Verify retries fill missing CutCircuits entries without changing existing entries.
+    #[tokio::test]
+    async fn retry_after_a_cut_off_freeze_completes_the_cut_circuits() {
+        use bitcoin::secp256k1::{Secp256k1, SecretKey};
+
+        let sender_peer_id = generate_local_key().public().to_peer_id().to_string();
+
+        let local_db = store::create_local_db("sqlite::memory:").await;
+        let (instance_id, graph_id) = (Uuid::new_v4(), Uuid::new_v4());
+        let package = build_setup_package(BABE_M_CC + 1).unwrap();
+        let secp = Secp256k1::new();
+        let mut state = OperatorBabeSetupState {
+            candidate_verifier_pubkeys: None,
+            candidates: (1..=3u8)
+                .map(|index| OperatorVerifierCandidate {
+                    verifier_peer_id: PeerId::random().to_bytes(),
+                    verifier_pubkey: PublicKey::new(
+                        SecretKey::from_slice(&[index; 32]).unwrap().public_key(&secp),
+                    ),
+                    setup_package: package.clone(),
+                    candidate_index: None,
+                    selected_circuit_indexes: vec![],
+                    gc_data: None,
+                    soldering_proof_ready: None,
+                })
+                .collect(),
+            candidate_collection_started_at: None,
+            proof_collection_started_at: None,
+            selected_verifier_pubkeys: None,
+            asserted_operator_proof: None,
+        };
+        let now = current_time_secs();
+        assert!(cut_circuits_owed(&state, now).is_empty(), "nothing is owed before the freeze");
+        freeze_operator_candidates(&mut state).unwrap();
+        let outbox_id = |candidate: &OperatorVerifierCandidate| {
+            format!("cut-circuits:{instance_id}:{graph_id}:{}", candidate.verifier_pubkey)
+        };
+        let outbox_state = async |message_id: String| -> Option<(String, i64)> {
+            local_db.acquire().await.unwrap().p2p_outbox_entry_state(&message_id).await.unwrap()
+        };
+
+        // First run: the set is frozen and saved, one CutCircuits is written, and
+        // then the handler is cut off.
+        let owed = cut_circuits_owed(&state, now);
+        assert_eq!(owed.len(), 3);
+        ensure_cut_circuits_outbox(&local_db, instance_id, graph_id, &owed[..1], &sender_peer_id)
+            .await
+            .unwrap();
+        // That verifier acknowledges it before the retry comes round.
+        let first_peer = PeerId::from_bytes(&owed[0].verifier_peer_id).unwrap().to_string();
+        let first_delivery_id = local_db
+            .acquire()
+            .await
+            .unwrap()
+            .p2p_outbox_delivery_id(&outbox_id(&owed[0]))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            local_db
+                .acquire()
+                .await
+                .unwrap()
+                .acknowledge_p2p_outbox_message(&first_delivery_id, &first_peer)
+                .await
+                .unwrap()
+        );
+        assert!(outbox_state(outbox_id(&owed[1])).await.is_none(), "never written");
+
+        // The retry: the set is frozen already, and everything is still owed.
+        let owed = cut_circuits_owed(&state, now);
+        assert_eq!(owed.len(), 3);
+        ensure_cut_circuits_outbox(&local_db, instance_id, graph_id, &owed, &sender_peer_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            outbox_state(outbox_id(&owed[0])).await,
+            Some(("Processed".to_string(), 0)),
+            "the acknowledged entry is left as it is, not re-opened"
+        );
+        for candidate in &owed[1..] {
+            let (entry_state, len) = outbox_state(outbox_id(candidate)).await.unwrap();
+            assert_eq!(entry_state, "Pending");
+            assert!(len > 0, "the missing CutCircuits is now queued for delivery");
+        }
+        // And again: nothing changes.
+        ensure_cut_circuits_outbox(&local_db, instance_id, graph_id, &owed, &sender_peer_id)
+            .await
+            .unwrap();
+        assert_eq!(outbox_state(outbox_id(&owed[0])).await, Some(("Processed".to_string(), 0)));
+
+        // A candidate that has delivered its proof is owed nothing more ...
+        state.candidates[0].soldering_proof_ready = Some(soldering_proof_ready(1));
+        assert_eq!(cut_circuits_owed(&state, now).len(), 2);
+        // ... nobody is once the proof window has closed with enough proofs in
+        // hand, so a late retry does not set verifiers garbling for nothing ...
+        let (_, gc_data, _) = gc_submission();
+        state.candidates[0].gc_data = Some(gc_data);
+        state.proof_collection_started_at = Some(now);
+        assert_eq!(cut_circuits_owed(&state, now).len(), 2, "the window is still open");
+        let after_window = now + get_verifier_candidate_collection_window_secs();
+        assert!(cut_circuits_owed(&state, after_window).is_empty());
+        // ... and nobody is once the selection is sealed.
+        state.proof_collection_started_at = None;
+        state.selected_verifier_pubkeys = Some(vec![state.candidates[0].verifier_pubkey]);
+        assert!(cut_circuits_owed(&state, now).is_empty());
     }
 
     #[test]
@@ -7606,5 +8158,65 @@ mod tests {
             "pubin-disprove transaction is {} non-witness bytes",
             tx.base_size()
         );
+    }
+    #[tokio::test]
+    async fn late_round_messages_are_dropped_only_once_the_round_is_provably_over() {
+        let local_db = store::create_local_db("sqlite::memory:").await;
+        let (instance_id, graph_id) = (Uuid::new_v4(), Uuid::new_v4());
+        // No row yet: the full path must run, it is what asks for the graph.
+        assert!(!graph_signing_round_is_over(&local_db, instance_id, graph_id).await.unwrap());
+
+        let mut storage = local_db.acquire().await.unwrap();
+        storage
+            .upsert_graph_definition(&store::Graph {
+                graph_id,
+                instance_id,
+                status: GraphStatus::OperatorPresigned.to_string(),
+                definition_hash: "definition".to_owned(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        drop(storage);
+        assert!(!graph_signing_round_is_over(&local_db, instance_id, graph_id).await.unwrap());
+
+        // Obsoleted straight from OperatorPresigned: the round never finished.
+        let obsoleted = Uuid::new_v4();
+        let mut storage = local_db.acquire().await.unwrap();
+        storage
+            .upsert_graph_definition(&store::Graph {
+                graph_id: obsoleted,
+                instance_id,
+                status: GraphStatus::OperatorPresigned.to_string(),
+                definition_hash: "definition".to_owned(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        storage
+            .transition_graph_status(
+                instance_id,
+                obsoleted,
+                GraphStatus::Obsoleted,
+                store::GraphStatusSource::ChainReconcile,
+                None,
+            )
+            .await
+            .unwrap();
+        storage
+            .transition_graph_status(
+                instance_id,
+                graph_id,
+                GraphStatus::CommitteePresigned,
+                store::GraphStatusSource::Definition,
+                None,
+            )
+            .await
+            .unwrap();
+        drop(storage);
+        assert!(!graph_signing_round_is_over(&local_db, instance_id, obsoleted).await.unwrap());
+        assert!(graph_signing_round_is_over(&local_db, instance_id, graph_id).await.unwrap());
+        // The row answers for its own instance only.
+        assert!(!graph_signing_round_is_over(&local_db, Uuid::new_v4(), graph_id).await.unwrap());
     }
 }

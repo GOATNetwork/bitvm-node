@@ -18,6 +18,7 @@ use reqwest::Url;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::time::SystemTime;
 use strum::{Display, EnumString};
 use tracing::{info, warn};
 use util::hex_parse;
@@ -79,7 +80,7 @@ pub const DEFAULT_MIN_REQUIRED_VERIFIER: usize = 1;
 pub const DEFAULT_VERIFIER_CANDIDATE_BACKUP_COUNT: usize = 2;
 pub const DEFAULT_VERIFIER_CANDIDATE_COLLECTION_WINDOW_SECS: i64 = 15;
 pub const DEFAULT_P2P_GRAPH_SETUP_RETRY_INTERVAL_SECS: i64 = 10;
-pub const DEFAULT_P2P_GRAPH_SETUP_RETRY_WINDOW_SECS: i64 = 180;
+pub const DEFAULT_P2P_GRAPH_SETUP_RETRY_WINDOW_SECS: i64 = 600;
 
 pub const ENV_BITCOIN_NETWORK: &str = "BITCOIN_NETWORK";
 pub const ENV_GOAT_NETWORK: &str = "GOAT_NETWORK";
@@ -108,10 +109,9 @@ pub const ENV_SEQUENCER_SET_MONITOR_START_COSMOS_BLOCK: &str =
 pub const ENV_COSMOS_RPC_URL: &str = "COSMOS_RPC_URL";
 pub const DEFAULT_COSMOS_RPC_URL: &str = "https://rpc.testnet3.goat.network/goat-rpc";
 
-// fee estimate
-// TODO: more precise fee estimation
-pub const CHEKSIG_P2WSH_INPUT_VBYTES: u64 = 100;
-pub const CHEKSIG_P2TR_INPUT_VBYTES: u64 = 100;
+// Conservative fee-reserve estimates, not exact serialized transaction sizes.
+pub const CHECKSIG_P2WSH_INPUT_VBYTES_ESTIMATE: u64 = 100;
+pub const CHECKSIG_P2TR_INPUT_VBYTES_ESTIMATE: u64 = 100;
 pub const P2WSH_OUTPUT_VBYTES: u64 = 50;
 pub const P2TR_OUTPUT_VBYTES: u64 = 50;
 pub const P2A_OUTPUT_VBYTES: u64 = 50;
@@ -125,8 +125,6 @@ pub const MIN_SATKE_AMOUNT: u64 = 4_000_000; // 0.04 BTC
 pub const MIN_CHALLENGE_AMOUNT: u64 = 1_000_000; // 0.01 BTC
 pub const STAKE_RATE: u64 = 0; // 0%
 pub const CHALLENGE_RATE: u64 = 0; // 0%
-
-pub const RATE_MULTIPLIER: u64 = 10000;
 
 const COMMITTEE_MEMBER_NUMBER: usize = 2;
 
@@ -144,8 +142,6 @@ pub const SYNC_GRAPH_MAX_WAIT_SECS: u64 = 30;
 // use to judge load history event thread is dead
 pub const LOAD_HISTORY_EVENT_NO_WOKING_MAX_SECS: i64 = 600;
 
-pub const GATEWAY_RATE_MULTIPLIER: u64 = 10000;
-
 pub const HEARTBEAT_INTERVAL_SECOND: u64 = 60 * 5;
 pub const REGULAR_TASK_INTERVAL_SECOND: u64 = 20;
 pub const SEQUENCER_SET_MONITOR_INTERVAL_SECS: u64 = 5;
@@ -155,8 +151,40 @@ pub const ENV_MAINTENANCE_RUN_TIMEOUT_SECS: &str = "MAINTENANCE_RUN_TIMEOUT_SECS
 pub const DEFAULT_MAINTENANCE_RUN_TIMEOUT_SECS: u64 = 60;
 pub const ENV_P2P_INBOX_BATCH_SIZE: &str = "P2P_INBOX_BATCH_SIZE";
 pub const DEFAULT_P2P_INBOX_BATCH_SIZE: i64 = 16;
-pub const ENV_P2P_OUTBOX_BATCH_SIZE: &str = "P2P_OUTBOX_BATCH_SIZE";
-pub const DEFAULT_P2P_OUTBOX_BATCH_SIZE: i64 = 16;
+/// Maximum decoded JSON gossip size.
+pub const ENV_P2P_MAX_JSON_MESSAGE_BYTES: &str = "P2P_MAX_JSON_MESSAGE_BYTES";
+pub const DEFAULT_P2P_MAX_JSON_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
+/// Ceiling on the payload bytes queued in the durable P2P inbox. The per-class
+/// and per-sender quotas are derived from it, see `p2p_admission::InboundLimits`.
+pub const ENV_P2P_INBOX_MAX_QUEUED_BYTES: &str = "P2P_INBOX_MAX_QUEUED_BYTES";
+pub const DEFAULT_P2P_INBOX_MAX_QUEUED_BYTES: i64 = 2 * 1024 * 1024 * 1024;
+/// Ceilings on libp2p connections. Inbound only: outgoing dials stay unlimited.
+/// Keep the inbound ceiling well below the process file descriptor limit.
+pub const ENV_P2P_MAX_INCOMING_CONNECTIONS: &str = "P2P_MAX_INCOMING_CONNECTIONS";
+pub const DEFAULT_P2P_MAX_INCOMING_CONNECTIONS: u32 = 512;
+/// Inbound slots, out of `P2P_MAX_INCOMING_CONNECTIONS`, only registered peers
+/// may take.
+pub const ENV_P2P_INBOUND_REGISTERED_RESERVE: &str = "P2P_INBOUND_REGISTERED_RESERVE";
+pub const DEFAULT_P2P_INBOUND_REGISTERED_RESERVE: u32 = 128;
+/// Comma-separated peer IDs eligible for reserved inbound capacity.
+/// Does not grant registration, message quota or ban exemption.
+pub const ENV_P2P_RESERVED_PEERS: &str = "P2P_RESERVED_PEERS";
+/// Comma-separated `<peer id>=<operator master public key>` bindings.
+/// Stake is verified on chain at startup.
+pub const ENV_P2P_TRUSTED_OPERATOR_BINDINGS: &str = "P2P_TRUSTED_OPERATOR_BINDINGS";
+/// Longest wait between two re-publishes of a signing-round outbox row.
+pub const ENV_P2P_PROTOCOL_RETRY_MAX_SECS: &str = "P2P_PROTOCOL_RETRY_MAX_SECS";
+pub const DEFAULT_P2P_PROTOCOL_RETRY_MAX_SECS: i64 = 600;
+/// Handler execution timeout on the business/control worker.
+/// Timeout cancels at an await; durable messages are retried.
+pub const ENV_P2P_HANDLER_TIMEOUT_SECS: &str = "P2P_HANDLER_TIMEOUT_SECS";
+pub const DEFAULT_P2P_HANDLER_TIMEOUT_SECS: u64 = 300;
+/// Comma-separated peer IDs whose persisted replay marks are cleared at startup.
+pub const ENV_P2P_REPLAY_MARK_RESET_PEERS: &str = "P2P_REPLAY_MARK_RESET_PEERS";
+pub const ENV_P2P_MAX_PENDING_INCOMING_CONNECTIONS: &str = "P2P_MAX_PENDING_INCOMING_CONNECTIONS";
+pub const DEFAULT_P2P_MAX_PENDING_INCOMING_CONNECTIONS: u32 = 128;
+pub const ENV_P2P_MAX_CONNECTIONS_PER_PEER: &str = "P2P_MAX_CONNECTIONS_PER_PEER";
+pub const DEFAULT_P2P_MAX_CONNECTIONS_PER_PEER: u32 = 4;
 pub const ENV_ENABLE_COMMITTEE_INSTANCE_KEY_DELETE: &str = "ENABLE_COMMITTEE_INSTANCE_KEY_DELETE";
 pub const DEFAULT_ENABLE_COMMITTEE_INSTANCE_KEY_DELETE: bool = false;
 pub const ENV_COMMITTEE_INSTANCE_KEY_DELETE_TIMELOCK_BLOCKS: &str =
@@ -353,6 +381,20 @@ pub fn get_local_node_info() -> NodeInfo {
         addr_op
     };
     let socket_addr = std::env::var(ENV_EXTERNAL_SOCKET_ADDR).unwrap_or("".to_string());
+    // Sign this node's peer ID binding with its master key.
+    let issued_at = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or_default();
+    let binding_sig = match get_bitvm_key() {
+        Ok(keypair) => {
+            crate::action::sign_node_info_binding(&peer_key, &pubkey_str, issued_at, &keypair)
+        }
+        Err(error) => {
+            tracing::error!("failed to sign node info binding: {error}");
+            String::new()
+        }
+    };
     NodeInfo {
         peer_id: peer_key,
         actor: actor.to_string(),
@@ -362,6 +404,8 @@ pub fn get_local_node_info() -> NodeInfo {
         node_name: get_node_name(),
         service_fee_rate: get_operator_node_service_fee_rate(),
         available_peg_btc: "0".to_string(),
+        binding_sig,
+        binding_issued_at: issued_at,
     }
 }
 pub fn get_committee_member_num() -> usize {
@@ -639,8 +683,16 @@ pub fn get_soldering_proof_payload_store_path() -> anyhow::Result<String> {
     Ok(value.to_string())
 }
 
+pub const fn actor_needs_soldering_builder(actor: &Actor) -> bool {
+    matches!(actor, Actor::Verifier | Actor::Operator)
+}
+
+pub const fn actor_runs_babe_setup_state_cleanup(actor: &Actor) -> bool {
+    actor_needs_soldering_builder(actor)
+}
+
 pub fn validate_soldering_proof_payload_store_config(actor: &Actor) -> anyhow::Result<()> {
-    if matches!(actor, Actor::Verifier | Actor::Operator | Actor::All) {
+    if actor_needs_soldering_builder(actor) {
         get_soldering_proof_payload_store_path()
             .map(|_| ())
             .map_err(|err| anyhow::anyhow!("{err}; required for actor {actor}"))
@@ -716,12 +768,132 @@ pub fn get_p2p_inbox_batch_size() -> i64 {
         .unwrap_or(DEFAULT_P2P_INBOX_BATCH_SIZE)
 }
 
-pub fn get_p2p_outbox_batch_size() -> i64 {
-    std::env::var(ENV_P2P_OUTBOX_BATCH_SIZE)
+pub fn get_p2p_max_json_message_bytes() -> usize {
+    std::env::var(ENV_P2P_MAX_JSON_MESSAGE_BYTES)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .map(|size| {
+            size.clamp(64 * 1024, crate::middleware::behaviour::MAX_GOSSIPSUB_TRANSMIT_SIZE)
+        })
+        .unwrap_or(DEFAULT_P2P_MAX_JSON_MESSAGE_BYTES)
+}
+
+fn p2p_connection_limit(name: &str, default: u32) -> u32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|limit| *limit > 0)
+        .unwrap_or(default)
+}
+
+pub fn get_p2p_max_incoming() -> u32 {
+    p2p_connection_limit(ENV_P2P_MAX_INCOMING_CONNECTIONS, DEFAULT_P2P_MAX_INCOMING_CONNECTIONS)
+}
+
+pub fn get_p2p_inbound_registered_reserve() -> u32 {
+    p2p_connection_limit(ENV_P2P_INBOUND_REGISTERED_RESERVE, DEFAULT_P2P_INBOUND_REGISTERED_RESERVE)
+}
+
+pub fn get_p2p_reserved_peers() -> std::collections::HashSet<libp2p::PeerId> {
+    parse_reserved_peers(&std::env::var(ENV_P2P_RESERVED_PEERS).unwrap_or_default())
+}
+
+pub fn parse_reserved_peers(value: &str) -> std::collections::HashSet<libp2p::PeerId> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .filter_map(|entry| {
+            let parsed = libp2p::PeerId::from_str(entry).ok();
+            if parsed.is_none() {
+                tracing::error!("ignoring malformed {ENV_P2P_RESERVED_PEERS} entry {entry:?}");
+            }
+            parsed
+        })
+        .collect()
+}
+
+/// Signing-round retry ceiling; defaults to one quarter of the pre-signing window, clamped to 30–600 seconds.
+pub fn get_p2p_protocol_retry_max_secs() -> i64 {
+    std::env::var(ENV_P2P_PROTOCOL_RETRY_MAX_SECS)
         .ok()
         .and_then(|value| value.parse::<i64>().ok())
-        .map(|size| size.clamp(1, 128))
-        .unwrap_or(DEFAULT_P2P_OUTBOX_BATCH_SIZE)
+        .map(|secs| secs.clamp(30, 3600))
+        .unwrap_or_else(|| {
+            (get_instance_presigned_time_expired_secs() / 4)
+                .clamp(30, DEFAULT_P2P_PROTOCOL_RETRY_MAX_SECS)
+        })
+}
+
+pub fn get_p2p_handler_timeout() -> std::time::Duration {
+    let secs = std::env::var(ENV_P2P_HANDLER_TIMEOUT_SECS)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|secs| secs.clamp(5, 3600))
+        .unwrap_or(DEFAULT_P2P_HANDLER_TIMEOUT_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
+/// Parse `P2P_TRUSTED_OPERATOR_BINDINGS`. A malformed entry is reported and
+/// skipped: a typo must not stop the node, nor silently trust something else.
+pub fn get_p2p_trusted_operator_bindings() -> Vec<(libp2p::PeerId, [u8; 32])> {
+    parse_trusted_operator_bindings(
+        &std::env::var(ENV_P2P_TRUSTED_OPERATOR_BINDINGS).unwrap_or_default(),
+    )
+}
+
+pub fn parse_trusted_operator_bindings(value: &str) -> Vec<(libp2p::PeerId, [u8; 32])> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .filter_map(|entry| {
+            let parsed = entry.split_once('=').and_then(|(peer_id, pubkey)| {
+                let peer_id = libp2p::PeerId::from_str(peer_id.trim()).ok()?;
+                let pubkey = PublicKey::from_str(pubkey.trim()).ok()?;
+                Some((peer_id, bitcoin::XOnlyPublicKey::from(pubkey).serialize()))
+            });
+            if parsed.is_none() {
+                tracing::error!(
+                    "ignoring malformed {ENV_P2P_TRUSTED_OPERATOR_BINDINGS} entry {entry:?}; \
+                     expected <peer id>=<public key>"
+                );
+            }
+            parsed
+        })
+        .collect()
+}
+
+pub fn get_p2p_replay_mark_reset_peers() -> Vec<String> {
+    std::env::var(ENV_P2P_REPLAY_MARK_RESET_PEERS)
+        .map(|peers| {
+            peers
+                .split(',')
+                .map(str::trim)
+                .filter(|peer| !peer.is_empty())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub fn get_p2p_max_pending_incoming() -> u32 {
+    p2p_connection_limit(
+        ENV_P2P_MAX_PENDING_INCOMING_CONNECTIONS,
+        DEFAULT_P2P_MAX_PENDING_INCOMING_CONNECTIONS,
+    )
+}
+
+pub fn get_p2p_max_per_peer() -> u32 {
+    p2p_connection_limit(ENV_P2P_MAX_CONNECTIONS_PER_PEER, DEFAULT_P2P_MAX_CONNECTIONS_PER_PEER)
+}
+
+pub fn get_p2p_inbox_max_queued_bytes() -> i64 {
+    std::env::var(ENV_P2P_INBOX_MAX_QUEUED_BYTES)
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .map(|size| size.max(256 * 1024 * 1024))
+        .unwrap_or(DEFAULT_P2P_INBOX_MAX_QUEUED_BYTES)
 }
 
 pub fn is_enable_committee_instance_key_delete() -> bool {
@@ -772,7 +944,7 @@ mod tests {
 
         assert!(validate_soldering_proof_payload_store_config(&Actor::Verifier).is_err());
         assert!(validate_soldering_proof_payload_store_config(&Actor::Operator).is_err());
-        assert!(validate_soldering_proof_payload_store_config(&Actor::All).is_err());
+        assert!(validate_soldering_proof_payload_store_config(&Actor::All).is_ok());
         assert!(validate_soldering_proof_payload_store_config(&Actor::Committee).is_ok());
         assert!(validate_soldering_proof_payload_store_config(&Actor::Watchtower).is_ok());
         assert!(validate_soldering_proof_payload_store_config(&Actor::Publisher).is_ok());

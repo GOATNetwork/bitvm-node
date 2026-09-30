@@ -1,7 +1,7 @@
 use crate::action::{
     ConfirmInstance, GOATMessage, GOATMessageContent, MessageDeferReason, PeginConfirmNonce,
     PeginConfirmNonceConsensus, PeginConfirmPartialSig, PeginRequest, PostReady,
-    push_local_unhandled_messages_with_reason,
+    RetryableDispatchError, RetryableDispatchReason, defer_or_enqueue_message,
 };
 use crate::env::{
     COMMITTEE_INSTANCE_KEYS_DIR, get_bitvm_key, get_committee_instance_key_delete_timelock_blocks,
@@ -67,6 +67,34 @@ fn advance_instance_page_state(task_key: &'static str, watermark: i64, last: (i6
     state.insert(task_key, InstancePageState { watermark, cursor: Some(last) });
 }
 
+fn finish_recovery_enqueue(
+    result: anyhow::Result<()>,
+    instance_id: Uuid,
+    action: &'static str,
+) -> anyhow::Result<bool> {
+    match result {
+        Ok(()) => Ok(true),
+        Err(error)
+            if error.chain().any(|cause| {
+                cause.downcast_ref::<RetryableDispatchError>().is_some_and(|retryable| {
+                    retryable.reason == RetryableDispatchReason::ResourceLocked
+                })
+            }) =>
+        {
+            warn!(
+                event = "pegin_confirm_recovery",
+                outcome = "resource_locked",
+                instance_id = %instance_id,
+                action,
+                error = %error,
+                "skip recovery enqueue while the local message is actively claimed"
+            );
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 async fn find_one_instance_page(
     local_db: &LocalDB,
     task_key: &'static str,
@@ -112,15 +140,18 @@ async fn find_one_instance_page(
 async fn update_instance<'a>(
     storage_processor: &mut StorageProcessor<'a>,
     params: &InstanceUpdate,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     match storage_processor.update_instance(params).await {
-        Ok(true) => info!("update instance with input: {:?}", params),
-        Ok(false) => info!("skip stale instance update with input: {:?}", params),
-        Err(err) => {
-            warn!("update_instance_status with input: {:?} failed {}, will try later", params, err);
+        Ok(updated) => {
+            if updated {
+                info!("update instance with input: {:?}", params);
+            } else {
+                info!("skip stale instance update with input: {:?}", params);
+            }
+            Ok(updated)
         }
+        Err(err) => Err(err.context("update instance")),
     }
-    Ok(())
 }
 
 /// for committee
@@ -186,15 +217,25 @@ pub async fn instance_answers_monitor(
         let mut tx = local_db.start_transaction().await?;
         if let Some(event) = event {
             if is_outside_response_window {
-                if let Some(instance) = discarded_instance {
-                    tx.upsert_instance(&instance).await?;
+                if let Some(instance) = discarded_instance
+                    && !tx.insert_instance_if_absent(&instance).await?
+                    && !tx
+                        .update_instance(
+                            &InstanceUpdate::new_with_instance_id(instance.instance_id)
+                                .with_status(InstanceBridgeInStatus::UserDiscarded.to_string())
+                                .with_only_if_status_in(vec![
+                                    InstanceBridgeInStatus::UserIniting.to_string(),
+                                    InstanceBridgeInStatus::UserInited.to_string(),
+                                ]),
+                        )
+                        .await?
+                {
+                    info!("skip stale UserDiscarded update for instance {}", instance.instance_id);
                 }
             } else {
                 upsert_message(
                     &mut tx,
                     false,
-                    tx_record.instance_id,
-                    None,
                     SELF_SENDER.to_string(),
                     Actor::All,
                     GOATMessageContent::PeginRequest(PeginRequest {
@@ -366,7 +407,8 @@ pub async fn instance_expiration_monitor(
             update_instance(
                 &mut storage_processor,
                 &InstanceUpdate::new_with_instance_id(instance.instance_id)
-                    .with_status(InstanceBridgeInStatus::Timeout.to_string()),
+                    .with_status(InstanceBridgeInStatus::Timeout.to_string())
+                    .with_only_if_status_in(vec![instance.status.clone()]),
             )
             .await?;
         } else {
@@ -430,45 +472,46 @@ pub async fn instance_btc_tx_monitor(
         {
             let mut tx = local_db.start_transaction().await?;
             let mut instance_update = InstanceUpdate::new_with_instance_id(instance.instance_id)
-                .with_status(next_status.to_string());
-            match next_status {
-                InstanceBridgeInStatus::UserBroadcastPeginPrepare => {
-                    instance_update = instance_update
-                        .with_btc_height(status.block_height.unwrap_or_default() as i64);
-                    upsert_message(
-                        &mut tx,
-                        false,
-                        instance.instance_id,
-                        None,
-                        SELF_SENDER.to_string(),
-                        Actor::All,
-                        GOATMessageContent::ConfirmInstance(ConfirmInstance {
-                            instance_id: instance.instance_id,
-                        }),
-                        0,
-                        0,
-                    )
-                    .await?;
-                }
-                InstanceBridgeInStatus::RelayerL1Broadcasted => {
-                    upsert_message(
-                        &mut tx,
-                        false,
-                        instance.instance_id,
-                        None,
-                        SELF_SENDER.to_string(),
-                        Actor::All,
-                        GOATMessageContent::PostReady(PostReady {
-                            instance_id: instance.instance_id,
-                        }),
-                        0,
-                        0,
-                    )
-                    .await?;
-                }
-                _ => {}
+                .with_status(next_status.to_string())
+                .with_only_if_status_in(vec![instance.status.clone()]);
+            if next_status == InstanceBridgeInStatus::UserBroadcastPeginPrepare {
+                instance_update =
+                    instance_update.with_btc_height(status.block_height.unwrap_or_default() as i64);
             }
-            update_instance(&mut tx, &instance_update).await?;
+
+            if update_instance(&mut tx, &instance_update).await? {
+                match next_status {
+                    InstanceBridgeInStatus::UserBroadcastPeginPrepare => {
+                        upsert_message(
+                            &mut tx,
+                            false,
+                            SELF_SENDER.to_string(),
+                            Actor::All,
+                            GOATMessageContent::ConfirmInstance(ConfirmInstance {
+                                instance_id: instance.instance_id,
+                            }),
+                            0,
+                            0,
+                        )
+                        .await?;
+                    }
+                    InstanceBridgeInStatus::RelayerL1Broadcasted => {
+                        upsert_message(
+                            &mut tx,
+                            false,
+                            SELF_SENDER.to_string(),
+                            Actor::All,
+                            GOATMessageContent::PostReady(PostReady {
+                                instance_id: instance.instance_id,
+                            }),
+                            0,
+                            0,
+                        )
+                        .await?;
+                    }
+                    _ => {}
+                }
+            }
             tx.commit().await?;
         } else {
             warn!(
@@ -497,7 +540,8 @@ pub async fn instance_btc_tx_monitor(
                 update_instance(
                     &mut storage_processor,
                     &InstanceUpdate::new_with_instance_id(instance.instance_id)
-                        .with_status(InstanceBridgeInStatus::UserDiscarded.to_string()),
+                        .with_status(InstanceBridgeInStatus::UserDiscarded.to_string())
+                        .with_only_if_status_in(vec![instance.status.clone()]),
                 )
                 .await?;
             }
@@ -580,15 +624,20 @@ pub async fn pegin_confirm_recovery_monitor(
                     endorse_sig,
                 }),
             );
-            push_local_unhandled_messages_with_reason(
-                local_db,
+            if !finish_recovery_enqueue(
+                defer_or_enqueue_message(
+                    local_db,
+                    &message,
+                    0,
+                    MessageDeferReason::RecoveryRepublish,
+                    "re-publishing persisted pegin-confirm partial signature",
+                )
+                .await,
                 instance_id,
-                &message,
-                0,
-                MessageDeferReason::RecoveryRepublish,
-                "re-publishing persisted pegin-confirm partial signature",
-            )
-            .await?;
+                "republish_partial_signature",
+            )? {
+                continue;
+            }
             tracing::info!(
                 event = "pegin_confirm_recovery",
                 action = "republish_partial_signature",
@@ -635,15 +684,20 @@ pub async fn pegin_confirm_recovery_monitor(
                 nonce_sig,
             }),
         );
-        push_local_unhandled_messages_with_reason(
-            local_db,
+        if !finish_recovery_enqueue(
+            defer_or_enqueue_message(
+                local_db,
+                &message,
+                0,
+                MessageDeferReason::RecoveryRepublish,
+                "re-publishing persisted pegin-confirm nonce",
+            )
+            .await,
             instance_id,
-            &message,
-            0,
-            MessageDeferReason::RecoveryRepublish,
-            "re-publishing persisted pegin-confirm nonce",
-        )
-        .await?;
+            "republish_nonce",
+        )? {
+            continue;
+        }
         tracing::info!(
             event = "pegin_confirm_recovery",
             action = "republish_nonce",
@@ -665,15 +719,20 @@ pub async fn pegin_confirm_recovery_monitor(
                     signature,
                 }),
             );
-            push_local_unhandled_messages_with_reason(
-                local_db,
+            if !finish_recovery_enqueue(
+                defer_or_enqueue_message(
+                    local_db,
+                    &message,
+                    0,
+                    MessageDeferReason::RecoveryRepublish,
+                    "re-publishing persisted PeginConfirm nonce consensus",
+                )
+                .await,
                 instance_id,
-                &message,
-                0,
-                MessageDeferReason::RecoveryRepublish,
-                "re-publishing persisted PeginConfirm nonce consensus",
-            )
-            .await?;
+                "republish_nonce_consensus",
+            )? {
+                continue;
+            }
             tracing::info!(
                 event = "pegin_confirm_recovery",
                 action = "republish_nonce_consensus",
