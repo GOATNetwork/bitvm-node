@@ -632,6 +632,8 @@ pub(crate) async fn update_long_running_task(
     chain_name: String,
     proving_time: i64,
     zkm_version: String,
+    // Unix seconds of the latest EL block in the proved batch (chain time anchor for issue #366).
+    el_block_anchor_unix_secs: i64,
 ) -> anyhow::Result<u64> {
     let mut storage_processor = local_db.acquire().await?;
     let task = storage_processor

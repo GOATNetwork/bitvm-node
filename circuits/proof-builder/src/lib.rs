@@ -72,6 +72,22 @@ pub enum ProofRequest {
     },
 }
 
+/// Latest EL block time in the state-chain batch (max header timestamp), Unix seconds.
+///
+/// Used for `total_time_to_proof` as (time when proving completes) − (latest proved block time);
+/// see <https://github.com/GOATNetwork/bitvm2-node/issues/366>.
+pub fn state_chain_el_anchor_unix_secs(ctx: &ProofRequest) -> anyhow::Result<i64> {
+    let ProofRequest::StateChainProofRequest { blocks, .. } = ctx else {
+        anyhow::bail!("expected state chain proof request");
+    };
+    let max_ts = blocks
+        .iter()
+        .map(|b| b.evm_block.current_block.header.timestamp)
+        .max()
+        .ok_or_else(|| anyhow::anyhow!("state chain batch has no blocks"))?;
+    i64::try_from(max_ts).map_err(|_| anyhow::anyhow!("EL block timestamp out of range for i64"))
+}
+
 #[derive(Error, Debug, Clone)]
 pub enum ProofError {
     #[error("Retry after {0} seconds")]

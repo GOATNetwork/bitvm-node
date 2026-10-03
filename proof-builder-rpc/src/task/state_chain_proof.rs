@@ -2,7 +2,7 @@ use crate::task::ProofState::{Failed, New, Proven, Proving};
 use crate::task::fetch_latest_long_running_task_by_state;
 use crate::task::{create_long_running_task, update_long_running_task};
 use crate::{ProofBuilderConfig, task::fetch_latest_long_running_task};
-use proof_builder::{ProofBuilder, ProofRequest};
+use proof_builder::{state_chain_el_anchor_unix_secs, ProofBuilder, ProofRequest};
 use state_chain_proof::{StateChainProofBuilder, fetch_state_chain};
 use std::time::Duration;
 use store::localdb::LocalDB;
@@ -165,6 +165,14 @@ async fn spawn_state_chain_prover(
                     }
                 };
 
+                let el_anchor = match state_chain_el_anchor_unix_secs(&ctx) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::error!("EL block anchor for total_time_to_proof: {e:?}");
+                        continue;
+                    }
+                };
+
                 let affteced = match update_long_running_task(
                     &local_db,
                     start_index as i64,
@@ -177,6 +185,7 @@ async fn spawn_state_chain_prover(
                     StateChainProofBuilder::name(),
                     0,
                     "".to_string(),
+                    el_anchor,
                 ).await {
                     Ok(affected) => affected,
                     Err(e) => {
@@ -213,8 +222,21 @@ async fn spawn_state_chain_prover(
                 } else {
                     "failed"
                 };
-                metrics_state.record_attempt(STATE_CHAIN_PROOF, outcome, attempt_start.elapsed());
-                let affected = match attempt {
+
+                let affteced = match update_long_running_task(
+                    &local_db,
+                    start_index as i64,
+                    batch_size as i64,
+                    args.output_proof.clone(),
+                    public_value_hex,
+                    proof_size as i64,
+                    cycles,
+                    Proven,
+                    StateChainProofBuilder::name(),
+                    proving_time as i64,
+                    zkm_version,
+                    el_anchor,
+                ).await {
                     Ok(affected) => affected,
                     Err(error) => {
                         tracing::error!("State chain proof attempt failed: {error}");
