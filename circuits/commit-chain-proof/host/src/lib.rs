@@ -313,9 +313,10 @@ impl ProofBuilder for CommitChainProofBuilder {
 
         let public_values = proof.public_values.to_vec();
 
-        std::fs::write(output_proof, proof.bytes())?;
+        let proof_bytes = proof.bytes()?;
+        std::fs::write(output_proof, &proof_bytes)?;
         let public_value_hex = hex::encode(&public_values);
-        let proof_size = proof.bytes().len();
+        let proof_size = proof_bytes.len();
         let zkm_version = proof.zkm_version.clone();
         std::fs::write(format!("{}.public_inputs.bin", output_proof), public_values)?;
         std::fs::write(format!("{}.vk_hash.bin", output_proof), self.verifying_key.bytes32())?;

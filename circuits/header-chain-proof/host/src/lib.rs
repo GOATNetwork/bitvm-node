@@ -316,9 +316,10 @@ impl ProofBuilder for HeaderChainProofBuilder {
         //fs::write(&format!("{}.vk", output_proof), bincode::serialize(&self.verifying_key)?)?;
         //fs::write(&format!("{}.in", output_proof), input)?;
 
-        std::fs::write(output_proof, proof.bytes())?;
+        let proof_bytes = proof.bytes()?;
+        std::fs::write(output_proof, &proof_bytes)?;
         let public_value_hex = hex::encode(proof.public_values.to_vec());
-        let proof_size = proof.bytes().len();
+        let proof_size = proof_bytes.len();
         let zkm_version = proof.zkm_version.clone();
         std::fs::write(
             format!("{}.public_inputs.bin", output_proof),

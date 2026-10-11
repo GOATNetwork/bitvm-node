@@ -119,7 +119,7 @@ ark-groth16 = { workspace = true }
 zkm-sdk = { workspace = true }
 zkm-verifier = { workspace = true, features = ["ark"] }
 zkm-recursion-core = { workspace = true }
-zkm-stark = { workspace = true }
+zkm-pcs = { workspace = true }
 p3-bn254-fr = { workspace = true }
 p3-field = { workspace = true }
 borsh = { version = "1.5.3", features = ["derive"] }

@@ -351,9 +351,10 @@ impl ProofBuilder for WatchtowerProofBuilder {
         let ProofRequest::WatchtowerProofRequest { output, .. } = ctx else {
             anyhow::bail!("invalid context");
         };
-        std::fs::write(output, proof.bytes())?;
+        let proof_bytes = proof.bytes()?;
+        std::fs::write(output, &proof_bytes)?;
         let public_value_hex = hex::encode(proof.public_values.to_vec());
-        let proof_size = proof.bytes().len();
+        let proof_size = proof_bytes.len();
         let zkm_version = proof.zkm_version.clone();
         std::fs::write(format!("{}.public_inputs.bin", output), proof.public_values.to_vec())?;
         std::fs::write(format!("{}.vk_hash.bin", output), self.verifying_key.bytes32())?;

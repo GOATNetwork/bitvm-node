@@ -13,7 +13,7 @@ header-chain = { path = "../../../crates/header-chain" }
 borsh = { version = "1.5.3", features = ["derive"] }
 
 # Ziren
-zkm-zkvm = { git = "https://github.com/ProjectZKM/Ziren", tag = "v1.2.7", features = ["verify"] }
+zkm-zkvm = { git = "https://github.com/ProjectZKM/Ziren", features = ["verify"] }
 #zkm-zkvm = { path = "../../../Ziren/crates/zkvm/entrypoint", features = ["verify"] }
 
 # Statically turns off logging

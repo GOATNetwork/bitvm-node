@@ -587,7 +587,7 @@ impl ProofBuilder for OperatorProofBuilder {
             anyhow::bail!("invalid context");
         };
         let public_value_hex = hex::encode(proof.public_values.to_vec());
-        let proof_size = proof.bytes().len();
+        let proof_size = proof.bytes()?.len();
         let zkm_version = proof.zkm_version.clone();
         std::fs::write(format!("{}.public_inputs.bin", output), proof.public_values.to_vec())?;
         std::fs::write(format!("{}.vk_hash.bin", output), self.verifying_key.bytes32())?;

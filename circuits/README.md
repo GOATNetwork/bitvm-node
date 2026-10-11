@@ -58,6 +58,13 @@ For case 2,
 
 With multiple proof recursions, we generate a Groth16 proof, and verify with `Groth16Verifier::verify_by_imm_groth16_vk(proof, zkm_public_values, zkm_vk_hash, groth16_vk, part_stark_vk)`.
 
+Ziren 2.0 (circuit version `v2.0.0`) changed the wrap circuit itself: its public inputs are
+`[vkey_hash, committed_values_digest, vk_root]`, where `vk_root` is the root of the recursion verifying-key
+allowlist, so the immutable Groth16 vk differs from the 1.2.x one. A 1.2.x Groth16 proof does not verify
+under 2.0, so the header, commit and state chain proofs restart from genesis at the 2.0 cut-over. The
+BABE garbled-circuit verifier treats `vkey_hash` and `vk_root` as static inputs and `committed_values_digest`
+as the dynamic one.
+
 ## Preparation
 
 ```bash

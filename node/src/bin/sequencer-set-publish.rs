@@ -173,7 +173,11 @@ fn load_program_id_manifest(
         manifest.network == expected_network,
         "ProgramId manifest network does not match Bitcoin client"
     );
-    zkm_verifier::Groth16Verifier::get_part_stark_vk(&manifest.zkm_version);
+    anyhow::ensure!(
+        zkm_verifier::Groth16Verifier::try_get_part_stark_vk(&manifest.zkm_version).is_some(),
+        "ProgramId manifest Ziren version {} has no bundled partial STARK verifying key",
+        manifest.zkm_version
+    );
     let authorized_program_ids = manifest.authorized_program_ids.decode()?;
     authorized_program_ids.validate().map_err(anyhow::Error::msg)?;
     Ok(authorized_program_ids)

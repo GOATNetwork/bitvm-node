@@ -88,17 +88,19 @@ uuid = { version = "1.7", features = ["v4", "serde"] }
 zeroize = "1.8.1"
 
 bincode = "1.3.3"
-zkm-build = { git = "https://github.com/ProjectZKM/Ziren", tag = "v1.2.7" }
-zkm-core-executor = { git = "https://github.com/ProjectZKM/Ziren", tag = "v1.2.7" }
-zkm-prover = { git = "https://github.com/ProjectZKM/Ziren", tag = "v1.2.7" }
-zkm-sdk = { git = "https://github.com/ProjectZKM/Ziren", tag = "v1.2.7" }
-zkm-verifier = { git = "https://github.com/ProjectZKM/Ziren", tag = "v1.2.7" }
-zkm-primitives = { git = "https://github.com/ProjectZKM/Ziren", tag = "v1.2.7" }
-zkm-zkvm = { git = "https://github.com/ProjectZKM/Ziren", tag = "v1.2.7", features = ["verify"] }
-zkm-recursion-core = { git = "https://github.com/ProjectZKM/Ziren", tag = "v1.2.7" }
-zkm-stark = { git = "https://github.com/ProjectZKM/Ziren", tag = "v1.2.7" }
-p3-bn254-fr = { git = "https://github.com/ProjectZKM/Plonky3" }
-p3-field = { git = "https://github.com/ProjectZKM/Plonky3" }
+# Ziren
+zkm-build = { git = "https://github.com/ProjectZKM/Ziren" }
+zkm-core-executor = { git = "https://github.com/ProjectZKM/Ziren" }
+zkm-prover = { git = "https://github.com/ProjectZKM/Ziren" }
+zkm-sdk = { git = "https://github.com/ProjectZKM/Ziren" }
+zkm-verifier = { git = "https://github.com/ProjectZKM/Ziren" }
+zkm-primitives = { git = "https://github.com/ProjectZKM/Ziren" }
+zkm-zkvm = { git = "https://github.com/ProjectZKM/Ziren", features = ["verify"] }
+zkm-recursion-core = { git = "https://github.com/ProjectZKM/Ziren" }
+zkm-pcs = { git = "https://github.com/ProjectZKM/Ziren" }
+# Must match Ziren's own Plonky3 spec exactly, or the field types differ from Ziren's.
+p3-bn254-fr = { git = "https://github.com/ProjectZKM/Plonky3", rev = "4dd0d47a8176503fbaa7293c9f0e3b20004e16b2", package = "p3-bn254" }
+p3-field = { git = "https://github.com/ProjectZKM/Plonky3", rev = "4dd0d47a8176503fbaa7293c9f0e3b20004e16b2" }
 
 #zkm-build = { path = "../Ziren/crates/build" }
 #zkm-core-executor = { path = "../Ziren/crates/core/executor" }
@@ -107,9 +109,9 @@ p3-field = { git = "https://github.com/ProjectZKM/Plonky3" }
 #zkm-verifier = { path = "../Ziren/crates/verifier" }
 
 bitvm-lib = { package = "bitvm-gc", path = "crates/bitvm-gc" }
-verifiable-circuit-babe = { git = "https://github.com/GOATNetwork/bitvm-gc", branch = "feat/goat-bitvm3", features = ["aes"] }
-garbled-snark-verifier = { git = "https://github.com/GOATNetwork/bitvm-gc", branch = "feat/goat-bitvm3", features = ["_aes"] }
-soldering-host = { git = "https://github.com/GOATNetwork/bitvm-gc", branch = "feat/goat-bitvm3", features = ["aes"] }
+verifiable-circuit-babe = { git = "https://github.com/GOATNetwork/bitvm-gc", features = ["aes"] }
+garbled-snark-verifier = { git = "https://github.com/GOATNetwork/bitvm-gc", features = ["_aes"] }
+soldering-host = { git = "https://github.com/GOATNetwork/bitvm-gc", features = ["aes"] }
 
 #verifiable-circuit-babe = { path = "../bitvm-gc/verifiable-circuit-babe"}
 #garbled-snark-verifier = { path = "../bitvm-gc/garbled-snark-verifier"}
@@ -152,10 +154,10 @@ alloy-consensus = { git = "https://github.com/ziren-patches/alloy", branch = "pa
 # workspace
 
 # Reth
-guest-executor = { git = "https://github.com/ProjectZKM/reth-processor", branch = "feat/slot-state-check" }
-host-executor = { git = "https://github.com/ProjectZKM/reth-processor", branch = "feat/slot-state-check", features = ["execution-witness"] }
-primitives = { git = "https://github.com/ProjectZKM/reth-processor", branch = "feat/slot-state-check" }
-provider = { git = "https://github.com/ProjectZKM/reth-processor", branch = "feat/slot-state-check" }
+guest-executor = { git = "https://github.com/ProjectZKM/reth-processor", branch = "chore/ziren-v2-goat" }
+host-executor = { git = "https://github.com/ProjectZKM/reth-processor", branch = "chore/ziren-v2-goat", features = ["execution-witness"] }
+primitives = { git = "https://github.com/ProjectZKM/reth-processor", branch = "chore/ziren-v2-goat" }
+provider = { git = "https://github.com/ProjectZKM/reth-processor", branch = "chore/ziren-v2-goat" }
 
 reth-chainspec = { git = "https://github.com/ziren-patches/reth", branch = "patch-1.9.3", default-features = false }
 
