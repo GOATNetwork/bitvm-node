@@ -1804,6 +1804,22 @@ pub async fn validate_committee(
     committee_pubkey: &PublicKey,
 ) -> Result<()> {
     // return SpecialError::InvalidCommittee if not valid
+    let registry = crate::p2p_admission::peer_registry();
+    // A peer the registry has fresh word is unregistered gets no chain reads.
+    if registry.is_known_unregistered(peer_id, Instant::now()) {
+        bail!(SpecialError::InvalidCommittee("author is not a registered peer".to_string()));
+    }
+    // A peer the registry holds as committee whose binding on Goat does not
+    // match yet (a re-registered peer id, or a lagging Goat node) is asked
+    // again later instead of being refused for good; the job's deadline
+    // bounds the retries. Anyone else is refused.
+    let refused = |detail: &str| -> anyhow::Error {
+        if registry.is_committee(peer_id, Instant::now()) {
+            anyhow!("committee binding of {peer_id} on Goat does not match yet: {detail}")
+        } else {
+            anyhow!(SpecialError::InvalidCommittee(detail.to_string()))
+        }
+    };
     let pegin_data = goat_client.gateway_get_pegin_data(&instance_id).await?;
     for (i, pk) in pegin_data.committee_pubkeys.iter().enumerate() {
         let pk = PublicKey::from_slice(pk)?;
@@ -1811,16 +1827,12 @@ pub async fn validate_committee(
             let addr = pegin_data.committee_addresses[i];
             let stored_peer_id = goat_client.committee_mana_get_committee_peer_id(&addr).await?;
             if stored_peer_id.to_vec() != peer_id.to_bytes() {
-                bail!(SpecialError::InvalidCommittee(
-                    "committee pubkey & peer id mismatch".to_string()
-                ));
+                return Err(refused("committee pubkey & peer id mismatch"));
             }
             return Ok(());
         }
     }
-    bail!(SpecialError::InvalidCommittee(
-        "committee pubkey not found in instance's committee pubkeys".to_string()
-    ))
+    Err(refused("committee pubkey not found in instance's committee pubkeys"))
 }
 pub async fn validate_committee_with_evm_address(
     goat_client: &GOATClient,

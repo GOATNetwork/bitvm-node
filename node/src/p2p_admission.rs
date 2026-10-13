@@ -35,8 +35,9 @@ impl SenderClass {
     }
 }
 
-/// Pending retention for unregistered senders; registered senders use the normal retention window.
-pub const UNREGISTERED_PENDING_TTL_SECS: i64 = 2 * 60 * 60;
+/// How long a rejected network event keeps its inbox row, and so its share
+/// of the author's quota, before the maintenance purge removes it.
+pub const REJECTED_EVENT_TTL_SECS: i64 = 2 * 60 * 60;
 
 const VERIFIER_SET_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const VERIFIER_SET_RETRY_INTERVAL: Duration = Duration::from_secs(30);
@@ -45,7 +46,9 @@ const COMMITTEE_NEGATIVE_TTL: Duration = Duration::from_secs(2 * 60);
 /// Maximum stale age for retaining a registered classification during refresh.
 const COMMITTEE_STALE_LIMIT: Duration = Duration::from_secs(30 * 60);
 const COMMITTEE_CACHE_MAX_ENTRIES: usize = 4096;
-/// First-time lookup rate; known-member refreshes are exempt.
+/// Lookup rate for committee candidates (peers announcing themselves as
+/// committee by NodeInfo, or stored in the node table); known-member
+/// refreshes are exempt.
 const COMMITTEE_DISCOVERY_LOOKUPS_PER_MINUTE: u32 = 60;
 const COMMITTEE_MAX_IN_FLIGHT_LOOKUPS: usize = 16;
 /// Maximum unknown-identity lookups in flight.
@@ -93,10 +96,8 @@ pub struct InboundLimits {
     pub global: Quota,
     /// Global queue capacity reserved for committee.
     pub committee_reserve: Quota,
-    /// Every queued row from unregistered senders.
-    pub unregistered_class: Quota,
+    /// Every queued row of one registered sender, in whichever class.
     pub registered_peer: Quota,
-    pub unregistered_peer: Quota,
 }
 
 impl InboundLimits {
@@ -107,9 +108,7 @@ impl InboundLimits {
             max_binary_bytes: MAX_GOSSIPSUB_TRANSMIT_SIZE,
             global: Quota { rows: 16_384, bytes: max_queued_bytes },
             committee_reserve: Quota { rows: 4_096, bytes: max_queued_bytes / 4 },
-            unregistered_class: Quota { rows: 4_096, bytes: max_queued_bytes / 4 },
             registered_peer: Quota { rows: 1_024, bytes: max_queued_bytes / 8 },
-            unregistered_peer: Quota { rows: 512, bytes: max_queued_bytes / 32 },
         }
     }
 
@@ -132,6 +131,9 @@ pub enum DropReason {
     OversizedJson,
     OversizedBinary,
     BinaryFromNonVerifier,
+    /// A graph parameter endorsement from a peer outside the loaded verifier
+    /// set: verifying one costs chain reads, and only verifiers send them.
+    EndorsementFromNonVerifier,
     /// A registered author's message whose sequence number was already seen, or
     /// is older than the replay window: a verbatim re-publish by someone else.
     ReplayedSequence,
@@ -152,16 +154,12 @@ pub enum DropReason {
     /// is a sender exceeding its rate, this one is the node falling behind.
     ControlQueueFull,
     SenderQuota,
-    UnregisteredClassQuota,
     GlobalQuota,
     /// Not a message drop: a `NodeInfo` from a sender that is not registered was
     /// not stored because the `node` table is at its ceiling for such senders.
     NodeTableFull,
     /// NodeInfo rejected for invalid identity, fields or binding.
     NodeInfoRejected,
-    /// Not a drop: a message from an unregistered sender that was queued. Only
-    /// counted for the log summary, never exported as a drop metric.
-    AdmittedUnregistered,
     /// Not a drop: the engine already held the event (same author and
     /// content); recorded in the periodic summary.
     DuplicatePayload,
@@ -173,6 +171,7 @@ impl DropReason {
             Self::OversizedJson => "oversized_json",
             Self::OversizedBinary => "oversized_binary",
             Self::BinaryFromNonVerifier => "binary_from_non_verifier",
+            Self::EndorsementFromNonVerifier => "endorsement_from_non_verifier",
             Self::ReplayedSequence => "replayed_sequence",
             Self::FutureSequence => "future_sequence",
             Self::ForwardRate => "forward_rate",
@@ -185,11 +184,9 @@ impl DropReason {
             Self::ImmediateRateLimited => "immediate_rate_limited",
             Self::ControlQueueFull => "control_queue_full",
             Self::SenderQuota => "sender_quota",
-            Self::UnregisteredClassQuota => "unregistered_class_quota",
             Self::GlobalQuota => "global_quota",
             Self::NodeTableFull => "node_table_full",
             Self::NodeInfoRejected => "node_info_rejected",
-            Self::AdmittedUnregistered => "admitted_unregistered",
             Self::DuplicatePayload => "duplicate_payload",
         }
     }
@@ -204,11 +201,11 @@ impl DropReason {
         matches!(
             self,
             Self::UnexpectedBinaryKind
+                | Self::EndorsementFromNonVerifier
                 | Self::ForwardRate
                 | Self::ImmediateRateLimited
                 | Self::ControlQueueFull
                 | Self::SenderQuota
-                | Self::UnregisteredClassQuota
                 | Self::GlobalQuota
         )
     }
@@ -233,8 +230,8 @@ pub fn check_envelope(
     Ok(())
 }
 
-/// Whether one more queued row of `content_len` bytes from a sender of `class`
-/// fits. `usage` is the queued state *before* the row is added.
+/// Check whether a registered author's next inbox row fits its quotas.
+/// Usage excludes the new row; unregistered authors are not persisted.
 pub fn check_inbox_quota(
     class: SenderClass,
     content_len: usize,
@@ -263,24 +260,11 @@ pub fn check_inbox_quota(
     }
 
     // A sender can hold rows in more than one class: it is classified when each
-    // row arrives, and a registration lookup may complete in between.
+    // row arrives, and a committee lookup may complete in between.
     let peer_rows: i64 = usage.iter().map(|usage| usage.peer_rows).sum();
     let peer_bytes: i64 = usage.iter().map(|usage| usage.peer_bytes).sum();
-    let peer_quota =
-        if class.is_registered() { limits.registered_peer } else { limits.unregistered_peer };
-    if !peer_quota.admits(peer_rows + 1, peer_bytes + content_len) {
+    if !limits.registered_peer.admits(peer_rows + 1, peer_bytes + content_len) {
         return Err(DropReason::SenderQuota);
-    }
-
-    if !class.is_registered() {
-        let class_name = SenderClass::Unregistered.to_string();
-        let (class_rows, class_bytes) = usage
-            .iter()
-            .find(|usage| usage.admission_class == class_name)
-            .map_or((0, 0), |usage| (usage.rows, usage.bytes));
-        if !limits.unregistered_class.admits(class_rows + 1, class_bytes + content_len) {
-            return Err(DropReason::UnregisteredClassQuota);
-        }
     }
     Ok(())
 }
@@ -391,8 +375,9 @@ impl DiscoveryBudget {
 /// Whose budget a first-time committee lookup is charged to.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LookupBudget {
-    /// Discovery budget for signed message authors.
-    Author,
+    /// Discovery budget for peers identified as committee candidates by NodeInfo or
+    /// the node table. Durable messages do not trigger discovery.
+    Candidate,
     /// A peer this node holds a connection with; bounded by the connection
     /// ceiling. Local bans depend on these lookups coming back.
     Neighbour,
@@ -445,7 +430,7 @@ impl RegistryState {
             in_flight < COMMITTEE_MAX_IN_FLIGHT_LOOKUPS
         } else {
             match budget {
-                LookupBudget::Author => {
+                LookupBudget::Candidate => {
                     in_flight < COMMITTEE_MAX_UNKNOWN_IN_FLIGHT
                         && self
                             .committee_discovery
@@ -540,6 +525,12 @@ impl PeerRegistry {
 
     pub fn is_verifier(&self, peer: &PeerId) -> bool {
         self.lock().verifiers.contains(&peer.to_bytes())
+    }
+
+    /// Whether the verifier set was ever fetched; before that nobody is
+    /// turned away for not being in it.
+    pub fn verifier_set_loaded(&self) -> bool {
+        self.lock().verifiers_fetched_at.is_some()
     }
 
     pub fn sender_class(&self, peer: &PeerId, now: Instant) -> SenderClass {
@@ -782,8 +773,9 @@ impl PeerRegistry {
         let mut state = self.lock();
         RefreshPlan {
             verifier_set: state.claim_verifier_set_refresh(now),
-            committee_peer: peer
-                .is_some_and(|peer| state.claim_committee_lookup(peer, LookupBudget::Author, now)),
+            committee_peer: peer.is_some_and(|peer| {
+                state.claim_committee_lookup(peer, LookupBudget::Candidate, now)
+            }),
         }
     }
 
@@ -1018,7 +1010,8 @@ pub fn refresh_neighbour_in_background(
     }
 }
 
-/// Start whatever registry lookups are due for `peer` without waiting for them.
+/// Schedule due verifier-set and candidate committee lookups without waiting.
+/// Durable messages do not trigger these lookups.
 pub fn refresh_registry_in_background(
     local_db: &LocalDB,
     goat_client: &Arc<GOATClient>,
@@ -1077,6 +1070,47 @@ pub fn refresh_due_registrations_in_background(local_db: &LocalDB, goat_client: 
     }
     for (peer, operator_key) in registry.plan_due_operator_refreshes(now) {
         spawn_operator_stake_lookup(local_db, goat_client, peer, operator_key);
+    }
+}
+
+/// Committee candidates the node table holds (self-declared by NodeInfo)
+/// that the registry does not know as registered: looked up within the
+/// candidate budget, so a member whose NodeInfo arrived while the budget was
+/// spent, or before a restart, is classified by the maintenance tick instead
+/// of by its first message.
+const COMMITTEE_CANDIDATES_PER_TICK: u32 = 64;
+
+pub async fn revalidate_committee_candidates(local_db: &LocalDB, goat_client: &Arc<GOATClient>) {
+    let registry = peer_registry();
+    let now = Instant::now();
+    let candidates = match local_db.acquire().await {
+        Ok(mut storage) => {
+            storage
+                .find_nodes(
+                    &store::localdb::NodeQuery::default()
+                        .with_actor(bitvm_lib::actors::Actor::Committee.to_string())
+                        .with_order("updated_at DESC".to_string())
+                        .with_limit(COMMITTEE_CANDIDATES_PER_TICK),
+                )
+                .await
+        }
+        Err(error) => Err(error),
+    };
+    let candidates = match candidates {
+        Ok((nodes, _)) => nodes,
+        Err(error) => {
+            tracing::debug!(event = "p2p_admission", outcome = "candidate_scan_failed", error = %error, "could not read committee candidates");
+            return;
+        }
+    };
+    for node in candidates {
+        let Ok(peer) = PeerId::from_str(&node.peer_id) else { continue };
+        if registry.sender_class(&peer, now).is_registered() {
+            continue;
+        }
+        if registry.plan_refresh(Some(&peer), now).committee_peer {
+            spawn_committee_lookup(local_db, goat_client, peer);
+        }
     }
 }
 
@@ -1798,12 +1832,6 @@ pub fn record_drop(reason: DropReason) {
     DROP_STATS.record(reason);
 }
 
-/// Count an admitted message from an unregistered sender for the summary line.
-/// Those are not logged one by one: whoever floods decides how many there are.
-pub fn record_admitted_unregistered() {
-    DROP_STATS.record(DropReason::AdmittedUnregistered);
-}
-
 /// Emit one line for everything dropped since the previous call.
 pub fn log_drop_summary() {
     let dropped = DROP_STATS.take();
@@ -2077,6 +2105,18 @@ pub enum InboundVerdict {
     Enqueue { message: GOATMessage, class: SenderClass },
 }
 
+/// Drop the rejected network events the quota should stop charging for,
+/// after `REJECTED_EVENT_TTL_SECS`. The sender's outbox re-sends what still
+/// matters; the terminal retention of the engine is for audit, not quota.
+pub async fn purge_stale_network_events(local_db: &LocalDB) -> Result<u64> {
+    let before = crate::rpc_service::current_time_secs() - REJECTED_EVENT_TTL_SECS;
+    let purged = local_db.acquire().await?.purge_rejected_network_inbox_rows(before).await?;
+    if purged > 0 {
+        tracing::info!(event = "p2p_admission", purged, "rejected network events purged");
+    }
+    Ok(purged)
+}
+
 /// Evaluate admission without swarm or chain access; propagate database errors.
 pub async fn evaluate_inbound_message(
     local_db: &LocalDB,
@@ -2111,6 +2151,15 @@ pub async fn evaluate_inbound_message(
     {
         return Ok(InboundVerdict::Drop(DropReason::UnexpectedBinaryKind));
     }
+    // A verifier's endorsement of the graph parameters comes from the closed
+    // on-chain verifier set; once that set is loaded nobody else gets a
+    // committee node to verify one, which costs chain reads.
+    if matches!(message.content, GOATMessageContent::VerifierGraphParamsEndorsement(_))
+        && gates.registry.verifier_set_loaded()
+        && !gates.registry.is_verifier(source)
+    {
+        return Ok(InboundVerdict::Drop(DropReason::EndorsementFromNonVerifier));
+    }
 
     if message.content.p2p_delivery() == P2PMessageDelivery::Immediate {
         if !gates.immediate_limiter.allow(source, now) {
@@ -2119,8 +2168,10 @@ pub async fn evaluate_inbound_message(
         return Ok(InboundVerdict::Immediate(message));
     }
 
-    if !gates.keeps(message.content.kind()) {
-        // Apply the unregistered forwarding budget.
+    // Forward unhandled or unregistered messages within the forwarding budget.
+    // Only registered authors enter the durable inbox; registration is learned
+    // through NodeInfo and registry checks.
+    if !gates.keeps(message.content.kind()) || !class.is_registered() {
         if !class.is_registered()
             && let Err(reason) = gates.rate_limiter.charge_forward(data.len() as i64, now)
         {
@@ -2151,9 +2202,7 @@ mod tests {
         max_binary_bytes: 4096,
         global: Quota { rows: 6, bytes: 6000 },
         committee_reserve: Quota { rows: 0, bytes: 0 },
-        unregistered_class: Quota { rows: 4, bytes: 3000 },
         registered_peer: Quota { rows: 3, bytes: 5000 },
-        unregistered_peer: Quota { rows: 2, bytes: 2000 },
     };
 
     fn usage(class: SenderClass, rows: i64, bytes: i64, peer: (i64, i64)) -> InboxClassUsage {
@@ -2336,35 +2385,25 @@ mod tests {
     }
 
     #[test]
-    fn quota_is_charged_per_sender_per_class_and_globally() {
-        use SenderClass::{Registered, Unregistered};
+    fn quota_is_charged_per_sender_and_globally() {
+        use SenderClass::{Committee, Registered};
 
-        assert_eq!(check_inbox_quota(Unregistered, 100, &[], &SMALL), Ok(()));
+        assert_eq!(check_inbox_quota(Registered, 100, &[], &SMALL), Ok(()));
 
-        // The sender's own rows, in whichever class they were admitted.
-        let own = [usage(Unregistered, 1, 100, (1, 100)), usage(Registered, 1, 100, (1, 100))];
+        // The sender's own rows, in whichever class they were admitted (a
+        // committee lookup may complete between two of its messages).
+        let own = [usage(Registered, 2, 200, (2, 200)), usage(Committee, 1, 100, (1, 100))];
+        assert_eq!(check_inbox_quota(Committee, 100, &own, &SMALL), Err(DropReason::SenderQuota));
+        let other = [usage(Registered, 3, 300, (0, 0))];
+        assert_eq!(check_inbox_quota(Registered, 100, &other, &SMALL), Ok(()));
+        let own_bytes = [usage(Registered, 1, 4950, (1, 4950))];
         assert_eq!(
-            check_inbox_quota(Unregistered, 100, &own, &SMALL),
+            check_inbox_quota(Registered, 100, &own_bytes, &SMALL),
             Err(DropReason::SenderQuota)
         );
-        assert_eq!(check_inbox_quota(Registered, 100, &own, &SMALL), Ok(()));
-        let own_bytes = [usage(Unregistered, 1, 1950, (1, 1950))];
-        assert_eq!(
-            check_inbox_quota(Unregistered, 100, &own_bytes, &SMALL),
-            Err(DropReason::SenderQuota)
-        );
 
-        // Other unregistered senders exhaust the shared pool; a registered
-        // sender is not charged against it.
-        let crowded = [usage(Unregistered, 4, 400, (0, 0))];
-        assert_eq!(
-            check_inbox_quota(Unregistered, 100, &crowded, &SMALL),
-            Err(DropReason::UnregisteredClassQuota)
-        );
-        assert_eq!(check_inbox_quota(Registered, 100, &crowded, &SMALL), Ok(()));
-
-        // The global ceiling counts every class, including pre-migration rows.
-        let full = [usage(Unregistered, 3, 300, (0, 0)), usage(Registered, 3, 300, (0, 0))];
+        // The global ceiling counts every class.
+        let full = [usage(Committee, 3, 300, (0, 0)), usage(Registered, 3, 300, (0, 0))];
         assert_eq!(check_inbox_quota(Registered, 100, &full, &SMALL), Err(DropReason::GlobalQuota));
         let heavy = [usage(Registered, 1, 5950, (0, 0))];
         assert_eq!(
@@ -2376,12 +2415,11 @@ mod tests {
     #[test]
     fn derived_quotas_nest_inside_the_global_ceiling() {
         let limits = InboundLimits::with_queued_bytes(2 << 20, 2 << 30);
-        assert!(limits.unregistered_peer.bytes < limits.unregistered_class.bytes);
-        assert!(limits.unregistered_class.bytes < limits.global.bytes);
         assert!(limits.registered_peer.bytes < limits.global.bytes);
-        assert!(limits.unregistered_peer.rows < limits.unregistered_class.rows);
-        assert!(limits.unregistered_class.rows < limits.global.rows);
-        assert!(limits.max_json_bytes as i64 <= limits.unregistered_peer.bytes);
+        assert!(limits.committee_reserve.bytes < limits.global.bytes);
+        assert!(limits.registered_peer.rows < limits.global.rows);
+        assert!(limits.committee_reserve.rows < limits.global.rows);
+        assert!(limits.max_json_bytes as i64 <= limits.registered_peer.bytes);
     }
 
     #[test]
@@ -2652,17 +2690,23 @@ mod tests {
         let gates = TestGates::new(PeerRateLimiter::new(10.0, 1.0, 16));
         let now = Instant::now();
         let source = PeerId::random();
-        let limits = InboundLimits { unregistered_peer: Quota { rows: 1, bytes: 4096 }, ..SMALL };
+        let limits = InboundLimits { registered_peer: Quota { rows: 1, bytes: 4096 }, ..SMALL };
 
         let verdict = gates.evaluate(&local_db, &limits, &source, 1, b"not a message", now).await;
         assert!(matches!(verdict, InboundVerdict::Drop(DropReason::Undecodable)));
 
+        // An unregistered author's durable message is relayed, never stored.
         let first = durable_bytes().await;
         let verdict = gates.evaluate(&local_db, &limits, &source, 2, &first, now).await;
+        assert!(matches!(verdict, InboundVerdict::Forward));
+        let key = key(1);
+        gates.registry.observe_operator_binding(&source, &key, 1);
+        gates.registry.record_operator_stake(&source, &key, Some(true), now);
+        let verdict = gates.evaluate(&local_db, &limits, &source, 3, &first, now).await;
         let InboundVerdict::Enqueue { class, .. } = verdict else {
-            panic!("an empty inbox admits the first message");
+            panic!("an empty inbox admits the first message of a registered author");
         };
-        assert_eq!(class, SenderClass::Unregistered);
+        assert_eq!(class, SenderClass::Registered);
         // What admission recorded: a queued network event of this author.
         let mut storage = local_db.acquire().await.unwrap();
         storage
@@ -2684,15 +2728,14 @@ mod tests {
             .unwrap();
         drop(storage);
 
-        // Another payload from the same sender is over its row quota ...
+        // Another payload from the same sender is over its row quota, in
+        // whichever class it is admitted.
         let second = durable_bytes().await;
         let verdict = gates.evaluate(&local_db, &limits, &source, 4, &second, now).await;
         assert!(matches!(verdict, InboundVerdict::Drop(DropReason::SenderQuota)));
-
-        // ... unless the sender turns out to be registered.
         gates.registry.record_committee_peer(&source, Some(true), now);
         let verdict = gates.evaluate(&local_db, &limits, &source, 5, &second, now).await;
-        assert!(matches!(verdict, InboundVerdict::Enqueue { class: SenderClass::Committee, .. }));
+        assert!(matches!(verdict, InboundVerdict::Drop(DropReason::SenderQuota)));
     }
 
     /// Verify replay neither passes admission nor consumes rate budget.
@@ -2712,11 +2755,14 @@ mod tests {
             assert!(matches!(verdict, InboundVerdict::Drop(DropReason::ReplayedSequence)));
         }
 
-        // Unregistered authors use rate limits rather than replay tracking.
+        // Unregistered authors use rate limits rather than replay tracking:
+        // the same sequence number relayed twice is not a replay to them.
         let stranger = PeerId::random();
         let other = durable_bytes().await;
-        let verdict = gates.evaluate(&local_db, &SMALL, &stranger, 7, &other, now).await;
-        assert!(matches!(verdict, InboundVerdict::Enqueue { .. }));
+        for _ in 0..2 {
+            let verdict = gates.evaluate(&local_db, &SMALL, &stranger, 7, &other, now).await;
+            assert!(matches!(verdict, InboundVerdict::Forward));
+        }
     }
 
     #[test]
@@ -2935,29 +2981,30 @@ mod tests {
         let local_db = store::create_local_db("sqlite::memory:").await;
         let gates = TestGates::new(PeerRateLimiter::new(10.0, 1.0, 16));
         let now = Instant::now();
-        let limits = InboundLimits {
-            unregistered_class: Quota { rows: 2, bytes: 3000 },
-            unregistered_peer: Quota { rows: 2, bytes: 3000 },
-            ..SMALL
+        let limits = InboundLimits { global: Quota { rows: 2, bytes: 3000 }, ..SMALL };
+        let member = |index: u8| {
+            let peer = PeerId::random();
+            gates.registry.record_committee_peer(&peer, Some(true), now);
+            let _ = index;
+            peer
         };
 
         // Nothing is inserted between evaluations: only the cache can know that
-        // the class already has two rows on their way into the inbox.
+        // two rows are already on their way into the inbox.
         for sequence_number in 0..2 {
             let message = durable_bytes().await;
             let verdict = gates
-                .evaluate(&local_db, &limits, &PeerId::random(), sequence_number, &message, now)
+                .evaluate(&local_db, &limits, &member(0), sequence_number, &message, now)
                 .await;
             assert!(matches!(verdict, InboundVerdict::Enqueue { .. }));
         }
         let message = durable_bytes().await;
-        let verdict = gates.evaluate(&local_db, &limits, &PeerId::random(), 9, &message, now).await;
-        assert!(matches!(verdict, InboundVerdict::Drop(DropReason::UnregisteredClassQuota)));
+        let verdict = gates.evaluate(&local_db, &limits, &member(1), 9, &message, now).await;
+        assert!(matches!(verdict, InboundVerdict::Drop(DropReason::GlobalQuota)));
 
         // Reload totals after cache expiry.
         let later = now + INBOX_CLASS_TOTALS_TTL;
-        let verdict =
-            gates.evaluate(&local_db, &limits, &PeerId::random(), 10, &message, later).await;
+        let verdict = gates.evaluate(&local_db, &limits, &member(2), 10, &message, later).await;
         assert!(matches!(verdict, InboundVerdict::Enqueue { .. }));
     }
 
@@ -2980,6 +3027,45 @@ mod tests {
         gates.registry.record_verifier_set(Some(vec![source.to_bytes()]), now);
         let verdict = gates.evaluate(&local_db, &SMALL, &source, 2, &wrapped, now).await;
         assert!(matches!(verdict, InboundVerdict::Drop(DropReason::UnexpectedBinaryKind)));
+    }
+
+    /// A verifier's endorsement of the graph parameters.
+    fn verifier_endorsement() -> GOATMessage {
+        use crate::action::VerifierGraphParamsEndorsement;
+        let keypair = test_keypair(9);
+        let digest = bitcoin::secp256k1::Message::from_digest([5; 32]);
+        GOATMessage::new(
+            Actor::Committee,
+            GOATMessageContent::VerifierGraphParamsEndorsement(VerifierGraphParamsEndorsement {
+                instance_id: Uuid::new_v4(),
+                graph_id: Uuid::new_v4(),
+                verifier_pubkey: bitcoin::PublicKey::new(keypair.public_key()),
+                verifier_index: 0,
+                canonical_graph_params_hash: [5; 32],
+                signature: bitcoin::secp256k1::Secp256k1::new().sign_schnorr(&digest, &keypair),
+            }),
+        )
+    }
+
+    #[tokio::test]
+    async fn parameter_endorsements_come_from_the_verifier_set_once_it_is_loaded() {
+        let local_db = store::create_local_db("sqlite::memory:").await;
+        let gates = TestGates::new(PeerRateLimiter::new(10.0, 1.0, 16));
+        let now = Instant::now();
+        let (verifier, stranger) = (PeerId::random(), PeerId::random());
+        // The stranger is registered (a committee peer), just not a verifier.
+        gates.registry.record_committee_peer(&stranger, Some(true), now);
+        let message = verifier_endorsement().serialize_message().await.unwrap();
+
+        // Before the set is known nobody is turned away on it.
+        let verdict = gates.evaluate(&local_db, &SMALL, &stranger, 1, &message, now).await;
+        assert!(matches!(verdict, InboundVerdict::Enqueue { .. }));
+
+        gates.registry.record_verifier_set(Some(vec![verifier.to_bytes()]), now);
+        let verdict = gates.evaluate(&local_db, &SMALL, &stranger, 2, &message, now).await;
+        assert!(matches!(verdict, InboundVerdict::Drop(DropReason::EndorsementFromNonVerifier)));
+        let verdict = gates.evaluate(&local_db, &SMALL, &verifier, 1, &message, now).await;
+        assert!(matches!(verdict, InboundVerdict::Enqueue { .. }));
     }
 
     #[tokio::test]
@@ -3148,17 +3234,13 @@ mod tests {
 
     #[test]
     fn committee_reserve_is_closed_to_other_senders() {
-        use SenderClass::{Committee, Registered, Unregistered};
+        use SenderClass::{Committee, Registered};
         let limits = InboundLimits { committee_reserve: Quota { rows: 2, bytes: 2000 }, ..SMALL };
 
         // Four rows from staked operators fill everything outside the reserve.
         let crowded = [usage(Registered, 4, 400, (0, 0))];
         assert_eq!(
             check_inbox_quota(Registered, 100, &crowded, &limits),
-            Err(DropReason::GlobalQuota)
-        );
-        assert_eq!(
-            check_inbox_quota(Unregistered, 100, &crowded, &limits),
             Err(DropReason::GlobalQuota)
         );
         assert_eq!(check_inbox_quota(Committee, 100, &crowded, &limits), Ok(()));
@@ -3291,6 +3373,7 @@ mod tests {
         let mut gates = TestGates::new(PeerRateLimiter::new(10.0, 1.0, 16));
         let now = Instant::now();
         let source = PeerId::random();
+        gates.registry.record_committee_peer(&source, Some(true), now);
         let vote = durable_bytes().await;
 
         gates.local_actor = Actor::Verifier;
@@ -3405,6 +3488,36 @@ mod tests {
         gates.registry.record_committee_peer(&member, Some(true), now);
         let verdict = gates.evaluate(&local_db, &SMALL, &member, 1, &data, now).await;
         assert!(matches!(verdict, InboundVerdict::Forward), "registered authors are not charged");
+    }
+
+    /// A durable message this role handles is relayed, not stored, while its
+    /// author is unregistered; once the author is known it is stored.
+    #[tokio::test]
+    async fn durable_messages_from_unregistered_authors_are_relayed_not_stored() {
+        let local_db = store::create_local_db("sqlite::memory:").await;
+        let mut gates = TestGates::new(PeerRateLimiter::new(10.0, 1.0, 16));
+        let tier = TierRate { msg_burst: 1, msg_per_sec: 0, byte_burst: 1 << 20, byte_per_sec: 0 };
+        gates.rate_limiter = InboundRateLimiter::new(RateLimits {
+            unregistered_forward: tier,
+            ..RateLimits::defaults()
+        });
+        let now = Instant::now();
+        let source = PeerId::random();
+        let vote = durable_bytes().await;
+
+        let verdict = gates.evaluate(&local_db, &SMALL, &source, 1, &vote, now).await;
+        assert!(matches!(verdict, InboundVerdict::Forward));
+        // The relay budget is the unregistered one; past it the message is dropped.
+        let verdict = gates.evaluate(&local_db, &SMALL, &source, 2, &vote, now).await;
+        assert!(matches!(verdict, InboundVerdict::Drop(DropReason::ForwardRate)));
+        // Nothing was queued for the quota.
+        assert!(
+            local_db.acquire().await.unwrap().engine_inbox_class_totals().await.unwrap().is_empty()
+        );
+
+        gates.registry.record_committee_peer(&source, Some(true), now);
+        let verdict = gates.evaluate(&local_db, &SMALL, &source, 3, &vote, now).await;
+        assert!(matches!(verdict, InboundVerdict::Enqueue { class: SenderClass::Committee, .. }));
     }
 
     /// Verify neighbour discovery is independent of author discovery.

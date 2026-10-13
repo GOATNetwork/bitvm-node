@@ -267,6 +267,13 @@ async fn run(
         swap_escrow_timeout_monitor(local_db),
     )
     .await;
+    // Rejected and stale unregistered network events leave the inbox quota.
+    run_maintenance_subtask(
+        metrics_state,
+        "inbox_quota_purge",
+        crate::p2p_admission::purge_stale_network_events(local_db),
+    )
+    .await;
     // Chain facts for the Graph aggregate's peg-out phases.
     run_maintenance_subtask(
         metrics_state,

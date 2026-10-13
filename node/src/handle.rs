@@ -149,6 +149,15 @@ async fn record_node_info(ctx: &HandlerContext<'_>, node_info: &NodeInfo) -> Res
     // The binding is learned either way: it lives in the bounded registry, and
     // an operator must be able to become registered while the table is full.
     learn_node_info_binding(ctx.local_db, ctx.goat_client, node_info).await;
+    // A self-declared committee node is a candidate for the registry's
+    // committee lookup (within its budget); a durable message never is.
+    if node_info.actor == Actor::Committee.to_string() {
+        crate::p2p_admission::refresh_registry_in_background(
+            ctx.local_db,
+            ctx.goat_client,
+            Some(ctx.from_peer_id),
+        );
+    }
     Ok(())
 }
 

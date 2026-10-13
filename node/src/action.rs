@@ -504,7 +504,6 @@ pub async fn handle_inbound_p2p_message(
     use gossipsub::MessageAcceptance;
 
     let now = Instant::now();
-    p2p_admission::refresh_registry_in_background(local_db, goat_client, Some(from_peer_id));
     let verdict = p2p_admission::evaluate_inbound_message(
         local_db,
         &p2p_admission::AdmissionGates::global(&actor),
@@ -834,6 +833,7 @@ fn report_clock_leads(leads: Vec<(PeerId, Duration)>) {
 pub async fn run_p2p_admission_maintenance(local_db: &LocalDB, goat_client: &Arc<GOATClient>) {
     let now = Instant::now();
     crate::p2p_admission::refresh_due_registrations_in_background(local_db, goat_client);
+    crate::p2p_admission::revalidate_committee_candidates(local_db, goat_client).await;
     crate::p2p_admission::log_drop_summary();
     // Expired bans only need forgetting: the gate compares against the clock.
     crate::p2p_admission::direct_peer_strikes().take_expired_bans(now);

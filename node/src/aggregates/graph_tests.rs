@@ -113,6 +113,19 @@ impl MembershipProbe for Outsider {
     }
 }
 
+/// A member whose registry knows no peer.
+struct Unacquainted;
+
+impl MembershipProbe for Unacquainted {
+    fn holds_instance_key(&self, _instance_id: Uuid) -> bool {
+        true
+    }
+
+    fn is_registered_peer(&self, _peer: &str) -> bool {
+        false
+    }
+}
+
 async fn start(actor: Actor, relayer: bool) -> Harness {
     start_with(actor, relayer, Arc::new(Member)).await
 }
@@ -508,6 +521,18 @@ async fn a_definition_waits_for_its_predecessor_and_pulls_it() {
     t.handle.notify(&[slot_ref(OPERATOR, 1)]).await.unwrap();
     t.wait_inbox(&event_id, EngineInboxState::Applied).await;
     t.wait_job(graph_id, JOB_COMMITTEE_INGEST_GRAPH, EngineJobState::Done).await;
+    t.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_value_from_an_unregistered_author_waits_without_a_pull() {
+    let t = start_with(Actor::Committee, false, Arc::new(Unacquainted)).await;
+    let (instance_id, graph_id) = (Uuid::new_v4(), Uuid::new_v4());
+    let event_id =
+        t.submit(t.message("NonceGeneration", "peer-x", instance_id, graph_id, None)).await;
+    t.wait_waiting(&event_id).await;
+    settle().await;
+    assert!(t.jobs_of(graph_id).await.is_empty(), "no GetGraph pull for an unknown author");
     t.stop().await;
 }
 

@@ -598,14 +598,29 @@ pub fn retired(status: Option<GraphStatus>) -> bool {
 /// the apply; the jobs verify membership against Goat.
 pub trait MembershipProbe: Send + Sync {
     fn holds_instance_key(&self, instance_id: Uuid) -> bool;
+
+    /// Whether the author of a message is a peer the registry holds as
+    /// registered on chain. A parked message from anyone else waits for the
+    /// definition to arrive by itself: no GetGraph pull is spent on it.
+    fn is_registered_peer(&self, _peer: &str) -> bool {
+        true
+    }
 }
 
-/// The instance key envelope on disk.
+/// The instance key envelope on disk, and the peer registry.
 pub struct EnvelopeProbe;
 
 impl MembershipProbe for EnvelopeProbe {
     fn holds_instance_key(&self, instance_id: Uuid) -> bool {
         committee_instance_keys_envelope_path(instance_id).exists()
+    }
+
+    fn is_registered_peer(&self, peer: &str) -> bool {
+        libp2p::PeerId::from_str(peer).is_ok_and(|peer| {
+            crate::p2p_admission::peer_registry()
+                .sender_class(&peer, std::time::Instant::now())
+                .is_registered()
+        })
     }
 }
 
@@ -654,19 +669,18 @@ impl GraphAggregate {
             && self.local_operator.as_deref() == Some(row.operator_pubkey.as_str())
     }
 
-    /// Park a message on a definition this node lacks: pull it, unless the
-    /// instance is already failed (nothing more will happen to the graph) or
-    /// the message has waited past its TTL.
+    /// Wait for a missing definition, scheduling a fetch only for registered authors.
+    /// Reject the message if its instance failed or its waiting deadline elapsed.
     async fn park_for_definition(
         &self,
         ctx: &mut ApplyContext<'_>,
         graph_id: Uuid,
-        instance_id: Uuid,
+        inbound: &InboundMessage,
         created_at: i64,
         lookup: GraphLookup,
         waiting: WaitingFor,
     ) -> anyhow::Result<ApplyOutcome> {
-        if instance_failed(ctx, instance_id).await? {
+        if instance_failed(ctx, inbound.instance_id).await? {
             debug!(event = "graph_apply", graph_id = %graph_id, detail = %waiting.detail, "instance failed; message ignored");
             return Ok(ApplyOutcome::Applied);
         }
@@ -677,9 +691,13 @@ impl GraphAggregate {
                 waiting.detail
             )));
         }
-        let params =
-            bincode::serialize(&lookup).map_err(|error| anyhow!("encode graph lookup: {error}"))?;
-        self.ingest_job(ctx, JOB_FETCH_GRAPH, &params);
+        if self.membership.is_registered_peer(&inbound.author) {
+            let params = bincode::serialize(&lookup)
+                .map_err(|error| anyhow!("encode graph lookup: {error}"))?;
+            self.ingest_job(ctx, JOB_FETCH_GRAPH, &params);
+        } else {
+            debug!(event = "graph_apply", graph_id = %graph_id, author = %inbound.author, detail = %waiting.detail, "author is not a registered peer; waiting without a pull");
+        }
         Ok(ApplyOutcome::Waiting(waiting))
     }
 
@@ -790,12 +808,7 @@ impl GraphAggregate {
                         );
                         return self
                             .park_for_definition(
-                                ctx,
-                                graph_id,
-                                inbound.instance_id,
-                                created_at,
-                                lookup,
-                                waiting,
+                                ctx, graph_id, &inbound, created_at, lookup, waiting,
                             )
                             .await;
                     }
@@ -821,14 +834,7 @@ impl GraphAggregate {
                     };
                     let waiting = WaitingFor::on(&ctx.aggregate, "graph definition not stored yet");
                     return self
-                        .park_for_definition(
-                            ctx,
-                            graph_id,
-                            inbound.instance_id,
-                            created_at,
-                            lookup,
-                            waiting,
-                        )
+                        .park_for_definition(ctx, graph_id, &inbound, created_at, lookup, waiting)
                         .await;
                 }
                 if signing_round_over(status) {

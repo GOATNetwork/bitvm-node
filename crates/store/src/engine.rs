@@ -754,6 +754,20 @@ impl<'a> StorageProcessor<'a> {
         Ok(inbox + outbox + jobs)
     }
 
+    /// Drop the rejected (`Failed`) network events last updated before
+    /// `before`: the admission quota should stop charging for them well before
+    /// the terminal retention. A sender that wants one back sends it again.
+    pub async fn purge_rejected_network_inbox_rows(&mut self, before: i64) -> anyhow::Result<u64> {
+        Ok(sqlx::query(
+            "DELETE FROM engine_inbox \
+             WHERE source = 'network' AND state = 'Failed' AND updated_at < ?",
+        )
+        .bind(before)
+        .execute(self.conn())
+        .await?
+        .rows_affected())
+    }
+
     // -------------------------------------------------------------- aggregate
 
     pub async fn find_engine_aggregate(
@@ -1524,14 +1538,14 @@ impl<'a> StorageProcessor<'a> {
 
     // ------------------------------------------------------------------ quota
 
-    /// Queued network events (`Pending`, waiting or `Failed`: the rows that
-    /// still hold a payload) per admission class.
+    /// Queued network events (`Pending`, waiting, `Failed` or `Poisoned`: the
+    /// rows that still hold a payload) per admission class.
     pub async fn engine_inbox_class_totals(&mut self) -> anyhow::Result<Vec<InboxClassUsage>> {
         let rows = sqlx::query(
             "SELECT admission_class, COUNT(*) AS total_rows, \
                     COALESCE(SUM(payload_size), 0) AS total_bytes \
              FROM engine_inbox \
-             WHERE source = 'network' AND state IN ('Pending', 'Failed') \
+             WHERE source = 'network' AND state IN ('Pending', 'Failed', 'Poisoned') \
              GROUP BY admission_class",
         )
         .fetch_all(self.conn())
@@ -1559,7 +1573,7 @@ impl<'a> StorageProcessor<'a> {
             "SELECT admission_class, COUNT(*) AS peer_rows, \
                     COALESCE(SUM(payload_size), 0) AS peer_bytes \
              FROM engine_inbox \
-             WHERE source = 'network' AND state IN ('Pending', 'Failed') AND author = ? \
+             WHERE source = 'network' AND state IN ('Pending', 'Failed', 'Poisoned') AND author = ? \
              GROUP BY admission_class",
         )
         .bind(author)
@@ -2141,5 +2155,34 @@ mod tests {
             s.list_engine_inbox_events_for_aggregate("test", "a", 10).await.unwrap().len(),
             1
         );
+    }
+
+    /// Rejected network events stop counting against the quota long before
+    /// the terminal retention; everything else keeps its row.
+    #[tokio::test]
+    async fn rejected_network_rows_are_purged_early() {
+        let db = setup_db().await;
+        let mut s = db.acquire().await.unwrap();
+        for id in ["rejected", "parked", "fresh-rejected", "pending"] {
+            s.insert_engine_inbox_event(&network_event(id, "alice", "Registered", 8), 100)
+                .await
+                .unwrap();
+        }
+        // A rejected local event is never the quota's business.
+        s.insert_engine_inbox_event(&event("local", "x"), 100).await.unwrap();
+        s.mark_engine_inbox_failed("local", "no", 150).await.unwrap();
+        s.mark_engine_inbox_failed("rejected", "no", 150).await.unwrap();
+        s.mark_engine_inbox_failed("fresh-rejected", "no", 950).await.unwrap();
+        s.mark_engine_inbox_waiting("parked", "slot", "d", 1_000, 150).await.unwrap();
+        assert_eq!(s.purge_rejected_network_inbox_rows(900).await.unwrap(), 1);
+        for (id, kept) in [
+            ("rejected", false),
+            ("parked", true),
+            ("fresh-rejected", true),
+            ("pending", true),
+            ("local", true),
+        ] {
+            assert_eq!(s.find_engine_inbox_event(id).await.unwrap().is_some(), kept, "{id}");
+        }
     }
 }
