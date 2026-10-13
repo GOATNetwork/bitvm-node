@@ -1213,10 +1213,11 @@ impl<'a> StorageProcessor<'a> {
     /// Create a bridge-in instance from a pegin request, or refresh one that
     /// has not moved past the pegin-request stage yet.
     ///
-    /// `PeginRequest` is a re-deliverable P2P message, so a full-row replacement
-    /// would let a replayed or forged request roll a live instance back to its
-    /// initial row and clear everything the later stages wrote. The write is
-    /// therefore a compare-and-swap over the current status, and it only touches
+    /// The request monitor writes the row from the indexed Goat event and may
+    /// see the same request again, so a full-row replacement would let a late
+    /// or repeated request roll a live instance back to its initial row and
+    /// clear everything the later stages wrote. The write is therefore a
+    /// compare-and-swap over the current status, and it only touches
     /// the columns a pegin request owns:
     /// committee answers, instance parameters and the BTC-side fields are never
     /// overwritten. The caller is responsible for passing canonical request

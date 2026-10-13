@@ -19,8 +19,7 @@ use crate::scheduled_tasks::get_timestamp_from_contract_data;
 use crate::utils::evm_swap_utils::{extract_claim_data_from_tx, extract_escrow_data_from_tx};
 use crate::utils::{
     GenerateInstanceParams, generate_instance, get_bridge_out_global_stats,
-    obsolete_instance_graphs_except, outpoint_available, reflect_goat_address,
-    strip_hex_prefix_owned,
+    obsolete_instance_graphs_except, reflect_goat_address, strip_hex_prefix_owned,
 };
 use alloy::primitives::{Address as EvmAddress, U256};
 use alloy::sol_types::SolValue;
@@ -756,11 +755,10 @@ async fn handle_bridge_in_events<'a>(
             warn!("Instance {instance_id} is finished but not find in db. we will create it");
             if let Some(extra) = tx_record.extra.as_ref()
                 && let Ok(bridge_event) = serde_json::from_str::<BridgeInRequestEvent>(extra)
-                && let Ok((mut instance, _)) = generate_instance_from_bridge_in_request_event(
+                && let Ok(mut instance) = generate_instance_from_bridge_in_request_event(
                     btc_client.as_ref(),
                     goat_client.as_ref(),
                     &bridge_event,
-                    false,
                 )
                 .await
             {
@@ -1010,13 +1008,13 @@ async fn handle_swap_refund_events<'a>(
     Ok(())
 }
 
+/// Build an instance from BridgeInRequest and Goat pegin data. Input-spend checks
+/// are deferred until the Prepare transaction can be identified.
 pub(super) async fn generate_instance_from_bridge_in_request_event(
     btc_client: &BTCClient,
     goat_client: &GOATClient,
     event: &BridgeInRequestEvent,
-    is_check_utxos: bool,
-) -> anyhow::Result<(Instance, bool)> {
-    let mut input_utxo_available = true;
+) -> anyhow::Result<Instance> {
     let instance_id = Uuid::from_str(&strip_hex_prefix_owned(&event.instance_id))?;
     let pegin_data = goat_client.gateway_get_pegin_data(&instance_id).await?;
     let inputs: Vec<Input> = pegin_data
@@ -1027,17 +1025,6 @@ pub(super) async fn generate_instance_from_bridge_in_request_event(
             amount: Amount::from_sat(u.amount_sats),
         })
         .collect();
-
-    if is_check_utxos {
-        for input in &inputs {
-            if !outpoint_available(btc_client, &input.outpoint.txid, input.outpoint.vout.into())
-                .await?
-            {
-                input_utxo_available = false;
-                break;
-            }
-        }
-    }
 
     let user_change_address: Address<NetworkUnchecked> =
         Address::from_str(&event.user_change_address)?;
@@ -1054,7 +1041,7 @@ pub(super) async fn generate_instance_from_bridge_in_request_event(
         user_change_address: user_change_address.require_network(network)?,
         user_refund_address: user_refund_addr.require_network(network)?,
     };
-    let instance = generate_instance(
+    generate_instance(
         btc_client,
         GenerateInstanceParams {
             instance_id,
@@ -1065,8 +1052,7 @@ pub(super) async fn generate_instance_from_bridge_in_request_event(
             pegin_timestamp: event.block_timestamp.parse::<i64>().unwrap_or(current_time_secs()),
         },
     )
-    .await?;
-    Ok((instance, input_utxo_available))
+    .await
 }
 async fn handle_post_graph_data_events<'a>(
     actor: &Actor,

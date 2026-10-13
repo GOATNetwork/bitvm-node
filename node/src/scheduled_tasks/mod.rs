@@ -16,7 +16,7 @@ use crate::metrics_service::MetricsState;
 use crate::rpc_service::current_time_secs;
 use crate::scheduled_tasks::babe_setup_state_cleanup_task::babe_setup_state_cleanup_monitor;
 use crate::scheduled_tasks::instance_maintenance_tasks::{
-    instance_answers_monitor, pegin_confirm_recovery_monitor, swap_escrow_timeout_monitor,
+    pegin_request_monitor, swap_escrow_timeout_monitor,
 };
 use crate::scheduled_tasks::node_maintenance_tasks::node_available_pbtc_update_monitor;
 use crate::scheduled_tasks::spv_maintenance_tasks::spv_header_hash_update;
@@ -242,10 +242,11 @@ async fn run(
         return Ok(MaintenanceRunOutcome::DeferredHistorySync);
     }
 
+    // New peg-in requests become instance rows and `pegin_request` events.
     run_maintenance_subtask(
         metrics_state,
-        "instance_answers_monitor",
-        instance_answers_monitor(local_db, btc_client, goat_client),
+        "pegin_request_monitor",
+        pegin_request_monitor(local_db, btc_client, goat_client, engine),
     )
     .await;
     // Chain facts for the Instance aggregate; the apply decides every status.
@@ -259,12 +260,6 @@ async fn run(
         metrics_state,
         "instance_btc_scan",
         scan_instances_on_bitcoin(local_db, btc_client, engine, &actor),
-    )
-    .await;
-    run_maintenance_subtask(
-        metrics_state,
-        "pegin_confirm_recovery_monitor",
-        pegin_confirm_recovery_monitor(local_db, btc_client, &actor),
     )
     .await;
     run_maintenance_subtask(

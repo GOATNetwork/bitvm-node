@@ -1,29 +1,25 @@
-//! The Instance aggregate (refactor step 2; docs/node-protocol.md §10.2 and
-//! §10.7.1).
+//! Instance lifecycle decisions from messages, chain snapshots and job results.
 //!
-//! Business state is the `instance` row. The engine row mirrors its status and
-//! phase. Every input is an inbox event whose facts were gathered outside the
-//! apply: a Bitcoin snapshot from [`super::instance_scan`], the committee
-//! answers once the Goat response window closed, a locally finalized graph, the
-//! Goat `BridgeIn` event, or a job result. The apply only decides the
-//! transition from those facts and commits the row update together with the
-//! effects of the new state: the `ConfirmInstance` trigger, the relayer's post
-//! job, and on entering a failure state the obsoleted graphs, the closed
-//! deliveries and the key deletion job.
-//!
-//! Every deadline is a block height. `T0` opens the user's Peg-In-Cancel and
-//! closes signing; the abandon buffer `B` after it decides `Timeout` when the
-//! Peg-In-Confirm is neither confirmed nor visible in this node's mempool.
+//! Apply updates the instance row and records its jobs, outgoing messages and
+//! cleanup actions in one transaction. The engine row tracks status and phase.
+//! Signing closes at the cancel height. After the abandon buffer, an unconfirmed
+//! Peg-In-Confirm absent from the mempool can cause Timeout.
 
-use crate::action::{ConfirmInstance, GOATMessageContent};
+use crate::action::{BusinessRef, GOATMessage, HasBusinessRef};
+use crate::aggregates::graph::{
+    EnvelopeProbe, InboundMessage, MembershipProbe, NextStep, PARKED_MESSAGE_TTL_SECS,
+    PlannedMessage, content_event_id, operator_start_event,
+};
+use crate::engine_bridge::record_event_in;
 use crate::env::{
-    get_committee_instance_key_delete_timelock_blocks, get_network,
+    get_committee_instance_key_delete_timelock_blocks, get_network, get_peer_id,
     get_pegin_abandon_buffer_blocks, is_enable_committee_instance_key_delete, is_relayer,
 };
 use crate::metrics_service::node_metrics_state;
+use crate::middleware::get_topic_name;
 use crate::utils::{
-    SELF_SENDER, gen_instance_parameters_local, min_required_operator,
-    obsolete_instance_graphs_except, upsert_message,
+    find_pegin_instance_process_data, gen_instance_parameters_local, min_required_operator,
+    obsolete_instance_graphs_except,
 };
 use anyhow::{Context, anyhow};
 use async_trait::async_trait;
@@ -34,11 +30,12 @@ use client::btc_chain::BTCClient;
 use engine::{
     AggregateHandler, AggregateRef, ApplyContext, ApplyError, ApplyOutcome, EngineInboxEvent,
     EngineOutboxCloseTarget, EventSource, JOB_RESULT_KIND, JobPool, JobResultEvent,
-    JobResultOutcome, JobSpec, NewEvent, WaitingFor,
+    JobResultOutcome, JobSpec, NewEvent, OutboxMessage, WaitingFor,
 };
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
+use std::sync::Arc;
 use store::localdb::{InstanceUpdate, LocalDB, StorageProcessor};
 use store::{Instance, InstanceBridgeInStatus, SerializableTxid};
 use tracing::{debug, info, warn};
@@ -50,11 +47,37 @@ pub const EVENT_BTC_SNAPSHOT: &str = "btc_snapshot";
 pub const EVENT_ANSWER_WINDOW: &str = "answer_window";
 pub const EVENT_GRAPH_ENDORSED: &str = "graph_endorsed";
 pub const EVENT_L2_MINTED: &str = "l2_minted";
+/// A Goat `BridgeInRequest` this node indexed while its response window is open.
+pub const EVENT_PEGIN_REQUEST: &str = "pegin_request";
 
 pub const JOB_POST_PEGIN_DATA: &str = "post_pegin_data";
 pub const JOB_DELETE_INSTANCE_KEY: &str = "delete_instance_key";
+/// The committee's `answerPeginRequest` (Answer phase).
+pub const JOB_ANSWER_PEGIN_REQUEST: &str = "answer_pegin_request";
+/// Peg-In-Prepare confirmed: store the parameters, operators open a setup.
+pub const JOB_CONFIRM_INSTANCE: &str = "confirm_instance";
 /// The committee's PeginConfirm round start on entering Presigned.
 pub const JOB_START_PEGIN_CONFIRM: &str = "start_pegin_confirm";
+pub const JOB_INGEST_PEGIN_CONFIRM_NONCE: &str = "ingest_pegin_confirm_nonce";
+pub const JOB_PEGIN_CONFIRM_VOTE: &str = "pegin_confirm_vote";
+pub const JOB_INGEST_PEGIN_CONFIRM_VOTE: &str = "ingest_pegin_confirm_vote";
+pub const JOB_PEGIN_CONFIRM_SIGN: &str = "pegin_confirm_sign";
+pub const JOB_INGEST_PEGIN_CONFIRM_PARTIAL_SIG: &str = "ingest_pegin_confirm_partial_sig";
+/// The relayer's aggregation and broadcast of the Peg-In-Confirm.
+pub const JOB_BROADCAST_PEGIN_CONFIRM: &str = "broadcast_pegin_confirm";
+
+/// The jobs that return an [`InstancePlan`].
+pub const INSTANCE_JOBS: &[&str] = &[
+    JOB_ANSWER_PEGIN_REQUEST,
+    JOB_CONFIRM_INSTANCE,
+    JOB_START_PEGIN_CONFIRM,
+    JOB_INGEST_PEGIN_CONFIRM_NONCE,
+    JOB_PEGIN_CONFIRM_VOTE,
+    JOB_INGEST_PEGIN_CONFIRM_VOTE,
+    JOB_PEGIN_CONFIRM_SIGN,
+    JOB_INGEST_PEGIN_CONFIRM_PARTIAL_SIG,
+    JOB_BROADCAST_PEGIN_CONFIRM,
+];
 
 pub const PHASE_ANSWER: &str = "Answer";
 pub const PHASE_AWAIT_PREPARE: &str = "AwaitPrepare";
@@ -82,6 +105,81 @@ pub fn phase_of(status: InstanceBridgeInStatus) -> &'static str {
         RelayerL2Minted => PHASE_DONE,
         Timeout | UserCanceled | NoEnoughCommitteesAnswered | UserDiscarded => PHASE_FAILED,
     }
+}
+
+/// The job phase an action runs in; jobs are cancelled by phase.
+pub fn job_phase(action: &str) -> &'static str {
+    match action {
+        JOB_ANSWER_PEGIN_REQUEST => PHASE_ANSWER,
+        JOB_CONFIRM_INSTANCE => PHASE_PRESIGN,
+        JOB_POST_PEGIN_DATA => PHASE_POST,
+        JOB_DELETE_INSTANCE_KEY => PHASE_KEY,
+        _ => PHASE_CONFIRM,
+    }
+}
+
+/// The PeginConfirm round is over: nothing of the Confirm phase is sent or started any more.
+pub fn confirm_round_over(status: InstanceBridgeInStatus) -> bool {
+    status.is_failed()
+        || matches!(
+            status,
+            InstanceBridgeInStatus::RelayerL1Broadcasted | InstanceBridgeInStatus::RelayerL2Minted
+        )
+}
+
+// ------------------------------------------------------------------- routing
+
+/// Message kinds the aggregate takes from the network, and which job ingests
+/// them. Only committee nodes take part in the PeginConfirm round.
+pub fn route_action(kind: &str, actor: &Actor) -> Option<&'static str> {
+    if *actor != Actor::Committee {
+        return None;
+    }
+    Some(match kind {
+        "PeginConfirmNonce" => JOB_INGEST_PEGIN_CONFIRM_NONCE,
+        "PeginConfirmNonceConsensus" => JOB_INGEST_PEGIN_CONFIRM_VOTE,
+        "PeginConfirmPartialSig" => JOB_INGEST_PEGIN_CONFIRM_PARTIAL_SIG,
+        _ => return None,
+    })
+}
+
+/// Whether this role takes `kind` through the engine at all.
+pub fn engine_handles(kind: &str, actor: &Actor) -> bool {
+    route_action(kind, actor).is_some()
+}
+
+/// The inbox event for an admitted PeginConfirm round message, or `None`
+/// when this role does not take the kind through the engine.
+pub fn inbound_event(
+    actor: &Actor,
+    author: &str,
+    decoded: &GOATMessage,
+    raw: &[u8],
+) -> anyhow::Result<Option<NewEvent>> {
+    let kind = decoded.content.event_type();
+    if !engine_handles(kind, actor) {
+        return Ok(None);
+    }
+    let BusinessRef::Instance { instance_id } = decoded.content.business_ref() else {
+        return Ok(None);
+    };
+    let inbound = InboundMessage {
+        author: author.to_string(),
+        instance_id,
+        graph_nonce: None,
+        operator_pubkey: None,
+        message: raw.to_vec(),
+    };
+    Ok(Some(
+        NewEvent::new(
+            content_event_id(author, kind, &instance_id.to_string(), raw),
+            instance_ref(instance_id),
+            kind,
+            EventSource::Network,
+            inbound.encode()?,
+        )
+        .with_author(author),
+    ))
 }
 
 // ------------------------------------------------------------------ deadlines
@@ -148,6 +246,11 @@ impl TxFact {
     pub fn mempool() -> Self {
         Self { confirmed: false, block_height: None, in_mempool: true }
     }
+
+    /// Neither confirmed nor in this node's mempool.
+    pub fn invisible(&self) -> bool {
+        !self.confirmed && !self.in_mempool
+    }
 }
 
 /// Bitcoin facts about an instance at tip height `height`. A `None` fact was
@@ -199,6 +302,27 @@ impl AnswerWindow {
     }
 }
 
+/// The Goat `BridgeInRequest` the event watcher indexed.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeginRequested {
+    pub tx_hash: String,
+    pub height: i64,
+}
+
+/// One event per request transaction: a re-indexed request is a new event.
+pub fn pegin_request_event(
+    instance_id: Uuid,
+    request: &PeginRequested,
+) -> anyhow::Result<NewEvent> {
+    Ok(NewEvent::new(
+        format!("instance:{instance_id}:pegin-request:{}", request.tx_hash),
+        instance_ref(instance_id),
+        EVENT_PEGIN_REQUEST,
+        EventSource::Chain,
+        serde_json::to_vec(request)?,
+    ))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GraphEndorsed {
     pub graph_id: Uuid,
@@ -242,6 +366,50 @@ pub struct KeyDeleteResult {
     pub detail: String,
 }
 
+// ---------------------------------------------------------------------- plans
+
+/// The operator opens a setup session for its graph of the instance.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartGraph {
+    /// The id of the session, or of the existing session when one is open.
+    pub graph_id: Uuid,
+    pub operator_pubkey: String,
+}
+
+/// What an instance job decided; the apply commits it with the row.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstancePlan {
+    pub messages: Vec<PlannedMessage>,
+    pub next: Vec<NextStep>,
+    pub start_graph: Option<StartGraph>,
+    pub wake_refs: Vec<String>,
+    pub note: Option<String>,
+}
+
+impl InstancePlan {
+    pub fn noted(note: impl Into<String>) -> Self {
+        Self { note: Some(note.into()), ..Default::default() }
+    }
+
+    pub fn encode(&self) -> anyhow::Result<Vec<u8>> {
+        Ok(bincode::serialize(self)?)
+    }
+
+    pub fn decode(bytes: &[u8]) -> anyhow::Result<Self> {
+        Ok(bincode::deserialize(bytes)?)
+    }
+
+    pub fn send(&mut self, message: PlannedMessage) -> &mut Self {
+        self.messages.push(message);
+        self
+    }
+
+    pub fn then(&mut self, action: &str, params: Vec<u8>, delay_secs: Option<i64>) -> &mut Self {
+        self.next.push(NextStep::Job { action: action.to_string(), params, delay_secs });
+        self
+    }
+}
+
 // ------------------------------------------------------------------ decisions
 
 /// Conditions that need a human: the state machine does not move on them.
@@ -255,8 +423,13 @@ pub enum InstanceAlert {
     PostPeginDataRejected,
     /// The committee key envelope could not be deleted.
     KeyDeleteFailed,
-    /// The committee could not start its PeginConfirm round.
+    /// A step of the committee's PeginConfirm round failed for good.
     PeginConfirmRoundFailed,
+    /// The committee could not answer the peg-in request.
+    AnswerPeginRequestFailed,
+    /// Goat refused the data of a confirmed peg-in for good: no instance
+    /// parameters stored, no graph started by this operator.
+    ConfirmInstanceRejected,
 }
 
 impl InstanceAlert {
@@ -267,6 +440,8 @@ impl InstanceAlert {
             InstanceAlert::PostPeginDataRejected => "post_pegin_data_rejected",
             InstanceAlert::KeyDeleteFailed => "key_delete_failed",
             InstanceAlert::PeginConfirmRoundFailed => "pegin_confirm_round_failed",
+            InstanceAlert::AnswerPeginRequestFailed => "answer_pegin_request_failed",
+            InstanceAlert::ConfirmInstanceRejected => "confirm_instance_rejected",
         }
     }
 }
@@ -427,6 +602,18 @@ pub fn decide_l2_minted(status: InstanceBridgeInStatus, tx_hash: &str) -> Transi
     }
 }
 
+/// The relayer re-broadcasts a Peg-In-Confirm that is neither confirmed nor in its mempool
+/// while the instance stays Presigned.
+pub fn rebroadcast_due(
+    status: InstanceBridgeInStatus,
+    transition: &Transition,
+    snapshot: &BtcSnapshot,
+) -> bool {
+    status == InstanceBridgeInStatus::Presigned
+        && transition.next.is_none()
+        && snapshot.confirm.is_some_and(|confirm| confirm.invisible())
+}
+
 // --------------------------------------------------------------- signing gate
 
 /// Signing and broadcast eligibility for an instance.
@@ -491,6 +678,8 @@ pub struct InstanceAggregate {
     deadlines: PeginDeadlines,
     relayer: bool,
     key_delete_enabled: bool,
+    local_peer: String,
+    membership: Arc<dyn MembershipProbe>,
 }
 
 impl InstanceAggregate {
@@ -500,6 +689,7 @@ impl InstanceAggregate {
             PeginDeadlines::from_env(),
             is_relayer(),
             is_enable_committee_instance_key_delete(),
+            get_peer_id(),
         )
     }
 
@@ -508,12 +698,35 @@ impl InstanceAggregate {
         deadlines: PeginDeadlines,
         relayer: bool,
         key_delete_enabled: bool,
+        local_peer: String,
     ) -> Self {
-        Self { actor, deadlines, relayer, key_delete_enabled }
+        Self {
+            actor,
+            deadlines,
+            relayer,
+            key_delete_enabled,
+            local_peer,
+            membership: Arc::new(EnvelopeProbe),
+        }
+    }
+
+    pub fn with_membership(mut self, membership: Arc<dyn MembershipProbe>) -> Self {
+        self.membership = membership;
+        self
     }
 
     pub fn deadlines(&self) -> &PeginDeadlines {
         &self.deadlines
+    }
+
+    fn job(&self, ctx: &mut ApplyContext<'_>, action: &str, params: Vec<u8>) {
+        ctx.effects.enqueue_job(JobSpec::new(
+            &ctx.aggregate,
+            job_phase(action),
+            action,
+            JobPool::Network,
+            params,
+        ));
     }
 
     async fn commit(
@@ -577,18 +790,9 @@ impl InstanceAggregate {
                 .await?;
         }
         if transition.prepare_height.is_some() {
-            // Peg-In-Prepare confirmed: operators start graphs, every role
-            // stores the instance parameters.
-            upsert_message(
-                ctx.storage,
-                false,
-                SELF_SENDER.to_string(),
-                Actor::All,
-                GOATMessageContent::ConfirmInstance(ConfirmInstance { instance_id }),
-                0,
-                0,
-            )
-            .await?;
+            // Peg-In-Prepare confirmed: every role stores the instance parameters, operators
+            // start graphs.
+            self.job(ctx, JOB_CONFIRM_INSTANCE, Vec::new());
         }
         if transition.delete_key {
             self.request_key_delete(ctx, instance, "success");
@@ -611,32 +815,25 @@ impl InstanceAggregate {
     ) -> anyhow::Result<()> {
         use InstanceBridgeInStatus::*;
         match next {
+            CommitteesAnswered => {
+                ctx.effects.cancel_phase_jobs(PHASE_ANSWER);
+            }
             Presigned => {
-                // The committee's PeginConfirm round starts from the stored
-                // values; the legacy outbox re-publishes them until the round
-                // closes (§10.7.1 Confirm).
+                // The committee's PeginConfirm round starts from the stored values; the outbox
+                // re-publishes them until the round closes.
                 if self.actor == Actor::Committee {
-                    ctx.effects.enqueue_job(JobSpec::new(
-                        &ctx.aggregate,
-                        PHASE_CONFIRM,
-                        JOB_START_PEGIN_CONFIRM,
-                        JobPool::Network,
-                        Vec::new(),
-                    ));
+                    self.job(ctx, JOB_START_PEGIN_CONFIRM, Vec::new());
                 }
             }
             RelayerL1Broadcasted => {
+                self.close_confirm_round(ctx, instance.instance_id, "Peg-In-Confirm confirmed");
                 if self.relayer {
-                    ctx.effects.enqueue_job(JobSpec::new(
-                        &ctx.aggregate,
-                        PHASE_POST,
-                        JOB_POST_PEGIN_DATA,
-                        JobPool::Network,
-                        Vec::new(),
-                    ));
+                    self.job(ctx, JOB_POST_PEGIN_DATA, Vec::new());
                 }
             }
             RelayerL2Minted => {
+                self.close_confirm_round(ctx, instance.instance_id, "minted on Goat");
+                ctx.effects.cancel_phase_jobs(PHASE_CONFIRM);
                 ctx.effects.cancel_phase_jobs(PHASE_POST);
             }
             failed if failed.is_failed() => {
@@ -645,6 +842,18 @@ impl InstanceAggregate {
             _ => {}
         }
         Ok(())
+    }
+
+    /// Close the instance's Confirm-phase outbox deliveries.
+    fn close_confirm_round(&self, ctx: &mut ApplyContext<'_>, instance_id: Uuid, reason: &str) {
+        ctx.effects.close_outbox(
+            EngineOutboxCloseTarget::Phase {
+                aggregate_kind: INSTANCE_KIND.to_string(),
+                aggregate_id: instance_id.to_string(),
+                phase_ref: PHASE_CONFIRM.to_string(),
+            },
+            reason,
+        );
     }
 
     /// Close instance deliveries and retire its graphs on failure.
@@ -659,7 +868,6 @@ impl InstanceAggregate {
     ) -> anyhow::Result<()> {
         let instance_id = instance.instance_id;
         let obsoleted = obsolete_instance_graphs_except(ctx.storage, instance_id, None).await?;
-        let cancelled = ctx.storage.cancel_messages_by_business_id(&instance_id, None).await?;
         ctx.effects.close_outbox(
             EngineOutboxCloseTarget::Aggregate {
                 aggregate_kind: INSTANCE_KIND.to_string(),
@@ -667,8 +875,9 @@ impl InstanceAggregate {
             },
             format!("instance {failed}"),
         );
-        ctx.effects.cancel_phase_jobs(PHASE_POST);
-        ctx.effects.cancel_phase_jobs(PHASE_CONFIRM);
+        for phase in [PHASE_ANSWER, PHASE_PRESIGN, PHASE_CONFIRM, PHASE_POST] {
+            ctx.effects.cancel_phase_jobs(phase);
+        }
         // Close graph deliveries and cancel setup/post jobs. Keep kickoff and settlement
         // jobs so chain monitoring and challenges can continue.
         for graph in ctx.storage.get_graphs_by_instance_id(&instance_id).await? {
@@ -712,7 +921,6 @@ impl InstanceAggregate {
             from = %previous,
             to = %failed,
             obsoleted_graphs = ?obsoleted,
-            cancelled_messages = cancelled,
             "instance entered a failure state"
         );
         if failed.deletes_key_on_entry() {
@@ -754,6 +962,144 @@ impl InstanceAggregate {
             JobPool::Network,
             params,
         ));
+    }
+
+    /// A `pegin_request` event: the row was stored by the scan; a committee
+    /// node answers on Goat while the request is still in its Answer phase.
+    fn apply_pegin_request(
+        &self,
+        ctx: &mut ApplyContext<'_>,
+        status: InstanceBridgeInStatus,
+        payload: &[u8],
+    ) -> ApplyOutcome {
+        if !matches!(
+            status,
+            InstanceBridgeInStatus::UserIniting | InstanceBridgeInStatus::UserInited
+        ) {
+            return ApplyOutcome::Applied;
+        }
+        if self.actor == Actor::Committee {
+            self.job(ctx, JOB_ANSWER_PEGIN_REQUEST, payload.to_vec());
+        }
+        ApplyOutcome::Applied
+    }
+
+    /// A committee member's PeginConfirm round message: ignored from this
+    /// node itself, for instances this node holds no key of, and once the
+    /// round is over; otherwise handed to its ingest job. A partial
+    /// signature is still taken after the Peg-In-Confirm confirmed: it
+    /// carries the endorsement the relayer's post needs.
+    fn apply_round_message(
+        &self,
+        ctx: &mut ApplyContext<'_>,
+        instance_id: Uuid,
+        status: InstanceBridgeInStatus,
+        kind: &str,
+        payload: &[u8],
+    ) -> ApplyOutcome {
+        let inbound = match InboundMessage::decode(payload) {
+            Ok(inbound) => inbound,
+            Err(error) => {
+                return ApplyOutcome::Rejected(format!("malformed {kind} event: {error}"));
+            }
+        };
+        if inbound.author == self.local_peer {
+            return ApplyOutcome::Applied;
+        }
+        let Some(action) = route_action(kind, &self.actor) else {
+            return ApplyOutcome::Rejected(format!("{kind} is not handled by {}", self.actor));
+        };
+        // A relayer collects every round whether or not it signs in it: it
+        // aggregates and broadcasts for committees it is not a member of.
+        if !self.relayer && !self.membership.holds_instance_key(instance_id) {
+            debug!(event = "instance_apply", instance_id = %instance_id, kind, "not in this instance's committee; message ignored");
+            return ApplyOutcome::Applied;
+        }
+        let round_over = status.is_failed()
+            || status == InstanceBridgeInStatus::RelayerL2Minted
+            || (status == InstanceBridgeInStatus::RelayerL1Broadcasted
+                && kind != "PeginConfirmPartialSig");
+        if round_over {
+            debug!(event = "instance_apply", instance_id = %instance_id, kind, status = %status, "PeginConfirm round is over; message ignored");
+            return ApplyOutcome::Applied;
+        }
+        ctx.effects.enqueue_job(
+            JobSpec::new(&ctx.aggregate, PHASE_CONFIRM, action, JobPool::Network, payload.to_vec())
+                .with_deadline(ctx.now + PARKED_MESSAGE_TTL_SECS),
+        );
+        ApplyOutcome::Applied
+    }
+
+    async fn apply_plan(
+        &self,
+        ctx: &mut ApplyContext<'_>,
+        instance: &Instance,
+        status: InstanceBridgeInStatus,
+        plan: InstancePlan,
+    ) -> anyhow::Result<()> {
+        let instance_id = instance.instance_id;
+        let round_over = confirm_round_over(status);
+        for message in plan.messages {
+            if round_over && message.phase_ref == PHASE_CONFIRM {
+                continue;
+            }
+            ctx.effects.send(OutboxMessage {
+                outbox_id: message.outbox_id,
+                phase_ref: message.phase_ref,
+                kind: message.kind,
+                topic: get_topic_name(&message.actor),
+                payload: message.payload,
+                ack_set: message.ack_set,
+            });
+        }
+        for step in plan.next {
+            let NextStep::Job { action, params, delay_secs } = step;
+            let phase = job_phase(&action);
+            if round_over && phase == PHASE_CONFIRM {
+                continue;
+            }
+            let mut job = JobSpec::new(&ctx.aggregate, phase, &action, JobPool::Network, params);
+            if let Some(delay) = delay_secs {
+                job = job.with_run_after(ctx.now + delay.max(0));
+            }
+            ctx.effects.enqueue_job(job);
+        }
+        if let Some(start) = plan.start_graph
+            && !status.is_failed()
+        {
+            // One session per (instance, operator): a repeat of the job
+            // resumes the open session instead of opening a second one.
+            let graph_id = match ctx
+                .storage
+                .find_pending_graph_init_by_instance_and_operator_pubkey(
+                    &instance_id,
+                    &start.operator_pubkey,
+                )
+                .await?
+            {
+                Some(session) => session.graph_id,
+                None => {
+                    ctx.storage
+                        .upsert_pending_graph_init(
+                            &instance_id,
+                            &start.operator_pubkey,
+                            &start.graph_id,
+                        )
+                        .await?;
+                    start.graph_id
+                }
+            };
+            record_event_in(
+                ctx.storage,
+                operator_start_event(instance_id, graph_id, &start.operator_pubkey)?,
+            )
+            .await?;
+            info!(event = "graph_start", instance_id = %instance_id, graph_id = %graph_id, "operator setup session opened");
+        }
+        for wake_ref in plan.wake_refs {
+            ctx.effects.wake(wake_ref);
+        }
+        Ok(())
     }
 
     async fn apply_job_result(
@@ -818,18 +1164,45 @@ impl InstanceAggregate {
                     warn!(event = "instance_post", instance_id = %instance_id, outcome = "poisoned", error = %error, "post job panicked");
                 }
             },
-            JOB_START_PEGIN_CONFIRM => match &result.outcome {
-                JobResultOutcome::Done(_) => {
-                    info!(event = "pegin_confirm_round", instance_id = %instance_id, outcome = "started", stale = result.stale, "PeginConfirm round started");
+            action if INSTANCE_JOBS.contains(&action) => match &result.outcome {
+                JobResultOutcome::Done(bytes) => {
+                    let plan = match InstancePlan::decode(bytes) {
+                        Ok(plan) => plan,
+                        Err(error) => {
+                            return Ok(ApplyOutcome::Rejected(format!(
+                                "malformed plan from {action}: {error}"
+                            )));
+                        }
+                    };
+                    if let Some(note) = &plan.note {
+                        info!(event = "instance_job", instance_id = %instance_id, action, stale = result.stale, note = %note, "job note");
+                    }
+                    self.apply_plan(ctx, instance, status, plan).await?;
                 }
                 JobResultOutcome::Failed(error) => {
-                    raise_alert(instance_id, InstanceAlert::PeginConfirmRoundFailed, error);
+                    let alert = match action {
+                        JOB_ANSWER_PEGIN_REQUEST => Some(InstanceAlert::AnswerPeginRequestFailed),
+                        JOB_CONFIRM_INSTANCE => Some(InstanceAlert::ConfirmInstanceRejected),
+                        JOB_START_PEGIN_CONFIRM
+                        | JOB_PEGIN_CONFIRM_VOTE
+                        | JOB_PEGIN_CONFIRM_SIGN
+                        | JOB_BROADCAST_PEGIN_CONFIRM => {
+                            Some(InstanceAlert::PeginConfirmRoundFailed)
+                        }
+                        _ => None,
+                    };
+                    match alert {
+                        Some(alert) => raise_alert(instance_id, alert, error),
+                        None => {
+                            warn!(event = "instance_job", instance_id = %instance_id, action, error = %error, "job failed")
+                        }
+                    }
                 }
                 JobResultOutcome::Cancelled => {
-                    debug!(event = "pegin_confirm_round", instance_id = %instance_id, outcome = "cancelled", "PeginConfirm round start cancelled");
+                    debug!(event = "instance_job", instance_id = %instance_id, action, "job cancelled");
                 }
                 JobResultOutcome::Poisoned(error) => {
-                    warn!(event = "pegin_confirm_round", instance_id = %instance_id, outcome = "poisoned", error = %error, "PeginConfirm round start panicked");
+                    warn!(event = "instance_job", instance_id = %instance_id, action, error = %error, "job panicked");
                 }
             },
             other => {
@@ -839,6 +1212,22 @@ impl InstanceAggregate {
         ctx.storage.clear_engine_job_result(&result.job_id, ctx.now).await?;
         ctx.effects.set_status(status.to_string()).set_phase(phase_of(status).to_string());
         Ok(ApplyOutcome::Applied)
+    }
+
+    /// Every partial signature of the committee is stored locally: the
+    /// relayer can aggregate.
+    async fn partial_sigs_complete(
+        &self,
+        ctx: &mut ApplyContext<'_>,
+        instance: &Instance,
+    ) -> anyhow::Result<bool> {
+        let committee = instance.committees_answers.len();
+        if committee == 0 {
+            return Ok(false);
+        }
+        let process_data =
+            find_pegin_instance_process_data(ctx.storage, instance.instance_id).await?;
+        Ok(process_data.values().filter(|item| item.partial_sign.is_some()).count() >= committee)
     }
 }
 
@@ -876,13 +1265,27 @@ impl AggregateHandler for InstanceAggregate {
                     Ok(snapshot) => snapshot,
                     Err(rejected) => return Ok(rejected),
                 };
-                decide_btc_snapshot(
+                let transition = decide_btc_snapshot(
                     status,
                     instance.btc_height,
                     instance.key_deleted,
                     &snapshot,
                     &self.deadlines,
-                )
+                );
+                // The relayer re-sends a Peg-In-Confirm that fell out of its
+                // mempool, once per block, until it is seen or the instance
+                // is abandoned.
+                if self.relayer
+                    && rebroadcast_due(status, &transition, &snapshot)
+                    && self.partial_sigs_complete(ctx, &instance).await?
+                {
+                    self.job(
+                        ctx,
+                        JOB_BROADCAST_PEGIN_CONFIRM,
+                        snapshot.height.to_le_bytes().to_vec(),
+                    );
+                }
+                transition
             }
             EVENT_ANSWER_WINDOW => {
                 let window: AnswerWindow = match decode(EVENT_ANSWER_WINDOW, payload) {
@@ -922,9 +1325,22 @@ impl AggregateHandler for InstanceAggregate {
                 };
                 decide_l2_minted(status, &minted.tx_hash)
             }
+            EVENT_PEGIN_REQUEST => {
+                if let Err(rejected) = decode::<PeginRequested>(EVENT_PEGIN_REQUEST, payload) {
+                    return Ok(rejected);
+                }
+                let outcome = self.apply_pegin_request(ctx, status, payload);
+                ctx.effects.set_status(status.to_string()).set_phase(phase_of(status).to_string());
+                return Ok(outcome);
+            }
             JOB_RESULT_KIND => {
                 let result = JobResultEvent::decode(payload).map_err(ApplyError::invariant)?;
                 return self.apply_job_result(ctx, &instance, status, result).await;
+            }
+            kind if engine_handles(kind, &Actor::Committee) => {
+                let outcome = self.apply_round_message(ctx, instance_id, status, kind, payload);
+                ctx.effects.set_status(status.to_string()).set_phase(phase_of(status).to_string());
+                return Ok(outcome);
             }
             other => {
                 return Ok(ApplyOutcome::Rejected(format!("unknown instance event kind {other}")));
@@ -1206,5 +1622,84 @@ mod tests {
         let c = snap.event(id).unwrap().event_id;
         assert!(a != b && b != c && a != c);
         assert_eq!(graph_endorsed_event(id, id).unwrap().aggregate, instance_ref(id));
+        let request = PeginRequested { tx_hash: "0xreq".into(), height: 7 };
+        let event = pegin_request_event(id, &request).unwrap();
+        assert_eq!(event.kind, EVENT_PEGIN_REQUEST);
+        assert_eq!(event.event_id, format!("instance:{id}:pegin-request:0xreq"));
+    }
+
+    #[test]
+    fn round_messages_are_routed_to_committee_ingest_jobs_only() {
+        assert_eq!(
+            route_action("PeginConfirmNonce", &Actor::Committee),
+            Some(JOB_INGEST_PEGIN_CONFIRM_NONCE)
+        );
+        assert_eq!(
+            route_action("PeginConfirmNonceConsensus", &Actor::Committee),
+            Some(JOB_INGEST_PEGIN_CONFIRM_VOTE)
+        );
+        assert_eq!(
+            route_action("PeginConfirmPartialSig", &Actor::Committee),
+            Some(JOB_INGEST_PEGIN_CONFIRM_PARTIAL_SIG)
+        );
+        for actor in [Actor::Operator, Actor::Verifier, Actor::Watchtower, Actor::All] {
+            assert!(!engine_handles("PeginConfirmNonce", &actor), "{actor}");
+        }
+        assert!(!engine_handles("NonceGeneration", &Actor::Committee));
+        for action in INSTANCE_JOBS {
+            let phase = job_phase(action);
+            let expected = match *action {
+                JOB_ANSWER_PEGIN_REQUEST => PHASE_ANSWER,
+                JOB_CONFIRM_INSTANCE => PHASE_PRESIGN,
+                _ => PHASE_CONFIRM,
+            };
+            assert_eq!(phase, expected, "{action}");
+        }
+        assert_eq!(job_phase(JOB_POST_PEGIN_DATA), PHASE_POST);
+        assert_eq!(job_phase(JOB_DELETE_INSTANCE_KEY), PHASE_KEY);
+    }
+
+    #[test]
+    fn plans_round_trip_and_the_round_ends_with_the_confirm() {
+        let mut plan = InstancePlan::noted("x");
+        plan.send(crate::aggregates::graph::PlannedMessage {
+            outbox_id: "instance:i:PeginConfirmNonce".into(),
+            phase_ref: PHASE_CONFIRM.into(),
+            kind: "PeginConfirmNonce".into(),
+            actor: Actor::Committee.to_string(),
+            payload: vec![1, 2, 3],
+            ack_set: None,
+        })
+        .then(JOB_PEGIN_CONFIRM_VOTE, Vec::new(), None);
+        plan.start_graph = Some(StartGraph { graph_id: Uuid::nil(), operator_pubkey: "op".into() });
+        plan.wake_refs.push("graph:x".into());
+        assert_eq!(InstancePlan::decode(&plan.encode().unwrap()).unwrap(), plan);
+        for status in [RelayerL1Broadcasted, RelayerL2Minted] {
+            assert!(confirm_round_over(status), "{status}");
+        }
+        for status in InstanceBridgeInStatus::FAILED {
+            assert!(confirm_round_over(status), "{status}");
+        }
+        for status in [UserInited, CommitteesAnswered, UserBroadcastPeginPrepare, Presigned] {
+            assert!(!confirm_round_over(status), "{status}");
+        }
+    }
+
+    #[test]
+    fn rebroadcast_is_due_only_for_an_invisible_confirm_while_presigned() {
+        let mut snap = snapshot(1_050);
+        snap.confirm = Some(TxFact::UNKNOWN);
+        snap.cancel = Some(TxFact::UNKNOWN);
+        let stays = decide(Presigned, &snap);
+        assert!(rebroadcast_due(Presigned, &stays, &snap));
+        assert!(!rebroadcast_due(UserBroadcastPeginPrepare, &stays, &snap));
+        snap.confirm = Some(TxFact::mempool());
+        assert!(!rebroadcast_due(Presigned, &decide(Presigned, &snap), &snap));
+        snap.confirm = Some(TxFact::confirmed_at(1_049));
+        let moves = decide(Presigned, &snap);
+        assert_eq!(moves.next, Some(RelayerL1Broadcasted));
+        assert!(!rebroadcast_due(Presigned, &moves, &snap));
+        snap.confirm = None;
+        assert!(!rebroadcast_due(Presigned, &decide(Presigned, &snap), &snap));
     }
 }

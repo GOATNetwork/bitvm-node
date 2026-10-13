@@ -223,10 +223,12 @@ sequenceDiagram
 
     User->>GOAT: Initiate BridgeInRequest
     GOAT-->>EW: Trigger BridgeInRequest event
-    EW->>Committee: PeginRequest message
+    EW->>DB: Store instance, pegin_request event
 
     Committee->>Committee: Validate fees and availability
-    Committee->>Operator: ConfirmInstance
+    Committee->>GOAT: answerPeginRequest
+    User->>BTC: Broadcast Peg-In-Prepare
+    BTC-->>Operator: Prepare confirmed (confirm_instance job)
 
     Operator->>Operator: Create SimplifiedbitvmGraph
     Operator->>DB: Store graph_raw_data (JSON)

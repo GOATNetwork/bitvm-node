@@ -1803,18 +1803,6 @@ fn take_refused_peers() -> Vec<PeerId> {
     std::mem::take(&mut *REFUSED_PEERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner))
 }
 
-/// How often a protocol message this node has already stored is published again.
-const PROTOCOL_REPUBLISH_COOLDOWN: Duration = Duration::from_secs(30);
-
-static PROTOCOL_REPUBLISH_GATE: LazyLock<CooldownGate> =
-    LazyLock::new(|| CooldownGate::new(PROTOCOL_REPUBLISH_COOLDOWN, GRAPH_SET_MAX_ENTRIES));
-
-/// Throttle stored-value recovery; stamp only on success.
-/// A full gate leaves recovery open; live outbox rows retain their own retry schedule.
-pub fn protocol_republish_gate() -> &'static CooldownGate {
-    &PROTOCOL_REPUBLISH_GATE
-}
-
 /// How long one peer's identical `GetGraph` request stays on cooldown.
 const GET_GRAPH_RESPONSE_COOLDOWN: Duration = Duration::from_secs(60);
 const GRAPH_SET_MAX_ENTRIES: usize = 16_384;
@@ -3508,49 +3496,39 @@ mod tests {
         assert!(matches!(verdict, InboundVerdict::Enqueue { .. }));
     }
 
-    /// Verify every dispatch role arm is covered by `MessageKind::handled_by`.
+    /// Every kind `dispatch` or an aggregate handles is kept by `handled_by`
+    /// for the roles that handle it, and relayed for the others.
     #[test]
-    fn dispatch_arms_are_covered_by_the_role_table() {
+    fn handled_kinds_follow_the_role_table() {
         use crate::action::MessageKind;
-        use std::str::FromStr;
 
-        let source = include_str!("handle.rs");
-        let dispatcher = {
-            let start = source.find("pub async fn dispatch(").unwrap();
-            let end = source.find("fn make_message(").unwrap();
-            &source[start..end]
-        };
         let roles = [Actor::Committee, Actor::Operator, Actor::Verifier, Actor::Watchtower];
-        let mut arms = 0;
-        for (at, _) in dispatcher.match_indices("GOATMessageContent::") {
-            // Match dispatch patterns ending in `=>`, excluding expressions in arm bodies.
-            let rest = &dispatcher[at + "GOATMessageContent::".len()..];
-            let name: String = rest.chars().take_while(|c| c.is_alphanumeric()).collect();
-            let Ok(kind) = MessageKind::from_str(&name) else {
-                continue;
-            };
-            let Some(arrow) = rest.find("=>") else {
-                continue;
-            };
-            let pattern = &rest[..arrow];
-            if pattern.contains(';') || pattern.contains(".await") || pattern.contains("Some(") {
-                continue;
-            }
-            arms += 1;
-            let named: Vec<&Actor> =
-                roles.iter().filter(|role| pattern.contains(&format!("Actor::{role}"))).collect();
-            // No role named: the `_` arm, which every role reaches.
-            let reached: Vec<&Actor> =
-                if named.is_empty() { roles.iter().collect() } else { named };
-            for role in reached {
-                assert!(
-                    kind.handled_by(role),
-                    "dispatch has an arm for ({name}, {role}) but handled_by says it is not \
-                     handled: the message would be relayed without ever being processed"
-                );
+        // Immediate kinds reach every role's dispatch.
+        for kind in [
+            MessageKind::GraphSetupAck,
+            MessageKind::RequestNodeInfo,
+            MessageKind::ResponseNodeInfo,
+        ] {
+            for role in &roles {
+                assert!(kind.handled_by(role), "{kind} for {role}");
             }
         }
-        assert!(arms >= 8, "the scan found only {arms} arms; has dispatch moved?");
+        // The PeginConfirm round is the committee's.
+        for kind in [
+            MessageKind::PeginConfirmNonce,
+            MessageKind::PeginConfirmNonceConsensus,
+            MessageKind::PeginConfirmPartialSig,
+        ] {
+            assert!(kind.handled_by(&Actor::Committee), "{kind}");
+            for role in [Actor::Operator, Actor::Verifier, Actor::Watchtower] {
+                assert!(!kind.handled_by(&role), "{kind} for {role}");
+            }
+        }
+        // Graph-phase kinds follow the Graph aggregate's routing table.
+        assert!(MessageKind::InitGraph.handled_by(&Actor::Verifier));
+        assert!(!MessageKind::InitGraph.handled_by(&Actor::Committee));
+        assert!(MessageKind::GraphFinalize.handled_by(&Actor::Watchtower));
+        assert!(!MessageKind::KickoffSent.handled_by(&Actor::Committee));
     }
 
     /// Verify committee-only reserves in shared rate tiers.
@@ -3930,25 +3908,6 @@ mod tests {
     }
 
     /// Verify only successful recovery closes the gate.
-    #[test]
-    fn republish_gate_stays_open_until_a_publish_succeeds() {
-        let gate = CooldownGate::new(PROTOCOL_REPUBLISH_COOLDOWN, 16);
-        let now = Instant::now();
-        let key = "committee-presign:graph";
-
-        // First run: the value is stored, the publish fails, nothing is stamped.
-        assert!(!gate.is_cooling(key, now));
-        // The retry, seconds later, therefore publishes.
-        let retry = now + Duration::from_secs(10);
-        assert!(!gate.is_cooling(key, retry));
-        assert!(gate.allow(key, retry), "stamped after the publish went through");
-        // Later messages of the round do not publish it again ...
-        assert!(gate.is_cooling(key, retry + Duration::from_secs(1)));
-        // ... until the cooldown has passed, and other rounds are unaffected.
-        assert!(!gate.is_cooling(key, retry + PROTOCOL_REPUBLISH_COOLDOWN));
-        assert!(!gate.is_cooling("committee-presign:another-graph", retry));
-    }
-
     /// A "no" that has gone stale is not grounds for acting against a neighbour.
     #[test]
     fn a_stale_negative_is_not_known_unregistered() {

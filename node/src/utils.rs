@@ -1881,7 +1881,10 @@ pub async fn read_pegin_request(
 ) -> Result<(UserInfo, Amount, Vec<EvmAddress>)> {
     let pegin_data = goat_client.gateway_get_pegin_data(&instance_id).await?;
     if pegin_data.status != PeginStatus::Pending {
-        bail!("Invalid PeginRequest: expired or already processed");
+        bail!(SpecialError::InvalidPeginRequest(format!(
+            "pegin request is {} on Goat: expired or already processed",
+            pegin_data.status
+        )));
     }
     let network = get_network();
     let user_change_address = Address::from_str(&pegin_data.user_change_addr)
@@ -4204,44 +4207,6 @@ pub async fn generate_instance(
         created_at: current_time,
         updated_at: current_time,
     })
-}
-
-/// Store the pegin request against the local instance row.
-///
-/// Returns:
-/// - Ok(true) if the instance was created, or refreshed while still in a
-///   pegin-request stage
-/// - Ok(false) if the request was not applied because the instance has moved
-///   past the pegin-request stage, or the id belongs to a bridge-out instance
-pub async fn store_pegin_request(
-    btc_client: &BTCClient,
-    local_db: &LocalDB,
-    params: GenerateInstanceParams,
-) -> Result<bool> {
-    // store instance info to local db
-    let instance_id = params.instance_id;
-    let mut storage_processor = local_db.acquire().await?;
-    let instance = generate_instance(btc_client, params).await?;
-    // A PeginRequest only initializes an instance. Guarding the write on the
-    // pre-pegin statuses keeps a replayed or forged request from rolling a live
-    // instance back to UserInited and clearing what later stages stored.
-    let stored = storage_processor
-        .upsert_pegin_request_instance(
-            &instance,
-            &[
-                InstanceBridgeInStatus::UserIniting.to_string(),
-                InstanceBridgeInStatus::UserInited.to_string(),
-            ],
-        )
-        .await?;
-    if !stored {
-        warn!(
-            "ignore PeginRequest for instance {instance_id}: it is not a bridge-in instance in a pegin-request stage"
-        );
-        return Ok(false);
-    }
-    info!("stored PeginRequest for instance {instance_id}");
-    Ok(true)
 }
 
 pub async fn store_instance_parameters(

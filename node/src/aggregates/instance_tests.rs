@@ -1,17 +1,18 @@
 //! Instance lifecycle tests using the engine and SQLite, covering failure
 //! states, signing deadlines, the abandon buffer and cleanup effects.
 
+use super::graph::{InboundMessage, MembershipProbe, PlannedMessage, content_event_id};
 use super::instance::*;
-use crate::action::{ConfirmInstance, GOATMessageContent, LocalMessageKey, MessageKind};
-use crate::utils::{SELF_SENDER, mark_graph_as_endorsed, upsert_message};
+use crate::utils::{mark_graph_as_endorsed, store_committee_partial_sig_for_instance};
 use async_trait::async_trait;
 use bitvm_lib::actors::Actor;
 use engine::{
-    Backoff, EngineBuilder, EngineConfig, EngineHandle, EngineInboxState, JobContext, JobOutcome,
-    JobRunner, NewEvent,
+    Backoff, EngineBuilder, EngineConfig, EngineHandle, EngineInboxState, EventSource, JobContext,
+    JobOutcome, JobRunner, NewEvent,
 };
 use indexmap::IndexMap;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use store::localdb::LocalDB;
 use store::{
@@ -25,6 +26,8 @@ const DEADLINES: PeginDeadlines =
     PeginDeadlines { t0_blocks: 60, buffer_blocks: 6, key_delete_blocks: 32 };
 const PREPARE: i64 = 1_000;
 const WAIT: Duration = Duration::from_secs(10);
+const LOCAL_PEER: &str = "12D3KooWLocalPeer";
+const OTHER_PEER: &str = "12D3KooWOtherPeer";
 
 struct Harness {
     db: LocalDB,
@@ -32,6 +35,7 @@ struct Harness {
     handle: EngineHandle,
     cancel: CancellationToken,
     run: tokio::task::JoinHandle<anyhow::Result<()>>,
+    jobs: Arc<Scripted>,
 }
 
 struct StubKeyDelete;
@@ -53,12 +57,39 @@ impl JobRunner for StubPost {
     }
 }
 
-struct StubStartPeginConfirm;
+/// Returns the scripted plan for an action and records what it was asked.
+#[derive(Default)]
+struct Scripted {
+    plans: Mutex<HashMap<String, InstancePlan>>,
+    calls: Mutex<Vec<(String, Vec<u8>)>>,
+}
 
 #[async_trait]
-impl JobRunner for StubStartPeginConfirm {
-    async fn run(&self, _ctx: JobContext) -> JobOutcome {
-        JobOutcome::Done(b"started".to_vec())
+impl JobRunner for Scripted {
+    async fn run(&self, ctx: JobContext) -> JobOutcome {
+        let params = ctx.job.params.clone().unwrap_or_default();
+        self.calls.lock().unwrap().push((ctx.job.action.clone(), params));
+        let plan = self.plans.lock().unwrap().remove(&ctx.job.action).unwrap_or_default();
+        JobOutcome::Done(plan.encode().unwrap())
+    }
+}
+
+/// Every instance is this node's (the production probe looks for the key
+/// envelope on disk).
+struct Member;
+
+impl MembershipProbe for Member {
+    fn holds_instance_key(&self, _instance_id: Uuid) -> bool {
+        true
+    }
+}
+
+/// A node outside every committee.
+struct Outsider;
+
+impl MembershipProbe for Outsider {
+    fn holds_instance_key(&self, _instance_id: Uuid) -> bool {
+        false
     }
 }
 
@@ -81,6 +112,15 @@ fn fast_config() -> EngineConfig {
 }
 
 async fn start(actor: Actor, relayer: bool, key_delete_enabled: bool) -> Harness {
+    start_with(actor, relayer, key_delete_enabled, Arc::new(Member)).await
+}
+
+async fn start_with(
+    actor: Actor,
+    relayer: bool,
+    key_delete_enabled: bool,
+    membership: Arc<dyn MembershipProbe>,
+) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("instance.db");
     let db = LocalDB::new_with_busy_timeout(
@@ -90,19 +130,32 @@ async fn start(actor: Actor, relayer: bool, key_delete_enabled: bool) -> Harness
     )
     .await;
     db.migrate().await;
-    let (engine, _acks) = EngineBuilder::new(db.clone(), fast_config())
+    let jobs = Arc::new(Scripted::default());
+    let mut builder = EngineBuilder::new(db.clone(), fast_config())
         .handler(
             INSTANCE_KIND,
-            Arc::new(InstanceAggregate::new(actor, DEADLINES, relayer, key_delete_enabled)),
+            Arc::new(
+                InstanceAggregate::new(
+                    actor,
+                    DEADLINES,
+                    relayer,
+                    key_delete_enabled,
+                    LOCAL_PEER.to_string(),
+                )
+                .with_membership(membership),
+            ),
         )
         .job_runner(INSTANCE_KIND, JOB_DELETE_INSTANCE_KEY, Arc::new(StubKeyDelete))
-        .job_runner(INSTANCE_KIND, JOB_POST_PEGIN_DATA, Arc::new(StubPost))
-        .job_runner(INSTANCE_KIND, JOB_START_PEGIN_CONFIRM, Arc::new(StubStartPeginConfirm))
-        .build();
+        .job_runner(INSTANCE_KIND, JOB_POST_PEGIN_DATA, Arc::new(StubPost));
+    for action in INSTANCE_JOBS {
+        let runner: Arc<dyn JobRunner> = jobs.clone();
+        builder = builder.job_runner(INSTANCE_KIND, *action, runner);
+    }
+    let (engine, _acks) = builder.build();
     let handle = engine.handle();
     let cancel = CancellationToken::new();
     let run = tokio::spawn(engine.run(cancel.clone()));
-    Harness { db, _dir: dir, handle, cancel, run }
+    Harness { db, _dir: dir, handle, cancel, run, jobs }
 }
 
 fn instance_row(status: InstanceBridgeInStatus, prepare_height: i64) -> Instance {
@@ -146,14 +199,58 @@ impl Harness {
         graph.graph_id
     }
 
-    async fn insert_local_message(&self, instance_id: Uuid) -> String {
-        let content = GOATMessageContent::ConfirmInstance(ConfirmInstance { instance_id });
-        let message_id = LocalMessageKey::from_content(Actor::All, &content).unwrap().message_id();
+    fn script(&self, action: &str, plan: InstancePlan) {
+        self.jobs.plans.lock().unwrap().insert(action.to_string(), plan);
+    }
+
+    fn calls(&self) -> Vec<(String, Vec<u8>)> {
+        self.jobs.calls.lock().unwrap().clone()
+    }
+
+    /// A PeginConfirm round message event as `inbound_event` builds it; the
+    /// apply only reads the envelope.
+    fn round_message(&self, kind: &str, author: &str, instance_id: Uuid) -> NewEvent {
+        let inbound = InboundMessage {
+            author: author.to_string(),
+            instance_id,
+            graph_nonce: None,
+            operator_pubkey: None,
+            message: format!("{kind}:{instance_id}:{author}").into_bytes(),
+        };
+        NewEvent::new(
+            content_event_id(author, kind, &instance_id.to_string(), &inbound.message),
+            instance_ref(instance_id),
+            kind,
+            EventSource::Network,
+            inbound.encode().unwrap(),
+        )
+        .with_author(author)
+    }
+
+    async fn jobs_of(&self, instance_id: Uuid) -> Vec<store::EngineJob> {
         let mut storage = self.db.acquire().await.unwrap();
-        upsert_message(&mut storage, false, SELF_SENDER.to_string(), Actor::All, content, 0, 0)
+        storage
+            .list_engine_jobs_for_aggregate(INSTANCE_KIND, &instance_id.to_string())
             .await
-            .unwrap();
-        message_id
+            .unwrap()
+    }
+
+    async fn wait_job(&self, instance_id: Uuid, action: &str, state: &str) -> store::EngineJob {
+        wait_for(|| async {
+            self.jobs_of(instance_id)
+                .await
+                .into_iter()
+                .find(|job| job.action == action && job.state == state)
+        })
+        .await
+    }
+
+    async fn outbox(&self, outbox_id: &str) -> Option<store::EngineOutboxMessage> {
+        self.db.acquire().await.unwrap().find_engine_outbox_message(outbox_id).await.unwrap()
+    }
+
+    async fn wait_outbox(&self, outbox_id: &str, state: &str) -> store::EngineOutboxMessage {
+        wait_for(|| async { self.outbox(outbox_id).await.filter(|row| row.state == state) }).await
     }
 
     async fn insert_open_outbox(&self, instance_id: Uuid) -> String {
@@ -181,6 +278,12 @@ impl Harness {
 
     async fn submit(&self, event: NewEvent) {
         self.handle.submit(event).await.unwrap();
+    }
+
+    async fn submit_id(&self, event: NewEvent) -> String {
+        let event_id = event.event_id.clone();
+        self.handle.submit(event).await.unwrap();
+        event_id
     }
 
     /// A setup session of the operator's graph that has no row yet, with an
@@ -309,18 +412,6 @@ impl Harness {
         self.db.acquire().await.unwrap().find_graph(&graph_id).await.unwrap().unwrap().status
     }
 
-    async fn message_state(&self, message_id: &str) -> String {
-        self.db
-            .acquire()
-            .await
-            .unwrap()
-            .find_messages_by_id(message_id)
-            .await
-            .unwrap()
-            .unwrap()
-            .state
-    }
-
     async fn outbox_state(&self, outbox_id: &str) -> String {
         self.db
             .acquire()
@@ -389,7 +480,6 @@ async fn user_discarded_enters_failure_with_every_effect() {
     let t = start(Actor::Committee, false, true).await;
     let id = t.insert(&instance_row(CommitteesAnswered, 0)).await;
     let graph_id = t.insert_graph(id).await;
-    let message_id = t.insert_local_message(id).await;
     let outbox_id = t.insert_open_outbox(id).await;
 
     let mut snapshot = at(10, CommitteesAnswered);
@@ -398,7 +488,6 @@ async fn user_discarded_enters_failure_with_every_effect() {
 
     t.wait_status(id, UserDiscarded).await;
     assert_eq!(t.graph_status(graph_id).await, GraphStatus::Obsoleted.to_string());
-    assert_ne!(t.message_state(&message_id).await, "Pending");
     assert_eq!(t.outbox_state(&outbox_id).await, "Closed");
     t.wait_key_deleted(id).await;
     assert_eq!(t.job_actions(id).await, vec![JOB_DELETE_INSTANCE_KEY.to_string()]);
@@ -587,11 +676,273 @@ async fn prepare_confirmation_records_the_height_and_triggers_confirm_instance()
     t.snapshot(id, snapshot).await;
     let instance = t.wait_status(id, UserBroadcastPeginPrepare).await;
     assert_eq!(instance.btc_height, 480);
-    let content = GOATMessageContent::ConfirmInstance(ConfirmInstance { instance_id: id });
-    let message_id = LocalMessageKey::from_content(Actor::All, &content).unwrap().message_id();
-    let message = t.db.acquire().await.unwrap().find_messages_by_id(&message_id).await.unwrap();
-    assert_eq!(message.map(|m| m.msg_type), Some(MessageKind::ConfirmInstance.to_string()));
+    // Every role stores the parameters through the Presign-phase job.
+    let job = t.wait_job(id, JOB_CONFIRM_INSTANCE, "Done").await;
+    assert_eq!(job.phase, PHASE_PRESIGN);
     assert_eq!(t.engine_status(id).await.1, PHASE_PRESIGN);
+    t.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_confirm_plan_opens_the_operator_session_and_starts_the_graph() {
+    use InstanceBridgeInStatus::*;
+    let t = start(Actor::Operator, false, false).await;
+    let id = t.insert(&instance_row(CommitteesAnswered, 0)).await;
+    let graph_id = Uuid::new_v4();
+    let plan = InstancePlan {
+        start_graph: Some(StartGraph { graph_id, operator_pubkey: "operator".to_string() }),
+        ..Default::default()
+    };
+    t.script(JOB_CONFIRM_INSTANCE, plan);
+    let mut snapshot = at(500, CommitteesAnswered);
+    snapshot.prepare = Some(TxFact::confirmed_at(480));
+    t.snapshot(id, snapshot).await;
+    t.wait_job(id, JOB_CONFIRM_INSTANCE, "Done").await;
+    // The session and the Graph aggregate's start event are committed together.
+    let start_id =
+        crate::aggregates::graph::operator_start_event(id, graph_id, "operator").unwrap().event_id;
+    wait_for(|| async {
+        let mut storage = t.db.acquire().await.unwrap();
+        storage.find_engine_inbox_event(&start_id).await.unwrap().map(|_| ())
+    })
+    .await;
+    let session =
+        t.db.acquire()
+            .await
+            .unwrap()
+            .find_pending_graph_init_by_instance_and_operator_pubkey(&id, "operator")
+            .await
+            .unwrap()
+            .expect("setup session opened");
+    assert_eq!(session.graph_id, graph_id);
+    t.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pegin_request_is_answered_by_committee_nodes_until_the_window_closes() {
+    use InstanceBridgeInStatus::*;
+    let request = PeginRequested { tx_hash: "0xreq".to_string(), height: 100 };
+
+    let t = start(Actor::Operator, false, false).await;
+    let id = t.insert(&instance_row(UserInited, 0)).await;
+    let event = pegin_request_event(id, &request).unwrap();
+    let event_id = event.event_id.clone();
+    t.submit(event).await;
+    t.wait_applied(&event_id).await;
+    assert!(t.job_actions(id).await.is_empty(), "only committee nodes answer");
+    t.stop().await;
+
+    let t = start(Actor::Committee, false, false).await;
+    let id = t.insert(&instance_row(UserInited, 0)).await;
+    t.submit(pegin_request_event(id, &request).unwrap()).await;
+    let job = t.wait_job(id, JOB_ANSWER_PEGIN_REQUEST, "Done").await;
+    assert_eq!(job.phase, PHASE_ANSWER);
+    assert_eq!(t.calls().len(), 1);
+    // A request seen again after the Answer phase changes nothing.
+    let mut answers = IndexMap::new();
+    answers.insert("0xa".to_string(), vec![1u8; 33]);
+    let window = AnswerWindow { goat_height: 200, window_blocks: 50, quorum: 1, answers };
+    t.submit(window.event(id).unwrap()).await;
+    t.wait_status(id, CommitteesAnswered).await;
+    let late = PeginRequested { tx_hash: "0xagain".to_string(), height: 100 };
+    let event = pegin_request_event(id, &late).unwrap();
+    let event_id = event.event_id.clone();
+    t.submit(event).await;
+    t.wait_applied(&event_id).await;
+    assert_eq!(t.calls().len(), 1, "no second answer after the window");
+    t.stop().await;
+}
+
+// -------------------------------------------------------- pegin confirm round
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_round_message_becomes_an_ingest_job_whose_plan_is_sent_until_the_confirm() {
+    use InstanceBridgeInStatus::*;
+    let t = start(Actor::Committee, false, false).await;
+    let id = t.insert(&instance_row(Presigned, PREPARE)).await;
+    // Entering Presigned is what starts the round; here the row starts there,
+    // so the start job is not enqueued: the member's nonce arrives first.
+    let outbox_id = format!("instance:{id}:PeginConfirmNonceConsensus");
+    let mut plan = InstancePlan::default();
+    plan.send(PlannedMessage {
+        outbox_id: outbox_id.clone(),
+        phase_ref: PHASE_CONFIRM.to_string(),
+        kind: "PeginConfirmNonceConsensus".to_string(),
+        actor: Actor::Committee.to_string(),
+        payload: b"vote".to_vec(),
+        ack_set: None,
+    })
+    .then(JOB_PEGIN_CONFIRM_VOTE, Vec::new(), None);
+    t.script(JOB_INGEST_PEGIN_CONFIRM_NONCE, plan);
+
+    t.submit(t.round_message("PeginConfirmNonce", OTHER_PEER, id)).await;
+    let ingest = t.wait_job(id, JOB_INGEST_PEGIN_CONFIRM_NONCE, "Done").await;
+    assert_eq!(ingest.phase, PHASE_CONFIRM);
+    assert!(ingest.deadline_at.is_some(), "a parked message does not wait forever");
+    let row = t.wait_outbox(&outbox_id, "Open").await;
+    assert_eq!(row.phase_ref, PHASE_CONFIRM);
+    assert_eq!(row.aggregate_id, id.to_string());
+    t.wait_job(id, JOB_PEGIN_CONFIRM_VOTE, "Done").await;
+
+    // The same content again is a duplicate: no second ingest.
+    let duplicate = t.round_message("PeginConfirmNonce", OTHER_PEER, id);
+    t.submit(duplicate).await;
+    settle().await;
+    assert_eq!(
+        t.calls().iter().filter(|(action, _)| action == JOB_INGEST_PEGIN_CONFIRM_NONCE).count(),
+        1
+    );
+
+    // Peg-In-Confirm confirmed: the Confirm phase's deliveries close.
+    t.snapshot(id, presign_snapshot(1_050, TxFact::confirmed_at(1_049), TxFact::UNKNOWN)).await;
+    t.wait_status(id, RelayerL1Broadcasted).await;
+    t.wait_outbox(&outbox_id, "Closed").await;
+    // A late partial signature is still ingested (it carries the endorsement
+    // the relayer's post needs); a late nonce is not.
+    t.submit(t.round_message("PeginConfirmPartialSig", OTHER_PEER, id)).await;
+    t.wait_job(id, JOB_INGEST_PEGIN_CONFIRM_PARTIAL_SIG, "Done").await;
+    let late = t.round_message("PeginConfirmNonceConsensus", OTHER_PEER, id);
+    let late_id = t.submit_id(late).await;
+    t.wait_applied(&late_id).await;
+    assert!(!t.job_actions(id).await.contains(&JOB_INGEST_PEGIN_CONFIRM_VOTE.to_string()));
+    t.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn round_messages_from_this_node_outsiders_and_closed_rounds_are_ignored() {
+    use InstanceBridgeInStatus::*;
+    // This node's own message.
+    let t = start(Actor::Committee, false, false).await;
+    let id = t.insert(&instance_row(Presigned, PREPARE)).await;
+    let own = t.submit_id(t.round_message("PeginConfirmNonce", LOCAL_PEER, id)).await;
+    t.wait_applied(&own).await;
+    assert!(t.job_actions(id).await.is_empty());
+    // A round that is over.
+    let done = t.insert(&instance_row(RelayerL2Minted, PREPARE)).await;
+    let late = t.submit_id(t.round_message("PeginConfirmPartialSig", OTHER_PEER, done)).await;
+    t.wait_applied(&late).await;
+    assert!(t.job_actions(done).await.is_empty());
+    let failed = t.insert(&instance_row(UserCanceled, PREPARE)).await;
+    let late = t.submit_id(t.round_message("PeginConfirmNonce", OTHER_PEER, failed)).await;
+    t.wait_applied(&late).await;
+    assert!(t.job_actions(failed).await.is_empty());
+    t.stop().await;
+
+    // A committee node outside the instance's committee.
+    let t = start_with(Actor::Committee, false, false, Arc::new(Outsider)).await;
+    let id = t.insert(&instance_row(Presigned, PREPARE)).await;
+    let event = t.submit_id(t.round_message("PeginConfirmNonce", OTHER_PEER, id)).await;
+    t.wait_applied(&event).await;
+    assert!(t.job_actions(id).await.is_empty());
+    t.stop().await;
+
+    // A relayer outside the committee still collects the round: it
+    // aggregates and broadcasts for committees it does not sign in.
+    let t = start_with(Actor::Committee, true, false, Arc::new(Outsider)).await;
+    let id = t.insert(&instance_row(Presigned, PREPARE)).await;
+    let event = t.submit_id(t.round_message("PeginConfirmNonce", OTHER_PEER, id)).await;
+    t.wait_applied(&event).await;
+    t.wait_job(id, JOB_INGEST_PEGIN_CONFIRM_NONCE, "Done").await;
+    t.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn entering_presigned_starts_the_round_and_failure_cancels_it() {
+    use InstanceBridgeInStatus::*;
+    let t = start(Actor::Committee, false, true).await;
+    let id = t.insert(&instance_row(UserBroadcastPeginPrepare, PREPARE)).await;
+    let graph_id = t.insert_graph(id).await;
+    mark_graph_as_endorsed(&t.db, id, graph_id).await.unwrap();
+    let mut plan = InstancePlan::default();
+    plan.send(PlannedMessage {
+        outbox_id: format!("instance:{id}:PeginConfirmNonce"),
+        phase_ref: PHASE_CONFIRM.to_string(),
+        kind: "PeginConfirmNonce".to_string(),
+        actor: Actor::Committee.to_string(),
+        payload: b"nonce".to_vec(),
+        ack_set: None,
+    });
+    t.script(JOB_START_PEGIN_CONFIRM, plan);
+    t.submit(graph_endorsed_event(id, graph_id).unwrap()).await;
+    t.wait_status(id, Presigned).await;
+    t.wait_job(id, JOB_START_PEGIN_CONFIRM, "Done").await;
+    t.wait_outbox(&format!("instance:{id}:PeginConfirmNonce"), "Open").await;
+
+    // The user cancels: the round's deliveries close and its jobs go.
+    let pending = t.submit_id(t.round_message("PeginConfirmNonce", OTHER_PEER, id)).await;
+    t.wait_applied(&pending).await;
+    t.snapshot(id, presign_snapshot(1_070, TxFact::UNKNOWN, TxFact::confirmed_at(1_069))).await;
+    t.wait_status(id, UserCanceled).await;
+    t.wait_outbox(&format!("instance:{id}:PeginConfirmNonce"), "Closed").await;
+    let states: Vec<(String, String)> =
+        t.jobs_of(id).await.into_iter().map(|job| (job.action, job.state)).collect();
+    for (action, state) in &states {
+        if action == JOB_INGEST_PEGIN_CONFIRM_NONCE {
+            assert!(state == "Cancelled" || state == "Done", "{action}: {state}");
+        }
+    }
+    t.wait_key_deleted(id).await;
+    t.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_relayer_rebroadcasts_an_invisible_confirm_once_per_block() {
+    use InstanceBridgeInStatus::*;
+    let t = start(Actor::Committee, true, false).await;
+    let mut row = instance_row(Presigned, PREPARE);
+    row.committees_answers.insert("0xa".to_string(), vec![1u8; 33]);
+    let id = t.insert(&row).await;
+
+    // Not every partial signature is stored: nothing to aggregate.
+    t.snapshot(id, presign_snapshot(1_010, TxFact::UNKNOWN, TxFact::UNKNOWN)).await;
+    settle().await;
+    assert!(t.job_actions(id).await.is_empty());
+
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let keypair = bitcoin::secp256k1::Keypair::from_secret_key(
+        &secp,
+        &bitcoin::secp256k1::SecretKey::from_slice(&[9; 32]).unwrap(),
+    );
+    store_committee_partial_sig_for_instance(
+        &t.db,
+        id,
+        bitcoin::PublicKey::new(keypair.public_key()),
+        musig2::PartialSignature::one(),
+    )
+    .await
+    .unwrap();
+    t.snapshot(id, presign_snapshot(1_011, TxFact::UNKNOWN, TxFact::UNKNOWN)).await;
+    t.wait_job(id, JOB_BROADCAST_PEGIN_CONFIRM, "Done").await;
+    // Another block, still invisible: another broadcast; visible: none.
+    t.snapshot(id, presign_snapshot(1_012, TxFact::UNKNOWN, TxFact::UNKNOWN)).await;
+    wait_for(|| async {
+        (t.calls().iter().filter(|(action, _)| action == JOB_BROADCAST_PEGIN_CONFIRM).count() == 2)
+            .then_some(())
+    })
+    .await;
+    t.snapshot(id, presign_snapshot(1_013, TxFact::mempool(), TxFact::UNKNOWN)).await;
+    settle().await;
+    assert_eq!(
+        t.calls().iter().filter(|(action, _)| action == JOB_BROADCAST_PEGIN_CONFIRM).count(),
+        2
+    );
+    // A non-relayer committee node never broadcasts.
+    t.stop().await;
+    let t = start(Actor::Committee, false, false).await;
+    let mut row = instance_row(Presigned, PREPARE);
+    row.committees_answers.insert("0xa".to_string(), vec![1u8; 33]);
+    let id = t.insert(&row).await;
+    store_committee_partial_sig_for_instance(
+        &t.db,
+        id,
+        bitcoin::PublicKey::new(keypair.public_key()),
+        musig2::PartialSignature::one(),
+    )
+    .await
+    .unwrap();
+    t.snapshot(id, presign_snapshot(1_011, TxFact::UNKNOWN, TxFact::UNKNOWN)).await;
+    settle().await;
+    assert!(t.job_actions(id).await.is_empty());
     t.stop().await;
 }
 

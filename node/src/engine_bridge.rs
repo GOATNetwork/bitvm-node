@@ -141,10 +141,7 @@ pub fn build_engine(
             local_db: deps.local_db.clone(),
             btc_client: deps.btc_client.clone(),
             goat_client: deps.goat_client.clone(),
-            http_client: deps.http_client.clone(),
-            soldering_builder: deps.soldering_builder.clone(),
             metrics_state: deps.metrics_state.clone(),
-            publisher: publisher.clone(),
         }),
     );
     let builder = register_graph_jobs(
@@ -180,7 +177,7 @@ fn local_operator(actor: &Actor) -> Option<String> {
 static ENGINE_HANDLE: OnceLock<EngineHandle> = OnceLock::new();
 
 /// Make the running engine reachable from producers that have no handle of
-/// their own (legacy handlers, the event watcher).
+/// their own (the event watcher, the admission path).
 pub fn install_engine_handle(handle: EngineHandle) {
     let _ = ENGINE_HANDLE.set(handle);
 }
