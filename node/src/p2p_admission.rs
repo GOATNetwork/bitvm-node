@@ -660,6 +660,22 @@ impl PeerRegistry {
     }
 
     /// Registered verifier peer IDs; `None` means not yet fetched.
+    /// Committee peers the cache currently holds as registered, for ack sets.
+    pub fn committee_peer_ids(&self, now: Instant) -> Vec<PeerId> {
+        let state = self.lock();
+        state
+            .committee
+            .iter()
+            .filter(|(_, entry)| entry.is_registered(now))
+            .map(|(peer, _)| *peer)
+            .collect()
+    }
+
+    /// The peer currently bound to an operator master key, if known.
+    pub fn operator_peer_for(&self, pubkey: &OperatorKey) -> Option<PeerId> {
+        self.lock().operator_owner.get(pubkey).copied()
+    }
+
     pub fn verifier_peer_ids(&self) -> Option<Vec<String>> {
         let state = self.lock();
         state.verifiers_fetched_at?;
@@ -1812,6 +1828,8 @@ pub fn protocol_republish_gate() -> &'static CooldownGate {
 const SYNC_GRAPH_RESPONSE_COOLDOWN: Duration = Duration::from_secs(60);
 /// TTL for locally requested graph responses.
 const SYNC_GRAPH_REQUEST_TTL: Duration = Duration::from_secs(15 * 60);
+/// How long one peer's identical `GetGraph` request stays on cooldown.
+const GET_GRAPH_RESPONSE_COOLDOWN: Duration = Duration::from_secs(60);
 const GRAPH_SET_MAX_ENTRIES: usize = 16_384;
 
 /// A global token bucket, for a resource no per-peer key bounds.
@@ -1875,6 +1893,50 @@ static SYNC_GRAPH_RESPONSE_GATE: LazyLock<CooldownGate> =
 /// Per-graph cooldown for answering `SyncGraphRequest` on the relay side.
 pub fn sync_graph_response_gate() -> &'static CooldownGate {
     &SYNC_GRAPH_RESPONSE_GATE
+}
+
+static GET_GRAPH_RESPONSE_GATE: LazyLock<CooldownGate> =
+    LazyLock::new(|| CooldownGate::new(GET_GRAPH_RESPONSE_COOLDOWN, GRAPH_SET_MAX_ENTRIES));
+
+/// Cooldown for answering the same `GetGraph` request from the same peer.
+pub fn get_graph_response_gate() -> &'static CooldownGate {
+    &GET_GRAPH_RESPONSE_GATE
+}
+
+// Serving a definition reads and serializes up to tens of megabytes, so the
+// total rate is bounded per requester class, whatever the number of peers.
+static GET_GRAPH_RESPONSE_BUDGET_REGISTERED: LazyLock<GlobalRate> =
+    LazyLock::new(|| GlobalRate::new(32.0, 2.0));
+static GET_GRAPH_RESPONSE_BUDGET_UNREGISTERED: LazyLock<GlobalRate> =
+    LazyLock::new(|| GlobalRate::new(8.0, 0.2));
+
+/// One requester's share: a registered peer flooding requests runs out of
+/// its own tokens before it can drain the class budget other members need.
+static GET_GRAPH_PEER_BUDGET: LazyLock<PeerRateLimiter> =
+    LazyLock::new(|| PeerRateLimiter::new(8.0, 0.5, 1024));
+
+pub fn get_graph_peer_budget() -> &'static PeerRateLimiter {
+    &GET_GRAPH_PEER_BUDGET
+}
+
+/// Aggregate `GetGraph` response budgets by requester registration class.
+pub fn get_graph_response_budget(requester_registered: bool) -> &'static GlobalRate {
+    if requester_registered {
+        &GET_GRAPH_RESPONSE_BUDGET_REGISTERED
+    } else {
+        &GET_GRAPH_RESPONSE_BUDGET_UNREGISTERED
+    }
+}
+
+/// Definitions being read and serialized for `GetGraph` at once. A request
+/// that finds no free slot is refused, never queued.
+pub const GET_GRAPH_SERVE_SLOTS: usize = 4;
+
+static GET_GRAPH_SERVE_SLOTS_SEMAPHORE: LazyLock<std::sync::Arc<tokio::sync::Semaphore>> =
+    LazyLock::new(|| std::sync::Arc::new(tokio::sync::Semaphore::new(GET_GRAPH_SERVE_SLOTS)));
+
+pub fn get_graph_serve_slots() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
+    &GET_GRAPH_SERVE_SLOTS_SEMAPHORE
 }
 
 // Separate aggregate response budgets for registered and unregistered requesters.
@@ -3398,6 +3460,17 @@ mod tests {
         set.remove("a");
         assert!(!set.contains("a", now));
         assert!(set.insert("c", now));
+    }
+
+    #[test]
+    fn global_rate_spends_its_burst_and_refills_at_its_rate() {
+        let rate = GlobalRate::new(2.0, 1.0);
+        let now = Instant::now();
+        assert!(rate.allow(now));
+        assert!(rate.allow(now));
+        assert!(!rate.allow(now), "the burst is spent");
+        assert!(rate.allow(now + Duration::from_secs(1)), "one token per second comes back");
+        assert!(!rate.allow(now + Duration::from_secs(1)));
     }
 
     /// Verify restored replay marks reject older sequence numbers.

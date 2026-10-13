@@ -1,4 +1,6 @@
 use crate::middleware::behaviour::AllBehavioursEvent;
+use crate::middleware::get_graph::{GetGraphRequest, GetGraphResponse};
+use crate::middleware::publisher::PendingGraphRequests;
 use crate::middleware::{AllBehaviours, split_topic_name};
 use crate::{env, middleware};
 use anyhow::bail;
@@ -7,6 +9,8 @@ use bitvm_lib::actors::Actor;
 use futures::StreamExt;
 use libp2p::gossipsub::MessageId;
 use libp2p::multiaddr::Protocol;
+use libp2p::request_response;
+use libp2p::request_response::ResponseChannel;
 use libp2p::swarm::SwarmEvent;
 use libp2p::{Multiaddr, PeerId, Swarm, gossipsub, kad, noise, tcp, yamux};
 use prometheus_client::metrics::gauge::Gauge;
@@ -103,6 +107,19 @@ pub trait P2pMessageHandler {
     async fn graceful_shutdown(&self) -> anyhow::Result<()> {
         Ok(())
     }
+
+    /// Take a direct `GetGraph` request off the network loop: admit it and
+    /// answer later through `publisher`, or hand the channel back for an
+    /// immediate refusal. The default refuses.
+    fn serve_graph_request(
+        &self,
+        _peer: PeerId,
+        _request: GetGraphRequest,
+        channel: ResponseChannel<GetGraphResponse>,
+        _publisher: super::publisher::NetworkPublisher,
+    ) -> Option<ResponseChannel<GetGraphResponse>> {
+        Some(channel)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -122,6 +139,7 @@ pub struct BitvmNetworkManager {
     connected_peers: Gauge,
     required_topics_healthy: Gauge,
     publish_commands: tokio::sync::mpsc::Receiver<super::publisher::PublishCommand>,
+    pending_graph_requests: PendingGraphRequests,
 }
 impl BitvmNetworkManager {
     pub fn new(
@@ -167,6 +185,7 @@ impl BitvmNetworkManager {
             connected_peers,
             required_topics_healthy,
             publish_commands,
+            pending_graph_requests: PendingGraphRequests::new(),
         })
     }
 
@@ -234,7 +253,7 @@ impl BitvmNetworkManager {
         loop {
             select! {
                     Some(command) = self.publish_commands.recv() => {
-                        command.execute(&mut self.swarm);
+                        command.execute(&mut self.swarm, &mut self.pending_graph_requests);
                     }
                     _ = cancellation_token.cancelled() => {
                         info!("Swarm received shutdown signal");
@@ -327,6 +346,32 @@ impl BitvmNetworkManager {
                         SwarmEvent::Behaviour(AllBehavioursEvent::Gossipsub(gossipsub::Event::Unsubscribed { peer_id, topic})) => {
                             debug!("unsubscribed: {:?}, {:?}", peer_id, topic);
                         }
+                        SwarmEvent::Behaviour(AllBehavioursEvent::GetGraph(request_response::Event::Message { peer, message, .. })) => {
+                            match message {
+                                request_response::Message::Request { request, channel, .. } => {
+                                    let publisher = self.swarm.publisher();
+                                    if let Some(channel) = msg_handler.serve_graph_request(peer, request, channel, publisher)
+                                        && self.swarm.behaviour_mut().get_graph.send_response(channel, GetGraphResponse::not_found()).is_err()
+                                    {
+                                        debug!(%peer, "GetGraph requester went away before the refusal");
+                                    }
+                                }
+                                request_response::Message::Response { request_id, response } => {
+                                    if let Some(reply) = self.pending_graph_requests.remove(&request_id) {
+                                        let _ = reply.send(Ok(response));
+                                    }
+                                }
+                            }
+                        }
+                        SwarmEvent::Behaviour(AllBehavioursEvent::GetGraph(request_response::Event::OutboundFailure { peer, request_id, error, .. })) => {
+                            if let Some(reply) = self.pending_graph_requests.remove(&request_id) {
+                                let _ = reply.send(Err(anyhow::anyhow!("GetGraph to {peer} failed: {error}")));
+                            }
+                        }
+                        SwarmEvent::Behaviour(AllBehavioursEvent::GetGraph(request_response::Event::InboundFailure { peer, error, .. })) => {
+                            debug!(%peer, %error, "GetGraph inbound request failed");
+                        }
+                        SwarmEvent::Behaviour(AllBehavioursEvent::GetGraph(request_response::Event::ResponseSent { .. })) => {}
                         SwarmEvent::Behaviour(AllBehavioursEvent::Kademlia(kad::Event::RoutingUpdated{ peer, addresses,..})) => {
                             debug!("routing updated: {:?}, addresses:{:?}", peer, addresses);
                         }

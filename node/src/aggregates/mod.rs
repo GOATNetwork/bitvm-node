@@ -3,6 +3,7 @@
 //! Business data stays in the instance and graph tables; the engine manages
 //! pending events, jobs, outgoing messages and dependency waits.
 
+pub mod graph_fetch;
 pub mod instance;
 pub mod instance_jobs;
 pub mod instance_scan;

@@ -3,6 +3,7 @@ use crate::action::{
 };
 use crate::env::get_local_node_info;
 use crate::metrics_service::MetricsState;
+use crate::middleware::get_graph::{GetGraphRequest, GetGraphResponse};
 use crate::middleware::publisher::NetworkPublisher;
 use crate::middleware::swarm::{BitvmSwarmWrapper, P2pMessageHandler, TickMessageType};
 use crate::utils::detect_heart_beat;
@@ -13,6 +14,7 @@ use client::{btc_chain::BTCClient, goat_chain::GOATClient};
 use futures::FutureExt;
 use libp2p::PeerId;
 use libp2p::gossipsub::MessageId;
+use libp2p::request_response::ResponseChannel;
 use std::sync::{Arc, OnceLock};
 use store::localdb::LocalDB;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
@@ -306,6 +308,63 @@ impl P2pMessageHandler for BitvmNodeProcessor {
             }
         }
         Ok(())
+    }
+
+    /// Serve a stored graph definition to a direct `GetGraph` request. Any
+    /// role answers from its own copy; the requester authenticates what it
+    /// gets. Admission is a global budget by requester class first (it has no
+    /// per-key table an unregistered flood could fill), then the per-peer
+    /// bucket, the per-request cooldown and a cap on definitions in flight;
+    /// the read and the serialization run off the network loop.
+    fn serve_graph_request(
+        &self,
+        peer: PeerId,
+        request: GetGraphRequest,
+        channel: ResponseChannel<GetGraphResponse>,
+        publisher: NetworkPublisher,
+    ) -> Option<ResponseChannel<GetGraphResponse>> {
+        let now = std::time::Instant::now();
+        let registered =
+            crate::p2p_admission::peer_registry().sender_class(&peer, now).is_registered();
+        if !crate::p2p_admission::get_graph_response_budget(registered).allow(now) {
+            tracing::debug!(event = "get_graph", outcome = "budget_spent", %peer, registered, "GetGraph refused");
+            return Some(channel);
+        }
+        if !crate::p2p_admission::get_graph_peer_budget().allow(&peer, now) {
+            tracing::debug!(event = "get_graph", outcome = "peer_budget_spent", %peer, "GetGraph refused");
+            return Some(channel);
+        }
+        let gate_key = format!(
+            "{peer}:{:?}:{:?}:{:?}",
+            request.graph_id, request.operator_pubkey, request.graph_nonce
+        );
+        if !crate::p2p_admission::get_graph_response_gate().allow(&gate_key, now) {
+            return Some(channel);
+        }
+        let Ok(slot) = crate::p2p_admission::get_graph_serve_slots().clone().try_acquire_owned()
+        else {
+            tracing::debug!(event = "get_graph", outcome = "busy", %peer, "GetGraph refused");
+            return Some(channel);
+        };
+        let local_db = self.local_db.clone();
+        tokio::spawn(async move {
+            let _slot = slot;
+            let response = match crate::aggregates::graph_fetch::serve_graph_request(
+                &local_db, &request,
+            )
+            .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    tracing::warn!(event = "get_graph", outcome = "serve_failed", %peer, error = %error, "could not serve GetGraph request");
+                    GetGraphResponse::not_found()
+                }
+            };
+            if let Err(error) = publisher.respond_graph(channel, response).await {
+                tracing::debug!(event = "get_graph", outcome = "response_dropped", %peer, error = %error, "GetGraph response not delivered to the swarm");
+            }
+        });
+        None
     }
 
     async fn graceful_shutdown(&self) -> anyhow::Result<()> {

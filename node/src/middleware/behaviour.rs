@@ -37,6 +37,8 @@ pub struct AllBehaviours {
     pub kademlia: kad::Behaviour<MemoryStore>,
     //pub mdns: mdns::tokio::Behaviour,
     pub gossipsub: gossipsub::Behaviour<gossipsub::IdentityTransform, TopicFilter>,
+    /// Direct graph definition pulls.
+    pub get_graph: super::get_graph::GetGraphBehaviour,
 }
 impl AllBehaviours {
     pub fn new(key: &Keypair) -> Self {
@@ -81,7 +83,8 @@ impl AllBehaviours {
             crate::env::get_p2p_inbound_registered_reserve() as usize,
             crate::env::get_p2p_reserved_peers(),
         );
-        Self { connection_gate, connection_limits, kademlia, gossipsub }
+        let get_graph = super::get_graph::new_get_graph_behaviour();
+        Self { connection_gate, connection_limits, kademlia, gossipsub, get_graph }
     }
 }
 
