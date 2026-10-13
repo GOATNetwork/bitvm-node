@@ -1,11 +1,11 @@
 mod babe_setup_state_cleanup_task;
 mod event_watch_task;
-pub mod graph_maintenance_tasks;
 pub mod instance_maintenance_tasks;
 mod node_maintenance_tasks;
 mod sequencer_set_hash_monitor_task;
 mod spv_maintenance_tasks;
 
+use crate::aggregates::graph_scan::{abandon_unfinished_setups, scan_graphs_on_chain};
 use crate::aggregates::instance_scan::{scan_answer_windows, scan_instances_on_bitcoin};
 use crate::env::{
     actor_runs_babe_setup_state_cleanup, get_maintenance_run_timeout_secs, get_network,
@@ -15,9 +15,6 @@ use crate::env::{
 use crate::metrics_service::MetricsState;
 use crate::rpc_service::current_time_secs;
 use crate::scheduled_tasks::babe_setup_state_cleanup_task::babe_setup_state_cleanup_monitor;
-use crate::scheduled_tasks::graph_maintenance_tasks::{
-    detect_init_withdraw_call, detect_kickoff, detect_take1_or_challenge, process_graph_challenge,
-};
 use crate::scheduled_tasks::instance_maintenance_tasks::{
     instance_answers_monitor, pegin_confirm_recovery_monitor, swap_escrow_timeout_monitor,
 };
@@ -33,8 +30,7 @@ pub use sequencer_set_hash_monitor_task::run_sequencer_set_hash_monitor_task;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use store::Graph;
-use store::localdb::{LocalDB, StorageProcessor};
+use store::localdb::LocalDB;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -157,33 +153,6 @@ async fn refresh_alert_health(
     }
 }
 
-/// Return every graph in the requested status. Time-sensitive flows must not
-/// let a lower-index graph hide another graph owned by the same operator.
-pub(super) async fn fetch_all_graphs_by_status<'a>(
-    storage_processor: &mut StorageProcessor<'a>,
-    graph_status: &str,
-) -> anyhow::Result<Vec<Graph>> {
-    storage_processor.find_graphs_by_status_group_by_operator(graph_status).await
-}
-
-/// Return the lowest-index graph for each operator in the requested status.
-/// This is only suitable as the entry point for a chain-aware scan.
-pub(super) async fn fetch_first_graph_per_operator_by_status<'a>(
-    storage_processor: &mut StorageProcessor<'a>,
-    graph_status: &str,
-) -> anyhow::Result<Vec<Graph>> {
-    let graphs_ori = fetch_all_graphs_by_status(storage_processor, graph_status).await?;
-    let mut graphs: Vec<Graph> = vec![];
-    let mut pre_operator_pubkey = "".to_string();
-    for graph in graphs_ori {
-        if graph.operator_pubkey != pre_operator_pubkey {
-            pre_operator_pubkey = graph.operator_pubkey.clone();
-            graphs.push(graph);
-        }
-    }
-    Ok(graphs)
-}
-
 async fn run_maintenance_subtask<T>(
     metrics_state: &MetricsState,
     task: &'static str,
@@ -304,26 +273,21 @@ async fn run(
         swap_escrow_timeout_monitor(local_db),
     )
     .await;
+    // Chain facts for the Graph aggregate's peg-out phases.
     run_maintenance_subtask(
         metrics_state,
-        "detect_init_withdraw_call",
-        detect_init_withdraw_call(local_db),
+        "graph_chain_scan",
+        scan_graphs_on_chain(local_db, btc_client, goat_client, engine),
     )
     .await;
-    run_maintenance_subtask(metrics_state, "detect_kickoff", detect_kickoff(local_db, btc_client))
+    if actor == Actor::Operator {
+        run_maintenance_subtask(
+            metrics_state,
+            "graph_setup_abandon_scan",
+            abandon_unfinished_setups(local_db, btc_client, engine),
+        )
         .await;
-    run_maintenance_subtask(
-        metrics_state,
-        "detect_take1_or_challenge",
-        detect_take1_or_challenge(local_db, btc_client),
-    )
-    .await;
-    run_maintenance_subtask(
-        metrics_state,
-        "process_graph_challenge",
-        process_graph_challenge(local_db, btc_client),
-    )
-    .await;
+    }
     Ok(MaintenanceRunOutcome::Completed)
 }
 

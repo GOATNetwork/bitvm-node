@@ -1,4 +1,8 @@
-use crate::aggregates::graph::graph_posted_event;
+use crate::aggregates::graph::{graph_posted_event, graph_pull_event};
+use crate::aggregates::graph_fetch::GraphLookup;
+use crate::aggregates::graph_pegout::{
+    goat_status_event, withdraw_cancel_event, withdraw_init_event,
+};
 use crate::aggregates::instance::l2_minted_event;
 use crate::engine_bridge::record_event_in;
 use crate::env;
@@ -246,7 +250,7 @@ pub async fn fetch_and_handle_gateway_events<'a>(
         bridge_in_events,
     )
     .await?;
-    handle_post_graph_data_events(storage_processor, post_graph_data_events).await?;
+    handle_post_graph_data_events(&actor, storage_processor, post_graph_data_events).await?;
     Ok(())
 }
 
@@ -320,11 +324,14 @@ async fn handle_user_withdraw_events<'a>(
     init_withdraw_events: Vec<InitWithdrawEvent>,
     cancel_withdraw_events: Vec<CancelWithdrawEvent>,
 ) -> anyhow::Result<()> {
+    // Within a block, cancels go first: a cancel and a new init of the same
+    // graph in one block must leave the new withdraw active. The opposite
+    // order (an init cancelled in its own block) leaves a stale withdraw
+    // active, which the kickoff ignores after checking it on Goat.
     let mut user_withdraw_events: Vec<UserGraphWithdrawEvent> =
-        init_withdraw_events.into_iter().map(UserGraphWithdrawEvent::InitWithdraw).collect();
-    let mut user_cancel_withdraw_events: Vec<UserGraphWithdrawEvent> =
         cancel_withdraw_events.into_iter().map(UserGraphWithdrawEvent::CancelWithdraw).collect();
-    user_withdraw_events.append(&mut user_cancel_withdraw_events);
+    user_withdraw_events
+        .extend(init_withdraw_events.into_iter().map(UserGraphWithdrawEvent::InitWithdraw));
     user_withdraw_events.sort_by_key(|v| v.get_block_number());
     for event in user_withdraw_events {
         match event {
@@ -345,6 +352,12 @@ async fn handle_user_withdraw_events<'a>(
                     warn!("ignore InitWithdraw for missing graph {instance_id}:{graph_id}");
                     continue;
                 }
+                // The Graph aggregate takes the withdraw from here.
+                record_event_in(
+                    storage_processor,
+                    withdraw_init_event(instance_id, graph_id, &init_event.transaction_hash)?,
+                )
+                .await?;
                 storage_processor
                     .upsert_goat_tx_record(&GoatTxRecord {
                         instance_id,
@@ -353,7 +366,7 @@ async fn handle_user_withdraw_events<'a>(
                         tx_hash: init_event.transaction_hash,
                         height: init_event.block_number.parse::<i64>()?,
                         is_local: false,
-                        processing_status: GoatTxProcessingStatus::Pending.to_string(),
+                        processing_status: GoatTxProcessingStatus::Processed.to_string(),
                         extra: None,
                         created_at: current_time_secs(),
                     })
@@ -377,6 +390,11 @@ async fn handle_user_withdraw_events<'a>(
                     warn!("ignore CancelWithdraw for missing graph {instance_id}:{graph_id}");
                     continue;
                 }
+                record_event_in(
+                    storage_processor,
+                    withdraw_cancel_event(instance_id, graph_id, &cancel_event.transaction_hash)?,
+                )
+                .await?;
                 storage_processor
                     .upsert_goat_tx_record(&GoatTxRecord {
                         instance_id,
@@ -569,7 +587,9 @@ async fn handle_withdraw_paths_events<'a>(
         if is_new_event {
             add_node_reward(storage_processor, &goat_addr.unwrap(), reward_add).await?;
         }
-        storage_processor.cancel_messages_by_business_id(&graph_id, None).await?;
+        // The aggregate mirrors the settlement and releases the next slot.
+        record_event_in(storage_processor, goat_status_event(graph_id, status, &event.tx_hash())?)
+            .await?;
     }
     Ok(())
 }
@@ -649,7 +669,11 @@ async fn handle_withdraw_disproved_events<'a>(
             )
             .await?;
         }
-        storage_processor.cancel_messages_by_business_id(&graph_id, None).await?;
+        record_event_in(
+            storage_processor,
+            goat_status_event(graph_id, GraphStatus::Disprove, &event.transaction_hash)?,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -1045,6 +1069,7 @@ pub(super) async fn generate_instance_from_bridge_in_request_event(
     Ok((instance, input_utxo_available))
 }
 async fn handle_post_graph_data_events<'a>(
+    actor: &Actor,
     storage_processor: &mut StorageProcessor<'a>,
     post_graph_data_events: Vec<PostGraphDataEvent>,
 ) -> anyhow::Result<()> {
@@ -1054,13 +1079,27 @@ async fn handle_post_graph_data_events<'a>(
             Uuid::from_str(&strip_hex_prefix_owned(&event.graph_id)),
         ) {
             (Ok(instance_id), Ok(graph_id)) => {
-                let _ = apply_gateway_graph_status(
+                let outcome = apply_gateway_graph_status(
                     storage_processor,
                     instance_id,
                     graph_id,
                     GraphStatus::OperatorDataPushed,
                 )
                 .await?;
+                // Watching roles fetch a finalized definition when the posted graph is absent
+                // locally.
+                if matches!(outcome, GraphStatusTransitionOutcome::NotFound)
+                    && matches!(actor, Actor::Verifier | Actor::Watchtower)
+                {
+                    record_event_in(
+                        storage_processor,
+                        graph_pull_event(
+                            graph_id,
+                            GraphLookup::Id { instance_id, graph_id, finalized: true },
+                        )?,
+                    )
+                    .await?;
+                }
                 // Posted: the Graph aggregate closes every delivery of the graph.
                 record_event_in(storage_processor, graph_posted_event(instance_id, graph_id)?)
                     .await?;
@@ -1550,4 +1589,65 @@ async fn add_node_reward(
         storage_processor.update_node_reward_by_peer_id(&node.peer_id, &reward.to_string()).await?
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn db() -> (LocalDB, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("watch.db");
+        let db = LocalDB::new_with_busy_timeout(
+            &format!("sqlite:{}", path.display()),
+            false,
+            store::DEFAULT_BUSY_TIMEOUT,
+        )
+        .await;
+        db.migrate().await;
+        (db, dir)
+    }
+
+    fn posted(instance_id: Uuid, graph_id: Uuid) -> PostGraphDataEvent {
+        PostGraphDataEvent {
+            id: "1".to_string(),
+            transaction_hash: "0xaa".to_string(),
+            block_number: "1".to_string(),
+            instance_id: format!("0x{}", instance_id.simple()),
+            graph_id: format!("0x{}", graph_id.simple()),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_posted_graph_unknown_locally_is_pulled_by_the_watching_roles() {
+        let (db, _dir) = db().await;
+        for (actor, pulled) in [
+            (Actor::Verifier, true),
+            (Actor::Watchtower, true),
+            (Actor::Operator, false),
+            (Actor::Committee, false),
+        ] {
+            let (instance_id, graph_id) = (Uuid::new_v4(), Uuid::new_v4());
+            let mut tx = db.start_transaction().await.unwrap();
+            handle_post_graph_data_events(&actor, &mut tx, vec![posted(instance_id, graph_id)])
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+            let mut storage = db.acquire().await.unwrap();
+            let pull = storage
+                .find_engine_inbox_event(&format!("graph:{graph_id}:pull:finalized"))
+                .await
+                .unwrap();
+            assert_eq!(pull.is_some(), pulled, "{actor}");
+            // The posted event is recorded for every role.
+            assert!(
+                storage
+                    .find_engine_inbox_event(&format!("graph:{graph_id}:posted"))
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "{actor}"
+            );
+        }
+    }
 }

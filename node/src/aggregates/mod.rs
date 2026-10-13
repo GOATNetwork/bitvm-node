@@ -6,6 +6,9 @@
 pub mod graph;
 pub mod graph_fetch;
 pub mod graph_jobs;
+pub mod graph_pegout;
+pub mod graph_pegout_jobs;
+pub mod graph_scan;
 pub mod graph_setup;
 pub mod instance;
 pub mod instance_jobs;

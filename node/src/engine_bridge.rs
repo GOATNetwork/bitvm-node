@@ -79,6 +79,7 @@ pub fn engine_config_from_env() -> EngineConfig {
     EngineConfig {
         worker_count: env::get_engine_worker_count(defaults.worker_count),
         cpu_pool_slots: env::get_engine_cpu_pool_slots(defaults.cpu_pool_slots),
+        pegout_pool_slots: env::get_engine_pegout_pool_slots(defaults.pegout_pool_slots),
         network_pool_slots: env::get_engine_network_pool_slots(defaults.network_pool_slots),
         apply_timeout: Duration::from_secs(env::get_engine_apply_timeout_secs(
             defaults.apply_timeout.as_secs(),
@@ -128,11 +129,10 @@ pub fn build_engine(
         .handler(INSTANCE_KIND, Arc::new(InstanceAggregate::from_env(deps.actor.clone())))
         .handler(
             GRAPH_KIND,
-            Arc::new(GraphAggregate::new(
-                deps.actor.clone(),
-                env::is_relayer(),
-                deps.local_peer.clone(),
-            )),
+            Arc::new(
+                GraphAggregate::new(deps.actor.clone(), env::is_relayer(), deps.local_peer.clone())
+                    .with_local_operator(local_operator(&deps.actor)),
+            ),
         );
     let builder = register_instance_jobs(
         builder,
@@ -141,7 +141,7 @@ pub fn build_engine(
             local_db: deps.local_db.clone(),
             btc_client: deps.btc_client.clone(),
             goat_client: deps.goat_client.clone(),
-            http_client: deps.http_client,
+            http_client: deps.http_client.clone(),
             soldering_builder: deps.soldering_builder.clone(),
             metrics_state: deps.metrics_state.clone(),
             publisher: publisher.clone(),
@@ -153,6 +153,7 @@ pub fn build_engine(
             local_db: deps.local_db,
             btc_client: deps.btc_client,
             goat_client: deps.goat_client,
+            http_client: deps.http_client,
             soldering_builder: deps.soldering_builder,
             metrics_state: deps.metrics_state,
             publisher,
@@ -160,6 +161,20 @@ pub fn build_engine(
         }),
     );
     builder.build()
+}
+
+/// The operator key this node withdraws with, as graphs store it.
+fn local_operator(actor: &Actor) -> Option<String> {
+    if *actor != Actor::Operator {
+        return None;
+    }
+    match env::get_node_pubkey() {
+        Ok(pubkey) => Some(pubkey.to_string()),
+        Err(error) => {
+            tracing::warn!(error = %error, "operator key unavailable; peg-out jobs for own graphs are disabled");
+            None
+        }
+    }
 }
 
 static ENGINE_HANDLE: OnceLock<EngineHandle> = OnceLock::new();

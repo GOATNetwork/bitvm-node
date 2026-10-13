@@ -931,6 +931,7 @@ pub fn get_committee_instance_key_delete_timelock_blocks() -> i64 {
 
 pub const ENV_ENGINE_WORKER_COUNT: &str = "ENGINE_WORKER_COUNT";
 pub const ENV_ENGINE_CPU_POOL_SLOTS: &str = "ENGINE_CPU_POOL_SLOTS";
+pub const ENV_ENGINE_PEGOUT_POOL_SLOTS: &str = "ENGINE_PEGOUT_POOL_SLOTS";
 pub const ENV_ENGINE_NETWORK_POOL_SLOTS: &str = "ENGINE_NETWORK_POOL_SLOTS";
 pub const ENV_ENGINE_APPLY_TIMEOUT_SECS: &str = "ENGINE_APPLY_TIMEOUT_SECS";
 pub const ENV_ENGINE_RECHECK_INTERVAL_SECS: &str = "ENGINE_RECHECK_INTERVAL_SECS";
@@ -950,6 +951,10 @@ pub fn get_engine_worker_count(default: usize) -> usize {
 
 pub fn get_engine_cpu_pool_slots(default: usize) -> usize {
     engine_setting(ENV_ENGINE_CPU_POOL_SLOTS, default, 1, 64)
+}
+
+pub fn get_engine_pegout_pool_slots(default: usize) -> usize {
+    engine_setting(ENV_ENGINE_PEGOUT_POOL_SLOTS, default, 1, 64)
 }
 
 pub fn get_engine_network_pool_slots(default: usize) -> usize {

@@ -5,6 +5,7 @@
 
 use super::graph::*;
 use super::graph_fetch::GraphLookup;
+use super::graph_pegout::*;
 use async_trait::async_trait;
 use bitvm_lib::actors::Actor;
 use engine::{
@@ -127,13 +128,16 @@ async fn start_with(actor: Actor, relayer: bool, membership: Arc<dyn MembershipP
     .await;
     db.migrate().await;
     let jobs = Arc::new(Scripted::default());
+    let local_operator = (actor == Actor::Operator).then(|| OPERATOR.to_string());
     let mut builder = EngineBuilder::new(db.clone(), fast_config()).handler(
         GRAPH_KIND,
         Arc::new(
-            GraphAggregate::new(actor, relayer, LOCAL_PEER.to_string()).with_membership(membership),
+            GraphAggregate::new(actor, relayer, LOCAL_PEER.to_string())
+                .with_membership(membership)
+                .with_local_operator(local_operator),
         ),
     );
-    for action in ALL_JOBS {
+    for action in ALL_JOBS.iter().chain(PEGOUT_JOBS) {
         let runner: Arc<dyn JobRunner> = jobs.clone();
         builder = builder.job_runner(GRAPH_KIND, *action, runner);
     }
@@ -157,14 +161,6 @@ impl Harness {
 
     fn calls(&self) -> Vec<(String, Vec<u8>)> {
         self.jobs.calls.lock().unwrap().clone()
-    }
-
-    fn called(&self, action: &str) -> Vec<Vec<u8>> {
-        self.calls()
-            .into_iter()
-            .filter(|(called, _)| called == action)
-            .map(|(_, params)| params)
-            .collect()
     }
 
     /// The params the runner was handed for the first call of `action`.
@@ -915,5 +911,448 @@ async fn a_build_of_a_failed_instance_does_not_hold_the_next_build() {
     let ready_b = t.wait_inbox(&build_ready_id(graph_b), EngineInboxState::Applied).await;
     assert!(ready_b.waiting_ref.is_none());
     t.wait_job_live(graph_b, JOB_BUILD_GRAPH).await;
+    t.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unfinished_graph_is_given_up_at_the_abandon_height() {
+    let t = start(Actor::Operator, false).await;
+    // Other operators' graphs carried the instance; this operator's graph
+    // never got its committee signatures. Past the abandon height it is
+    // retired and its slot left for the Skip.
+    let carried = t.insert_instance(InstanceBridgeInStatus::RelayerL2Minted).await;
+    let unfinished = t.insert_graph(carried, 0, GraphStatus::OperatorPresigned).await;
+    let abandoned = SetupAbandoned { instance_id: carried, abandon_height: 166, height: 167 };
+    t.submit(setup_abandoned_event(unfinished, &abandoned).unwrap()).await;
+    t.wait_status(unfinished, GraphStatus::Obsoleted).await;
+    assert!(t.graph_state(unfinished).await.abandoned);
+
+    // A finalized graph, or another operator's, is never given up.
+    let finalized = t.insert_graph(carried, 1, GraphStatus::CommitteePresigned).await;
+    let foreign =
+        t.insert_graph_of(OTHER_OPERATOR, carried, 0, GraphStatus::OperatorPresigned).await;
+    for graph_id in [finalized, foreign] {
+        let event_id = t.submit(setup_abandoned_event(graph_id, &abandoned).unwrap()).await;
+        t.wait_inbox(&event_id, EngineInboxState::Applied).await;
+    }
+    assert_eq!(t.status(finalized).await, GraphStatus::CommitteePresigned);
+    assert_eq!(t.status(foreign).await, GraphStatus::OperatorPresigned);
+    t.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_unfinished_at_the_abandon_height_is_released() {
+    let t = start(Actor::Operator, false).await;
+    let instance_a = t.insert_instance(InstanceBridgeInStatus::RelayerL2Minted).await;
+    let instance_b = t.insert_instance(InstanceBridgeInStatus::Presigned).await;
+    let instance_c = t.insert_instance(InstanceBridgeInStatus::Presigned).await;
+    let (graph_a, graph_b, graph_c) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    for (instance_id, graph_id) in
+        [(instance_a, graph_a), (instance_b, graph_b), (instance_c, graph_c)]
+    {
+        t.insert_session(instance_id, graph_id).await;
+    }
+    let abandon = |instance_id| SetupAbandoned { instance_id, abandon_height: 166, height: 166 };
+    t.jobs.hold(JOB_BUILD_GRAPH);
+
+    // A's build is running and B's build waits behind it when A's instance
+    // passes the abandon height: A's session goes and B builds.
+    t.script(JOB_OPERATOR_INIT, build_plan());
+    let start_a = t.submit(operator_start_event(instance_a, graph_a, OPERATOR).unwrap()).await;
+    t.wait_inbox(&start_a, EngineInboxState::Applied).await;
+    t.wait_job(graph_a, JOB_BUILD_GRAPH, EngineJobState::Running).await;
+    t.script(JOB_OPERATOR_INIT, build_plan());
+    let start_b = t.submit(operator_start_event(instance_b, graph_b, OPERATOR).unwrap()).await;
+    t.wait_inbox(&start_b, EngineInboxState::Applied).await;
+    t.wait_waiting(&build_ready_id(graph_b)).await;
+    t.submit(setup_abandoned_event(graph_a, &abandon(instance_a)).unwrap()).await;
+    t.wait_inbox(&build_ready_id(graph_b), EngineInboxState::Applied).await;
+    t.wait_job_live(graph_b, JOB_BUILD_GRAPH).await;
+    assert!(t.session(graph_a).await.is_none());
+    assert!(t.graph_state(graph_a).await.abandoned);
+
+    // A session abandoned before its start applies is dropped.
+    let abandoned = t.submit(setup_abandoned_event(graph_c, &abandon(instance_c)).unwrap()).await;
+    t.wait_inbox(&abandoned, EngineInboxState::Applied).await;
+    let start_c = t.submit(operator_start_event(instance_c, graph_c, OPERATOR).unwrap()).await;
+    t.wait_inbox(&start_c, EngineInboxState::Applied).await;
+    settle().await;
+    assert!(t.session(graph_c).await.is_none());
+    assert_eq!(t.called(JOB_OPERATOR_INIT).len(), 2, "C never starts");
+    t.stop().await;
+}
+
+// ------------------------------------------------------------------ peg-out
+
+const OTHER_OPERATOR: &str = "02other";
+
+impl Harness {
+    async fn insert_graph_of(
+        &self,
+        operator: &str,
+        instance_id: Uuid,
+        nonce: i64,
+        status: GraphStatus,
+    ) -> Uuid {
+        let graph_id = Uuid::new_v4();
+        let mut storage = self.db.acquire().await.unwrap();
+        storage
+            .upsert_graph_definition(&Graph {
+                graph_id,
+                instance_id,
+                status: GraphStatus::OperatorPresigned.to_string(),
+                definition_hash: "definition".to_string(),
+                operator_pubkey: operator.to_string(),
+                kickoff_index: nonce,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        drop(storage);
+        if status != GraphStatus::OperatorPresigned {
+            self.set_status(instance_id, graph_id, status).await;
+        }
+        graph_id
+    }
+
+    async fn status(&self, graph_id: Uuid) -> GraphStatus {
+        let row = self.db.acquire().await.unwrap().find_graph(&graph_id).await.unwrap().unwrap();
+        row.status.parse().unwrap()
+    }
+
+    async fn wait_status(&self, graph_id: Uuid, status: GraphStatus) {
+        wait_for(|| async { (self.status(graph_id).await == status).then_some(()) }).await
+    }
+
+    async fn graph_state(&self, graph_id: Uuid) -> GraphState {
+        serde_json::from_str(self.aggregate(graph_id).await.state.as_deref().unwrap()).unwrap()
+    }
+
+    async fn session(&self, graph_id: Uuid) -> Option<store::PendingGraphInit> {
+        let mut storage = self.db.acquire().await.unwrap();
+        storage.find_pending_graph_init_by_graph_id(&graph_id).await.unwrap()
+    }
+
+    fn called(&self, action: &str) -> Vec<Vec<u8>> {
+        self.calls()
+            .into_iter()
+            .filter(|(called, _)| called == action)
+            .map(|(_, params)| params)
+            .collect()
+    }
+}
+
+fn scan(
+    height: i64,
+    status_at_scan: GraphStatus,
+    stage: GraphStatus,
+    signals: Vec<PegoutSignal>,
+    unusable: Option<Unusable>,
+) -> ChainScan {
+    ChainScan {
+        height,
+        status_at_scan: status_at_scan.to_string(),
+        stage,
+        sub_status: None,
+        challenge_txid: None,
+        unusable,
+        signals,
+    }
+}
+
+fn txid(byte: u8) -> bitcoin::Txid {
+    use bitcoin::hashes::Hash;
+    bitcoin::Txid::from_byte_array([byte; 32])
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_withdraw_waits_for_the_previous_slot_and_kicks_off_once_it_settles() {
+    let t = start(Actor::Operator, false).await;
+    let instance_id = t.insert_instance(InstanceBridgeInStatus::RelayerL2Minted).await;
+    let previous = t.insert_graph(instance_id, 0, GraphStatus::OperatorDataPushed).await;
+    let graph_id = t.insert_graph(instance_id, 1, GraphStatus::OperatorDataPushed).await;
+
+    let init = t.submit(withdraw_init_event(instance_id, graph_id, "0xinit").unwrap()).await;
+    let row = t.wait_waiting(&init).await;
+    assert_eq!(row.waiting_ref.as_deref(), Some(slot_ref(OPERATOR, 0).as_str()));
+    // Meanwhile a job settles the earlier slots from chain facts.
+    t.wait_job(graph_id, JOB_SETTLE_PREDECESSORS, EngineJobState::Done).await;
+    let params: KickoffParams =
+        serde_json::from_slice(&t.job_params(JOB_SETTLE_PREDECESSORS)).unwrap();
+    assert_eq!(params.tx_hash, "0xinit");
+    t.wait_phase(graph_id, PHASE_KICKOFF).await;
+    assert!(t.called(JOB_KICKOFF).is_empty(), "no kickoff over an unsettled slot");
+
+    // The previous slot settles on Goat: mirroring it wakes the withdraw.
+    t.set_status(instance_id, previous, GraphStatus::OperatorTake1).await;
+    t.submit(goat_status_event(previous, GraphStatus::OperatorTake1, "0xtake1").unwrap()).await;
+    t.wait_inbox(&init, EngineInboxState::Applied).await;
+    t.wait_job(graph_id, JOB_KICKOFF, EngineJobState::Done).await;
+    let params: KickoffParams = serde_json::from_slice(&t.job_params(JOB_KICKOFF)).unwrap();
+    assert_eq!(params.tx_hash, "0xinit");
+    assert_eq!(t.wait_phase(previous, PHASE_CLOSED).await.status, "OperatorTake1");
+    t.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancelled_withdraw_never_kicks_off_and_a_new_one_starts_over() {
+    let t = start(Actor::Operator, false).await;
+    let instance_id = t.insert_instance(InstanceBridgeInStatus::RelayerL2Minted).await;
+    let previous = t.insert_graph(instance_id, 0, GraphStatus::OperatorKickOff).await;
+    let graph_id = t.insert_graph(instance_id, 1, GraphStatus::OperatorDataPushed).await;
+
+    let init = t.submit(withdraw_init_event(instance_id, graph_id, "0xfirst").unwrap()).await;
+    t.wait_waiting(&init).await;
+    let cancel = t.submit(withdraw_cancel_event(instance_id, graph_id, "0xcancel").unwrap()).await;
+    t.wait_inbox(&cancel, EngineInboxState::Applied).await;
+    t.wait_phase(graph_id, PHASE_AWAIT_WITHDRAW).await;
+
+    // The previous slot settles; the cancelled withdraw stays cancelled.
+    t.set_status(instance_id, previous, GraphStatus::OperatorTake1).await;
+    t.submit(goat_status_event(previous, GraphStatus::OperatorTake1, "0xtake1").unwrap()).await;
+    t.wait_inbox(&init, EngineInboxState::Applied).await;
+    settle().await;
+    assert!(t.called(JOB_KICKOFF).is_empty());
+
+    // A new InitWithdraw gets jobs of its own.
+    let again = t.submit(withdraw_init_event(instance_id, graph_id, "0xsecond").unwrap()).await;
+    t.wait_inbox(&again, EngineInboxState::Applied).await;
+    t.wait_job(graph_id, JOB_KICKOFF, EngineJobState::Done).await;
+    let params: KickoffParams = serde_json::from_slice(&t.job_params(JOB_KICKOFF)).unwrap();
+    assert_eq!(params.tx_hash, "0xsecond");
+    t.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_new_withdraw_replaces_the_active_one() {
+    let t = start(Actor::Operator, false).await;
+    let instance_id = t.insert_instance(InstanceBridgeInStatus::RelayerL2Minted).await;
+    let previous = t.insert_graph(instance_id, 0, GraphStatus::OperatorKickOff).await;
+    let graph_id = t.insert_graph(instance_id, 1, GraphStatus::OperatorDataPushed).await;
+
+    let first = t.submit(withdraw_init_event(instance_id, graph_id, "0xfirst").unwrap()).await;
+    t.wait_waiting(&first).await;
+    // Its cancel never reached this node: the next init takes over.
+    let second = t.submit(withdraw_init_event(instance_id, graph_id, "0xsecond").unwrap()).await;
+    t.wait_waiting(&second).await;
+    let state = t.graph_state(graph_id).await;
+    assert_eq!(state.withdraw.as_deref(), Some("0xsecond"));
+    assert_eq!(state.retired_withdraws, vec!["0xfirst".to_string()]);
+
+    // The previous slot settles: only the live withdraw kicks off.
+    t.set_status(instance_id, previous, GraphStatus::OperatorTake1).await;
+    t.submit(goat_status_event(previous, GraphStatus::OperatorTake1, "0xtake1").unwrap()).await;
+    t.wait_inbox(&first, EngineInboxState::Applied).await;
+    t.wait_inbox(&second, EngineInboxState::Applied).await;
+    t.wait_job(graph_id, JOB_KICKOFF, EngineJobState::Done).await;
+    settle().await;
+    let kickoffs = t.called(JOB_KICKOFF);
+    assert_eq!(kickoffs.len(), 1);
+    let params: KickoffParams = serde_json::from_slice(&kickoffs[0]).unwrap();
+    assert_eq!(params.tx_hash, "0xsecond");
+    t.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn only_the_owning_operator_acts_on_a_withdraw() {
+    let t = start(Actor::Operator, false).await;
+    let instance_id = t.insert_instance(InstanceBridgeInStatus::RelayerL2Minted).await;
+    let foreign =
+        t.insert_graph_of(OTHER_OPERATOR, instance_id, 0, GraphStatus::OperatorDataPushed).await;
+    let init = t.submit(withdraw_init_event(instance_id, foreign, "0xother").unwrap()).await;
+    t.wait_inbox(&init, EngineInboxState::Applied).await;
+    // The first slot has no predecessor: the own graph kicks off at once.
+    let own = t.insert_graph(instance_id, 0, GraphStatus::OperatorDataPushed).await;
+    let init = t.submit(withdraw_init_event(instance_id, own, "0xown").unwrap()).await;
+    t.wait_inbox(&init, EngineInboxState::Applied).await;
+    t.wait_job(own, JOB_KICKOFF, EngineJobState::Done).await;
+    assert!(t.jobs_of(foreign).await.is_empty());
+    t.stop().await;
+
+    let t = start(Actor::Verifier, false).await;
+    let instance_id = t.insert_instance(InstanceBridgeInStatus::RelayerL2Minted).await;
+    let graph_id = t.insert_graph(instance_id, 0, GraphStatus::OperatorDataPushed).await;
+    let init = t.submit(withdraw_init_event(instance_id, graph_id, "0xv").unwrap()).await;
+    t.wait_inbox(&init, EngineInboxState::Applied).await;
+    settle().await;
+    assert!(t.calls().is_empty());
+    t.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_chain_scan_records_the_stage_and_runs_each_roles_job() {
+    let signals = vec![PegoutSignal::PreKickoffSent, PegoutSignal::KickoffSent];
+    for (actor, relayer, expected) in [
+        (Actor::Verifier, false, vec![JOB_CHECK_PREVIOUS_GRAPH, JOB_CHALLENGE_KICKOFF]),
+        (Actor::Committee, true, vec![JOB_PROCEED_WITHDRAW]),
+        (Actor::Committee, false, vec![]),
+        (Actor::Watchtower, false, vec![]),
+    ] {
+        let t = start(actor.clone(), relayer).await;
+        let instance_id = t.insert_instance(InstanceBridgeInStatus::RelayerL2Minted).await;
+        let graph_id = t.insert_graph(instance_id, 1, GraphStatus::OperatorDataPushed).await;
+        let event = scan(
+            100,
+            GraphStatus::OperatorDataPushed,
+            GraphStatus::OperatorKickOff,
+            signals.clone(),
+            None,
+        )
+        .event(graph_id)
+        .unwrap();
+        let event_id = t.submit(event).await;
+        t.wait_inbox(&event_id, EngineInboxState::Applied).await;
+        t.wait_status(graph_id, GraphStatus::OperatorKickOff).await;
+        t.wait_phase(graph_id, PHASE_SETTLEMENT).await;
+        for action in &expected {
+            t.wait_job(graph_id, action, EngineJobState::Done).await;
+        }
+        settle().await;
+        let mut called: Vec<String> = t.calls().into_iter().map(|(action, _)| action).collect();
+        called.sort();
+        let mut expected: Vec<String> = expected.iter().map(ToString::to_string).collect();
+        expected.sort();
+        assert_eq!(called, expected, "{actor} relayer={relayer}");
+        if actor == Actor::Verifier {
+            let check = PegoutSignal::decode(&t.job_params(JOB_CHECK_PREVIOUS_GRAPH)).unwrap();
+            assert_eq!(check, PegoutSignal::PreKickoffSent);
+        }
+        t.stop().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_closed_graph_keeps_the_relayers_goat_call() {
+    let t = start(Actor::Committee, true).await;
+    let instance_id = t.insert_instance(InstanceBridgeInStatus::RelayerL2Minted).await;
+    let graph_id = t.insert_graph(instance_id, 0, GraphStatus::OperatorKickOff).await;
+    let event = scan(
+        200,
+        GraphStatus::OperatorKickOff,
+        GraphStatus::OperatorTake1,
+        vec![PegoutSignal::PreKickoffSent, PegoutSignal::KickoffSent, PegoutSignal::Take1Sent],
+        None,
+    )
+    .event(graph_id)
+    .unwrap();
+    let event_id = t.submit(event).await;
+    t.wait_inbox(&event_id, EngineInboxState::Applied).await;
+    t.wait_phase(graph_id, PHASE_CLOSED).await;
+    // Closing the graph cancels setup work, not the Goat call it still owes.
+    t.wait_job(graph_id, JOB_FINISH_HAPPY, EngineJobState::Done).await;
+    t.wait_job(graph_id, JOB_PROCEED_WITHDRAW, EngineJobState::Done).await;
+    t.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dead_prekickoff_obsoletes_the_slot_and_every_later_one() {
+    let t = start(Actor::Committee, false).await;
+    let instance_id = t.insert_instance(InstanceBridgeInStatus::RelayerL2Minted).await;
+    let earlier = t.insert_graph(instance_id, 1, GraphStatus::OperatorDataPushed).await;
+    let dead = t.insert_graph(instance_id, 2, GraphStatus::CommitteePresigned).await;
+    let later = t.insert_graph(instance_id, 3, GraphStatus::OperatorDataPushed).await;
+    let foreign =
+        t.insert_graph_of(OTHER_OPERATOR, instance_id, 5, GraphStatus::OperatorPresigned).await;
+    let unusable = Unusable::PrekickoffInputSpent {
+        outpoint: bitcoin::OutPoint { txid: txid(1), vout: 2 },
+        spent_by: txid(9),
+    };
+    let event = scan(
+        300,
+        GraphStatus::CommitteePresigned,
+        GraphStatus::CommitteePresigned,
+        Vec::new(),
+        Some(unusable),
+    )
+    .event(dead)
+    .unwrap();
+    let event_id = t.submit(event).await;
+    t.wait_inbox(&event_id, EngineInboxState::Applied).await;
+    t.wait_status(dead, GraphStatus::Obsoleted).await;
+    // A later slot follows from its own scans, which report the dead slot at
+    // every height: posted on Goat, it still stays Obsoleted.
+    let mut status_at_scan = GraphStatus::OperatorDataPushed;
+    for height in [300, 301] {
+        let behind = scan(
+            height,
+            status_at_scan,
+            GraphStatus::OperatorDataPushed,
+            Vec::new(),
+            Some(Unusable::EarlierSlotDead { slot: 2 }),
+        );
+        let event_id = t.submit(behind.event(later).unwrap()).await;
+        t.wait_inbox(&event_id, EngineInboxState::Applied).await;
+        assert_eq!(t.status(later).await, GraphStatus::Obsoleted);
+        status_at_scan = GraphStatus::Obsoleted;
+    }
+    assert_eq!(t.status(earlier).await, GraphStatus::OperatorDataPushed);
+    assert_eq!(t.status(foreign).await, GraphStatus::OperatorPresigned);
+    assert!(t.graph_state(dead).await.dead);
+    assert!(!t.graph_state(later).await.dead, "only the dead slot raises the alert");
+    t.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_obsoleted_graph_stays_monitored_and_follows_the_chain() {
+    let t = start(Actor::Verifier, false).await;
+    let instance_id = t.insert_instance(InstanceBridgeInStatus::Timeout).await;
+    let graph_id = t.insert_graph(instance_id, 1, GraphStatus::Obsoleted).await;
+    let taken = Unusable::ConnectorZeroTaken { spent_by: txid(7) };
+
+    // Posted on Goat after all: the projection gives way to the fact.
+    let posted = scan(10, GraphStatus::Obsoleted, GraphStatus::OperatorDataPushed, vec![], None);
+    t.submit(posted.event(graph_id).unwrap()).await;
+    t.wait_status(graph_id, GraphStatus::OperatorDataPushed).await;
+    // Another graph took Connector-0: unusable again.
+    let gone = scan(
+        11,
+        GraphStatus::OperatorDataPushed,
+        GraphStatus::OperatorDataPushed,
+        vec![],
+        Some(taken),
+    );
+    t.submit(gone.event(graph_id).unwrap()).await;
+    t.wait_status(graph_id, GraphStatus::Obsoleted).await;
+    // Its Pre-Kickoff lands: chain progress overrides the projection, and
+    // the verifier checks the previous slot.
+    let prekicked = scan(
+        12,
+        GraphStatus::Obsoleted,
+        GraphStatus::PreKickoff,
+        vec![PegoutSignal::PreKickoffSent],
+        None,
+    );
+    t.submit(prekicked.event(graph_id).unwrap()).await;
+    t.wait_status(graph_id, GraphStatus::PreKickoff).await;
+    t.wait_job(graph_id, JOB_CHECK_PREVIOUS_GRAPH, EngineJobState::Done).await;
+    // Skipped: closed, out of the monitoring set.
+    let skipped = scan(
+        13,
+        GraphStatus::PreKickoff,
+        GraphStatus::Skipped,
+        vec![PegoutSignal::PreKickoffSent],
+        None,
+    );
+    t.submit(skipped.event(graph_id).unwrap()).await;
+    t.wait_status(graph_id, GraphStatus::Skipped).await;
+    t.wait_phase(graph_id, PHASE_CLOSED).await;
+    assert_eq!(t.called(JOB_CHECK_PREVIOUS_GRAPH).len(), 1, "a signal runs its job once");
+    t.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_copy_stored_after_its_instance_failed_is_obsoleted_by_its_scan() {
+    let t = start(Actor::Committee, false).await;
+    // A pull stored the definition after the instance had already failed:
+    // the instance's own failure never saw it.
+    let instance_id = t.insert_instance(InstanceBridgeInStatus::Timeout).await;
+    let graph_id = t.insert_graph(instance_id, 2, GraphStatus::OperatorPresigned).await;
+    let event =
+        scan(40, GraphStatus::OperatorPresigned, GraphStatus::OperatorPresigned, Vec::new(), None)
+            .event(graph_id)
+            .unwrap();
+    t.submit(event).await;
+    t.wait_status(graph_id, GraphStatus::Obsoleted).await;
+    t.wait_phase(graph_id, PHASE_OBSOLETED).await;
     t.stop().await;
 }

@@ -1,8 +1,8 @@
+#[cfg(feature = "rpc-debug-endpoints")]
+use crate::aggregates::graph_pegout_jobs::broadcast_verifier_challenge_assert_tx;
 use crate::env::{
     GraphBtcTxName, get_goat_gateway_contract_from_env, get_node_goat_address, get_node_pubkey,
 };
-#[cfg(feature = "rpc-debug-endpoints")]
-use crate::handle::broadcast_verifier_challenge_assert_tx;
 use crate::rpc_service::AppState;
 use crate::rpc_service::bitvm::*;
 use crate::rpc_service::node::ALIVE_TIME_JUDGE_THRESHOLD;

@@ -13,9 +13,11 @@ use super::graph::{
     JOB_INGEST_VOTE, JOB_OPERATOR_INIT, JOB_POST_GRAPH_DATA, JOB_SEAL_PROOFS, JOB_VERIFIER_SETUP,
     JOB_VERIFIER_SOLDER, JOB_VERIFIER_VALIDATE_GRAPH, OperatorStart, PHASE_COLLECT, PHASE_DELIVER,
     PHASE_ENDORSE, PHASE_SETUP, PHASE_SIGNING, PlannedMessage, delivery_id, graph_pulled_event,
-    graph_ref, outbox_id, slot_ref,
+    graph_ref, outbox_id, retired, slot_ref,
 };
 use super::graph_fetch::{GraphLookup, fetch_and_store_graph};
+use super::graph_pegout::PEGOUT_JOBS;
+use super::graph_pegout_jobs::run_pegout_step;
 use super::graph_setup::{
     CandidateReadiness, build_babe_prover_state, build_signed_init_graph,
     candidate_freeze_readiness, cut_circuits_owed, decode_soldering_proof_payload,
@@ -45,7 +47,7 @@ use crate::soldering_payload_store::{
 use crate::utils::{
     CommitteeMembership, OperatorBabeSetupState, OperatorStakeStatus, VerifierBabeSetupState,
     build_genesis_prekickoff_tx, build_graph_params, build_prekickoff_params,
-    compensate_graph_events, derive_operator_static_input, endorse_graph, endorse_graph_params,
+    derive_operator_static_input, endorse_graph, endorse_graph_params,
     get_committee_agg_nonce_consensus_for_graph, get_committee_endorsements_for_graph,
     get_committee_params_endorsements_for_graph, get_committee_partial_sigs_for_graph,
     get_committee_partial_sigs_for_graph_member, get_committee_pub_nonces_for_graph,
@@ -86,6 +88,7 @@ use bitvm_lib::operator::{
 use bitvm_lib::types::{BitvmGcGraph, SimplifiedBitvmGcGraph};
 use client::btc_chain::BTCClient;
 use client::goat_chain::{GOATClient, PeginStatus};
+use client::http_client::async_client::HttpAsyncClient;
 use engine::{EngineBuilder, JobContext, JobOutcome, JobRunner};
 use goat::transactions::pre_signed::PreSignedTransaction;
 use libp2p::PeerId;
@@ -103,6 +106,8 @@ pub struct GraphJobDeps {
     pub local_db: LocalDB,
     pub btc_client: Arc<BTCClient>,
     pub goat_client: Arc<GOATClient>,
+    /// Proof builder requests of the peg-out jobs.
+    pub http_client: Arc<HttpAsyncClient>,
     pub soldering_builder: Option<Arc<BabeBundleBuilder>>,
     pub metrics_state: MetricsState,
     pub publisher: NetworkPublisher,
@@ -112,7 +117,7 @@ pub struct GraphJobDeps {
 pub fn register_graph_jobs(builder: EngineBuilder, deps: Arc<GraphJobDeps>) -> EngineBuilder {
     let runner: Arc<dyn JobRunner> = Arc::new(GraphJobRunner { deps });
     let mut builder = builder;
-    for action in ALL_JOBS {
+    for action in ALL_JOBS.iter().chain(PEGOUT_JOBS) {
         builder = builder.job_runner(GRAPH_KIND, *action, runner.clone());
     }
     builder
@@ -125,15 +130,15 @@ pub enum Step {
 }
 
 impl Step {
-    fn done(plan: GraphPlan) -> Result<Step> {
+    pub(super) fn done(plan: GraphPlan) -> Result<Step> {
         Ok(Step::Plan(Box::new(plan)))
     }
 
-    fn ignore(note: impl Into<String>) -> Result<Step> {
+    pub(super) fn ignore(note: impl Into<String>) -> Result<Step> {
         Ok(Step::Plan(Box::new(GraphPlan::noted(note))))
     }
 
-    fn retry(reason: impl Into<String>, after_secs: i64) -> Result<Step> {
+    pub(super) fn retry(reason: impl Into<String>, after_secs: i64) -> Result<Step> {
         Ok(Step::Retry { reason: reason.into(), after_secs: Some(after_secs) })
     }
 }
@@ -165,6 +170,15 @@ impl JobRunner for GraphJobRunner {
                 JobOutcome::Transient { error: reason, retry_after_secs: after_secs }
             }
             Err(error) => match permanent_rejection(&error) {
+                Some(reason) if PEGOUT_JOBS.contains(&action.as_str()) => {
+                    // A Goat revert on a peg-out call: retrying cannot help.
+                    warn!(event = "graph_job", graph_id = %graph_id, action = %action, reason = %reason, "peg-out action rejected");
+                    self.deps.metrics_state.record_instance_alert("pegout_action_rejected");
+                    match GraphPlan::noted(format!("rejected: {reason}")).encode() {
+                        Ok(bytes) => JobOutcome::Done(bytes),
+                        Err(error) => JobOutcome::Failed(format!("encode plan: {error}")),
+                    }
+                }
                 Some(reason) => {
                     warn!(event = "graph_job", graph_id = %graph_id, action = %action, reason = %reason, "message rejected");
                     self.deps.metrics_state.record_graph_validation(false);
@@ -214,6 +228,9 @@ async fn run_step(
         JOB_INGEST_FINALIZED => ingest_finalized(deps, graph_id, params).await,
         JOB_POST_GRAPH_DATA => post_graph_data(deps, graph_id, params).await,
         JOB_FETCH_GRAPH => fetch_graph(deps, graph_id, params, attempts).await,
+        pegout if PEGOUT_JOBS.contains(&pegout) => {
+            run_pegout_step(deps, pegout, graph_id, params).await
+        }
         other => bail!("unknown graph job {other}"),
     }
 }
@@ -1208,10 +1225,15 @@ async fn ingest_endorsement(deps: &GraphJobDeps, graph_id: Uuid, params: &[u8]) 
 }
 
 async fn finalize_graph(deps: &GraphJobDeps, graph_id: Uuid, _params: &[u8]) -> Result<Step> {
-    let (instance_id, _) = match graph_identity(deps, graph_id).await? {
-        Some(identity) => identity,
-        None => return Step::ignore("graph not stored locally"),
+    let Some(row) = deps.local_db.acquire().await?.find_graph(&graph_id).await? else {
+        return Step::ignore("graph not stored locally");
     };
+    // Given up at the abandon height while the signatures were still being
+    // collected: the slot is left for the Skip, nothing is finalized.
+    if retired(GraphStatus::from_str(&row.status).ok()) {
+        return Step::ignore(format!("graph is {}", row.status));
+    }
+    let instance_id = row.instance_id;
     let endorsements =
         get_committee_endorsements_for_graph(&deps.local_db, instance_id, graph_id).await?;
     let params_endorsements =
@@ -1334,14 +1356,15 @@ async fn graph_identity(deps: &GraphJobDeps, graph_id: Uuid) -> Result<Option<(U
 }
 
 /// Reconcile the finalized graph against both chains; a failure here is only
-/// logged, the finalized definition is already stored.
+/// logged, the finalized definition is already stored. What the chain asks
+/// of this node next comes from the graph's chain scans.
 async fn refresh_and_compensate(
     deps: &GraphJobDeps,
     instance_id: Uuid,
     graph_id: Uuid,
     graph: &BitvmGcGraph,
 ) {
-    match refresh_graph(
+    if let Err(error) = refresh_graph(
         &deps.local_db,
         &deps.btc_client,
         &deps.goat_client,
@@ -1351,26 +1374,7 @@ async fn refresh_and_compensate(
     )
     .await
     {
-        Ok(refresh) => {
-            if refresh.status_transition_accepted
-                && let Err(error) = compensate_graph_events(
-                    &deps.local_db,
-                    &deps.btc_client,
-                    instance_id,
-                    graph_id,
-                    graph,
-                    refresh.scan.as_ref(),
-                    GraphStatus::CommitteePresigned,
-                    refresh.status,
-                )
-                .await
-            {
-                warn!(event = "graph_refresh", graph_id = %graph_id, error = %error, "graph compensation failed");
-            }
-        }
-        Err(error) => {
-            warn!(event = "graph_refresh", graph_id = %graph_id, error = %error, "graph refresh failed");
-        }
+        warn!(event = "graph_refresh", graph_id = %graph_id, error = %error, "graph refresh failed");
     }
 }
 

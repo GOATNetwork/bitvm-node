@@ -669,8 +669,8 @@ impl InstanceAggregate {
         );
         ctx.effects.cancel_phase_jobs(PHASE_POST);
         ctx.effects.cancel_phase_jobs(PHASE_CONFIRM);
-        // Every graph of the instance: deliveries closed, jobs cancelled, and
-        // its slot settled for the operator's next graph (§10.5).
+        // Close graph deliveries and cancel setup/post jobs. Keep kickoff and settlement
+        // jobs so chain monitoring and challenges can continue.
         for graph in ctx.storage.get_graphs_by_instance_id(&instance_id).await? {
             let graph_ref = crate::aggregates::graph::graph_ref(graph.graph_id);
             ctx.effects.close_outbox(
@@ -680,30 +680,24 @@ impl InstanceAggregate {
                 },
                 format!("instance {failed}"),
             );
-            ctx.effects.cancel_jobs_for_aggregate(&graph_ref);
+            for phase in [crate::aggregates::graph::JOB_PHASE, crate::aggregates::graph::PHASE_POST]
+            {
+                ctx.effects.cancel_phase_jobs_for_aggregate(&graph_ref, phase);
+            }
             ctx.effects.wake(crate::aggregates::graph::slot_ref(
                 &graph.operator_pubkey,
                 graph.kickoff_index as u64,
             ));
         }
         // A setup session that never stored a definition (the operator's own
-        // graph in Setup): its deliveries and jobs go, the session goes, and
-        // the slot it was taking is released to the starts waiting on it.
+        // graph in Setup) is released with the slot it was taking.
         for session in ctx.storage.list_pending_graph_inits_by_instance(&instance_id).await? {
-            let graph_ref = crate::aggregates::graph::graph_ref(session.graph_id);
-            ctx.effects.close_outbox(
-                EngineOutboxCloseTarget::Aggregate {
-                    aggregate_kind: graph_ref.kind.clone(),
-                    aggregate_id: graph_ref.id.clone(),
-                },
-                format!("instance {failed}"),
-            );
-            ctx.effects.cancel_jobs_for_aggregate(&graph_ref);
-            ctx.storage.delete_pending_graph_init(&instance_id, &session.operator_pubkey).await?;
-            let next_slot =
-                crate::aggregates::graph::next_slot(ctx, &session.operator_pubkey).await?;
-            ctx.effects
-                .wake(crate::aggregates::graph::slot_ref(&session.operator_pubkey, next_slot));
+            let next_slot = crate::aggregates::graph::release_setup_session(
+                ctx,
+                &session,
+                &format!("instance {failed}"),
+            )
+            .await?;
             info!(
                 event = "instance_failed",
                 instance_id = %instance_id,

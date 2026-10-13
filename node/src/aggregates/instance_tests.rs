@@ -460,6 +460,49 @@ async fn user_canceled_from_the_confirm_phase_deletes_the_key() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_instance_keeps_the_settlement_jobs_of_its_graphs() {
+    use InstanceBridgeInStatus::*;
+    let t = start(Actor::Committee, true, true).await;
+    let id = t.insert(&instance_row(Presigned, PREPARE)).await;
+    let graph_id = t.insert_graph(id).await;
+    let job = |job_id: &str, phase: &str, action: &str| store::NewEngineJob {
+        job_id: job_id.to_string(),
+        aggregate_kind: "graph".to_string(),
+        aggregate_id: graph_id.to_string(),
+        phase: phase.to_string(),
+        action: action.to_string(),
+        pool: "network".to_string(),
+        params: Vec::new(),
+        deadline_at: None,
+        first_at: i64::MAX,
+    };
+    {
+        let mut storage = t.db.acquire().await.unwrap();
+        for (job_id, phase, action) in [
+            ("setup", crate::aggregates::graph::JOB_PHASE, "committee_presign"),
+            ("post", crate::aggregates::graph::PHASE_POST, "post_graph_data"),
+            ("challenge", "Settlement", "challenge_kickoff"),
+        ] {
+            assert!(storage.insert_engine_job(&job(job_id, phase, action), 1).await.unwrap());
+        }
+    }
+    t.snapshot(id, presign_snapshot(1_070, TxFact::UNKNOWN, TxFact::confirmed_at(1_069))).await;
+    t.wait_status(id, UserCanceled).await;
+    assert_eq!(t.graph_status(graph_id).await, GraphStatus::Obsoleted.to_string());
+    let mut storage = t.db.acquire().await.unwrap();
+    for (job_id, state) in [("setup", "Cancelled"), ("post", "Cancelled"), ("challenge", "Pending")]
+    {
+        assert_eq!(
+            storage.find_engine_job(job_id).await.unwrap().unwrap().state,
+            state,
+            "{job_id}"
+        );
+    }
+    drop(storage);
+    t.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn timeout_keeps_the_key_until_cancel_confirms() {
     use InstanceBridgeInStatus::*;
     let t = start(Actor::Committee, true, true).await;

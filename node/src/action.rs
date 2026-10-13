@@ -2,8 +2,7 @@
 #![allow(clippy::single_match)]
 #![allow(clippy::collapsible_else_if)]
 
-use crate::aggregates::graph::{graph_pull_event, inbound_event};
-use crate::aggregates::graph_fetch::GraphLookup;
+use crate::aggregates::graph::inbound_event;
 use crate::env::{MESSAGE_EXPIRE_TIME, get_p2p_inbox_batch_size};
 use crate::handle::{HandlerContext, dispatch as handle_dispatch};
 use crate::metrics_service::MetricsState;
@@ -592,18 +591,12 @@ impl MessageKind {
     /// Receiver roles handled by `dispatch` or, for the graph-phase kinds, by
     /// the Graph aggregate (`aggregates::graph::route_action`).
     pub fn handled_by(self, actor: &Actor) -> bool {
-        use Actor::{Committee, Operator, Verifier, Watchtower};
+        use Actor::Committee;
         match self {
             // Every role has an arm (a role-specific one or the default).
             Self::PeginRequest
             | Self::ConfirmInstance
             | Self::GraphSetupAck
-            | Self::KickoffSent
-            | Self::PreKickoffSent
-            | Self::ChallengeSent
-            | Self::DisproveSent
-            | Self::Take1Sent
-            | Self::Take2Sent
             | Self::RequestNodeInfo
             | Self::ResponseNodeInfo
             // Not dispatched through the role table; keep them as they are.
@@ -627,19 +620,27 @@ impl MessageKind {
             | Self::PeginConfirmNonceConsensus
             | Self::PeginConfirmPartialSig
             | Self::PostReady => matches!(actor, Committee),
+            // Peg-out runs on the Graph aggregate from chain scans (step 4);
+            // these local events are no longer dispatched by anyone.
             Self::KickoffReady
+            | Self::KickoffSent
+            | Self::PreKickoffSent
+            | Self::ChallengeSent
+            | Self::DisproveSent
+            | Self::Take1Sent
+            | Self::Take2Sent
             | Self::WatchtowerChallengeSent
             | Self::WatchtowerChallengeTimeout
             | Self::OperatorCommitPubinReady
             | Self::AssertReady
             | Self::ChallengeAssertSent
             | Self::Take1Ready
-            | Self::Take2Ready => matches!(actor, Operator),
-            Self::WatchtowerChallengeInitSent => matches!(actor, Watchtower),
-            Self::NackReady
+            | Self::Take2Ready
+            | Self::WatchtowerChallengeInitSent
+            | Self::NackReady
             | Self::OperatorCommitPubinTimeout
             | Self::AssertSent
-            | Self::WronglyChallengeTimeout => matches!(actor, Verifier),
+            | Self::WronglyChallengeTimeout => false,
         }
     }
 }
@@ -3240,77 +3241,6 @@ fn defer_current_inbox(message: &GOATMessage, delay_secs: usize, reason_detail: 
             true
         })
         .unwrap_or(false)
-}
-
-/// Try to get the graph. If missing, ask the Graph aggregate to pull the
-/// definition (docs/node-protocol.md §10.5) and defer the current handling.
-pub(crate) async fn get_graph_or_defer(
-    local_db: &LocalDB,
-    instance_id: Uuid,
-    graph_id: Uuid,
-    message: &GOATMessage,
-) -> Result<Option<SimplifiedBitvmGcGraph>> {
-    match get_graph(local_db, instance_id, graph_id).await? {
-        Some(g) => Ok(Some(g)),
-        None => {
-            let pull = match graph_pull_event(
-                graph_id,
-                GraphLookup::Id { instance_id, graph_id, finalized: false },
-            ) {
-                Ok(event) => crate::engine_bridge::submit_event(local_db, event).await,
-                Err(error) => Err(error),
-            };
-            let pull_outcome = match pull {
-                Ok(()) => "submitted",
-                Err(error) => {
-                    tracing::warn!(
-                        event = "graph_resolution",
-                        outcome = "pull_request_failed",
-                        instance_id = %instance_id,
-                        graph_id = %graph_id,
-                        message_type = message.content.event_type(),
-                        error = %error,
-                        "failed to ask for the graph definition"
-                    );
-                    "failed"
-                }
-            };
-            let delay_secs: usize = 60;
-            if let Err(error) = defer_or_enqueue_message(
-                local_db,
-                message,
-                delay_secs,
-                MessageDeferReason::GraphSyncPending,
-                "graph is missing locally; asked the Graph aggregate to pull it",
-            )
-            .await
-            {
-                tracing::error!(
-                    event = "graph_resolution",
-                    outcome = "defer_failed",
-                    instance_id = %instance_id,
-                    graph_id = %graph_id,
-                    message_type = message.content.event_type(),
-                    retry_after_secs = delay_secs,
-                    error_class = "database",
-                    error = %error,
-                    "failed to enqueue message while graph is missing"
-                );
-                return Err(error).context("failed to defer message while graph is missing");
-            }
-            tracing::info!(
-                event = "graph_resolution",
-                outcome = "deferred_missing_graph",
-                instance_id = %instance_id,
-                graph_id = %graph_id,
-                message_type = message.content.event_type(),
-                pull_outcome,
-                retry_after_secs = delay_secs,
-                "graph missing locally; asked for it and deferred the message"
-            );
-            Ok(None)
-        }
-    }
 }
 
 #[cfg(test)]

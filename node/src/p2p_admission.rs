@@ -2309,7 +2309,7 @@ pub async fn evaluate_inbound_message(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::action::KickoffSent;
+    use crate::action::{ConfirmInstance, KickoffSent};
     use bitvm_lib::actors::Actor;
     use uuid::Uuid;
 
@@ -2399,13 +2399,11 @@ mod tests {
         }
     }
 
-    async fn kickoff_sent_bytes() -> Vec<u8> {
+    /// A durable message every role stores.
+    async fn durable_bytes() -> Vec<u8> {
         GOATMessage::new(
-            Actor::Committee,
-            GOATMessageContent::KickoffSent(KickoffSent {
-                instance_id: Uuid::new_v4(),
-                graph_id: Uuid::new_v4(),
-            }),
+            Actor::All,
+            GOATMessageContent::ConfirmInstance(ConfirmInstance { instance_id: Uuid::new_v4() }),
         )
         .serialize_message()
         .await
@@ -2806,7 +2804,7 @@ mod tests {
         let verdict = gates.evaluate(&local_db, &limits, &source, 1, b"not a message", now).await;
         assert!(matches!(verdict, InboundVerdict::Drop(DropReason::Undecodable)));
 
-        let first = kickoff_sent_bytes().await;
+        let first = durable_bytes().await;
         let verdict = gates.evaluate(&local_db, &limits, &source, 2, &first, now).await;
         let InboundVerdict::Enqueue { class, content_hash, .. } = verdict else {
             panic!("an empty inbox admits the first message");
@@ -2818,7 +2816,7 @@ mod tests {
                 message_id: "first".to_string(),
                 actor: "Committee".to_string(),
                 from_peer: source.to_string(),
-                msg_type: "KickoffSent".to_string(),
+                msg_type: "ConfirmInstance".to_string(),
                 content: first.clone(),
                 content_size: first.len() as i64,
                 admission_class: class.to_string(),
@@ -2834,7 +2832,7 @@ mod tests {
         assert!(matches!(verdict, InboundVerdict::Duplicate(_)));
 
         // A different payload from the same sender is over its row quota ...
-        let second = kickoff_sent_bytes().await;
+        let second = durable_bytes().await;
         let verdict = gates.evaluate(&local_db, &limits, &source, 4, &second, now).await;
         assert!(matches!(verdict, InboundVerdict::Drop(DropReason::SenderQuota)));
 
@@ -2856,7 +2854,7 @@ mod tests {
         let member = PeerId::random();
         gates.registry.record_committee_peer(&member, Some(true), now);
 
-        let message = kickoff_sent_bytes().await;
+        let message = durable_bytes().await;
         let verdict = gates.evaluate(&local_db, &SMALL, &member, 100, &message, now).await;
         assert!(matches!(verdict, InboundVerdict::Enqueue { .. }));
         for _ in 0..3 {
@@ -2866,7 +2864,7 @@ mod tests {
 
         // Unregistered authors use rate limits rather than replay tracking.
         let stranger = PeerId::random();
-        let other = kickoff_sent_bytes().await;
+        let other = durable_bytes().await;
         let verdict = gates.evaluate(&local_db, &SMALL, &stranger, 7, &other, now).await;
         assert!(matches!(verdict, InboundVerdict::Enqueue { .. }));
     }
@@ -3096,13 +3094,13 @@ mod tests {
         // Nothing is inserted between evaluations: only the cache can know that
         // the class already has two rows on their way into the inbox.
         for sequence_number in 0..2 {
-            let message = kickoff_sent_bytes().await;
+            let message = durable_bytes().await;
             let verdict = gates
                 .evaluate(&local_db, &limits, &PeerId::random(), sequence_number, &message, now)
                 .await;
             assert!(matches!(verdict, InboundVerdict::Enqueue { .. }));
         }
-        let message = kickoff_sent_bytes().await;
+        let message = durable_bytes().await;
         let verdict = gates.evaluate(&local_db, &limits, &PeerId::random(), 9, &message, now).await;
         assert!(matches!(verdict, InboundVerdict::Drop(DropReason::UnregisteredClassQuota)));
 
@@ -3488,27 +3486,25 @@ mod tests {
     /// takes no inbox row and no quota.
     #[tokio::test]
     async fn messages_for_another_role_are_forwarded_without_being_stored() {
-        use crate::action::NackReady;
+        use crate::action::PostReady;
 
         let local_db = store::create_local_db("sqlite::memory:").await;
         let mut gates = TestGates::new(PeerRateLimiter::new(10.0, 1.0, 16));
         let now = Instant::now();
         let source = PeerId::random();
-        let nack_ready = GOATMessage::new(
-            Actor::Verifier,
-            GOATMessageContent::NackReady(NackReady {
-                instance_id: Uuid::new_v4(),
-                graph_id: Uuid::new_v4(),
-            }),
+        let post_ready = GOATMessage::new(
+            Actor::Committee,
+            GOATMessageContent::PostReady(PostReady { instance_id: Uuid::new_v4() }),
         )
         .serialize_message()
         .await
         .unwrap();
 
-        let verdict = gates.evaluate(&local_db, &SMALL, &source, 1, &nack_ready, now).await;
-        assert!(matches!(verdict, InboundVerdict::Forward), "a committee node has no handler");
         gates.local_actor = Actor::Verifier;
-        let verdict = gates.evaluate(&local_db, &SMALL, &source, 2, &nack_ready, now).await;
+        let verdict = gates.evaluate(&local_db, &SMALL, &source, 1, &post_ready, now).await;
+        assert!(matches!(verdict, InboundVerdict::Forward), "a verifier node has no handler");
+        gates.local_actor = Actor::Committee;
+        let verdict = gates.evaluate(&local_db, &SMALL, &source, 2, &post_ready, now).await;
         assert!(matches!(verdict, InboundVerdict::Enqueue { .. }));
     }
 
@@ -3554,7 +3550,7 @@ mod tests {
                 );
             }
         }
-        assert!(arms >= 25, "the scan found only {arms} arms; has dispatch moved?");
+        assert!(arms >= 8, "the scan found only {arms} arms; has dispatch moved?");
     }
 
     /// Verify committee-only reserves in shared rate tiers.

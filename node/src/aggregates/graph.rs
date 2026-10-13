@@ -6,6 +6,10 @@
 
 use crate::action::{BusinessRef, GOATMessage, GOATMessageContent, HasBusinessRef};
 use crate::aggregates::graph_fetch::GraphLookup;
+use crate::aggregates::graph_pegout::{
+    EVENT_CHAIN_SCAN, EVENT_GOAT_STATUS, EVENT_WITHDRAW_CANCEL, EVENT_WITHDRAW_INIT, PEGOUT_JOBS,
+    PHASE_KICKOFF, PHASE_SETTLEMENT, pegout_job_pool,
+};
 use crate::aggregates::instance::graph_endorsed_event;
 use crate::engine_bridge::record_event_in;
 use crate::metrics_service::node_metrics_state;
@@ -25,7 +29,7 @@ use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use store::localdb::GraphQuery;
-use store::{EngineJobState, GraphStatus, InstanceBridgeInStatus};
+use store::{EngineJobState, GraphStatus, GraphStatusSource, InstanceBridgeInStatus};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -36,6 +40,8 @@ pub const EVENT_GRAPH_POSTED: &str = "graph_posted";
 pub const EVENT_GRAPH_PULL: &str = "graph_pull";
 /// A definition this node pulled was stored (sent to the pulled graph).
 pub const EVENT_GRAPH_PULLED: &str = "graph_pulled";
+/// The operator's setup was still unfinished at the instance's abandon height.
+pub const EVENT_SETUP_ABANDONED: &str = "setup_abandoned";
 /// The operator's setup collected its proofs: build the definition once no
 /// other build of the operator is in flight.
 pub const EVENT_BUILD_READY: &str = "build_ready";
@@ -51,12 +57,12 @@ pub const PHASE_SIGNED: &str = "Signed";
 pub const PHASE_DELIVER: &str = "Deliver";
 pub const PHASE_POST: &str = "Post";
 pub const PHASE_AWAIT_WITHDRAW: &str = "AwaitWithdraw";
-pub const PHASE_PEGOUT: &str = "Pegout";
 pub const PHASE_CLOSED: &str = "Closed";
 pub const PHASE_OBSOLETED: &str = "Obsoleted";
 /// Outbox phase of the verifier's endorsement (closes on CommitteePresigned).
 pub const PHASE_ENDORSE: &str = "Endorse";
-/// Job phase of everything but the relayer's post.
+/// Job phase of the setup and signing jobs (everything before the relayer's
+/// post); peg-out jobs run in the Kickoff and Settlement phases.
 pub const JOB_PHASE: &str = "graph";
 
 pub const JOB_OPERATOR_INIT: &str = "operator_init_graph";
@@ -111,6 +117,9 @@ pub const ALL_JOBS: &[&str] = &[
 
 /// CPU-bound jobs share the engine's `J` slots; the rest talk to the chain.
 pub fn job_pool(action: &str) -> JobPool {
+    if PEGOUT_JOBS.contains(&action) {
+        return pegout_job_pool(action);
+    }
     match action {
         JOB_VERIFIER_SETUP
         | JOB_VERIFIER_SOLDER
@@ -189,6 +198,14 @@ pub struct GraphPull {
 pub struct GraphPulled {
     pub instance_id: Uuid,
     pub finalized: bool,
+}
+
+/// The Bitcoin height a scan saw at or past the instance's abandon height.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetupAbandoned {
+    pub instance_id: Uuid,
+    pub abandon_height: i64,
+    pub height: i64,
 }
 
 /// A message the apply writes to the outbox.
@@ -278,6 +295,18 @@ pub struct GraphState {
     pub finalized: bool,
     #[serde(default)]
     pub pending_session: bool,
+    /// The operator's live `InitWithdraw` (its Goat tx hash): Kickoff phase.
+    #[serde(default)]
+    pub withdraw: Option<String>,
+    /// Withdraws cancelled on Goat; a late re-apply of their init is ignored.
+    #[serde(default)]
+    pub retired_withdraws: Vec<String>,
+    /// The graph's Pre-Kickoff can never confirm (reported once).
+    #[serde(default)]
+    pub dead: bool,
+    /// The operator gave up its unfinished setup at the abandon height.
+    #[serde(default)]
+    pub abandoned: bool,
 }
 
 impl GraphState {
@@ -453,6 +482,21 @@ pub fn build_ready_event(graph_id: Uuid) -> NewEvent {
     )
 }
 
+/// Keyed by height, not only by graph: a graph whose build lands after its
+/// session was released is still given up on a later block.
+pub fn setup_abandoned_event(
+    graph_id: Uuid,
+    abandoned: &SetupAbandoned,
+) -> anyhow::Result<NewEvent> {
+    Ok(NewEvent::new(
+        format!("graph:{graph_id}:abandon:{}", abandoned.height),
+        graph_ref(graph_id),
+        EVENT_SETUP_ABANDONED,
+        EventSource::Height,
+        bincode::serialize(abandoned)?,
+    ))
+}
+
 /// A pull stored this graph's definition; the graph's own apply decides what
 /// follows (the relayer's post for a finalized one).
 pub fn graph_pulled_event(
@@ -500,8 +544,13 @@ pub fn graph_pull_event(graph_id: Uuid, lookup: GraphLookup) -> anyhow::Result<N
 
 // -------------------------------------------------------------------- phases
 
-/// Phase of the graph state machine for this role (§10.7.2).
-pub fn phase_of(status: Option<GraphStatus>, actor: &Actor, relayer: bool) -> &'static str {
+/// Choose the local phase from graph status, node role and live withdrawal state.
+pub fn phase_of(
+    status: Option<GraphStatus>,
+    actor: &Actor,
+    relayer: bool,
+    withdrawing: bool,
+) -> &'static str {
     use GraphStatus::*;
     match status {
         None => PHASE_SETUP,
@@ -515,8 +564,10 @@ pub fn phase_of(status: Option<GraphStatus>, actor: &Actor, relayer: bool) -> &'
             _ if relayer => PHASE_POST,
             _ => PHASE_SIGNED,
         },
+        Some(OperatorDataPushed) if withdrawing => PHASE_KICKOFF,
         Some(OperatorDataPushed) => PHASE_AWAIT_WITHDRAW,
-        Some(PreKickoff | OperatorKickOff | Challenge) => PHASE_PEGOUT,
+        Some(PreKickoff) => PHASE_KICKOFF,
+        Some(OperatorKickOff | Challenge) => PHASE_SETTLEMENT,
         Some(Obsoleted) => PHASE_OBSOLETED,
         Some(Skipped | Disprove | OperatorTake1 | OperatorTake2) => PHASE_CLOSED,
     }
@@ -534,7 +585,8 @@ pub fn posted_or_later(status: Option<GraphStatus>) -> bool {
     })
 }
 
-/// The graph is unusable or finished: deliveries closed, jobs cancelled.
+/// Whether setup and deliveries should stop. Peg-out work may still be needed
+/// for chain monitoring or Goat settlement.
 pub fn retired(status: Option<GraphStatus>) -> bool {
     status.is_some_and(|status| status.is_obsoleted() || status.is_closed())
 }
@@ -562,16 +614,44 @@ pub struct GraphAggregate {
     relayer: bool,
     local_peer: String,
     membership: Arc<dyn MembershipProbe>,
+    /// The local operator key as stored in `graph.operator_pubkey`.
+    local_operator: Option<String>,
 }
 
 impl GraphAggregate {
     pub fn new(actor: Actor, relayer: bool, local_peer: String) -> Self {
-        Self { actor, relayer, local_peer, membership: Arc::new(EnvelopeProbe) }
+        Self {
+            actor,
+            relayer,
+            local_peer,
+            membership: Arc::new(EnvelopeProbe),
+            local_operator: None,
+        }
     }
 
     pub fn with_membership(mut self, membership: Arc<dyn MembershipProbe>) -> Self {
         self.membership = membership;
         self
+    }
+
+    /// The operator key whose graphs this node withdraws and defends.
+    pub fn with_local_operator(mut self, operator_pubkey: Option<String>) -> Self {
+        self.local_operator = operator_pubkey;
+        self
+    }
+
+    pub(super) fn actor(&self) -> Actor {
+        self.actor.clone()
+    }
+
+    pub(super) fn relayer(&self) -> bool {
+        self.relayer
+    }
+
+    /// The graph belongs to this node's operator.
+    pub(super) fn owns(&self, row: &store::Graph) -> bool {
+        self.actor == Actor::Operator
+            && self.local_operator.as_deref() == Some(row.operator_pubkey.as_str())
     }
 
     /// Park a message on a definition this node lacks: pull it, unless the
@@ -789,12 +869,9 @@ impl GraphAggregate {
                 if let Some(note) = &plan.note {
                     info!(event = "graph_job", graph_id = %graph_id, action = %result.action, stale = result.stale, note = %note, "job note");
                 }
-                // A setup or post job that finished after the graph was
-                // retired has nothing left to deliver or queue: its jobs were
-                // cancelled and its deliveries closed when the status moved.
-                // The wakes are kept: a waiter re-checks and finds the graph
-                // retired.
-                if retired(status) {
+                // Drop late setup/post actions for retired graphs, but preserve dependency wakes.
+                // Peg-out results may still be needed for settlement.
+                if retired(status) && !PEGOUT_JOBS.contains(&result.action.as_str()) {
                     info!(event = "graph_job", graph_id = %graph_id, action = %result.action, status = ?status, "graph retired; plan dropped");
                     plan = GraphPlan { wake_refs: plan.wake_refs, ..Default::default() };
                 }
@@ -864,7 +941,13 @@ impl GraphAggregate {
                     record_event_in(ctx.storage, build_ready_event(graph_id)).await?;
                 }
                 NextStep::Job { action, params, delay_secs } => {
-                    let phase = if action == JOB_POST_GRAPH_DATA { PHASE_POST } else { JOB_PHASE };
+                    let phase = if action == JOB_POST_GRAPH_DATA {
+                        PHASE_POST
+                    } else if PEGOUT_JOBS.contains(&action.as_str()) {
+                        PHASE_SETTLEMENT
+                    } else {
+                        JOB_PHASE
+                    };
                     let mut job =
                         JobSpec::new(&ctx.aggregate, phase, &action, job_pool(&action), params);
                     if let Some(delay) = delay_secs {
@@ -923,17 +1006,75 @@ impl GraphAggregate {
         Ok(ApplyOutcome::Applied)
     }
 
+    /// Retire unfinished setup at the abandon height and release its pending session,
+    /// allowing later setups to proceed. Built graphs without committee signatures
+    /// remain available for Skip handling.
+    async fn abandon_setup(
+        &self,
+        ctx: &mut ApplyContext<'_>,
+        graph_id: Uuid,
+        state: &mut GraphState,
+        row: Option<&store::Graph>,
+        abandoned: &SetupAbandoned,
+    ) -> anyhow::Result<ApplyOutcome> {
+        if self.actor != Actor::Operator || instance_failed(ctx, abandoned.instance_id).await? {
+            return Ok(ApplyOutcome::Applied);
+        }
+        match row {
+            Some(row) => {
+                if !self.owns(row) || row.status != GraphStatus::OperatorPresigned.to_string() {
+                    return Ok(ApplyOutcome::Applied);
+                }
+                ctx.storage
+                    .transition_graph_status(
+                        row.instance_id,
+                        graph_id,
+                        GraphStatus::Obsoleted,
+                        GraphStatusSource::ChainReconcile,
+                        None,
+                    )
+                    .await?;
+            }
+            None => {
+                let Some(session) =
+                    ctx.storage.find_pending_graph_init_by_graph_id(&graph_id).await?
+                else {
+                    return Ok(ApplyOutcome::Applied);
+                };
+                release_setup_session(ctx, &session, "setup abandoned").await?;
+                state.pending_session = false;
+            }
+        }
+        state.abandoned = true;
+        warn!(
+            event = "graph_abandoned",
+            graph_id = %graph_id,
+            instance_id = %abandoned.instance_id,
+            built = row.is_some(),
+            height = abandoned.height,
+            abandon_height = abandoned.abandon_height,
+            "setup unfinished at the abandon height; given up"
+        );
+        Ok(ApplyOutcome::Applied)
+    }
+
     /// Mirror graph status and close deliveries for completed or retired phases.
-    fn finish(
+    async fn finish(
         &self,
         ctx: &mut ApplyContext<'_>,
         graph_id: Uuid,
         state: &GraphState,
-        status: Option<GraphStatus>,
     ) -> anyhow::Result<()> {
+        // The apply may have moved the row (a chain scan): mirror what is stored.
+        let row = ctx.storage.find_graph(&graph_id).await?;
+        let status = row.as_ref().and_then(|row| GraphStatus::from_str(&row.status).ok());
         let previous = ctx.status().to_string();
         let current = status.map(|status| status.to_string()).unwrap_or_default();
         if current != previous {
+            // Waiters on the slot re-check: the operator's next build and kickoff.
+            if let Some(row) = &row {
+                ctx.effects.wake(slot_ref(&row.operator_pubkey, row.kickoff_index as u64));
+            }
             if signing_round_over(status) {
                 for phase in [PHASE_SIGNING, PHASE_ENDORSE, PHASE_SETUP] {
                     ctx.effects.close_outbox(
@@ -957,14 +1098,20 @@ impl GraphAggregate {
                 ctx.effects.cancel_phase_jobs(PHASE_POST);
             }
             if retired(status) {
-                let aggregate = ctx.aggregate.clone();
-                ctx.effects.cancel_jobs_for_aggregate(&aggregate);
+                ctx.effects.cancel_phase_jobs(JOB_PHASE);
+                ctx.effects.cancel_phase_jobs(PHASE_POST);
+            }
+            // Taken, disproved or skipped: the slot can no longer be kicked off. Obsoleted
+            // alone forbids nothing.
+            if status.is_some_and(|status| status.is_closed()) {
+                ctx.effects.cancel_phase_jobs(PHASE_KICKOFF);
             }
             info!(event = "graph_transition", graph_id = %graph_id, from = %previous, to = %current, "graph status mirrored");
         }
+        let withdrawing = state.withdraw.is_some();
         ctx.effects
             .set_status(current)
-            .set_phase(phase_of(status, &self.actor, self.relayer).to_string())
+            .set_phase(phase_of(status, &self.actor, self.relayer, withdrawing).to_string())
             .set_state(Some(serde_json::to_string(state)?));
         Ok(())
     }
@@ -1011,6 +1158,9 @@ impl AggregateHandler for GraphAggregate {
                 if row.is_some() {
                     // Built already; its deliveries live in the outbox.
                     ApplyOutcome::Applied
+                } else if state.abandoned {
+                    info!(event = "graph_apply", graph_id = %graph_id, instance_id = %start.instance_id, "instance passed its abandon height before the graph started; start dropped");
+                    ApplyOutcome::Applied
                 } else if instance_failed(ctx, start.instance_id).await? {
                     ctx.storage
                         .delete_pending_graph_init(&start.instance_id, &start.operator_pubkey)
@@ -1053,12 +1203,31 @@ impl AggregateHandler for GraphAggregate {
                 }
                 ApplyOutcome::Applied
             }
-            EVENT_GRAPH_POSTED => {
-                // The watcher already wrote OperatorDataPushed; mirroring closes
-                // every delivery of the graph below.
+            EVENT_GRAPH_POSTED | EVENT_GOAT_STATUS => {
+                // The watcher already wrote the status (OperatorDataPushed or a
+                // settlement); mirroring below closes deliveries and wakes the
+                // next slot.
                 ApplyOutcome::Applied
             }
             EVENT_BUILD_READY => self.apply_build_ready(ctx, graph_id, row.as_ref()).await?,
+            EVENT_SETUP_ABANDONED => {
+                let abandoned: SetupAbandoned = match bincode::deserialize(payload) {
+                    Ok(abandoned) => abandoned,
+                    Err(error) => {
+                        return Ok(ApplyOutcome::Rejected(format!(
+                            "malformed setup_abandoned: {error}"
+                        )));
+                    }
+                };
+                self.abandon_setup(ctx, graph_id, &mut state, row.as_ref(), &abandoned).await?
+            }
+            EVENT_WITHDRAW_INIT => {
+                self.apply_withdraw_init(ctx, &mut state, row.as_ref(), payload).await?
+            }
+            EVENT_WITHDRAW_CANCEL => self.apply_withdraw_cancel(ctx, &mut state),
+            EVENT_CHAIN_SCAN => {
+                self.apply_chain_scan(ctx, graph_id, &mut state, row.as_ref(), payload).await?
+            }
             EVENT_GRAPH_PULL => {
                 let pull: GraphPull = match bincode::deserialize(payload) {
                     Ok(pull) => pull,
@@ -1089,14 +1258,17 @@ impl AggregateHandler for GraphAggregate {
             }
         };
         if matches!(outcome, ApplyOutcome::Applied | ApplyOutcome::Waiting(_)) {
-            self.finish(ctx, graph_id, &state, status)?;
+            self.finish(ctx, graph_id, &state).await?;
         }
         Ok(outcome)
     }
 }
 
 /// The instance is in a failure state; an unknown instance is not.
-async fn instance_failed(ctx: &mut ApplyContext<'_>, instance_id: Uuid) -> anyhow::Result<bool> {
+pub(super) async fn instance_failed(
+    ctx: &mut ApplyContext<'_>,
+    instance_id: Uuid,
+) -> anyhow::Result<bool> {
     Ok(ctx
         .storage
         .find_instance(&instance_id)
@@ -1131,6 +1303,29 @@ pub(crate) async fn next_slot(
         .await?
         .map(|graph| graph.kickoff_index as u64 + 1)
         .unwrap_or(0))
+}
+
+/// Close a setup session that never stored its definition: its deliveries
+/// and jobs go, the session goes, and the slot it was taking is released to
+/// the starts waiting on it. Returns that slot.
+pub(crate) async fn release_setup_session(
+    ctx: &mut ApplyContext<'_>,
+    session: &store::PendingGraphInit,
+    reason: &str,
+) -> anyhow::Result<u64> {
+    let graph_ref = graph_ref(session.graph_id);
+    ctx.effects.close_outbox(
+        EngineOutboxCloseTarget::Aggregate {
+            aggregate_kind: graph_ref.kind.clone(),
+            aggregate_id: graph_ref.id.clone(),
+        },
+        reason,
+    );
+    ctx.effects.cancel_jobs_for_aggregate(&graph_ref);
+    ctx.storage.delete_pending_graph_init(&session.instance_id, &session.operator_pubkey).await?;
+    let next_slot = next_slot(ctx, &session.operator_pubkey).await?;
+    ctx.effects.wake(slot_ref(&session.operator_pubkey, next_slot));
+    Ok(next_slot)
 }
 
 /// Another session of the operator whose `build_graph` is pending or running
@@ -1214,20 +1409,24 @@ mod tests {
 
     #[test]
     fn phases_follow_the_phase_table() {
-        assert_eq!(phase_of(None, &Actor::Operator, false), PHASE_SETUP);
-        assert_eq!(phase_of(Some(OperatorPresigned), &Actor::Operator, false), PHASE_COLLECT);
-        assert_eq!(phase_of(Some(OperatorPresigned), &Actor::Committee, false), PHASE_SIGNING);
-        assert_eq!(phase_of(Some(OperatorPresigned), &Actor::Verifier, false), PHASE_SETUP);
-        assert_eq!(phase_of(Some(CommitteePresigned), &Actor::Operator, false), PHASE_DELIVER);
-        assert_eq!(phase_of(Some(CommitteePresigned), &Actor::Committee, true), PHASE_POST);
-        assert_eq!(phase_of(Some(CommitteePresigned), &Actor::Committee, false), PHASE_SIGNED);
+        let phase = |status, actor: &Actor, relayer| phase_of(status, actor, relayer, false);
+        assert_eq!(phase(None, &Actor::Operator, false), PHASE_SETUP);
+        assert_eq!(phase(Some(OperatorPresigned), &Actor::Operator, false), PHASE_COLLECT);
+        assert_eq!(phase(Some(OperatorPresigned), &Actor::Committee, false), PHASE_SIGNING);
+        assert_eq!(phase(Some(OperatorPresigned), &Actor::Verifier, false), PHASE_SETUP);
+        assert_eq!(phase(Some(CommitteePresigned), &Actor::Operator, false), PHASE_DELIVER);
+        assert_eq!(phase(Some(CommitteePresigned), &Actor::Committee, true), PHASE_POST);
+        assert_eq!(phase(Some(CommitteePresigned), &Actor::Committee, false), PHASE_SIGNED);
+        assert_eq!(phase(Some(OperatorDataPushed), &Actor::Operator, false), PHASE_AWAIT_WITHDRAW);
         assert_eq!(
-            phase_of(Some(OperatorDataPushed), &Actor::Operator, false),
-            PHASE_AWAIT_WITHDRAW
+            phase_of(Some(OperatorDataPushed), &Actor::Operator, false, true),
+            PHASE_KICKOFF
         );
-        assert_eq!(phase_of(Some(OperatorKickOff), &Actor::Operator, false), PHASE_PEGOUT);
-        assert_eq!(phase_of(Some(Obsoleted), &Actor::Operator, false), PHASE_OBSOLETED);
-        assert_eq!(phase_of(Some(Skipped), &Actor::Operator, false), PHASE_CLOSED);
+        assert_eq!(phase(Some(PreKickoff), &Actor::Verifier, false), PHASE_KICKOFF);
+        assert_eq!(phase(Some(OperatorKickOff), &Actor::Operator, false), PHASE_SETTLEMENT);
+        assert_eq!(phase(Some(Challenge), &Actor::Committee, true), PHASE_SETTLEMENT);
+        assert_eq!(phase(Some(Obsoleted), &Actor::Operator, false), PHASE_OBSOLETED);
+        assert_eq!(phase(Some(Skipped), &Actor::Operator, false), PHASE_CLOSED);
         assert!(!signing_round_over(Some(OperatorPresigned)) && !signing_round_over(None));
         assert!(
             signing_round_over(Some(CommitteePresigned)) && signing_round_over(Some(Obsoleted))

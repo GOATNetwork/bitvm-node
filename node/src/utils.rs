@@ -1,7 +1,5 @@
 use crate::action::{
-    BusinessRef, ChallengeSent, DisproveSent, GOATMessage, GOATMessageContent, HasBusinessRef,
-    KickoffSent, LocalMessageKey, MessageKind, NodeInfo, PreKickoffSent, SolderingProofReady,
-    Take1Sent, Take2Sent, send_to_peer,
+    GOATMessage, GOATMessageContent, LocalMessageKey, NodeInfo, SolderingProofReady, send_to_peer,
 };
 use crate::env::*;
 use crate::error::SpecialError;
@@ -79,16 +77,14 @@ use crate::rpc_service::routes::v1::{
     NODES_OPERATOR_BASE, NODES_WATCHTOWER_BASE, PROOFS_WATCHTOWER_PROOF_TIMEOUT,
 };
 
-use crate::scheduled_tasks::graph_maintenance_tasks::{
-    ChallengeSubStatus, VerifierChallengeStatus,
-};
+use crate::aggregates::graph_scan::{ChallengeSubStatus, VerifierChallengeStatus};
 use bitcoin_light_client_circuit::hash_operator_constant;
 use bitvm_lib::babe_adapter::{
     BABE_M_CC, BabeVerifierPrivateState, CACSetupPackage, FinalizedInstanceData, Seed,
     SolderingData, compact_soldering_proof_payload,
 };
 use bitvm_lib::transactions::base::BaseTransaction;
-use client::goat_chain::{DisproveTxType, GraphData, PeginStatus, WithdrawStatus};
+use client::goat_chain::{DisproveTxType, GraphData, PeginStatus};
 use client::http_client::async_client::HttpAsyncClient;
 use proof_builder::api_auth::{ProofBuilderAuthRole, sign_proof_builder_request};
 use proof_builder::{
@@ -1215,9 +1211,8 @@ pub mod evm_swap_utils {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-#[allow(clippy::redundant_pattern_matching)]
-#[allow(clippy::collapsible_else_if)]
+/// Re-derive the graph's stage from both chains and record it
+/// (ChainReconcile); a stale stage is ignored with a warning.
 pub(crate) async fn refresh_graph(
     local_db: &LocalDB,
     btc_client: &BTCClient,
@@ -1225,7 +1220,7 @@ pub(crate) async fn refresh_graph(
     instance_id: Uuid,
     graph_id: Uuid,
     graph: &BitvmGcGraph,
-) -> Result<GraphRefreshResult> {
+) -> Result<()> {
     if graph.parameters.instance_parameters.instance_id != instance_id
         || graph.parameters.graph_id != graph_id
     {
@@ -1245,82 +1240,57 @@ pub(crate) async fn refresh_graph(
         Some(scan.sub_status.clone()),
     )
     .await?;
-
     match outcome {
-        GraphStatusTransitionOutcome::Applied => {
+        GraphStatusTransitionOutcome::Applied | GraphStatusTransitionOutcome::AlreadyCurrent => {
             if let Some(challenge_txid) = scan.challenge_txid {
                 update_graph_challenge_txid_if_needed(local_db, graph_id, challenge_txid).await?;
             }
-            Ok(GraphRefreshResult {
-                status: scan.status,
-                sub_status: Some(scan.sub_status.clone()),
-                scan: Some(scan),
-                status_transition_accepted: true,
-            })
         }
-        GraphStatusTransitionOutcome::AlreadyCurrent => {
-            if let Some(challenge_txid) = scan.challenge_txid {
-                update_graph_challenge_txid_if_needed(local_db, graph_id, challenge_txid).await?;
-            }
-            Ok(GraphRefreshResult {
-                status: scan.status,
-                sub_status: Some(scan.sub_status.clone()),
-                // Preserve the verified scan even for an idempotent status
-                // replay. The previous attempt may have committed the status
-                // before it could enqueue the corresponding local message.
-                scan: Some(scan),
-                status_transition_accepted: true,
-            })
-        }
-        GraphStatusTransitionOutcome::Rejected { current } => {
-            warn!(
-                "ignore stale chain scan for graph {instance_id}:{graph_id}: candidate={}, current={current}",
-                scan.status
-            );
-            Ok(GraphRefreshResult {
-                status: current,
-                sub_status: None,
-                scan: None,
-                status_transition_accepted: false,
-            })
-        }
+        GraphStatusTransitionOutcome::Rejected { current } => warn!(
+            "ignore stale chain scan for graph {instance_id}:{graph_id}: candidate={}, current={current}",
+            scan.status
+        ),
         GraphStatusTransitionOutcome::NotFound => {
-            warn!("graph {instance_id}:{graph_id} disappeared while applying chain scan");
-            Ok(GraphRefreshResult {
-                status: scan.status,
-                sub_status: None,
-                scan: None,
-                status_transition_accepted: false,
-            })
+            warn!("graph {instance_id}:{graph_id} disappeared while applying chain scan")
         }
     }
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
-struct DetectedDisprove {
-    disprove_type: DisproveTxType,
-    index: usize,
-    challenge_start_txid: Option<Txid>,
-    challenge_finish_txid: Txid,
+pub(crate) struct DetectedDisprove {
+    pub(crate) disprove_type: DisproveTxType,
+    pub(crate) index: usize,
+    pub(crate) challenge_start_txid: Option<Txid>,
+    pub(crate) challenge_finish_txid: Txid,
 }
 
+/// What both chains say about a graph's transactions: the stage it reached
+/// and, in a challenge, how far each branch got.
 #[derive(Clone, Debug)]
 pub(crate) struct GraphChainScan {
-    status: GraphStatus,
-    sub_status: ChallengeSubStatus,
-    challenge_txid: Option<Txid>,
+    pub(crate) status: GraphStatus,
+    pub(crate) sub_status: ChallengeSubStatus,
+    pub(crate) challenge_txid: Option<Txid>,
     #[allow(dead_code)]
     watchtower_challenge_init_on_chain: bool,
     #[allow(dead_code)]
     operator_assert_on_chain: bool,
-    disprove: Option<DetectedDisprove>,
+    pub(crate) disprove: Option<DetectedDisprove>,
 }
 
-pub(crate) struct GraphRefreshResult {
-    pub(crate) status: GraphStatus,
-    pub(crate) sub_status: Option<ChallengeSubStatus>,
-    pub(crate) scan: Option<GraphChainScan>,
-    pub(crate) status_transition_accepted: bool,
+#[cfg(test)]
+impl GraphChainScan {
+    pub(crate) fn for_test(status: GraphStatus) -> Self {
+        Self {
+            status,
+            sub_status: ChallengeSubStatus::default(),
+            challenge_txid: None,
+            watchtower_challenge_init_on_chain: false,
+            operator_assert_on_chain: false,
+            disprove: None,
+        }
+    }
 }
 
 fn initial_challenge_sub_status(watchtower_num: usize, verifier_num: usize) -> ChallengeSubStatus {
@@ -1383,7 +1353,7 @@ async fn detect_guardian_disprove(
     challenge_start_txid: Option<Txid>,
 ) -> Result<Option<DetectedDisprove>> {
     let quick_challenge_txid = graph.quick_challenge.tx().compute_txid();
-    if tx_on_chain(btc_client, &quick_challenge_txid).await? {
+    if tx_confirmed(btc_client, &quick_challenge_txid).await? {
         return Ok(Some(DetectedDisprove {
             disprove_type: DisproveTxType::QuickChallenge,
             index: 0,
@@ -1393,7 +1363,7 @@ async fn detect_guardian_disprove(
     }
 
     let challenge_incomplete_kickoff_txid = graph.challenge_incomplete_kickoff.tx().compute_txid();
-    if tx_on_chain(btc_client, &challenge_incomplete_kickoff_txid).await? {
+    if tx_confirmed(btc_client, &challenge_incomplete_kickoff_txid).await? {
         return Ok(Some(DetectedDisprove {
             disprove_type: DisproveTxType::ChallengeIncompleteKickoff,
             index: 0,
@@ -1411,7 +1381,7 @@ async fn detect_connector_d_disprove(
 ) -> Result<Option<DetectedDisprove>> {
     let connector_d = connector_d_outpoint(graph)?;
     let Some(spent_txid) =
-        outpoint_spent_txid(btc_client, &connector_d.txid, connector_d.vout as u64).await?
+        outpoint_spent_confirmed(btc_client, &connector_d.txid, connector_d.vout as u64).await?
     else {
         return Ok(None);
     };
@@ -1445,7 +1415,7 @@ async fn detect_watchtower_flow_disprove(
 ) -> Result<Option<DetectedDisprove>> {
     for (index, nack) in graph.operator_challenge_nacks.iter().enumerate() {
         let txid = nack.tx().compute_txid();
-        if tx_on_chain(btc_client, &txid).await? {
+        if tx_confirmed(btc_client, &txid).await? {
             return Ok(Some(DetectedDisprove {
                 disprove_type: DisproveTxType::OperatorChallengeNack,
                 index,
@@ -1456,7 +1426,7 @@ async fn detect_watchtower_flow_disprove(
     }
 
     let txid = graph.operator_commit_timeout.tx().compute_txid();
-    if tx_on_chain(btc_client, &txid).await? {
+    if tx_confirmed(btc_client, &txid).await? {
         return Ok(Some(DetectedDisprove {
             disprove_type: DisproveTxType::OperatorCommitTimeout,
             index: 0,
@@ -1468,12 +1438,11 @@ async fn detect_watchtower_flow_disprove(
     Ok(None)
 }
 
-async fn scan_graph_chain_state(
+pub(crate) async fn scan_graph_chain_state(
     btc_client: &BTCClient,
     goat_client: &GOATClient,
     graph: &BitvmGcGraph,
 ) -> Result<GraphChainScan> {
-    let instance_id = graph.parameters.instance_parameters.instance_id;
     let graph_id = graph.parameters.graph_id;
     let watchtower_num = graph.parameters.watchtower_pubkeys.len();
     let verifier_num = graph.verifier_asserts.len();
@@ -1499,70 +1468,40 @@ async fn scan_graph_chain_state(
     if graph_data_on_goat.operator_pubkey != [0u8; 32] {
         current_status = GraphStatus::OperatorDataPushed;
     }
-    // A claimed pegin is terminal, so a graph which did not complete that
-    // withdrawal can never be used. A Locked pegin is intentionally excluded:
-    // the active withdrawal may still be cancelled and return to Withdrawable.
-    if current_status == GraphStatus::OperatorDataPushed {
-        let pegin_data = goat_client.gateway_get_pegin_data(&instance_id).await?;
-        let withdraw_data = goat_client.gateway_get_withdraw_data(&graph_id).await?;
-        if pegin_data.status == PeginStatus::Claimed && withdraw_data.status == WithdrawStatus::None
-        {
-            current_status = GraphStatus::Obsoleted;
-        }
+    // Derive stages from confirmed chain progress, not local Obsoleted state.
+    // Mempool transactions can be replaced and must not decide a terminal stage.
+    if !tx_confirmed(btc_client, &prekickoff_txid).await? {
+        return Ok(GraphChainScan {
+            status: current_status,
+            sub_status,
+            challenge_txid: None,
+            watchtower_challenge_init_on_chain: false,
+            operator_assert_on_chain: false,
+            disprove: None,
+        });
     }
-    // check Prekickoff
-    if matches!(
-        current_status,
-        GraphStatus::OperatorPresigned
-            | GraphStatus::CommitteePresigned
-            | GraphStatus::OperatorDataPushed
-            | GraphStatus::Obsoleted
-    ) {
-        if !tx_on_chain(btc_client, &prekickoff_txid).await? {
+    // check Kickoff/SkipKickoff. Only a confirmed spend decides: Skipped is
+    // closed and never scanned again, so a Skip-Kickoff that is only in the
+    // mempool must not hide the Kickoff that replaces it, and a mempool
+    // Kickoff replaced by the Skip must not strand the graph at OperatorKickOff.
+    let kickoff_connector_vout = 1;
+    let kickoff_connector_spent =
+        outpoint_spent_confirmed(btc_client, &prekickoff_txid, kickoff_connector_vout).await?;
+    match kickoff_connector_spent {
+        Some(spent_txid) if spent_txid != kickoff_txid => {
             return Ok(GraphChainScan {
-                status: current_status,
+                status: GraphStatus::Skipped,
                 sub_status,
                 challenge_txid: None,
                 watchtower_challenge_init_on_chain: false,
                 operator_assert_on_chain: false,
                 disprove: None,
             });
-        } else {
-            current_status = if current_status == GraphStatus::OperatorDataPushed {
-                GraphStatus::PreKickoff
-            } else {
-                // for GraphStatus::OperatorPresigned/CommitteePresigned:
-                // if prekickoff is on-chain while graph data not yet posted,
-                // it means this graph will never be posted and operator is going to skip it,
-                // mark it as Obsoleted so that it can be skipped later
-                //
-                // for GraphStatus::Obsoleted: if the graph is obsoleted,
-                // keep it as Obsoleted so that it can be skipped later
-                GraphStatus::Obsoleted
-            };
         }
-    }
-    // check Kickoff/SkipKickoff
-    if matches!(current_status, GraphStatus::PreKickoff | GraphStatus::Obsoleted) {
-        let kickoff_connector_vout = 1;
-        if let Some(spent_txid) =
-            outpoint_spent_txid(btc_client, &prekickoff_txid, kickoff_connector_vout).await?
-        {
-            if spent_txid != kickoff_txid {
-                return Ok(GraphChainScan {
-                    status: GraphStatus::Skipped,
-                    sub_status,
-                    challenge_txid: None,
-                    watchtower_challenge_init_on_chain: false,
-                    operator_assert_on_chain: false,
-                    disprove: None,
-                });
-            } else {
-                current_status = GraphStatus::OperatorKickOff;
-            }
-        } else {
+        Some(_) => current_status = GraphStatus::OperatorKickOff,
+        None => {
             return Ok(GraphChainScan {
-                status: current_status,
+                status: GraphStatus::PreKickoff,
                 sub_status,
                 challenge_txid: None,
                 watchtower_challenge_init_on_chain: false,
@@ -1590,7 +1529,7 @@ async fn scan_graph_chain_state(
     if current_status == GraphStatus::OperatorKickOff {
         let connector_a = connector_a_outpoint(graph)?;
         if let Some(spent_txid) =
-            outpoint_spent_txid(btc_client, &connector_a.txid, connector_a.vout as u64).await?
+            outpoint_spent_confirmed(btc_client, &connector_a.txid, connector_a.vout as u64).await?
         {
             if spent_txid != take1_txid {
                 current_status = GraphStatus::Challenge;
@@ -1620,7 +1559,7 @@ async fn scan_graph_chain_state(
     if current_status == GraphStatus::Challenge && challenge_txid.is_none() {
         let connector_a = connector_a_outpoint(graph)?;
         if let Some(spent_txid) =
-            outpoint_spent_txid(btc_client, &connector_a.txid, connector_a.vout as u64).await?
+            outpoint_spent_confirmed(btc_client, &connector_a.txid, connector_a.vout as u64).await?
             && spent_txid != take1_txid
         {
             challenge_txid = Some(spent_txid);
@@ -1738,7 +1677,7 @@ async fn scan_graph_chain_state(
             let disprove_txid = graph.disproves[verifier_index].tx().compute_txid();
             if tx_on_chain(btc_client, &verifier_assert_txid).await? {
                 if let Some(spent_txid) =
-                    outpoint_spent_txid(btc_client, &verifier_assert_txid, 0).await?
+                    outpoint_spent_confirmed(btc_client, &verifier_assert_txid, 0).await?
                 {
                     if spent_txid == disprove_txid {
                         sub_status.verifier_challenge_status[verifier_index] =
@@ -1786,7 +1725,7 @@ async fn scan_graph_chain_state(
                 disprove: Some(disprove),
             });
         }
-        if tx_on_chain(btc_client, &take2_txid).await? {
+        if tx_confirmed(btc_client, &take2_txid).await? {
             return Ok(GraphChainScan {
                 status: GraphStatus::OperatorTake2,
                 sub_status,
@@ -1806,233 +1745,6 @@ async fn scan_graph_chain_state(
         operator_assert_on_chain,
         disprove: None,
     })
-}
-
-#[allow(clippy::enum_variant_names)]
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum GraphCompensateEventKind {
-    PreKickoffSent, // OperatorDataPushed -> PreKickoff
-    KickoffSent,    // PreKickoff -> OperatorKickOff
-    Take1Sent,      // OperatorKickOff -> OperatorTake1
-    ChallengeSent,  // OperatorKickOff -> Challenge
-    DisproveSent,   // Challenge -> Disprove
-    Take2Sent,      // Challenge -> OperatorTake2
-}
-
-fn map_transition_to_event(from: GraphStatus, to: GraphStatus) -> Option<GraphCompensateEventKind> {
-    use GraphStatus::*;
-    match (from, to) {
-        (OperatorDataPushed, PreKickoff) => Some(GraphCompensateEventKind::PreKickoffSent),
-        (PreKickoff, OperatorKickOff) => Some(GraphCompensateEventKind::KickoffSent),
-        (OperatorKickOff, OperatorTake1) => Some(GraphCompensateEventKind::Take1Sent),
-        (OperatorKickOff, Challenge) => Some(GraphCompensateEventKind::ChallengeSent),
-        (Challenge, Disprove) => Some(GraphCompensateEventKind::DisproveSent),
-        (Challenge, OperatorTake2) => Some(GraphCompensateEventKind::Take2Sent),
-        _ => None,
-    }
-}
-
-/// The canonical protocol ancestry used only for recovering missed local
-/// messages. It is deliberately separate from transition authorization: a
-/// chain scan can authorize additional recovery edges such as
-/// `Obsoleted -> OperatorDataPushed`, but those edges do not imply a P2P
-/// phase message should be synthesized.
-fn compensation_previous_status(status: GraphStatus) -> Option<GraphStatus> {
-    use GraphStatus::*;
-
-    match status {
-        CommitteePresigned => Some(OperatorPresigned),
-        OperatorDataPushed => Some(CommitteePresigned),
-        PreKickoff | Obsoleted | Skipped => Some(OperatorDataPushed),
-        OperatorKickOff => Some(PreKickoff),
-        OperatorTake1 | Challenge => Some(OperatorKickOff),
-        Disprove | OperatorTake2 => Some(Challenge),
-        OperatorPresigned => None,
-    }
-}
-
-fn compensation_events_from(
-    compensation_anchor_status: GraphStatus,
-    final_status: GraphStatus,
-) -> Option<Vec<GraphCompensateEventKind>> {
-    if compensation_anchor_status == final_status {
-        return Some(vec![]);
-    }
-
-    let mut reverse_path = vec![final_status];
-    let mut cursor = final_status;
-    while cursor != compensation_anchor_status {
-        let previous = compensation_previous_status(cursor)?;
-        reverse_path.push(previous);
-        cursor = previous;
-    }
-    reverse_path.reverse();
-
-    Some(
-        reverse_path
-            .windows(2)
-            .filter_map(|window| match window {
-                [from, to] => map_transition_to_event(*from, *to),
-                _ => None,
-            })
-            .collect(),
-    )
-}
-
-async fn upsert_graph_compensate_message(
-    local_db: &LocalDB,
-    actor: Actor,
-    message_content: GOATMessageContent,
-) -> Result<()> {
-    let key = LocalMessageKey::from_content(actor.clone(), &message_content)?;
-    let graph_id = match message_content.business_ref() {
-        BusinessRef::Graph { graph_id, .. } => graph_id,
-        _ => bail!("graph compensation message must be graph-scoped"),
-    };
-    let message_id = key.message_id();
-    let mut storage_processor = local_db.start_transaction().await?;
-    if !storage_processor.insert_graph_compensation_marker(graph_id, &message_id).await? {
-        storage_processor.commit().await?;
-        return Ok(());
-    }
-
-    upsert_message(
-        &mut storage_processor,
-        false,
-        SELF_SENDER.to_string(),
-        actor,
-        message_content,
-        0,
-        0,
-    )
-    .await?;
-    storage_processor.commit().await
-}
-
-async fn push_graph_compensate_message(
-    local_db: &LocalDB,
-    actor: Actor,
-    message_content: GOATMessageContent,
-) -> Result<()> {
-    // Unlike an action retry, an inferred chain event must not reset an
-    // existing queued message. This makes compensation safe to retry when the
-    // status write committed before the message was persisted.
-    upsert_graph_compensate_message(local_db, actor, message_content).await
-}
-
-#[allow(dead_code)]
-async fn should_emit_wrongly_challenge_timeout(
-    btc_client: &BTCClient,
-    challenge_assert_txid: Txid,
-) -> Result<bool> {
-    let status = btc_client.get_tx_status(&challenge_assert_txid).await?;
-    let Some(block_height) = status.block_height else {
-        return Ok(false);
-    };
-    let current_height = btc_client.get_height().await?;
-    Ok(current_height >= block_height + disprove_timelock(get_network()))
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn compensate_graph_events(
-    local_db: &LocalDB,
-    _btc_client: &BTCClient,
-    instance_id: Uuid,
-    graph_id: Uuid,
-    _graph: &BitvmGcGraph,
-    scan: Option<&GraphChainScan>,
-    compensation_anchor_status: GraphStatus,
-    final_status: GraphStatus,
-) -> Result<()> {
-    let Some(scan) = scan else {
-        tracing::debug!(
-            "Skip graph compensation for {instance_id}:{graph_id}: chain scan result is missing"
-        );
-        return Ok(());
-    };
-
-    // The action anchor is the only input used to build a recovery path. The
-    // persisted status is a projection and must not manufacture or suppress
-    // messages after a restart. Every enqueue below is idempotent.
-    let Some(events) = compensation_events_from(compensation_anchor_status, final_status) else {
-        tracing::debug!(
-            "Skip graph compensation without a canonical observed path for {instance_id}:{graph_id}: anchor={compensation_anchor_status:?}, final={final_status:?}"
-        );
-        return Ok(());
-    };
-
-    for event in events {
-        match event {
-            GraphCompensateEventKind::PreKickoffSent => {
-                push_graph_compensate_message(
-                    local_db,
-                    Actor::Verifier,
-                    GOATMessageContent::PreKickoffSent(PreKickoffSent { instance_id, graph_id }),
-                )
-                .await?;
-            }
-            GraphCompensateEventKind::KickoffSent => {
-                push_graph_compensate_message(
-                    local_db,
-                    Actor::All,
-                    GOATMessageContent::KickoffSent(KickoffSent { instance_id, graph_id }),
-                )
-                .await?;
-            }
-            GraphCompensateEventKind::Take1Sent => {
-                push_graph_compensate_message(
-                    local_db,
-                    Actor::Committee,
-                    GOATMessageContent::Take1Sent(Take1Sent { instance_id, graph_id }),
-                )
-                .await?;
-            }
-            GraphCompensateEventKind::ChallengeSent => {
-                if let Some(challenge_txid) = scan.challenge_txid {
-                    push_graph_compensate_message(
-                        local_db,
-                        Actor::Operator,
-                        GOATMessageContent::ChallengeSent(ChallengeSent {
-                            instance_id,
-                            graph_id,
-                            challenge_txid,
-                        }),
-                    )
-                    .await?;
-                }
-            }
-            GraphCompensateEventKind::DisproveSent => {
-                let disprove = scan.disprove.clone().ok_or_else(|| {
-                    anyhow!(
-                        "Graph {instance_id}:{graph_id} reached Disprove but no disprove transaction was detected"
-                    )
-                })?;
-                upsert_graph_compensate_message(
-                    local_db,
-                    Actor::Committee,
-                    GOATMessageContent::DisproveSent(DisproveSent {
-                        instance_id,
-                        graph_id,
-                        disprove_type: disprove.disprove_type,
-                        index: disprove.index,
-                        challenge_start_txid: disprove.challenge_start_txid,
-                        challenge_finish_txid: disprove.challenge_finish_txid,
-                    }),
-                )
-                .await?;
-            }
-            GraphCompensateEventKind::Take2Sent => {
-                push_graph_compensate_message(
-                    local_db,
-                    Actor::Committee,
-                    GOATMessageContent::Take2Sent(Take2Sent { instance_id, graph_id }),
-                )
-                .await?;
-            }
-        }
-    }
-
-    Ok(())
 }
 
 pub fn build_graph_data(graph: &BitvmGcGraph) -> Result<GraphData> {
@@ -3824,6 +3536,21 @@ pub async fn tx_confirmed(client: &BTCClient, txid: &Txid) -> Result<bool> {
     Ok(client.get_tx_status(txid).await?.confirmed)
 }
 
+/// The confirmed spender of an outpoint. A spend that is only in the mempool can be replaced,
+/// so nothing irreversible is decided on it.
+pub async fn outpoint_spent_confirmed(
+    client: &BTCClient,
+    txid: &Txid,
+    vout: u64,
+) -> Result<Option<Txid>> {
+    match outpoint_spent_txid(client, txid, vout).await? {
+        Some(spent_txid) if client.get_tx_status(&spent_txid).await?.confirmed => {
+            Ok(Some(spent_txid))
+        }
+        _ => Ok(None),
+    }
+}
+
 pub async fn outpoint_available(client: &BTCClient, txid: &Txid, vout: u64) -> Result<bool> {
     match client.get_output_status(txid, vout).await? {
         Some(status) => Ok(!status.spent),
@@ -3877,13 +3604,6 @@ pub async fn upsert_message(
     let msg_type = message_content.kind();
     let message = GOATMessage::new(actor.clone(), message_content.clone());
     if is_update || storage_processor.find_messages_by_id(&message_id).await?.is_none() {
-        if let Some(cancel_msg_type) = match msg_type {
-            MessageKind::AssertSent => Some(MessageKind::WatchtowerChallengeInitSent),
-            _ => None,
-        } {
-            notify_to_cancel_proof_task(storage_processor, business_id, cancel_msg_type).await?;
-        }
-
         return storage_processor
             .upsert_message(Message {
                 message_id,
@@ -3909,82 +3629,39 @@ pub async fn upsert_message(
     Ok(false)
 }
 
-pub async fn notify_to_cancel_proof_task(
-    storage_processor: &mut StorageProcessor<'_>,
-    business_id: Uuid,
-    msg_type: MessageKind,
-) -> Result<()> {
-    // AssertInitSent is removed; update related logic if needed;
-    if !matches!(msg_type, MessageKind::WatchtowerChallengeInitSent) {
-        warn!("notify_to_cancel_proof_task: input wrong message type:{msg_type}");
-        return Ok(());
-    }
-    if get_actor() != Actor::Watchtower {
-        return Ok(());
-    }
-
-    let host = match get_proof_build_rpc_host() {
-        Some(host) => Url::parse(&host)?,
-        None => {
-            warn!("notify_to_cancel_proof_task:failed to get proof_build_rpc_host");
-            return Ok(());
-        }
+/// Tell the proof builder that this watchtower's proof for the graph is no
+/// longer needed: the operator asserted, the watchtower window is over.
+/// Returns whether the builder accepted it; without a builder host, `false`.
+pub async fn notify_watchtower_proof_timeout(instance_id: Uuid, graph_id: Uuid) -> Result<bool> {
+    let Some(host) = get_proof_build_rpc_host() else {
+        warn!("notify_watchtower_proof_timeout: proof builder host is not configured");
+        return Ok(false);
     };
-
-    if let Some(message) =
-        storage_processor.find_message_by_business_id(&business_id, &msg_type.to_string()).await?
-        && let Some(graph) = storage_processor.find_graph(&business_id).await?
-    {
-        if !matches!(message.state.as_str(), "Pending" | "Processing") {
-            warn!(
-                "message {business_id}, msg_type: {msg_type} no need to cancel.as state is {}",
-                message.state
-            );
-            return Ok(());
-        }
-
-        // It will only be called a few times under limited conditions, so we just create a new object
-        let http_client = HttpAsyncClient::new(None);
-        let notify_result = match msg_type {
-            MessageKind::WatchtowerChallengeInitSent => {
-                let url = host.join(PROOFS_WATCHTOWER_PROOF_TIMEOUT)?;
-                let payload = WatchtowerProofTimeoutUpdateRequest {
-                    instance_id: graph.instance_id.to_string(),
-                    graph_id: graph.graph_id.to_string(),
-                    gateway_address: Some(env::get_goat_gateway_contract_from_env().to_string()),
-                    public_key: get_node_pubkey()?.to_string(),
-                };
-                let auth_keypair = get_bitvm_key()?;
-                let response  = http_client
-                    .post_response_json_with_dynamic_headers::<WatchtowerProofTimeoutUpdateResponse, _, _>(
-                        url.as_str(),
-                        &payload,
-                        || {
-                            proof_builder_auth_headers(
-                                &auth_keypair,
-                                ProofBuilderAuthRole::Watchtower,
-                                PROOFS_WATCHTOWER_PROOF_TIMEOUT,
-                                &payload,
-                            )
-                        },
-                    )
-                    .await?;
-                info!("call {}, response:{:?}", PROOFS_WATCHTOWER_PROOF_TIMEOUT, response);
-                response.data.is_some()
-            }
-            _ => false,
-        };
-        if notify_result {
-            // cancel unfinished p2p message; when notify success!
-            storage_processor
-                .cancel_messages_by_business_id(&business_id, Some(msg_type.to_string()))
-                .await?;
-        }
-    } else {
-        warn!("message {business_id}, msg_type: {msg_type} or graph {business_id} not fund in DB");
-    }
-
-    Ok(())
+    let url = Url::parse(&host)?.join(PROOFS_WATCHTOWER_PROOF_TIMEOUT)?;
+    let payload = WatchtowerProofTimeoutUpdateRequest {
+        instance_id: instance_id.to_string(),
+        graph_id: graph_id.to_string(),
+        gateway_address: Some(env::get_goat_gateway_contract_from_env().to_string()),
+        public_key: get_node_pubkey()?.to_string(),
+    };
+    let auth_keypair = get_bitvm_key()?;
+    // Called once per graph at most; a fresh client is enough.
+    let response = HttpAsyncClient::new(None)
+        .post_response_json_with_dynamic_headers::<WatchtowerProofTimeoutUpdateResponse, _, _>(
+            url.as_str(),
+            &payload,
+            || {
+                proof_builder_auth_headers(
+                    &auth_keypair,
+                    ProofBuilderAuthRole::Watchtower,
+                    PROOFS_WATCHTOWER_PROOF_TIMEOUT,
+                    &payload,
+                )
+            },
+        )
+        .await?;
+    info!("call {}, response:{:?}", PROOFS_WATCHTOWER_PROOF_TIMEOUT, response);
+    Ok(response.data.is_some())
 }
 
 /// store new graph, graph_raw_data, and update instance_id

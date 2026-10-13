@@ -1,9 +1,7 @@
 use super::utils::{deserialize_u256, serialize_u256};
+use crate::aggregates::graph_scan::{ChallengeSubStatus, VerifierChallengeStatus};
 use crate::aggregates::instance::PeginDeadlines;
 use crate::rpc_service::current_time_secs;
-use crate::scheduled_tasks::graph_maintenance_tasks::{
-    ChallengeSubStatus, VerifierChallengeStatus,
-};
 use crate::utils::{check_bridge_in_uxto_available_or_self_spent, reflect_goat_address};
 use alloy::hex::ToHexExt;
 use alloy::primitives::U256;
