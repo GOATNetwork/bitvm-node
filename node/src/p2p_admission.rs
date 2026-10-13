@@ -137,9 +137,6 @@ pub enum DropReason {
     ReplayedSequence,
     /// Sequence number exceeds the accepted clock lead.
     FutureSequence,
-    /// The chain has said the author does not hold the role this kind of
-    /// message can only come from.
-    SenderRoleDenied,
     /// A message addressed to another role, from an unregistered author, beyond
     /// what this node relays for such authors.
     ForwardRate,
@@ -178,7 +175,6 @@ impl DropReason {
             Self::BinaryFromNonVerifier => "binary_from_non_verifier",
             Self::ReplayedSequence => "replayed_sequence",
             Self::FutureSequence => "future_sequence",
-            Self::SenderRoleDenied => "sender_role_denied",
             Self::ForwardRate => "forward_rate",
             Self::DirectPeerRate => "direct_peer_rate",
             Self::AuthorRate => "author_rate",
@@ -208,7 +204,6 @@ impl DropReason {
         matches!(
             self,
             Self::UnexpectedBinaryKind
-                | Self::SenderRoleDenied
                 | Self::ForwardRate
                 | Self::ImmediateRateLimited
                 | Self::ControlQueueFull
@@ -524,23 +519,6 @@ pub enum TrustedBindingConflict {
     KeyBoundToAnotherPeer(PeerId),
 }
 
-/// The role a kind of message can only legitimately come from.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SenderRole {
-    /// Chain observations and requests any node may publish.
-    Any,
-    Committee,
-    Verifier,
-    Operator,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RoleVerdict {
-    Confirmed,
-    Denied,
-    Unknown,
-}
-
 /// What the caller should fetch from the chain, decided under the cache lock so
 /// concurrent messages from one peer start a single lookup.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -583,39 +561,6 @@ impl PeerRegistry {
         self.sender_class(peer, now) == SenderClass::Committee
     }
 
-    /// Cached role verdict. Only fresh negative answers are Denied; missing or stale answers are Unknown.
-    pub fn role_verdict(&self, peer: &PeerId, role: SenderRole, now: Instant) -> RoleVerdict {
-        let state = self.lock();
-        match role {
-            SenderRole::Any => RoleVerdict::Confirmed,
-            SenderRole::Committee => match state.committee.get(peer) {
-                Some(entry) if entry.is_registered(now) => RoleVerdict::Confirmed,
-                Some(entry) if !entry.registered && !entry.needs_refresh(now) => {
-                    RoleVerdict::Denied
-                }
-                _ => RoleVerdict::Unknown,
-            },
-            SenderRole::Verifier => {
-                if state.verifiers.contains(&peer.to_bytes()) {
-                    RoleVerdict::Confirmed
-                } else if state.verifiers_fetched_at.is_some_and(|at| {
-                    now.saturating_duration_since(at) < VERIFIER_SET_REFRESH_INTERVAL * 2
-                }) {
-                    RoleVerdict::Denied
-                } else {
-                    RoleVerdict::Unknown
-                }
-            }
-            SenderRole::Operator => match state.operators.get(peer) {
-                Some(binding) if binding.is_registered(now) => RoleVerdict::Confirmed,
-                Some(binding) if binding.staked == Some(false) && !binding.needs_refresh(now) => {
-                    RoleVerdict::Denied
-                }
-                _ => RoleVerdict::Unknown,
-            },
-        }
-    }
-
     /// Whether fresh chain results identify the peer as unregistered.
     pub fn is_known_unregistered(&self, peer: &PeerId, now: Instant) -> bool {
         // A stale "no" does not count: the peer may have registered since.
@@ -642,19 +587,6 @@ impl PeerRegistry {
     /// The peer currently bound to an operator master key, if known.
     pub fn operator_peer_for(&self, pubkey: &OperatorKey) -> Option<PeerId> {
         self.lock().operator_owner.get(pubkey).copied()
-    }
-
-    pub fn verifier_peer_ids(&self) -> Option<Vec<String>> {
-        let state = self.lock();
-        state.verifiers_fetched_at?;
-        Some(
-            state
-                .verifiers
-                .iter()
-                .filter_map(|bytes| PeerId::from_bytes(bytes).ok())
-                .map(|peer| peer.to_string())
-                .collect(),
-        )
     }
 
     /// Record a verified binding; newer issuance wins and each key maps to one peer.
@@ -1908,18 +1840,14 @@ struct AuthorSequence {
     highest: u64,
     /// Sequence numbers seen within `REPLAY_WINDOW` of `highest`.
     recent: std::collections::BTreeSet<u64>,
-    /// Persisted rejection floor restored at startup.
-    floor: Option<u64>,
-    /// The mark the store is known to hold. `highest` above it is still owed.
-    persisted: u64,
     /// Rejection count since the last report; diagnostic only.
     rejected: u32,
 }
 
-/// Per-registered-author sequence window with periodically persisted high-water marks.
-/// Accept unseen numbers within the window; restored marks are rejection floors.
-/// Authors must keep numbering monotonic across restarts.
-/// `P2P_REPLAY_MARK_RESET_PEERS` clears selected persisted marks at startup.
+/// Per-registered-author sequence window, in memory only: accept unseen numbers
+/// within `REPLAY_WINDOW` of the highest one admitted. A restart re-opens every
+/// window; what a replay can then re-inject is bounded by the engine inbox's
+/// content-id dedup and, for a registered author, charged to its own rate budget.
 #[derive(Debug, Default)]
 pub struct ReplayGuard {
     authors: Mutex<HashMap<PeerId, AuthorSequence>>,
@@ -1958,10 +1886,6 @@ impl ReplayGuard {
             }
         }
         let state = authors.entry(*author).or_default();
-        if state.floor.is_some_and(|floor| sequence_number <= floor) {
-            state.rejected = state.rejected.saturating_add(1);
-            return Err(DropReason::ReplayedSequence);
-        }
         if sequence_number > state.highest {
             state.highest = sequence_number;
             let floor = sequence_number.saturating_sub(REPLAY_WINDOW);
@@ -1988,39 +1912,6 @@ impl ReplayGuard {
     pub fn take_clock_leads(&self) -> Vec<(PeerId, Duration)> {
         let mut leads = self.clock_leads.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         leads.drain().map(|(author, lead)| (author, Duration::from_nanos(lead))).collect()
-    }
-
-    /// Restore an author's persisted mark. Call before any message is admitted.
-    pub fn restore_mark(&self, author: &PeerId, highest: u64) {
-        let mut authors = self.authors.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if authors.len() >= REPLAY_MAX_TRACKED_AUTHORS {
-            return;
-        }
-        let state = authors.entry(*author).or_default();
-        state.highest = state.highest.max(highest);
-        state.persisted = state.persisted.max(highest);
-        state.floor = Some(state.floor.map_or(highest, |floor| floor.max(highest)));
-    }
-
-    /// Marks awaiting successful persistence confirmation.
-    pub fn pending_marks(&self) -> Vec<(PeerId, u64)> {
-        let authors = self.authors.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        authors
-            .iter()
-            .filter(|(_, state)| state.highest > state.persisted)
-            .map(|(author, state)| (*author, state.highest))
-            .collect()
-    }
-
-    /// Acknowledge marks that were written. A mark that has moved on since it
-    /// was read stays owed for the difference.
-    pub fn confirm_persisted(&self, marks: &[(PeerId, u64)]) {
-        let mut authors = self.authors.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        for (author, written) in marks {
-            if let Some(state) = authors.get_mut(author) {
-                state.persisted = state.persisted.max(*written);
-            }
-        }
     }
 
     /// Return authors exceeding the rejection reporting threshold.
@@ -2219,12 +2110,6 @@ pub async fn evaluate_inbound_message(
         && !matches!(message.content, GOATMessageContent::GenCircuits(_))
     {
         return Ok(InboundVerdict::Drop(DropReason::UnexpectedBinaryKind));
-    }
-
-    // Reject only definite sender-role denials; unknown identities remain subject to unregistered limits.
-    let sender_role = message.content.kind().sender_role();
-    if gates.registry.role_verdict(source, sender_role, now) == RoleVerdict::Denied {
-        return Ok(InboundVerdict::Drop(DropReason::SenderRoleDenied));
     }
 
     if message.content.p2p_delivery() == P2PMessageDelivery::Immediate {
@@ -3315,54 +3200,7 @@ mod tests {
         assert!(!rate.allow(now + Duration::from_secs(1)));
     }
 
-    /// Verify restored replay marks reject older sequence numbers.
-    #[test]
-    fn restored_replay_mark_is_a_floor() {
-        let guard = ReplayGuard::default();
-        let author = PeerId::random();
-        assert_eq!(guard.admit(&author, Some(500), WALL_CLOCK), Ok(()));
-        assert_eq!(guard.admit(&author, Some(498), WALL_CLOCK), Ok(()));
-        assert_eq!(guard.pending_marks(), vec![(author, 500)]);
-
-        let restarted = ReplayGuard::default();
-        restarted.restore_mark(&author, 500);
-        assert!(restarted.pending_marks().is_empty(), "a restored mark is already stored");
-        for replayed in [497, 498, 499, 500] {
-            assert_eq!(
-                restarted.admit(&author, Some(replayed), WALL_CLOCK),
-                Err(DropReason::ReplayedSequence)
-            );
-        }
-        assert_eq!(restarted.admit(&author, Some(501), WALL_CLOCK), Ok(()));
-        assert_eq!(restarted.pending_marks(), vec![(author, 501)]);
-    }
-
-    /// Persisted confirmation must retain failed writes and newer pending marks.
-    #[test]
-    fn replay_marks_stay_owed_until_the_write_is_confirmed() {
-        let guard = ReplayGuard::default();
-        let author = PeerId::random();
-        assert_eq!(guard.admit(&author, Some(10), WALL_CLOCK), Ok(()));
-
-        // Tick 1: the marks are read, the write fails, nothing is confirmed.
-        let owed = guard.pending_marks();
-        assert_eq!(owed, vec![(author, 10)]);
-        assert_eq!(guard.pending_marks(), owed, "still owed on the next tick");
-
-        // Tick 2: the write is under way when a newer message is admitted.
-        let written = guard.pending_marks();
-        assert_eq!(guard.admit(&author, Some(11), WALL_CLOCK), Ok(()));
-        guard.confirm_persisted(&written);
-        assert_eq!(guard.pending_marks(), vec![(author, 11)], "only 10 reached the store");
-
-        guard.confirm_persisted(&[(author, 11)]);
-        assert!(guard.pending_marks().is_empty());
-        // A late confirmation of an older write never moves the record back.
-        guard.confirm_persisted(&[(author, 10)]);
-        assert!(guard.pending_marks().is_empty());
-    }
-
-    /// Verify future sequence numbers do not raise replay marks.
+    /// Verify future sequence numbers do not move the window.
     #[test]
     fn future_sequence_numbers_cannot_raise_the_mark() {
         let guard = ReplayGuard::default();
@@ -3372,7 +3210,11 @@ mod tests {
             guard.admit(&author, Some(ahead + 1), WALL_CLOCK),
             Err(DropReason::FutureSequence)
         );
-        assert!(guard.pending_marks().is_empty(), "nothing was recorded");
+        assert_eq!(
+            guard.admit(&author, Some(ahead - REPLAY_WINDOW), WALL_CLOCK),
+            Ok(()),
+            "nothing was recorded: the window did not move up to the refused number"
+        );
         assert_eq!(guard.admit(&author, Some(ahead), WALL_CLOCK), Ok(()), "inside the tolerance");
 
         // The corrected clock numbers lower than the mark: refused, and surfaced
@@ -3563,80 +3405,6 @@ mod tests {
         gates.registry.record_committee_peer(&member, Some(true), now);
         let verdict = gates.evaluate(&local_db, &SMALL, &member, 1, &data, now).await;
         assert!(matches!(verdict, InboundVerdict::Forward), "registered authors are not charged");
-    }
-
-    /// A kind only one role can send is refused once the chain has said the
-    /// author does not hold that role — and only then.
-    #[tokio::test]
-    async fn sender_role_is_refused_only_on_a_definite_answer() {
-        use crate::action::{AggNonceConsensus, MessageKind};
-
-        assert_eq!(MessageKind::NonceGeneration.sender_role(), SenderRole::Committee);
-        assert_eq!(MessageKind::GenCircuits.sender_role(), SenderRole::Verifier);
-        assert_eq!(MessageKind::InitGraph.sender_role(), SenderRole::Operator);
-        assert_eq!(MessageKind::GraphFinalize.sender_role(), SenderRole::Any);
-        // Keep the prefilter no stricter than handler authorization.
-        assert_eq!(MessageKind::SolderingProofReady.sender_role(), SenderRole::Any);
-
-        let registry = PeerRegistry::default();
-        let now = Instant::now();
-        let (unknown, outsider, member) = (PeerId::random(), PeerId::random(), PeerId::random());
-        registry.record_committee_peer(&outsider, Some(false), now);
-        registry.record_committee_peer(&member, Some(true), now);
-        let verdict = |peer, role, at| registry.role_verdict(peer, role, at);
-        assert_eq!(verdict(&unknown, SenderRole::Committee, now), RoleVerdict::Unknown);
-        assert_eq!(verdict(&outsider, SenderRole::Committee, now), RoleVerdict::Denied);
-        assert_eq!(verdict(&member, SenderRole::Committee, now), RoleVerdict::Confirmed);
-        assert_eq!(verdict(&outsider, SenderRole::Any, now), RoleVerdict::Confirmed);
-        assert_eq!(
-            verdict(&outsider, SenderRole::Committee, now + COMMITTEE_NEGATIVE_TTL),
-            RoleVerdict::Unknown,
-            "a stale \"no\" is not a \"no\": the peer may have registered since"
-        );
-        // The verifier set is definite once fetched; before that nobody is denied.
-        assert_eq!(verdict(&unknown, SenderRole::Verifier, now), RoleVerdict::Unknown);
-        registry.record_verifier_set(Some(vec![member.to_bytes()]), now);
-        assert_eq!(verdict(&unknown, SenderRole::Verifier, now), RoleVerdict::Denied);
-        assert_eq!(verdict(&member, SenderRole::Verifier, now), RoleVerdict::Confirmed);
-        // An operator is denied only by a negative stake verdict for its binding.
-        assert_eq!(verdict(&unknown, SenderRole::Operator, now), RoleVerdict::Unknown);
-        registry.observe_operator_binding(&outsider, &key(1), 1);
-        assert_eq!(verdict(&outsider, SenderRole::Operator, now), RoleVerdict::Unknown);
-        assert!(registry.plan_operator_refresh(&outsider, &key(1), now));
-        registry.record_operator_stake(&outsider, &key(1), Some(false), now);
-        assert_eq!(verdict(&outsider, SenderRole::Operator, now), RoleVerdict::Denied);
-
-        // End to end: the same committee-only message, from an unknown author
-        // and from one the chain has turned down.
-        let local_db = store::create_local_db("sqlite::memory:").await;
-        let gates = TestGates::new(PeerRateLimiter::new(10.0, 1.0, 16));
-        gates.registry.record_committee_peer(&outsider, Some(false), now);
-        let secp = bitcoin::secp256k1::Secp256k1::new();
-        let keypair = bitcoin::secp256k1::Keypair::from_secret_key(
-            &secp,
-            &bitcoin::secp256k1::SecretKey::from_slice(&[7; 32]).unwrap(),
-        );
-        let digest = bitcoin::secp256k1::Message::from_digest([3; 32]);
-        let data = GOATMessage::new(
-            Actor::Committee,
-            GOATMessageContent::AggNonceConsensus(AggNonceConsensus {
-                instance_id: Uuid::new_v4(),
-                graph_id: Uuid::new_v4(),
-                committee_pubkey: bitcoin::PublicKey::new(keypair.public_key()),
-                consensus_hash: [3; 32],
-                signature: secp.sign_schnorr(&digest, &keypair),
-            }),
-        )
-        .serialize_message()
-        .await
-        .unwrap();
-        let verdict = gates.evaluate(&local_db, &SMALL, &unknown, 1, &data, now).await;
-        assert!(
-            matches!(verdict, InboundVerdict::Enqueue { .. }),
-            "unknown is not denied: the handler stays the authority"
-        );
-        let verdict = gates.evaluate(&local_db, &SMALL, &outsider, 1, &data, now).await;
-        assert!(matches!(verdict, InboundVerdict::Drop(DropReason::SenderRoleDenied)));
     }
 
     /// Verify neighbour discovery is independent of author discovery.

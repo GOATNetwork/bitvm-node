@@ -163,25 +163,6 @@ impl MessageKind {
     }
 }
 
-impl MessageKind {
-    /// Sender roles verified against chain registration; other message kinds use `Any`.
-    pub fn sender_role(self) -> crate::p2p_admission::SenderRole {
-        use crate::p2p_admission::SenderRole;
-        match self {
-            Self::NonceGeneration
-            | Self::AggNonceConsensus
-            | Self::CommitteePresign
-            | Self::EndorseGraph
-            | Self::PeginConfirmNonce
-            | Self::PeginConfirmNonceConsensus
-            | Self::PeginConfirmPartialSig => SenderRole::Committee,
-            Self::GenCircuits | Self::VerifierGraphParamsEndorsement => SenderRole::Verifier,
-            Self::InitGraph => SenderRole::Operator,
-            _ => SenderRole::Any,
-        }
-    }
-}
-
 impl GOATMessageContent {
     pub fn kind(&self) -> MessageKind {
         self.into()
@@ -805,23 +786,6 @@ pub async fn load_persisted_peer_bindings(
             ),
         }
     }
-    // Apply configured replay resets, then restore persisted marks before admission.
-    let reset_peers = crate::env::get_p2p_replay_mark_reset_peers();
-    if !reset_peers.is_empty() {
-        let dropped = local_db.acquire().await?.delete_p2p_replay_marks(&reset_peers).await?;
-        tracing::warn!(
-            event = "p2p_admission",
-            outcome = "replay_marks_reset",
-            requested = reset_peers.len(),
-            dropped,
-            "dropped persisted replay marks on operator request"
-        );
-    }
-    for (peer_id, highest) in local_db.acquire().await?.load_p2p_replay_marks().await? {
-        if let Ok(peer_id) = PeerId::from_str(&peer_id) {
-            crate::p2p_admission::replay_guard().restore_mark(&peer_id, highest as u64);
-        }
-    }
     // Peers confirmed on chain in an earlier session keep their class and are
     // re-validated as known members, outside the discovery budget.
     loaded += crate::p2p_admission::seed_registry_from_store(
@@ -880,33 +844,18 @@ pub async fn run_p2p_admission_maintenance(local_db: &LocalDB, goat_client: &Arc
             outcome = "replay_lockout_suspected",
             peer_id = %peer,
             rejected,
-            reset_env = crate::env::ENV_P2P_REPLAY_MARK_RESET_PEERS,
             "a registered author keeps being refused as a replay; if it is not under \
              attack, its clock stepped back or another instance shares its key"
         );
     }
 
-    // Persist replay marks and confirm them only after a successful write.
-    let owed = crate::p2p_admission::replay_guard().pending_marks();
-    let marks: Vec<(String, i64)> = owed
-        .iter()
-        .map(|(peer, highest)| (peer.to_string(), (*highest).min(i64::MAX as u64) as i64))
-        .collect();
-    let purge_due = crate::p2p_admission::node_table_purge_due(NODE_TABLE_PURGE_INTERVAL, now);
-    if marks.is_empty() && !purge_due {
+    if !crate::p2p_admission::node_table_purge_due(NODE_TABLE_PURGE_INTERVAL, now) {
         return;
     }
     let result = async {
-        let mut storage = local_db.acquire().await?;
-        storage.raise_p2p_replay_marks(&marks).await?;
-        crate::p2p_admission::replay_guard().confirm_persisted(&owed);
-        if !purge_due {
-            return Ok(0);
-        }
-        if let Some(verifiers) = crate::p2p_admission::peer_registry().verifier_peer_ids() {
-            storage.prune_p2p_replay_marks(&verifiers).await?;
-        }
-        storage
+        local_db
+            .acquire()
+            .await?
             .purge_stale_unregistered_nodes(
                 current_time_secs() - NODE_TABLE_STALE_SECS,
                 &crate::env::get_peer_id(),
@@ -926,7 +875,7 @@ pub async fn run_p2p_admission_maintenance(local_db: &LocalDB, goat_client: &Arc
             event = "p2p_admission",
             outcome = "maintenance_write_failed",
             error = %error,
-            "failed to persist replay marks or purge stale node rows; retried next tick"
+            "failed to purge stale node rows; retried next tick"
         ),
     }
 }

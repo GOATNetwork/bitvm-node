@@ -157,11 +157,6 @@ pub const ENV_P2P_RESERVED_PEERS: &str = "P2P_RESERVED_PEERS";
 /// Comma-separated `<peer id>=<operator master public key>` bindings.
 /// Stake is verified on chain at startup.
 pub const ENV_P2P_TRUSTED_OPERATOR_BINDINGS: &str = "P2P_TRUSTED_OPERATOR_BINDINGS";
-/// Longest wait between two re-publishes of a signing-round outbox row.
-/// Handler execution timeout on the business/control worker.
-/// Timeout cancels at an await; durable messages are retried.
-/// Comma-separated peer IDs whose persisted replay marks are cleared at startup.
-pub const ENV_P2P_REPLAY_MARK_RESET_PEERS: &str = "P2P_REPLAY_MARK_RESET_PEERS";
 pub const ENV_P2P_MAX_PENDING_INCOMING_CONNECTIONS: &str = "P2P_MAX_PENDING_INCOMING_CONNECTIONS";
 pub const DEFAULT_P2P_MAX_PENDING_INCOMING_CONNECTIONS: u32 = 128;
 pub const ENV_P2P_MAX_CONNECTIONS_PER_PEER: &str = "P2P_MAX_CONNECTIONS_PER_PEER";
@@ -815,19 +810,6 @@ pub fn parse_trusted_operator_bindings(value: &str) -> Vec<(libp2p::PeerId, [u8;
             parsed
         })
         .collect()
-}
-
-pub fn get_p2p_replay_mark_reset_peers() -> Vec<String> {
-    std::env::var(ENV_P2P_REPLAY_MARK_RESET_PEERS)
-        .map(|peers| {
-            peers
-                .split(',')
-                .map(str::trim)
-                .filter(|peer| !peer.is_empty())
-                .map(String::from)
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 pub fn get_p2p_max_pending_incoming() -> u32 {

@@ -2247,50 +2247,6 @@ impl<'a> StorageProcessor<'a> {
             .map_err(Into::into)
     }
 
-    /// Raise the persisted replay marks to `marks` (`peer_id -> highest sequence
-    /// number admitted`). A mark never moves down.
-    pub async fn raise_p2p_replay_marks(&mut self, marks: &[(String, i64)]) -> anyhow::Result<()> {
-        for (peer_id, highest) in marks {
-            sqlx::query(
-                "INSERT INTO p2p_replay_mark (peer_id, highest) VALUES (?, ?) \
-                 ON CONFLICT (peer_id) DO UPDATE SET highest = MAX(highest, excluded.highest)",
-            )
-            .bind(peer_id)
-            .bind(highest)
-            .execute(self.conn())
-            .await?;
-        }
-        Ok(())
-    }
-
-    pub async fn load_p2p_replay_marks(&mut self) -> anyhow::Result<Vec<(String, i64)>> {
-        let rows = sqlx::query("SELECT peer_id, highest FROM p2p_replay_mark")
-            .fetch_all(self.conn())
-            .await?;
-        rows.iter()
-            .map(|row| Ok((row.try_get("peer_id")?, row.try_get("highest")?)))
-            .collect::<Result<Vec<_>, sqlx::Error>>()
-            .map_err(Into::into)
-    }
-
-    /// Remove marks for unregistered peers, retaining verifier peer IDs in `keep`.
-    pub async fn prune_p2p_replay_marks(&mut self, keep: &[String]) -> anyhow::Result<u64> {
-        let keep_predicate = if keep.is_empty() {
-            String::new()
-        } else {
-            format!(" AND peer_id NOT IN ({})", create_place_holders(keep))
-        };
-        let query = format!(
-            "DELETE FROM p2p_replay_mark \
-             WHERE peer_id NOT IN (SELECT peer_id FROM p2p_registered_peer){keep_predicate}"
-        );
-        let mut query = sqlx::query(&query);
-        for peer_id in keep {
-            query = query.bind(peer_id);
-        }
-        Ok(query.execute(self.conn()).await?.rows_affected())
-    }
-
     /// Allow existing peers or a new unregistered row below `max_rows`.
     /// At capacity, evict the oldest unregistered row older than `evict_stale_before`.
     pub async fn node_row_admissible(
@@ -2325,22 +2281,6 @@ impl<'a> StorageProcessor<'a> {
         .execute(self.conn())
         .await?;
         Ok(evicted.rows_affected() > 0)
-    }
-
-    /// Drop the persisted replay marks of `peer_ids`.
-    pub async fn delete_p2p_replay_marks(&mut self, peer_ids: &[String]) -> anyhow::Result<u64> {
-        if peer_ids.is_empty() {
-            return Ok(0);
-        }
-        let query = format!(
-            "DELETE FROM p2p_replay_mark WHERE peer_id IN ({})",
-            create_place_holders(peer_ids)
-        );
-        let mut query = sqlx::query(&query);
-        for peer_id in peer_ids {
-            query = query.bind(peer_id);
-        }
-        Ok(query.execute(self.conn()).await?.rows_affected())
     }
 
     /// Delete stale node rows except this node and confirmed registered peers.
@@ -3777,15 +3717,6 @@ mod tests {
         s.delete_p2p_registered_peer("other-member", "Committee").await.unwrap();
         assert_eq!(load(&mut s).await.len(), 1);
 
-        // Replay marks only move up, and are kept for registered peers and the
-        // verifiers the caller names.
-        s.raise_p2p_replay_marks(&[("member".into(), 50), ("verifier".into(), 7)]).await.unwrap();
-        s.raise_p2p_replay_marks(&[("member".into(), 40), ("gone".into(), 9)]).await.unwrap();
-        assert_eq!(s.prune_p2p_replay_marks(&["verifier".to_string()]).await.unwrap(), 1);
-        let mut marks = s.load_p2p_replay_marks().await.unwrap();
-        marks.sort();
-        assert_eq!(marks, [("member".to_string(), 50), ("verifier".to_string(), 7)]);
-
         for (peer_id, updated_at) in [("member", 10), ("sybil", 10), ("local", 10), ("live", 900)] {
             s.upsert_node(&Node {
                 peer_id: peer_id.to_string(),
@@ -3828,10 +3759,6 @@ mod tests {
         assert_eq!(s.purge_stale_unregistered_nodes(500, "local").await.unwrap(), 1);
         assert!(!known(&mut s, "left").await);
         assert!(known(&mut s, "member").await && known(&mut s, "local").await);
-
-        s.raise_p2p_replay_marks(&[("locked-out".into(), 99)]).await.unwrap();
-        assert_eq!(s.delete_p2p_replay_marks(&["locked-out".to_string()]).await.unwrap(), 1);
-        assert_eq!(s.delete_p2p_replay_marks(&[]).await.unwrap(), 0);
     }
 
     #[tokio::test]
