@@ -10,6 +10,7 @@ members = [
     "crates/cbft-rpc",
     "crates/bitvm-gc",
     "crates/store",
+    "crates/engine",
     "crates/node-macros",
     "crates/client",
     "crates/util",
@@ -115,6 +116,7 @@ soldering-host = { git = "https://github.com/GOATNetwork/bitvm-gc", branch = "fe
 #garbled-snark-verifier = { path = "../bitvm-gc/garbled-snark-verifier"}
 #soldering-host = { path = "../bitvm-gc/babe-programs/soldering/host" }
 store = { path = "crates/store" }
+engine = { path = "crates/engine" }
 util = { path = "crates/util" }
 client = { path = "crates/client" }
 bitcoin-light-client-circuit = { path = "crates/bitcoin-light-client-circuit" }

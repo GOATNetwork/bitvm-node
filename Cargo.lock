@@ -4712,6 +4712,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "engine"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "futures",
+ "hex",
+ "prometheus-client",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "store",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid 1.23.0",
+]
+
+[[package]]
 name = "enr"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
