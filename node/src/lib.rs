@@ -1,4 +1,6 @@
 pub mod action;
+pub mod aggregates;
+pub mod engine_bridge;
 pub mod env;
 pub mod handle;
 pub mod metrics_service;

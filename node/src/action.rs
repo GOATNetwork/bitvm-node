@@ -3447,7 +3447,7 @@ pub(crate) async fn try_finalize_graph(
         let simplified_graph = graph.to_simplified()?;
         let store_outcome = store_finalized_graph_if_needed(local_db, &simplified_graph).await?;
         mark_graph_as_endorsed(local_db, instance_id, graph_id).await?;
-        try_transition_instance_to_presigned(local_db, instance_id).await?;
+        notify_graph_endorsed(local_db, instance_id, graph_id).await?;
         // Throttle GraphFinalize recovery and stamp the gate only on success.
         let gate = crate::p2p_admission::protocol_republish_gate();
         let gate_key = format!("graph-finalize:{graph_id}");
@@ -3522,18 +3522,8 @@ impl SigningRound {
         instance: Option<&InstanceBridgeInStatus>,
     ) -> bool {
         use InstanceBridgeInStatus as Instance;
-        let instance_failed = matches!(
-            instance,
-            Some(
-                Instance::PresignedFailed
-                    | Instance::RelayerL2MintedFailed
-                    | Instance::Timeout
-                    | Instance::UserCanceled
-                    | Instance::NoEnoughCommitteesAnswered
-                    | Instance::UserDiscarded
-            )
-        );
-        if instance_failed {
+        // The failure set F closes every round (docs/node-protocol.md §10.4).
+        if instance.is_some_and(|status| status.is_failed()) {
             return true;
         }
         match self {
@@ -4178,7 +4168,7 @@ mod tests {
         assert!(!SigningRound::PeginConfirm.delivery_finished(None, None));
         assert!(SigningRound::PeginConfirm.delivery_finished(None, Some(&I::RelayerL1Broadcasted)));
         // A failed instance closes everything.
-        for failed in [I::PresignedFailed, I::Timeout, I::UserCanceled, I::UserDiscarded] {
+        for failed in I::FAILED {
             assert!(
                 SigningRound::GraphSigning
                     .delivery_finished(Some(G::OperatorPresigned), Some(&failed))

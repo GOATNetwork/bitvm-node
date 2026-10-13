@@ -211,6 +211,26 @@ pub async fn get_debug_status(
 }
 
 // TODO(auth): Require operator authentication before exposing local debug state.
+/// Execution engine snapshot: row counts by state, aggregates parked on a
+/// `waiting_for`, and poisoned aggregates.
+#[axum::debug_handler]
+pub async fn get_debug_engine(
+    State(app_state): State<Arc<AppState>>,
+) -> ApiResult<engine::EngineSnapshot> {
+    let Some(engine) = app_state.engine.as_ref() else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "ENGINE_DISABLED".to_string(),
+                message: "execution engine is not enabled on this node".to_string(),
+            }),
+        ));
+    };
+    let snapshot = engine.snapshot().await.api_error("GET_DEBUG_ENGINE_ERROR")?;
+    ok_response(snapshot)
+}
+
+// TODO(auth): Require operator authentication before exposing local debug state.
 #[axum::debug_handler]
 pub async fn get_graph_debug_messages(
     Path(graph_id): Path<String>,

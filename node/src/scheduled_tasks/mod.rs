@@ -6,6 +6,7 @@ mod node_maintenance_tasks;
 mod sequencer_set_hash_monitor_task;
 mod spv_maintenance_tasks;
 
+use crate::aggregates::instance_scan::{scan_answer_windows, scan_instances_on_bitcoin};
 use crate::env::{
     actor_runs_babe_setup_state_cleanup, get_maintenance_run_timeout_secs, get_network,
     get_node_goat_address, get_node_pubkey, is_enable_babe_setup_state_cleanup,
@@ -18,9 +19,7 @@ use crate::scheduled_tasks::graph_maintenance_tasks::{
     detect_init_withdraw_call, detect_kickoff, detect_take1_or_challenge, process_graph_challenge,
 };
 use crate::scheduled_tasks::instance_maintenance_tasks::{
-    instance_answers_monitor, instance_btc_tx_monitor, instance_committee_key_cleanup_monitor,
-    instance_expiration_monitor, instance_window_expiration_monitor,
-    pegin_confirm_recovery_monitor, swap_escrow_timeout_monitor,
+    instance_answers_monitor, pegin_confirm_recovery_monitor, swap_escrow_timeout_monitor,
 };
 use crate::scheduled_tasks::node_maintenance_tasks::node_available_pbtc_update_monitor;
 use crate::scheduled_tasks::spv_maintenance_tasks::spv_header_hash_update;
@@ -28,6 +27,7 @@ use crate::utils::node_p2wsh_address;
 use bitvm_lib::actors::Actor;
 use client::btc_chain::BTCClient;
 use client::goat_chain::GOATClient;
+use engine::EngineHandle;
 pub use event_watch_task::{is_processing_gateway_history_events, run_watch_event_task};
 pub use sequencer_set_hash_monitor_task::run_sequencer_set_hash_monitor_task;
 use std::future::Future;
@@ -229,6 +229,7 @@ async fn run(
     btc_client: Arc<BTCClient>,
     goat_client: Arc<GOATClient>,
     metrics_state: &MetricsState,
+    engine: &EngineHandle,
 ) -> anyhow::Result<MaintenanceRunOutcome> {
     let btc_client = btc_client.as_ref();
     let goat_client = goat_client.as_ref();
@@ -278,34 +279,23 @@ async fn run(
         instance_answers_monitor(local_db, btc_client, goat_client),
     )
     .await;
+    // Chain facts for the Instance aggregate; the apply decides every status.
     run_maintenance_subtask(
         metrics_state,
-        "instance_window_expiration_monitor",
-        instance_window_expiration_monitor(local_db, goat_client),
+        "instance_answer_window_scan",
+        scan_answer_windows(local_db, goat_client, engine),
     )
     .await;
     run_maintenance_subtask(
         metrics_state,
-        "instance_expiration_monitor",
-        instance_expiration_monitor(local_db, btc_client),
-    )
-    .await;
-    run_maintenance_subtask(
-        metrics_state,
-        "instance_btc_tx_monitor",
-        instance_btc_tx_monitor(local_db, btc_client),
+        "instance_btc_scan",
+        scan_instances_on_bitcoin(local_db, btc_client, engine, &actor),
     )
     .await;
     run_maintenance_subtask(
         metrics_state,
         "pegin_confirm_recovery_monitor",
         pegin_confirm_recovery_monitor(local_db, btc_client, &actor),
-    )
-    .await;
-    run_maintenance_subtask(
-        metrics_state,
-        "instance_committee_key_cleanup_monitor",
-        instance_committee_key_cleanup_monitor(local_db, btc_client),
     )
     .await;
     run_maintenance_subtask(
@@ -337,6 +327,7 @@ async fn run(
     Ok(MaintenanceRunOutcome::Completed)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_maintenance_tasks(
     actor: Actor,
     local_db: LocalDB,
@@ -345,6 +336,7 @@ pub async fn run_maintenance_tasks(
     interval: u64,
     cancellation_token: CancellationToken,
     metrics_state: MetricsState,
+    engine: EngineHandle,
 ) -> anyhow::Result<String> {
     let mut tick: u64 = 0;
     let maintenance_run_timeout = Duration::from_secs(get_maintenance_run_timeout_secs());
@@ -369,6 +361,7 @@ pub async fn run_maintenance_tasks(
                         btc_client.clone(),
                         goat_client.clone(),
                         &metrics_state,
+                        &engine,
                     ),
                 ).await {
                     Ok(Ok(MaintenanceRunOutcome::Completed)) => {

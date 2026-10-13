@@ -311,6 +311,7 @@ pub struct InstanceUpdate {
     pub post_pegin_txhash: Option<String>,
     pub btc_height: Option<i64>,
     pub committees_answers: Option<IndexMap<String, Vec<u8>>>,
+    pub key_deleted: Option<bool>,
     pub only_if_status_in: Option<Vec<String>>,
 }
 
@@ -328,6 +329,7 @@ impl InstanceUpdate {
             post_pegin_txhash: None,
             btc_height: None,
             committees_answers: None,
+            key_deleted: None,
             only_if_status_in: None,
         }
     }
@@ -388,6 +390,12 @@ impl InstanceUpdate {
         self
     }
 
+    /// Record whether the committee instance key envelope has been deleted.
+    pub fn with_key_deleted(mut self, key_deleted: bool) -> Self {
+        self.key_deleted = Some(key_deleted);
+        self
+    }
+
     /// Apply this update only while the instance is still in one of the
     /// expected states. The condition is folded into the UPDATE statement.
     pub fn with_only_if_status_in(mut self, statuses: Vec<String>) -> Self {
@@ -406,6 +414,7 @@ impl InstanceUpdate {
             || self.post_pegin_txhash.is_some()
             || self.btc_height.is_some()
             || self.committees_answers.is_some()
+            || self.key_deleted.is_some()
     }
 
     pub fn get_query_builder(&self, base_sql: &str) -> QueryBuilder {
@@ -449,6 +458,10 @@ impl InstanceUpdate {
             let committees_answers = serde_json::to_string(committees_answers)
                 .expect("IndexMap<String, Vec<u8>> serialization is infallible");
             query_builder.set_field("committees_answers", QueryParam::Text(committees_answers));
+        }
+
+        if let Some(key_deleted) = self.key_deleted {
+            query_builder.set_field("key_deleted", QueryParam::Int(i64::from(key_deleted)));
         }
 
         // Add update time
@@ -1442,62 +1455,6 @@ impl<'a> StorageProcessor<'a> {
         .execute(self.conn())
         .await?;
         Ok(row.rows_affected())
-    }
-
-    /// Update expired instances status
-    ///
-    /// Updates the status of instances that have expired based on a time threshold.
-    /// This is typically used for cleanup operations to mark old instances as expired.
-    ///
-    /// Parameters:
-    /// - current_status: The current status to match for instances to be updated
-    /// - expired_status: The new status to set for expired instances
-    /// - time_threshold: Timestamp threshold - instances updated before this time will be marked as expired
-    ///
-    /// Returns:
-    /// - Ok(affected_rows) number of instances that were updated
-    /// - Err if the update operation failed
-    pub async fn update_expired_instance(
-        &mut self,
-        current_status: &str,
-        expired_status: &str,
-        time_threshold: i64,
-    ) -> anyhow::Result<u64> {
-        let current_time = get_current_timestamp_secs();
-        let row = sqlx::query!(
-            r#"UPDATE instance SET status = ?, status_updated_at = ?, updated_at = ?  WHERE status = ? AND updated_at < ?"#,
-            expired_status,
-            current_time,
-            current_time,
-            current_status,
-            time_threshold
-        )
-            .execute(self.conn())
-            .await?;
-        Ok(row.rows_affected())
-    }
-
-    /// Transition an instance only when it is still in the expected status.
-    pub async fn update_instance_status_if_current(
-        &mut self,
-        instance_id: &Uuid,
-        current_status: &str,
-        new_status: &str,
-    ) -> anyhow::Result<bool> {
-        let current_time = get_current_timestamp_secs();
-        let result = sqlx::query!(
-            "UPDATE instance SET status = ?, status_updated_at = ?, updated_at = ? \
-             WHERE instance_id = ? AND status = ?",
-            new_status,
-            current_time,
-            current_time,
-            instance_id,
-            current_status,
-        )
-        .execute(self.conn())
-        .await?;
-
-        Ok(result.rows_affected() > 0)
     }
 
     /// Update instance fields using builder pattern

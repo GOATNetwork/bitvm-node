@@ -1176,7 +1176,6 @@ pub async fn get_unsigned_pegin_txn(
             InstanceBridgeInStatus::CommitteesAnswered.to_string(),
             InstanceBridgeInStatus::UserBroadcastPeginPrepare.to_string(),
             InstanceBridgeInStatus::Presigned.to_string(),
-            InstanceBridgeInStatus::PresignedFailed.to_string(),
             InstanceBridgeInStatus::Timeout.to_string(),
         ]
         .contains(&instance.status)

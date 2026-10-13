@@ -115,12 +115,18 @@ use zkm_verifier::{
 pub const SELF_SENDER: &str = "self";
 const BABE_SETUP_STATE_ORPHAN_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// Path of the committee instance key envelope for `instance_id`.
+pub fn committee_instance_keys_envelope_path(instance_id: Uuid) -> PathBuf {
+    let mut envelope_path = PathBuf::from(COMMITTEE_INSTANCE_KEYS_DIR);
+    envelope_path.push(format!("{instance_id}.json"));
+    envelope_path
+}
+
 pub(crate) fn load_committee_instance_keypair(
     committee_master_key: &CommitteeMasterKey,
     instance_id: Uuid,
 ) -> Result<Keypair> {
-    let mut envelope_path = PathBuf::from(COMMITTEE_INSTANCE_KEYS_DIR);
-    envelope_path.push(format!("{instance_id}.json"));
+    let envelope_path = committee_instance_keys_envelope_path(instance_id);
     committee_master_key.load_instance_keypair(instance_id, &envelope_path).with_context(|| {
         format!(
             "load committee instance keypair failed for {} at {}",
@@ -4448,6 +4454,7 @@ pub async fn generate_instance(
         btc_height: 0,
         parameters: None,
         post_pegin_txhash: None,
+        key_deleted: false,
         status_updated_at: params.pegin_timestamp,
         created_at: current_time,
         updated_at: current_time,
@@ -5569,26 +5576,18 @@ pub async fn has_required_presigned_graphs(local_db: &LocalDB, instance_id: Uuid
     Ok(get_endorsed_graph_count(local_db, instance_id).await? >= min_required_operator())
 }
 
-pub async fn try_transition_instance_to_presigned(
+/// A graph of the instance is finalized and endorsed locally: the Instance aggregate re-checks
+/// the Presigned threshold.
+pub async fn notify_graph_endorsed(
     local_db: &LocalDB,
     instance_id: Uuid,
-) -> Result<bool> {
-    if !has_required_presigned_graphs(local_db, instance_id).await? {
-        return Ok(false);
-    }
-
-    let mut storage_processor = local_db.acquire().await?;
-    let transitioned = storage_processor
-        .update_instance_status_if_current(
-            &instance_id,
-            &InstanceBridgeInStatus::UserBroadcastPeginPrepare.to_string(),
-            &InstanceBridgeInStatus::Presigned.to_string(),
-        )
-        .await?;
-    if transitioned {
-        info!("Instance {instance_id} reached the required finalized graph threshold");
-    }
-    Ok(transitioned)
+    graph_id: Uuid,
+) -> Result<()> {
+    crate::engine_bridge::submit_event(
+        local_db,
+        crate::aggregates::instance::graph_endorsed_event(instance_id, graph_id)?,
+    )
+    .await
 }
 pub async fn store_committee_pub_nonce_for_instance(
     local_db: &LocalDB,

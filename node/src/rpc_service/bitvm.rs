@@ -1,4 +1,5 @@
 use super::utils::{deserialize_u256, serialize_u256};
+use crate::aggregates::instance::PeginDeadlines;
 use crate::rpc_service::current_time_secs;
 use crate::scheduled_tasks::graph_maintenance_tasks::{
     ChallengeSubStatus, VerifierChallengeStatus,
@@ -24,10 +25,7 @@ use uuid::Uuid;
 
 const BRIDGE_IN_FAIL_AS_UTXO_BEEN_SPENT: &str = "Your UTXO has already been spent.";
 // const BRIDGE_IN_FAIL_AS_NO_ENOUGH_COMMITTEES: &str = "Unfortunately, no enough committee answered.";
-const BRIDGE_IN_FAIL_AS_PRESIGNED_FAILED: &str = "Unfortunately, the presigned failed.";
 const BRIDGE_IN_FAIL_AS_VERIFICATION_FAILED: &str = "Unfortunately, the verification failed.";
-
-const BRIDGE_IN_FAIL_AS_L2_MINTED_FAILED: &str = "Unfortunately, PegBTC minted failed.";
 
 const BRIDGE_IN_FAIL_AS_TIMEOUT: &str = "The operation timed out. Please try again.";
 const _BRIDGE_IN_FAIL_AS_L1_LOCK_TIMEOUT: &str =
@@ -200,6 +198,12 @@ pub struct InstanceExtended {
     pub confirmations: u32,
     pub target_confirmations: u32,
     pub status_extra: StatusExtra,
+    /// `Prepare height + T0`: from this Bitcoin height the user may broadcast Peg-In-Cancel.
+    /// `None` before Prepare confirmed.
+    pub cancel_from_height: Option<i64>,
+    /// `Prepare height + T0 + buffer`: from this height the peg-in is abandoned
+    /// unless Peg-In-Confirm is confirmed or visible in the mempool.
+    pub abandon_height: Option<i64>,
 }
 
 impl InstanceExtended {
@@ -231,6 +235,9 @@ impl InstanceExtended {
                 response_window_blocks,
             );
 
+        let deadlines = PeginDeadlines::from_env();
+        let cancel_from_height = deadlines.cancel_from_height(instance.btc_height);
+        let abandon_height = deadlines.abandon_height(instance.btc_height);
         // instance.status = instance.convert_to_display_status();
         Ok(Self {
             waiting_time_in_secs,
@@ -238,6 +245,8 @@ impl InstanceExtended {
             confirmations: 0,
             target_confirmations: 0,
             status_extra,
+            cancel_from_height,
+            abandon_height,
             utxo: utxos,
             instance: instance.into(),
         })
@@ -286,16 +295,6 @@ async fn get_instance_status_extra(
                 status_extra.is_failed = true;
                 status_extra.error = Some(BRIDGE_IN_FAIL_AS_VERIFICATION_FAILED.to_string());
                 status_extra.user_action = StatusUserAction::Cancel;
-            }
-            InstanceBridgeInStatus::PresignedFailed => {
-                status_extra.is_failed = true;
-                status_extra.error = Some(BRIDGE_IN_FAIL_AS_PRESIGNED_FAILED.to_string());
-                status_extra.user_action = StatusUserAction::None;
-            }
-            InstanceBridgeInStatus::RelayerL2MintedFailed => {
-                status_extra.is_failed = true;
-                status_extra.error = Some(BRIDGE_IN_FAIL_AS_L2_MINTED_FAILED.to_string());
-                status_extra.user_action = StatusUserAction::None;
             }
             InstanceBridgeInStatus::Timeout => {
                 status_extra.is_failed = true;
@@ -720,9 +719,7 @@ impl DisplayStatusConvert for Instance {
             Ok(InstanceBridgeInStatus::RelayerL2Minted) => {
                 InstanceDisplayStatus::Success.to_string()
             }
-            Ok(InstanceBridgeInStatus::PresignedFailed)
-            | Ok(InstanceBridgeInStatus::RelayerL2MintedFailed)
-            | Ok(InstanceBridgeInStatus::NoEnoughCommitteesAnswered)
+            Ok(InstanceBridgeInStatus::NoEnoughCommitteesAnswered)
             | Ok(InstanceBridgeInStatus::UserDiscarded) => {
                 InstanceDisplayStatus::Failed.to_string()
             }
@@ -755,8 +752,6 @@ impl DisplayStatusConvert for Instance {
                 vec![InstanceBridgeInStatus::UserCanceled.to_string()]
             }
             Ok(InstanceDisplayStatus::Failed) => vec![
-                InstanceBridgeInStatus::PresignedFailed.to_string(),
-                InstanceBridgeInStatus::RelayerL2MintedFailed.to_string(),
                 InstanceBridgeInStatus::NoEnoughCommitteesAnswered.to_string(),
                 InstanceBridgeInStatus::UserDiscarded.to_string(),
             ],

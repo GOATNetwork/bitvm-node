@@ -1,8 +1,9 @@
 use crate::action::*;
+use crate::aggregates::instance::{SigningGate, signing_gate};
 use crate::env::{
-    COMMITTEE_INSTANCE_KEYS_DIR, get_babe_gc_asset_paths, get_bitvm_key, get_node_goat_address,
-    get_peer_id, get_soldering_proof_payload_store_path, get_verifier_candidate_backup_count,
-    get_verifier_candidate_collection_window_secs, is_relayer,
+    get_babe_gc_asset_paths, get_bitvm_key, get_node_goat_address,
+    get_operator_graph_start_cutoff_blocks, get_peer_id, get_soldering_proof_payload_store_path,
+    get_verifier_candidate_backup_count, get_verifier_candidate_collection_window_secs, is_relayer,
 };
 use crate::error::SpecialError;
 use crate::metrics_service::MetricsState;
@@ -49,7 +50,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Instant;
 use store::localdb::LocalDB;
-use store::{GoatTxType, GraphStatus, SerializableTxid};
+use store::{GoatTxType, GraphStatus, InstanceBridgeInStatus, SerializableTxid};
 use uuid::Uuid;
 
 pub struct HandlerContext<'a> {
@@ -166,12 +167,6 @@ pub(crate) async fn run_heavy_task(context: &HeavyTaskContext, task: HeavyTask) 
     }
 }
 
-fn committee_instance_keys_envelope_path(instance_id: Uuid) -> std::path::PathBuf {
-    let mut path = std::path::PathBuf::from(COMMITTEE_INSTANCE_KEYS_DIR);
-    path.push(format!("{instance_id}.json"));
-    path
-}
-
 fn is_io_not_found_error(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
         cause
@@ -180,7 +175,8 @@ fn is_io_not_found_error(err: &anyhow::Error) -> bool {
     })
 }
 
-fn load_or_create_committee_instance_keypair(
+async fn load_or_create_committee_instance_keypair(
+    local_db: &LocalDB,
     committee_master_key: &CommitteeMasterKey,
     instance_id: Uuid,
 ) -> Result<bitcoin::key::Keypair> {
@@ -196,6 +192,18 @@ fn load_or_create_committee_instance_keypair(
                         envelope_path.display()
                     )
                 });
+            }
+            // A deleted key is never regenerated (docs/node-protocol.md §10.2).
+            if local_db
+                .acquire()
+                .await?
+                .find_instance(&instance_id)
+                .await?
+                .is_some_and(|instance| instance.key_deleted)
+            {
+                bail!(
+                    "committee instance key for {instance_id} was deleted; refusing to regenerate it"
+                );
             }
             tracing::info!(
                 "committee instance key not found for {} at {}: {}, creating new envelope",
@@ -572,9 +580,6 @@ pub async fn dispatch(ctx: &mut HandlerContext<'_>, content: &GOATMessageContent
                 content,
             )
             .await
-        }
-        (GOATMessageContent::PostReady(PostReady { instance_id }), Actor::Committee) => {
-            handle_post_ready(ctx, *instance_id).await
         }
         (
             GOATMessageContent::KickoffReady(KickoffReady { instance_id, graph_id }),
@@ -1504,7 +1509,8 @@ async fn handle_pegin_request_committee(
     }
     let committee_master_key = CommitteeMasterKey::new(get_bitvm_key()?);
     let instance_keypair =
-        load_or_create_committee_instance_keypair(&committee_master_key, instance_id)?;
+        load_or_create_committee_instance_keypair(ctx.local_db, &committee_master_key, instance_id)
+            .await?;
     let pubkey_for_instance = instance_keypair.public_key().into();
     ctx.goat_client.gateway_answer_pegin_request(&instance_id, &pubkey_for_instance).await?;
     Ok(())
@@ -1726,6 +1732,15 @@ async fn handle_confirm_instance_operator(
         return Ok(());
     }
 
+    if let Some(reason) = graph_start_blocked(ctx, instance_id).await? {
+        tracing::info!(
+            event = "graph_start_cutoff",
+            instance_id = %instance_id,
+            reason = %reason,
+            "not starting a new graph for this instance"
+        );
+        return Ok(());
+    }
     // 1. read & check parameters
     let instance_params = match read_instance_info_from_goat(ctx.goat_client, instance_id).await {
         Ok(v) => v,
@@ -3195,6 +3210,11 @@ async fn maybe_vote_and_presign_graph(
         .iter()
         .find(|(committee_pubkey, _, _)| *committee_pubkey == local_committee_pubkey)
         .map(|(_, _, signature)| *signature);
+    if local_vote.is_none()
+        && signing_closed(ctx, instance_id, "graph nonce consensus vote").await?
+    {
+        return Ok(());
+    }
     let (signature, origin) = match local_vote {
         Some(signature) => (signature, StoredValue::Found),
         None => {
@@ -3274,6 +3294,9 @@ async fn maybe_vote_and_presign_graph(
             .await?;
     validate_verifier_graph_params_endorsements(ctx.goat_client, graph, &verifier_endorsements)
         .await?;
+    if signing_closed(ctx, instance_id, "committee presign").await? {
+        return Ok(());
+    }
     let (_, sec_nonces, _) =
         committee_master_key.nonces_for_graph_job_with_keypair(&full_graph, instance_keypair)?;
     let committee_partial_sigs =
@@ -3323,6 +3346,9 @@ async fn endorse_graph_if_presigned(
         return Ok(());
     }
 
+    if signing_closed(ctx, instance_id, "graph endorsement").await? {
+        return Ok(());
+    }
     let committee_sig_for_graph = endorse_graph(ctx.goat_client, graph).await?;
     let committee_sig_for_params = endorse_graph_params(graph).await?;
     let committee_master_key = CommitteeMasterKey::new(get_bitvm_key()?);
@@ -4139,7 +4165,7 @@ async fn handle_graph_finalize_committee(
     .await?;
     // After storing, mark the graph as finalized for the instance threshold.
     mark_graph_as_endorsed(ctx.local_db, instance_id, graph_id).await?;
-    try_transition_instance_to_presigned(ctx.local_db, instance_id).await?;
+    notify_graph_endorsed(ctx.local_db, instance_id, graph_id).await?;
     let finalized_graph = BitvmGcGraph::from_simplified(graph)?;
     refresh_newly_finalized_graph(ctx, instance_id, graph_id, &finalized_graph).await?;
     // 3. if endorsed graph count >= threshold, generate & broadcast PeginConfirmNonce
@@ -4154,7 +4180,9 @@ async fn handle_graph_finalize_committee(
         )
         .await?;
         if stored_pub_nonce.is_none() {
-            if get_committee_partial_sig_for_instance(
+            if signing_closed(ctx, instance_id, "PeginConfirm nonce").await? {
+                // Nothing new after T0; stored values are still re-sent below.
+            } else if get_committee_partial_sig_for_instance(
                 ctx.local_db,
                 instance_id,
                 &local_committee_pubkey,
@@ -4298,7 +4326,7 @@ async fn handle_graph_finalize_default(
     )
     .await?;
     mark_graph_as_endorsed(ctx.local_db, instance_id, graph_id).await?;
-    try_transition_instance_to_presigned(ctx.local_db, instance_id).await?;
+    notify_graph_endorsed(ctx.local_db, instance_id, graph_id).await?;
     let finalized_graph = BitvmGcGraph::from_simplified(graph)?;
     refresh_newly_finalized_graph(ctx, instance_id, graph_id, &finalized_graph).await?;
     Ok(())
@@ -4391,6 +4419,15 @@ async fn broadcast_pegin_confirm_if_presigned(
     committee_pubkeys: &[PublicKey],
 ) -> Result<()> {
     if !is_relayer() {
+        return Ok(());
+    }
+    if let Some(reason) = pegin_confirm_broadcast_blocked(ctx, instance_id).await? {
+        tracing::info!(
+            event = "signing_gate",
+            instance_id = %instance_id,
+            reason = %reason,
+            "not broadcasting Peg-In-Confirm"
+        );
         return Ok(());
     }
     let pub_nonces = get_committee_pub_nonces_for_instance(ctx.local_db, instance_id).await?;
@@ -4498,6 +4535,11 @@ async fn maybe_vote_and_sign_pegin_confirm(
         .iter()
         .find(|(committee_pubkey, _, _)| *committee_pubkey == local_committee_pubkey)
         .map(|(_, _, signature)| *signature);
+    if local_vote.is_none()
+        && signing_closed(ctx, instance_id, "PeginConfirm nonce consensus vote").await?
+    {
+        return Ok(());
+    }
     let (signature, origin) = match local_vote {
         Some(signature) => (signature, StoredValue::Found),
         None => {
@@ -4541,6 +4583,9 @@ async fn maybe_vote_and_sign_pegin_confirm(
         return Ok(());
     }
 
+    if signing_closed(ctx, instance_id, "PeginConfirm partial signature").await? {
+        return Ok(());
+    }
     let (sec_nonce, _, _) = committee_master_key
         .nonce_for_instance_job_with_keypair(&instance_parameters, instance_keypair)?;
     let mut pegin_confirm = instance_parameters.build_pegin_tx()?.1;
@@ -4880,174 +4925,71 @@ async fn handle_pegin_confirm_partial_sig_committee(
         .await
 }
 
-#[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id))]
-async fn handle_post_ready(ctx: &mut HandlerContext<'_>, instance_id: Uuid) -> Result<()> {
-    // triggered by PeginConfirm tx
-    if !is_relayer() {
-        return Ok(());
-    }
-    // 1. (Relayer)call Gateway.postPeginData on GoatChain
-    let committee_pubkeys = ctx.goat_client.gateway_get_committee_pubkeys(&instance_id).await?;
-    let pegin_data = ctx.goat_client.gateway_get_pegin_data(&instance_id).await?;
-    if pegin_data.status == PeginStatus::None {
-        tracing::warn!("Ignore PostReady for {instance_id}: not a pending pegin request");
-        return Ok(());
-    } else if pegin_data.status == PeginStatus::Pending {
-        let instance_params = get_instance_parameters(ctx.local_db, instance_id)
-            .await?
-            .ok_or_else(|| anyhow!("Instance parameters not found for {instance_id}"))?;
-        let pegin_confirm = instance_params.build_pegin_tx()?.1;
-        let pegin_txid = pegin_confirm.tx().compute_txid();
-        let pegin_tx = match ctx.btc_client.get_tx(&pegin_txid).await? {
-            Some(tx) => tx,
-            None => {
-                let delay_secs = avg_block_time_secs(ctx.btc_client.network());
-                let message = GOATMessage::new(
-                    ctx.actor.clone(),
-                    GOATMessageContent::PostReady(PostReady { instance_id }),
-                );
-                defer_or_enqueue_message(
-                    ctx.local_db,
-                    &message,
-                    delay_secs as usize,
-                    MessageDeferReason::BitcoinTransactionPending,
-                    "pegin-confirm transaction is not available from the Bitcoin backend",
-                )
-                .await?;
-                tracing::warn!(
-                    "Retry postPeginData later for {instance_id}: Pegin-Confirm transaction not found on Bitcoin: {pegin_txid}"
-                );
-                return Ok(());
-            }
-        };
-        let endorse_sigs = get_committee_endorse_sigs_for_pegin(ctx.local_db, instance_id)
-            .await?
-            .into_iter()
-            .map(|(_, es)| es)
-            .collect::<Vec<_>>();
-        if endorse_sigs.len() != committee_pubkeys.len() {
-            let delay_secs = avg_block_time_secs(ctx.btc_client.network());
-            let message = GOATMessage::new(
-                ctx.actor.clone(),
-                GOATMessageContent::PostReady(PostReady { instance_id }),
-            );
-            defer_or_enqueue_message(
-                ctx.local_db,
-                &message,
-                delay_secs as usize,
-                MessageDeferReason::CommitteeEndorsementsPending,
-                "waiting for all committee endorsements of the pegin-confirm transaction",
-            )
-            .await?;
-            tracing::warn!(
-                "Retry postPeginData later for {instance_id}: not enough endorse sigs for pegin confirm tx: {}",
-                endorse_sigs.len()
-            );
-            return Ok(());
-        }
-        let pegin_height = match ctx.btc_client.get_tx_status(&pegin_txid).await?.block_height {
-            Some(height) => height as u64,
-            None => {
-                let delay_secs = avg_block_time_secs(ctx.btc_client.network());
-                let message = GOATMessage::new(
-                    ctx.actor.clone(),
-                    GOATMessageContent::PostReady(PostReady { instance_id }),
-                );
-                defer_or_enqueue_message(
-                    ctx.local_db,
-                    &message,
-                    delay_secs as usize,
-                    MessageDeferReason::BitcoinConfirmationPending,
-                    "pegin-confirm transaction is not confirmed on Bitcoin",
-                )
-                .await?;
-                tracing::info!(
-                    "Retry postPeginData later for {instance_id}: pegin confirm tx not confirmed on btc yet"
-                );
-                return Ok(());
-            }
-        };
-        let goat_confirmed_height = ctx.goat_client.btc_spv_latest_height().await?;
-        if goat_confirmed_height < pegin_height {
-            let delay_secs = avg_block_time_secs(ctx.btc_client.network())
-                * (pegin_height - goat_confirmed_height);
-            let message = GOATMessage::new(
-                ctx.actor.clone(),
-                GOATMessageContent::PostReady(PostReady { instance_id }),
-            );
-            defer_or_enqueue_message(
-                ctx.local_db,
-                &message,
-                delay_secs as usize,
-                MessageDeferReason::GoatSpvPending,
-                "pegin-confirm block is not available through GOAT SPV",
-            )
-            .await?;
+/// The T0 gate (docs/node-protocol.md §10.2): no new protocol signature for
+/// an instance in F or at `h >= H_p + T0`. Stored values may still be re-sent.
+async fn signing_closed(ctx: &HandlerContext<'_>, instance_id: Uuid, what: &str) -> Result<bool> {
+    match signing_gate(ctx.local_db, ctx.btc_client, instance_id).await? {
+        SigningGate::Open => Ok(false),
+        SigningGate::Closed(reason) => {
             tracing::info!(
-                "Retry postPeginData later for {instance_id}: pegin confirm tx block not posted to goat spv contract yet"
+                event = "signing_gate",
+                instance_id = %instance_id,
+                what,
+                reason = %reason,
+                "refusing to produce a new protocol signature"
             );
-            return Ok(());
+            Ok(true)
         }
-        let result = ctx
-            .goat_client
-            .gateway_post_pegin_data(ctx.btc_client, &instance_id, &pegin_tx, &endorse_sigs)
-            .await;
-        ctx.metrics_state.record_pegin_post(result.is_ok());
-        result?;
-    } else {
-        // already posted
     }
-    // 2. (Relayer)call Gateway.postGraphData on GoatChain
-    let graph_ids = get_graph_ids_for_instance(ctx.local_db, instance_id).await?;
-    let mut missing_graph_endorsements = false;
-    for graph_id in &graph_ids {
-        let graph_data = ctx.goat_client.gateway_get_graph_data(graph_id).await?;
-        if graph_data.operator_pubkey != [0u8; 32] {
-            // already posted
-            continue;
+}
+
+/// The relayer broadcasts Peg-In-Confirm only before T0 and while no
+/// Peg-In-Cancel is confirmed (docs/node-protocol.md §10.2).
+async fn pegin_confirm_broadcast_blocked(
+    ctx: &HandlerContext<'_>,
+    instance_id: Uuid,
+) -> Result<Option<String>> {
+    let instance = ctx.local_db.acquire().await?.find_instance(&instance_id).await?;
+    let Some(instance) = instance else {
+        return Ok(Some("instance not found".to_string()));
+    };
+    if let SigningGate::Closed(reason) =
+        signing_gate(ctx.local_db, ctx.btc_client, instance_id).await?
+    {
+        return Ok(Some(reason));
+    }
+    if let Some(cancel_txid) = instance.pegin_cancel_txid
+        && let Some(cancel_tx) = ctx.btc_client.get_tx_info(&cancel_txid.0).await?
+        && cancel_tx.status.confirmed
+    {
+        return Ok(Some(format!("Peg-In-Cancel {} is confirmed", cancel_txid.0)));
+    }
+    Ok(None)
+}
+
+/// Local operator policy (docs/node-protocol.md §10.2): no new graph for an
+/// instance in F or past `Prepare height + OPERATOR_GRAPH_START_CUTOFF_BLOCKS`.
+async fn graph_start_blocked(
+    ctx: &HandlerContext<'_>,
+    instance_id: Uuid,
+) -> Result<Option<String>> {
+    let instance = ctx.local_db.acquire().await?.find_instance(&instance_id).await?;
+    let Some(instance) = instance else {
+        return Ok(None);
+    };
+    if let Ok(status) = InstanceBridgeInStatus::from_str(&instance.status)
+        && status.is_failed()
+    {
+        return Ok(Some(format!("instance is {status}")));
+    }
+    if instance.btc_height > 0 {
+        let cutoff = instance.btc_height + get_operator_graph_start_cutoff_blocks();
+        let height = i64::from(ctx.btc_client.get_height().await?);
+        if height > cutoff {
+            return Ok(Some(format!("height {height} is past the graph start cutoff {cutoff}")));
         }
-        let endorsement_sigs =
-            get_committee_endorsements_for_graph(ctx.local_db, instance_id, *graph_id)
-                .await?
-                .into_iter()
-                .map(|(_, _, sig)| sig)
-                .collect::<Vec<_>>();
-        if endorsement_sigs.len() != committee_pubkeys.len() {
-            missing_graph_endorsements = true;
-            tracing::warn!(
-                "Defer postGraphData for {instance_id}:{graph_id}: not enough endorse sigs for graph: {}",
-                endorsement_sigs.len()
-            );
-            continue;
-        }
-        let graph = get_graph(ctx.local_db, instance_id, *graph_id)
-            .await?
-            .ok_or_else(|| anyhow!("Graph not found for {instance_id}:{graph_id}"))?;
-        let graph = BitvmGcGraph::from_simplified(&graph)?;
-        let graph_data = build_graph_data(&graph)?;
-        ctx.goat_client
-            .gateway_post_graph_data(&instance_id, graph_id, &graph_data, &endorsement_sigs)
-            .await?;
     }
-    if missing_graph_endorsements {
-        let delay_secs = avg_block_time_secs(ctx.btc_client.network());
-        let message = GOATMessage::new(
-            ctx.actor.clone(),
-            GOATMessageContent::PostReady(PostReady { instance_id }),
-        );
-        defer_or_enqueue_message(
-            ctx.local_db,
-            &message,
-            delay_secs as usize,
-            MessageDeferReason::CommitteeEndorsementsPending,
-            "waiting for committee graph endorsements",
-        )
-        .await?;
-        tracing::info!(
-            "Retry postGraphData later for {instance_id}: waiting for committee graph endorsements"
-        );
-    }
-    Ok(())
+    Ok(None)
 }
 
 #[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]

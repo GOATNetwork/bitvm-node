@@ -130,6 +130,7 @@ bitvm = { workspace = true }
 goat = { workspace = true }
 bitvm-lib = { workspace = true }
 store = { workspace = true }
+engine = { workspace = true }
 client = { workspace = true }
 bitcoin-light-client-circuit = { workspace = true }
 commit-chain = { workspace = true }

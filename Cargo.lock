@@ -3086,6 +3086,7 @@ dependencies = [
  "client",
  "commit-chain",
  "dotenv",
+ "engine",
  "esplora-client",
  "futures",
  "goat",

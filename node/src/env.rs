@@ -8,7 +8,9 @@ use base64::Engine;
 use bitcoin::{Network, PublicKey, key::Keypair};
 use bitvm_lib::actors::Actor;
 use bitvm_lib::keys::NodeMasterKey;
-use bitvm_lib::timelocks::{default_connector_z_timelock_blocks, estimated_block_interval_secs};
+use bitvm_lib::timelocks::{
+    default_connector_z_timelock_blocks, default_pegin_abandon_buffer_blocks,
+};
 use client::goat_chain::utils::{
     get_committee_management_contract, get_gateway_relay_contracts, is_validate_committee,
 };
@@ -207,10 +209,27 @@ pub fn get_network() -> Network {
     }
 }
 
-pub fn get_instance_presigned_time_expired_secs() -> i64 {
-    let network = get_network();
-    let connector_z_blocks = default_connector_z_timelock_blocks(network) as i64;
-    estimated_block_interval_secs(network) * connector_z_blocks * 2 / 3
+pub const ENV_PEGIN_ABANDON_BUFFER_BLOCKS: &str = "PEGIN_ABANDON_BUFFER_BLOCKS";
+pub const ENV_OPERATOR_GRAPH_START_CUTOFF_BLOCKS: &str = "OPERATOR_GRAPH_START_CUTOFF_BLOCKS";
+
+/// `B`, the peg-in abandon buffer in blocks after `Prepare height + T0`. Defaults to the
+/// network's confirmed-action window.
+pub fn get_pegin_abandon_buffer_blocks() -> i64 {
+    std::env::var(ENV_PEGIN_ABANDON_BUFFER_BLOCKS)
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .map(|blocks| blocks.clamp(1, 100_000))
+        .unwrap_or_else(|| i64::from(default_pegin_abandon_buffer_blocks(get_network())))
+}
+
+/// Local operator policy: no new graph for an instance once the tip is past
+/// `Prepare height + cutoff`. Defaults to two thirds of `T0`.
+pub fn get_operator_graph_start_cutoff_blocks() -> i64 {
+    std::env::var(ENV_OPERATOR_GRAPH_START_CUTOFF_BLOCKS)
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .map(|blocks| blocks.clamp(0, 100_000))
+        .unwrap_or_else(|| i64::from(default_connector_z_timelock_blocks(get_network())) * 2 / 3)
 }
 
 pub fn get_goat_network() -> GoatNetwork {
@@ -813,16 +832,13 @@ pub fn parse_reserved_peers(value: &str) -> std::collections::HashSet<libp2p::Pe
         .collect()
 }
 
-/// Signing-round retry ceiling; defaults to one quarter of the pre-signing window, clamped to 30–600 seconds.
+/// Signing-round retry ceiling of the legacy outbox, clamped to 30–3600 seconds.
 pub fn get_p2p_protocol_retry_max_secs() -> i64 {
     std::env::var(ENV_P2P_PROTOCOL_RETRY_MAX_SECS)
         .ok()
         .and_then(|value| value.parse::<i64>().ok())
         .map(|secs| secs.clamp(30, 3600))
-        .unwrap_or_else(|| {
-            (get_instance_presigned_time_expired_secs() / 4)
-                .clamp(30, DEFAULT_P2P_PROTOCOL_RETRY_MAX_SECS)
-        })
+        .unwrap_or(DEFAULT_P2P_PROTOCOL_RETRY_MAX_SECS)
 }
 
 pub fn get_p2p_handler_timeout() -> std::time::Duration {
@@ -896,16 +912,13 @@ pub fn get_p2p_inbox_max_queued_bytes() -> i64 {
         .unwrap_or(DEFAULT_P2P_INBOX_MAX_QUEUED_BYTES)
 }
 
+/// Enable committee key deletion on terminal failure except Timeout, or 32 blocks
+/// after Confirm confirmation. Disabled deletion leaves key_deleted false.
 pub fn is_enable_committee_instance_key_delete() -> bool {
-    // TODO: enable this feature when ready
-    tracing::warn!(
-        "Committee key delete not activated, ignore ENV_ENABLE_COMMITTEE_INSTANCE_KEY_DELETE"
-    );
-    false
-    // std::env::var(ENV_ENABLE_COMMITTEE_INSTANCE_KEY_DELETE)
-    //     .ok()
-    //     .map(|value| value.eq_ignore_ascii_case("true"))
-    //     .unwrap_or(DEFAULT_ENABLE_COMMITTEE_INSTANCE_KEY_DELETE)
+    std::env::var(ENV_ENABLE_COMMITTEE_INSTANCE_KEY_DELETE)
+        .ok()
+        .map(|value| value.eq_ignore_ascii_case("true"))
+        .unwrap_or(DEFAULT_ENABLE_COMMITTEE_INSTANCE_KEY_DELETE)
 }
 
 pub fn get_committee_instance_key_delete_timelock_blocks() -> i64 {
@@ -914,6 +927,41 @@ pub fn get_committee_instance_key_delete_timelock_blocks() -> i64 {
         .and_then(|value| value.parse::<i64>().ok())
         .map(|v| v.clamp(1, 200_000))
         .unwrap_or(DEFAULT_COMMITTEE_INSTANCE_KEY_DELETE_TIMELOCK_BLOCKS)
+}
+
+pub const ENV_ENGINE_WORKER_COUNT: &str = "ENGINE_WORKER_COUNT";
+pub const ENV_ENGINE_CPU_POOL_SLOTS: &str = "ENGINE_CPU_POOL_SLOTS";
+pub const ENV_ENGINE_NETWORK_POOL_SLOTS: &str = "ENGINE_NETWORK_POOL_SLOTS";
+pub const ENV_ENGINE_APPLY_TIMEOUT_SECS: &str = "ENGINE_APPLY_TIMEOUT_SECS";
+pub const ENV_ENGINE_RECHECK_INTERVAL_SECS: &str = "ENGINE_RECHECK_INTERVAL_SECS";
+
+fn engine_setting<T: FromStr + PartialOrd>(name: &str, default: T, min: T, max: T) -> T {
+    match std::env::var(name).ok().and_then(|value| value.parse::<T>().ok()) {
+        Some(value) if value < min => min,
+        Some(value) if value > max => max,
+        Some(value) => value,
+        None => default,
+    }
+}
+
+pub fn get_engine_worker_count(default: usize) -> usize {
+    engine_setting(ENV_ENGINE_WORKER_COUNT, default, 1, 64)
+}
+
+pub fn get_engine_cpu_pool_slots(default: usize) -> usize {
+    engine_setting(ENV_ENGINE_CPU_POOL_SLOTS, default, 1, 64)
+}
+
+pub fn get_engine_network_pool_slots(default: usize) -> usize {
+    engine_setting(ENV_ENGINE_NETWORK_POOL_SLOTS, default, 1, 256)
+}
+
+pub fn get_engine_apply_timeout_secs(default: u64) -> u64 {
+    engine_setting(ENV_ENGINE_APPLY_TIMEOUT_SECS, default, 1, 3600)
+}
+
+pub fn get_engine_recheck_interval_secs(default: u64) -> u64 {
+    engine_setting(ENV_ENGINE_RECHECK_INTERVAL_SECS, default, 1, 3600)
 }
 
 pub fn should_always_challenge() -> bool {

@@ -1,3 +1,5 @@
+use crate::aggregates::instance::l2_minted_event;
+use crate::engine_bridge::record_event_in;
 use crate::env;
 use crate::env::{
     ENV_GOAT_GATEWAY_CONTRACT_ADDRESS, ENV_GOAT_SWAP_CONTRACT_ADDRESS,
@@ -40,9 +42,7 @@ use std::ops::AddAssign;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use store::localdb::{
-    GraphRuntimeUpdate, InstanceUpdate, LocalDB, NodeQuery, StorageProcessor, SwapEscrowUpdate,
-};
+use store::localdb::{GraphRuntimeUpdate, LocalDB, NodeQuery, StorageProcessor, SwapEscrowUpdate};
 use store::{
     GoatTxProcessingStatus, GoatTxRecord, GoatTxType, GraphStatus, GraphStatusSource,
     GraphStatusTransitionOutcome, Instance, InstanceBridgeInStatus, SwapEscrow, SwapEscrowStatus,
@@ -714,14 +714,11 @@ async fn handle_bridge_in_events<'a>(
 ) -> anyhow::Result<()> {
     for event in bridge_in_events {
         let post_pegin_txhash = event.transaction_hash.clone();
-        if let Ok(instance_id) = Uuid::from_str(&strip_hex_prefix_owned(&event.instance_id))
-            && !storage_processor
-                .update_instance(
-                    &InstanceUpdate::new_with_instance_id(instance_id)
-                        .with_status(InstanceBridgeInStatus::RelayerL2Minted.to_string())
-                        .with_post_pegin(post_pegin_txhash.clone()),
-                )
-                .await?
+        let Ok(instance_id) = Uuid::from_str(&strip_hex_prefix_owned(&event.instance_id)) else {
+            warn!("failed to parse instance id of BridgeIn event: {event:?}");
+            continue;
+        };
+        if storage_processor.find_instance(&instance_id).await?.is_none()
             && let Some(tx_record) = storage_processor
                 .find_graph_goat_tx_record(
                     &instance_id,
@@ -747,13 +744,6 @@ async fn handle_bridge_in_events<'a>(
                 instance.post_pegin_txhash = Some(post_pegin_txhash.clone());
                 if !storage_processor.insert_instance_if_absent(&instance).await? {
                     info!("Instance {instance_id} was created concurrently; applying mint event");
-                    storage_processor
-                        .update_instance(
-                            &InstanceUpdate::new_with_instance_id(instance_id)
-                                .with_status(InstanceBridgeInStatus::RelayerL2Minted.to_string())
-                                .with_post_pegin(post_pegin_txhash.clone()),
-                        )
-                        .await?;
                 }
             }
 
@@ -771,6 +761,10 @@ async fn handle_bridge_in_events<'a>(
                     .await?;
             }
         }
+        // The Instance aggregate applies the mint, or alerts when it holds the instance in a
+        // failure state.
+        record_event_in(storage_processor, l2_minted_event(instance_id, &post_pegin_txhash)?)
+            .await?;
     }
     Ok(())
 }

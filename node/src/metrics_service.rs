@@ -79,6 +79,11 @@ struct EventWatchStateLabels {
     state: String,
 }
 
+#[derive(Debug, Clone, Hash, PartialEq, Eq, prometheus_client::encoding::EncodeLabelSet)]
+struct ReasonLabels {
+    reason: String,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EventWatchState {
     Healthy,
@@ -158,6 +163,7 @@ pub struct MetricsState {
     pegin_graph_setup_total: Family<OutcomeLabels, Counter>,
     pegin_confirm_total: Family<OutcomeLabels, Counter>,
     pegin_post_total: Family<OutcomeLabels, Counter>,
+    instance_alerts_total: Family<ReasonLabels, Counter>,
     pegout_disprove_total: Counter,
     withdraw_finalize_total: Family<OutcomeLabels, Counter>,
     goat_gas_balance_wei: Gauge,
@@ -225,6 +231,7 @@ impl MetricsState {
         let pegin_graph_setup_total = Family::default();
         let pegin_confirm_total = Family::default();
         let pegin_post_total = Family::default();
+        let instance_alerts_total = Family::default();
         let pegout_disprove_total = Counter::default();
         let withdraw_finalize_total = Family::default();
         let goat_gas_balance_wei = Gauge::default();
@@ -424,6 +431,11 @@ impl MetricsState {
                 pegin_post_total.clone(),
             );
             registry.register(
+                "bitvm_node_instance_alerts",
+                "Total bridge-in instance conditions that need manual handling, by reason",
+                instance_alerts_total.clone(),
+            );
+            registry.register(
                 "bitvm_node_pegout_disprove",
                 "Total confirmed Disprove terminal events",
                 pegout_disprove_total.clone(),
@@ -500,6 +512,7 @@ impl MetricsState {
             pegin_graph_setup_total,
             pegin_confirm_total,
             pegin_post_total,
+            instance_alerts_total,
             pegout_disprove_total,
             withdraw_finalize_total,
             goat_gas_balance_wei,
@@ -645,6 +658,11 @@ impl MetricsState {
 
     pub fn record_pegin_post(&self, success: bool) {
         self.pegin_post_total.get_or_create(&OutcomeLabels { outcome: outcome(success) }).inc();
+    }
+
+    /// Record an instance alert, such as a late confirmation, rejected post or failed key deletion.
+    pub fn record_instance_alert(&self, reason: &str) {
+        self.instance_alerts_total.get_or_create(&ReasonLabels { reason: reason.to_owned() }).inc();
     }
 
     pub fn record_pegout_disprove(&self) {

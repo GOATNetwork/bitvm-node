@@ -21,7 +21,7 @@ use crate::rpc_service::handler::{
 };
 #[cfg(feature = "rpc-debug-endpoints")]
 use crate::rpc_service::handler::{
-    get_debug_message_details, get_debug_status, get_graph_debug_messages,
+    get_debug_engine, get_debug_message_details, get_debug_status, get_graph_debug_messages,
     get_instance_debug_messages, send_challenge, send_verifier_challenge,
 };
 use anyhow::Context;
@@ -72,6 +72,8 @@ pub struct AppState {
     pub metrics_state: MetricsState,
     pub actor: Actor,
     pub peer_id: String,
+    /// Present when the execution engine is enabled (debug and status endpoints).
+    pub engine: Option<engine::EngineHandle>,
     rpc_auth_nonces: Mutex<HashMap<String, i64>>,
 }
 
@@ -81,6 +83,16 @@ impl AppState {
         actor: Actor,
         peer_id: String,
         metrics_state: MetricsState,
+    ) -> anyhow::Result<Arc<AppState>> {
+        Self::create_arc_app_state_with_engine(local_db, actor, peer_id, metrics_state, None).await
+    }
+
+    pub async fn create_arc_app_state_with_engine(
+        local_db: LocalDB,
+        actor: Actor,
+        peer_id: String,
+        metrics_state: MetricsState,
+        engine: Option<engine::EngineHandle>,
     ) -> anyhow::Result<Arc<AppState>> {
         let btc_client = BTCClient::new(get_network(), get_btc_url_from_env().as_deref());
         let goat_client = GOATClient::new(goat_config_from_env().await, get_goat_network());
@@ -92,6 +104,7 @@ impl AppState {
             metrics_state,
             actor,
             peer_id,
+            engine,
             http_client,
             rpc_auth_nonces: Mutex::new(HashMap::new()),
         }))
@@ -117,6 +130,7 @@ impl AppState {
             metrics_state,
             actor,
             peer_id,
+            engine: None,
             http_client: HttpAsyncClient::new(None),
             rpc_auth_nonces: Mutex::new(HashMap::new()),
         }))
@@ -170,7 +184,8 @@ pub(crate) fn build_business_router(app_state: Arc<AppState>) -> Router {
         .route(routes::v1::DEBUG_STATUS, get(get_debug_status))
         .route(routes::v1::DEBUG_GRAPH_MESSAGES, get(get_graph_debug_messages))
         .route(routes::v1::DEBUG_INSTANCE_MESSAGES, get(get_instance_debug_messages))
-        .route(routes::v1::DEBUG_MESSAGE_DETAILS, get(get_debug_message_details));
+        .route(routes::v1::DEBUG_MESSAGE_DETAILS, get(get_debug_message_details))
+        .route(routes::v1::DEBUG_ENGINE, get(get_debug_engine));
 
     let signed_routes = Router::new().route(routes::v1::PEGOUT, post(pegout));
 
@@ -584,6 +599,7 @@ mod tests {
             client.get(format!("http://{addr}/v1/debug/instances/{id}/messages")).send().await?;
         let message_details =
             client.get(format!("http://{addr}/v1/debug/messages/missing")).send().await?;
+        let engine = client.get(format!("http://{addr}/v1/debug/engine")).send().await?;
         let verifier_challenge = client
             .post(format!("http://{addr}/v1/graphs/{id}/send-verifier-challenge"))
             .send()
@@ -596,12 +612,17 @@ mod tests {
             assert_eq!(message_details.status().as_u16(), 404);
             let message_body: Value = message_details.json().await?;
             assert_eq!(message_body["error"], "DEBUG_MESSAGE_NOT_FOUND");
+            // The engine is not enabled on the mock node.
+            assert_eq!(engine.status().as_u16(), 404);
+            let engine_body: Value = engine.json().await?;
+            assert_eq!(engine_body["error"], "ENGINE_DISABLED");
             assert_eq!(verifier_challenge.status().as_u16(), 401);
         } else {
             assert_eq!(status.status().as_u16(), 404);
             assert_eq!(graph_messages.status().as_u16(), 404);
             assert_eq!(instance_messages.status().as_u16(), 404);
             assert_eq!(message_details.status().as_u16(), 404);
+            assert_eq!(engine.status().as_u16(), 404);
             assert_eq!(verifier_challenge.status().as_u16(), 404);
         }
 
@@ -932,6 +953,7 @@ mod tests {
             pegin_data_tx_hash: format!("0x{}", hex::encode(generate_random_bytes(32))),
             parameters: None,
             post_pegin_txhash: None,
+            key_deleted: false,
             status_updated_at: current_time_secs(),
             created_at: current_time_secs(),
             updated_at: current_time_secs(),
@@ -959,6 +981,7 @@ mod tests {
             pegin_data_tx_hash: format!("0x{}", hex::encode(generate_random_bytes(32))),
             parameters: None,
             post_pegin_txhash: None,
+            key_deleted: false,
             status_updated_at: current_time_secs(),
             created_at: current_time_secs(),
             updated_at: current_time_secs(),

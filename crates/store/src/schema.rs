@@ -196,7 +196,12 @@ pub struct CommitteeSignatures {
     pub l2_sig: Vec<u8>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Display, EnumString)]
+/// Bridge-in lifecycle status.
+/// Failure states do not return to success; Timeout may transition to UserCanceled.
+/// Transitions are based on chain facts and block heights.
+#[derive(
+    Copy, Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq, Hash, Display, EnumString,
+)]
 pub enum InstanceBridgeInStatus {
     #[default]
     UserIniting, // front has call contract, but node not get event
@@ -205,14 +210,52 @@ pub enum InstanceBridgeInStatus {
     CommitteesAnswered,        // enough committee responsed & window expired
     UserBroadcastPeginPrepare, // user pegin prepare
     Presigned,                 // enough graphs completed committee pre-signing
-    PresignedFailed,           // required graph pre-signing did not finish in time
-    RelayerL1Broadcasted,      // PeginConfirm broadcast by relayer
+    RelayerL1Broadcasted,      // PeginConfirm confirmed on Bitcoin
     RelayerL2Minted,           // success
-    RelayerL2MintedFailed,
-    Timeout,                    // time to cancle bridgein
-    UserCanceled,               // user broadcast Pegin-cancel tx
+    /// Abandoned: `h >= prepare height + T0 + buffer` and Peg-In-Confirm is
+    /// neither confirmed nor visible in the mempool. Failure terminal; the
+    /// committee key is kept for manual handling.
+    Timeout,
+    UserCanceled,               // Peg-In-Cancel confirmed
     NoEnoughCommitteesAnswered, // no enough committee responsed & window expired
     UserDiscarded,              // pegin prepare tx input uxto been spent in other tx
+}
+
+impl InstanceBridgeInStatus {
+    /// States that stop normal bridge-in progression.
+    pub const FAILED: [InstanceBridgeInStatus; 4] = [
+        InstanceBridgeInStatus::NoEnoughCommitteesAnswered,
+        InstanceBridgeInStatus::UserDiscarded,
+        InstanceBridgeInStatus::UserCanceled,
+        InstanceBridgeInStatus::Timeout,
+    ];
+
+    pub fn is_failed(self) -> bool {
+        Self::FAILED.contains(&self)
+    }
+
+    pub fn is_success(self) -> bool {
+        self == InstanceBridgeInStatus::RelayerL2Minted
+    }
+
+    pub fn is_terminal(self) -> bool {
+        self.is_failed() || self.is_success()
+    }
+
+    /// Entering this failure state deletes the committee instance key in the
+    /// same transaction. `Timeout` keeps the key for manual handling.
+    pub fn deletes_key_on_entry(self) -> bool {
+        matches!(
+            self,
+            InstanceBridgeInStatus::NoEnoughCommitteesAnswered
+                | InstanceBridgeInStatus::UserDiscarded
+                | InstanceBridgeInStatus::UserCanceled
+        )
+    }
+
+    pub fn failed_statuses() -> Vec<String> {
+        Self::FAILED.iter().map(ToString::to_string).collect()
+    }
 }
 
 /// Lifecycle of a swap-based bridge-out escrow.
@@ -287,6 +330,9 @@ pub struct Instance {
     pub pegin_data_tx_hash: String,
     pub parameters: Option<String>,
     pub post_pegin_txhash: Option<String>,
+    /// The committee instance key envelope was deleted; a rebuilt projection must not
+    /// regenerate it.
+    pub key_deleted: bool,
     pub status_updated_at: i64,
     pub created_at: i64,
     pub updated_at: i64,
@@ -990,6 +1036,33 @@ mod tests {
             InstanceBridgeInStatus::RelayerL2Minted
         );
         assert!(InstanceBridgeInStatus::from_str("Invalid").is_err());
+        assert!(InstanceBridgeInStatus::from_str("PresignedFailed").is_err());
+        assert!(InstanceBridgeInStatus::from_str("RelayerL2MintedFailed").is_err());
+    }
+
+    #[test]
+    fn test_bridge_in_failure_set() {
+        use InstanceBridgeInStatus::*;
+        for status in InstanceBridgeInStatus::FAILED {
+            assert!(status.is_failed());
+            assert!(status.is_terminal());
+            assert!(!status.is_success());
+        }
+        assert!(RelayerL2Minted.is_success() && RelayerL2Minted.is_terminal());
+        for status in [
+            UserIniting,
+            UserInited,
+            CommitteesAnswered,
+            UserBroadcastPeginPrepare,
+            Presigned,
+            RelayerL1Broadcasted,
+        ] {
+            assert!(!status.is_terminal());
+        }
+        assert!(!Timeout.deletes_key_on_entry());
+        assert!(UserCanceled.deletes_key_on_entry());
+        assert!(UserDiscarded.deletes_key_on_entry());
+        assert!(NoEnoughCommitteesAnswered.deletes_key_on_entry());
     }
 
     #[test]

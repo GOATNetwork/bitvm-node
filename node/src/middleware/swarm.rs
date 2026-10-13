@@ -174,6 +174,11 @@ impl BitvmNetworkManager {
         self.peer_id.to_string()
     }
 
+    /// Bounded publisher handle for tasks that send through the swarm.
+    pub fn publisher(&self) -> super::publisher::NetworkPublisher {
+        self.swarm.publisher()
+    }
+
     fn refresh_required_topics_health(&self, actor: &Actor) {
         let role_topic = middleware::get_topic_name(&actor.to_string());
         let all_topic = middleware::get_topic_name(&Actor::All.to_string());
