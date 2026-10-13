@@ -29,16 +29,16 @@ The BitVM Node (`bitvm-noded`) is a multi-role distributed node that participate
 - **Multi-signature Consensus**: Committee-based transaction presigning
 - **Optimistic Verification**: Watchtower monitoring with dispute resolution
 - **ZK Proofs**: Cryptographic verification of state transitions
-- **P2P Graph Distribution**: Decentralized graph data synchronization via relayer nodes
+- **P2P Graph Distribution**: graph definitions are pulled directly from relayers, committee members or the operator (`GetGraph` request-response)
 
 ### Key Capabilities
 
 | Capability | Description |
 |------------|-------------|
-| **P2P Communication** | libp2p-based gossip network (Kademlia DHT + Gossipsub) |
+| **P2P Communication** | libp2p-based gossip network (Kademlia DHT + Gossipsub) plus a direct `GetGraph` protocol |
 | **Chain Monitoring** | Bitcoin and GOAT L2 event watching |
+| **Execution Engine** | One durable inbox, single-writer aggregates (instance, graph), one outbox, leased jobs (`crates/engine`) |
 | **Graph Management** | Transaction graph creation, signing, and lifecycle tracking |
-| **Graph Synchronization** | P2P-based graph distribution with relayer node support |
 | **Challenge Processing** | Watchtower challenges and dispute resolution |
 | **Proof Coordination** | ZK proof generation via proof-builder-rpc |
 
@@ -63,14 +63,15 @@ flowchart TB
             RPC["RPC Service (Axum)"]
         end
 
-        subgraph Core["Core Processing"]
-            MH["Message Handler"]
-            DISP["Role Dispatcher"]
+        subgraph Core["Execution Engine"]
+            INBOX[("engine_inbox")]
+            AGG["Aggregates\n(instance, graph)"]
+            OUTBOX[("engine_outbox")]
+            JOBS["Jobs\n(CPU pool, network pool)"]
         end
 
         subgraph Tasks["Background Tasks"]
-            GM["Graph Maintenance"]
-            IM["Instance Maintenance"]
+            SCAN["Chain Scans\n(instance, graph)"]
             NM["Node Maintenance"]
             SPV["SPV Maintenance"]
         end
@@ -84,22 +85,26 @@ flowchart TB
 
     BTC --> EW
     GOAT --> EW
-    EW --> MH
-    P2P --> MH
-    RPC --> MH
-    MH --> DISP
-    DISP --> GM
-    DISP --> IM
-    GM --> DB
-    IM --> DB
+    BTC --> SCAN
+    GOAT --> SCAN
+    EW --> INBOX
+    P2P --> INBOX
+    SCAN --> INBOX
+    RPC --> DB
+    INBOX --> AGG
+    AGG --> OUTBOX
+    AGG --> JOBS
+    JOBS --> INBOX
+    OUTBOX --> P2P
+    AGG --> DB
+    JOBS --> GD
+    JOBS --> GM_TBL
+    JOBS --> PB
     NM --> DB
     SPV --> DB
-    GM --> GD
-    GM --> GM_TBL
-    GM --> PB
 ```
 
-**Description**: The system employs a three-layer architecture. The Input Layer receives events from external chains, P2P network messages, and RPC requests. The Core Processing Layer dispatches messages to role-specific handlers. The Background Tasks Layer manages graph state machines, instance lifecycles, node health, and SPV header chain updates. All state is persisted to SQLite database, with graph data stored in a dedicated `graph_raw_data` table.
+**Description**: Every input (an admitted P2P message, a chain event, a chain scan at a block height, a job result) is recorded once in `engine_inbox` and applied by the single-writer aggregate it belongs to (`instance:<id>` or `graph:<id>`) inside one SQLite transaction together with its effects: outbox rows, jobs and `waiting_for` registrations. The outbox is the only sender; it re-publishes until the aggregate closes the row. Heavy work (circuit setup, graph building, signing, proof verification, chain calls) runs in leased jobs whose results come back as inbox events. See `docs/node-protocol.md` §4–§5 and §10.
 
 ### Fig-01-2-Component-Interaction
 
@@ -126,10 +131,10 @@ flowchart LR
     V <--> TV
     W <--> TW
     C & O & V & W & R <--> TA
-    R -.->|"SyncGraph"| TA
+    V -.->|"GetGraph (direct)"| R
 ```
 
-**Description**: Each role subscribes to its corresponding gossipsub topic for message exchange. All roles subscribe to the `/All` topic for broadcast messages. Relayer nodes (Committee members with `ENABLE_RELAYER=true`) respond to graph synchronization requests and distribute graph data across the network.
+**Description**: Each role subscribes to its corresponding gossipsub topic for message exchange. All roles subscribe to the `/All` topic for broadcast messages. Graph definitions are not gossiped on request: a node that lacks one asks a relayer, a committee member or the operator directly over the `GetGraph` request-response protocol and authenticates what it receives. Relayer nodes (Committee members with `ENABLE_RELAYER=true`) post graph data to GOAT and serve as the second pull source.
 
 ---
 
@@ -194,11 +199,11 @@ classDiagram
 
 | Role | Responsibilities | Key Messages |
 |------|------------------|--------------|
-| **Committee** | Multi-sig committee member, responsible for presigning and graph endorsement | `NonceGeneration`, `CommitteePresign`, `EndorseGraph` |
-| **Operator** | Bridge operator, creates graphs and executes withdrawal transactions | `CreateGraph`, `KickoffSent`, `Take1Sent`, `Take2Sent` |
-| **Verifier** | Dispute verifier, monitors timeouts and submits disproofs | `DisproveReady`, `DisproveSent` |
-| **Watchtower** | Chain monitor, validates block headers and submits challenges | `WatchtowerChallengeSent` |
-| **Relayer** | Graph data distributor, responds to sync requests | `SyncGraphRequest`, `SyncGraph` |
+| **Committee** | Multi-sig committee member, responsible for presigning, graph endorsement and the Peg-In-Confirm signature | `NonceGeneration`, `CommitteePresign`, `EndorseGraph`, `PeginConfirmPartialSig` |
+| **Operator** | Bridge operator, creates graphs and executes withdrawal transactions (kickoff, takes are Bitcoin transactions driven by chain scans) | `InitGraph`, `CreateGraph`, `GraphFinalize` |
+| **Verifier** | Dispute verifier, builds and solders circuits, monitors timeouts and submits disproofs | `GenCircuits`, `SolderingProofReady`, `VerifierGraphParamsEndorsement` |
+| **Watchtower** | Chain monitor, validates block headers and submits challenges | (chain scans only) |
+| **Relayer** | Committee member that posts peg-in and graph data to GOAT and serves `GetGraph` pulls | `GetGraph` (direct protocol) |
 
 ---
 
@@ -464,7 +469,7 @@ Source: `scan_graph_chain_state`, `node/src/utils.rs:1328-1681` (the sole writer
 
 ### Fig-04-3-Challenge-SubStatus
 
-`ChallengeSubStatus` is **not** three parallel single-value status enums as earlier revisions of this document claimed — that shape does not exist in the code. The actual struct (`node/src/scheduled_tasks/graph_maintenance_tasks.rs:52-58`) is:
+`ChallengeSubStatus` is **not** three parallel single-value status enums as earlier revisions of this document claimed — that shape does not exist in the code. The actual struct (`node/src/aggregates/graph_scan.rs`) is:
 
 ```rust
 pub struct ChallengeSubStatus {
@@ -479,7 +484,7 @@ pub enum VerifierChallengeStatus { None, VerifierAsserted, ProverAnswered, Dispr
 pub enum DisproveTxType { Disprove, QuickChallenge, ChallengeIncompleteKickoff, PubinDisprove, OperatorChallengeNack, OperatorCommitTimeout }
 ```
 
-`watchtower_challenge_status` and `verifier_challenge_status` are **observational bookkeeping only** — they are recorded for the frontend/API (`node/src/rpc_service/bitvm.rs:672-693`, collapsed there into a simpler `SimpleChallengeSubStatus{None, WatchtowerChallenge, Assert}` view) but are never read by anything that decides `GraphStatus`. In particular, `ChallengeSubStatus::is_watchtower_challenge_success` (`graph_maintenance_tasks.rs:98-105`) has no call sites anywhere in the repo. The real `Challenge --> OperatorTake2` gate is purely `tx_on_chain(take2_txid)` after none of the four disprove detectors fired (`node/src/utils.rs:1661-1670`); the operator's actual authorization to broadcast take2 is enforced by Bitcoin-script timelocks (`detect_take2`, `graph_maintenance_tasks.rs:1089-1233`), not by any application-level quorum over watchtower or verifier counts.
+`watchtower_challenge_status` and `verifier_challenge_status` are **observational bookkeeping only** — they are recorded for the frontend/API (`node/src/rpc_service/bitvm.rs:672-693`, collapsed there into a simpler `SimpleChallengeSubStatus{None, WatchtowerChallenge, Assert}` view) but are never read by anything that decides `GraphStatus`.  The real `Challenge --> OperatorTake2` gate is purely `tx_on_chain(take2_txid)` after none of the four disprove detectors fired (`node/src/utils.rs:1661-1670`); the operator's actual authorization to broadcast take2 is enforced by Bitcoin-script timelocks (the `take2` job re-checks them), not by any application-level quorum over watchtower or verifier counts.
 
 ### Known gap: no ordering guarantee between chain-scan and L2-event writers
 
@@ -495,7 +500,7 @@ Both currently go through a raw `UPDATE graph SET status = ?` (`crates/store/src
 
 ## Graph Storage & Synchronization
 
-Graph data is stored locally in SQLite and distributed via P2P messaging.
+Graph data is stored locally in SQLite. A node that lacks a definition pulls it over the direct `GetGraph` protocol; nothing is re-gossiped.
 
 ### Fig-05-1-Graph-Storage-Architecture
 
@@ -513,10 +518,10 @@ flowchart TB
         SERIALIZE["serialize_graph_raw_data()"]
     end
 
-    subgraph P2P["P2P Synchronization"]
-        REQ["SyncGraphRequest"]
-        RESP["SyncGraph"]
-        RELAY["Relayer Nodes"]
+    subgraph Pull["Direct Pull"]
+        REQ["GetGraphRequest\n(graph_id or operator slot)"]
+        RESP["GetGraphResponse"]
+        PEERS["Relayer / Committee / Operator"]
     end
 
     CREATE -->|"Atomic Transaction"| GT
@@ -526,44 +531,34 @@ flowchart TB
     PARSE -->|"spawn_blocking"| GRD
     SERIALIZE -->|"spawn_blocking"| GRD
 
-    REQ -->|"Broadcast to All"| RELAY
-    RELAY -->|"Lookup Local DB"| GRD
-    RELAY -->|"Respond with Graph"| RESP
+    REQ -->|"request-response"| PEERS
+    PEERS -->|"Lookup Local DB"| GRD
+    PEERS -->|"Answer"| RESP
 ```
 
-**Description**: Graph storage uses a two-table approach: `graph` for metadata/transaction IDs and `graph_raw_data` for full serialized graph JSON. Large graph serialization uses `spawn_blocking` to prevent async runtime blocking. P2P synchronization enables nodes to request missing graphs from relayer nodes.
+**Description**: Graph storage uses a two-table approach: `graph` for metadata/transaction IDs and `graph_raw_data` for full serialized graph JSON. Large graph serialization uses `spawn_blocking` to prevent async runtime blocking. The `graph` table is unique per `(operator_pubkey, kickoff_index)`: one definition per operator slot.
 
-### Fig-05-2-Graph-Sync-Sequence
+### Fig-05-2-Graph-Pull-Sequence
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant NodeA as Node A (Missing Graph)
-    participant P2P as P2P Network
-    participant Relayer as Relayer Node
-    participant DB as Relayer DB
+    participant Peer as Relayer / Committee / Operator
+    participant DB as Peer DB
 
-    NodeA->>NodeA: Check local DB for graph
-    Note over NodeA: Graph NOT FOUND
+    NodeA->>NodeA: Apply parks on the missing definition (waiting_for)
+    NodeA->>Peer: GetGraphRequest(graph_id | operator slot) over /get-graph/1
+    Peer->>Peer: Admission: class budget, per-peer bucket, cooldown, in-flight slots
+    Peer->>DB: Query graph + graph_raw_data
+    DB-->>Peer: Serialized graph
+    Peer-->>NodeA: GetGraphResponse
 
-    NodeA->>P2P: SyncGraphRequest(instance_id, graph_id)
-    P2P->>Relayer: Broadcast to All topic
-
-    Relayer->>Relayer: is_relayer() check
-    Note over Relayer: ENABLE_RELAYER=true
-
-    Relayer->>DB: Query graph_raw_data
-    DB-->>Relayer: Return serialized graph
-
-    Relayer->>P2P: SyncGraph(instance_id, graph_id, graph_data)
-    P2P->>NodeA: Deliver response
-
-    NodeA->>NodeA: Validate graph_id on GOAT chain
-    NodeA->>NodeA: store_graph() locally
-    Note over NodeA: Graph synchronized!
+    NodeA->>NodeA: Authenticate: operator pre-signatures, instance parameters, committee pre-signatures if finalized
+    NodeA->>NodeA: store_graph() locally, wake the waiting events
 ```
 
-**Description**: When a node lacks required graph data, it broadcasts a `SyncGraphRequest`. Relayer nodes (Committee members with `ENABLE_RELAYER=true`) respond with the full graph data via `SyncGraph` message. The requesting node validates and stores the graph locally.
+**Description**: The `fetch_graph` job of the Graph aggregate asks relayers and committee members first and the operator last; a definition claimed to be finalized must carry valid committee pre-signatures, and a graph already posted on GOAT is never accepted as an unsigned copy. Serving is rate limited per requester class and per peer (see `docs/node-protocol.md` §2.3).
 
 ### Graph Data Tables
 
@@ -604,23 +599,23 @@ classDiagram
 
     class GOATMessageContent {
         <<enumeration>>
-        PeginRequest
+        InitGraph
+        GenCircuits
+        CutCircuits
+        SolderingProofReady
         CreateGraph
-        ConfirmInstance
+        VerifierGraphParamsEndorsement
         NonceGeneration
+        AggNonceConsensus
         CommitteePresign
         EndorseGraph
         GraphFinalize
-        KickoffReady
-        KickoffSent
-        ChallengeSent
-        DisproveReady
-        DisproveSent
-        Take1Sent
-        Take2Sent
-        SyncGraphRequest
-        SyncGraph
-        ...
+        PeginConfirmNonce
+        PeginConfirmNonceConsensus
+        PeginConfirmPartialSig
+        GraphSetupAck
+        RequestNodeInfo
+        ResponseNodeInfo
     }
 
     class Actor {
@@ -636,50 +631,42 @@ classDiagram
     GOATMessage --> GOATMessageContent : payload
 ```
 
-**Description**: The message system uses role-based addressing. Each message specifies a target role and content type, broadcast via Gossipsub to the corresponding topic. Messages are serialized using `serde_json` with `spawn_blocking` for large payloads.
+**Description**: The message system uses role-based addressing. Each message specifies a target topic and a content type, broadcast via Gossipsub. Messages are JSON (`GenCircuits` is bincode behind a `GOATBIN1` prefix). Only the 17 kinds above exist on the wire; chain observations are engine events, never messages. An admitted durable message becomes an inbox event of its aggregate (content id `H(author ‖ kind ‖ business id ‖ H(payload))`), so a re-published copy is a no-op; heavy messages are acknowledged with `GraphSetupAck` once their material is durably stored.
 
 ### Message Categories
 
-#### Peg-in Messages
+#### Graph setup and signing (Graph aggregate)
+
+| Message | Sender | Receiver | ACK | Description |
+|---------|--------|----------|-----|-------------|
+| `InitGraph` | Operator | Verifier | no | Recruit verifiers for a new graph |
+| `GenCircuits` | Verifier | Operator | yes | Candidate's circuit setup package |
+| `CutCircuits` | Operator | Verifier | yes | Which circuits the candidate opens or proves |
+| `SolderingProofReady` | Verifier | Operator | yes | Soldering proof descriptor (payload out of band) |
+| `CreateGraph` | Operator | Verifier, Committee | yes | The operator-presigned graph definition |
+| `VerifierGraphParamsEndorsement` | Verifier | Committee | no | Verifier's endorsement of the graph parameters |
+| `NonceGeneration` | Committee | Committee, Operator | no | MuSig2 public nonces |
+| `AggNonceConsensus` | Committee | Committee | no | Signature over the agreed nonce set |
+| `CommitteePresign` | Committee | Committee, Operator | no | Committee partial signatures |
+| `EndorseGraph` | Committee | Operator | no | EVM endorsements of the graph |
+| `GraphFinalize` | Operator | All | yes | The finalized graph with every endorsement |
+
+#### Peg-In-Confirm round (Instance aggregate, committee only)
 
 | Message | Sender | Receiver | Description |
 |---------|--------|----------|-------------|
-| `PeginRequest` | EventWatch | Committee | Peg-in request notification |
-| `ConfirmInstance` | Committee | Operator | Instance creation confirmation |
-| `CreateGraph` | Operator | Committee | Graph creation request (includes full graph) |
-| `NonceGeneration` | Committee | Committee/Operator | MuSig2 nonce broadcast |
-| `CommitteePresign` | Committee | Committee/Operator | Presignature broadcast |
-| `EndorseGraph` | Committee | Operator | Graph endorsement |
-| `GraphFinalize` | Operator | All | Graph completion notification |
+| `PeginConfirmNonce` | Committee | Committee | Deterministic nonce for the Peg-In-Confirm |
+| `PeginConfirmNonceConsensus` | Committee | Committee | Signature over the agreed nonce set |
+| `PeginConfirmPartialSig` | Committee | Committee | Partial signature plus the EVM endorsement the relayer posts |
 
-#### Peg-out Messages
+#### Control messages (not persisted)
 
 | Message | Sender | Receiver | Description |
 |---------|--------|----------|-------------|
-| `KickoffReady` | System | Operator | Kickoff ready notification |
-| `KickoffSent` | Operator | All | Kickoff transaction broadcast |
-| `Take1Ready` | System | Operator | Take1 ready (Happy Path) |
-| `Take1Sent` | Operator | All | Take1 transaction broadcast |
-| `Take2Ready` | System | Operator | Take2 ready (Challenge Path) |
-| `Take2Sent` | Operator | All | Take2 transaction broadcast |
+| `GraphSetupAck` | Receiver of a heavy message | Sender | Delivery acknowledged (`delivery_id`) |
+| `RequestNodeInfo` / `ResponseNodeInfo` | Any | All | Peer discovery and the operator key binding |
 
-#### Challenge Messages
-
-| Message | Sender | Receiver | Description |
-|---------|--------|----------|-------------|
-| `WatchtowerChallengeInitSent` | Operator | Watchtower | WT challenge initialization |
-| `WatchtowerChallengeSent` | Watchtower | Operator | WT challenge submission |
-| `WatchtowerChallengeTimeout` | System | Operator | WT challenge timeout |
-| `OperatorAckTimeout` | System | Verifier | Operator ACK timeout |
-| `DisproveReady` | System | Verifier | Disprove ready |
-| `DisproveSent` | Verifier | All | Disprove transaction broadcast |
-
-#### Synchronization Messages
-
-| Message | Sender | Receiver | Description |
-|---------|--------|----------|-------------|
-| `SyncGraphRequest` | Any Node | All | Request missing graph data |
-| `SyncGraph` | Relayer | All | Respond with full graph data |
+Peg-out has no messages: the Graph aggregate scans both chains every Bitcoin block and turns what it sees (kickoff, challenge, asserts, takes) into jobs for the roles concerned.
 
 ---
 
@@ -692,30 +679,23 @@ flowchart TB
     subgraph EventWatch["Event Watch Task (Continuous)"]
         EW1["fetch_and_handle_gateway_events"]
         EW2["fetch_and_handle_bridge_out_events"]
-        EW1 --> MSG1["PeginRequest"]
-        EW2 --> MSG2["InitWithdraw detection"]
+        EW1 --> EV1["BridgeInRequest record, l2_minted, graph_posted, goat_status events"]
+        EW2 --> EV2["withdraw_init / withdraw_cancel events"]
     end
 
-    subgraph GraphMaint["Graph Maintenance (20s interval)"]
-        GM1["detect_init_withdraw_call"]
-        GM2["detect_kickoff"]
-        GM3["detect_take1_or_challenge"]
-        GM4["process_graph_challenge"]
-
-        GM1 -->|"KickoffReady"| GM2
-        GM2 -->|"Status update"| GM3
-        GM3 -->|"Challenge"| GM4
-        GM3 -->|"Take1Ready"| T1["Take1 processing"]
-        GM4 -->|"Take2Ready"| T2["Take2 processing"]
-        GM4 -->|"DisproveReady"| DP["Disprove processing"]
+    subgraph Maint["Maintenance (10s interval)"]
+        M1["pegin_request_monitor"]
+        M2["instance_answer_window_scan"]
+        M3["instance_btc_scan"]
+        M4["graph_chain_scan"]
+        M5["graph_setup_abandon_scan (operator)"]
+        M6["swap_escrow_timeout_monitor"]
     end
 
-    subgraph InstMaint["Instance Maintenance (20s interval)"]
-        IM1["instance_answers_monitor"]
-        IM2["instance_window_expiration_monitor"]
-        IM3["instance_btc_tx_monitor"]
-        IM4["swap_escrow_timeout_monitor"]
-        IM5["instance_committee_key_cleanup_monitor"]
+    subgraph Engine["Execution Engine"]
+        INBOX["engine_inbox"]
+        APPLY["Instance / Graph apply"]
+        JOBS["jobs"]
     end
 
     subgraph Other["Other Tasks"]
@@ -723,27 +703,29 @@ flowchart TB
         SPV["SPV Header Updates"]
     end
 
-    EventWatch --> GraphMaint
-    GraphMaint --> InstMaint
+    EventWatch --> INBOX
+    Maint --> INBOX
+    INBOX --> APPLY --> JOBS
 ```
 
-**Description**: The system runs 5 types of background tasks. Event Watch continuously monitors chain events; Graph Maintenance executes graph state machine transitions every 20 seconds; Instance Maintenance manages instance lifecycles; Node Maintenance maintains node health; SPV Maintenance updates the Bitcoin header chain.
+**Description**: The event watcher indexes GOAT events; the maintenance tick gathers chain facts (it is the only place that queries the chains for the aggregates) and records them as inbox events; the engine applies them and runs the resulting jobs. No task decides a status by itself.
 
 ### Task Responsibilities
 
 | Task | Interval | Responsibility |
 |------|----------|----------------|
-| `run_watch_event_task` | Continuous | Monitor GOAT L2 and Bitcoin events |
-| `detect_init_withdraw_call` | 20s | Detect withdrawal requests, send KickoffReady |
-| `detect_kickoff` | 20s | Monitor Kickoff transaction confirmations |
-| `detect_take1_or_challenge` | 20s | Check Happy Path or Challenge |
-| `process_graph_challenge` | 20s | Process Challenge sub-phases |
-| `instance_answers_monitor` | 20s | Track committee responses |
-| `instance_window_expiration_monitor` | 20s | Handle response window timeouts |
-| `instance_btc_tx_monitor` | 20s | Track pegin/confirm/cancel BTC transaction confirmations |
-| `swap_escrow_timeout_monitor` | 20s | Mark swap escrows past their refund deadline as timed out |
-| `instance_committee_key_cleanup_monitor` | 20s | Scan `cache/committee-instance-keys/` and delete expired key envelopes after configurable pegin-confirm timelock |
+| `run_watch_event_task` | Continuous | Index GOAT gateway and swap events; record `l2_minted`, `graph_posted`, `goat_status`, `withdraw_init` / `withdraw_cancel` events |
+| `pegin_request_monitor` | 10s | Turn pending `BridgeInRequest` records into instance rows and `pegin_request` events (committee nodes answer from the event); late requests with spent inputs are recorded `UserDiscarded` |
+| `instance_answer_window_scan` | 10s | Record the committee answers of each `UserInited` instance once its GOAT response window closed |
+| `instance_btc_scan` | 10s | One `btc_snapshot` per live instance and Bitcoin height: Prepare / Confirm / Cancel status and input spends |
+| `graph_chain_scan` | 10s | One `chain_scan` per non-closed graph and Bitcoin height: chain stage, unusable facts, peg-out signals |
+| `graph_setup_abandon_scan` | 10s (operator) | Give up the operator's unfinished setups once the instance passed its abandon height |
+| `swap_escrow_timeout_monitor` | 10s | Mark swap escrows past their refund deadline as timed out |
+| `node_available_pbtc_update_monitor` | 10s (operator, relayer) | Refresh the node's available pegBTC |
 | `spv_header_hash_update` | Periodic | Update SPV header hashes |
+| `babe_setup_state_cleanup_monitor` | 10s (optional) | Remove orphaned BABE setup state files |
+
+Admission maintenance (registry refresh, drop summaries, node table purge) runs on its own 20-second timer next to the swarm.
 
 ---
 
@@ -751,33 +733,50 @@ flowchart TB
 
 ```
 node/src/
-├── main.rs                          # Entry point, starts 4 async tasks
+├── main.rs                          # Entry point, starts the background tasks and the engine
 ├── lib.rs                           # Module exports
-├── action.rs                        # Message type definitions (45+ types)
-├── handle.rs                        # Message dispatch and role handlers
-├── p2p_msg_handler.rs              # P2P message processing interface
-├── env.rs                           # Environment configuration (40+ variables)
+├── action.rs                        # Wire message types, admission entry point, publish
+├── handle.rs                        # Control messages (NodeInfo, GraphSetupAck)
+├── p2p_admission.rs                 # Inbound admission: registry, replay window, rate limits, quota
+├── p2p_msg_handler.rs               # Swarm handler: admission, control worker, GetGraph service
+├── engine_bridge.rs                 # Engine assembly, gossip transport, ACK forwarder
+├── aggregates/                      # Aggregates on the execution engine
+│   ├── instance.rs                  # Instance apply: deadlines, F, Answer/Presign/Confirm/Post phases
+│   ├── instance_jobs.rs             # answerPeginRequest, confirm_instance, PeginConfirm round, post
+│   ├── instance_scan.rs             # Bitcoin / answer-window facts for instances
+│   ├── graph.rs                     # Graph apply: setup, collect, signing, deliver, post
+│   ├── graph_jobs.rs                # Setup, signing and finalize jobs
+│   ├── graph_setup.rs               # Setup helpers
+│   ├── graph_fetch.rs               # GetGraph pull and authentication
+│   ├── graph_pegout.rs              # Kickoff / Settlement apply, Skip premise
+│   ├── graph_pegout_jobs.rs         # Peg-out jobs
+│   └── graph_scan.rs                # Chain scan of every non-closed graph
+├── env.rs                           # Environment configuration
 ├── utils.rs                         # Graph state management & storage utilities
 ├── error.rs                         # Error types
-├── vk.rs                           # Verification key management
-├── metrics_service.rs              # Prometheus metrics
-├── rpc_service/                    # REST API implementation
-│   ├── mod.rs                      # Service orchestration
-│   ├── bitvm.rs                   # BitVM-specific endpoints
-│   ├── routes.rs                   # HTTP route definitions
-│   ├── validation.rs               # Input validation
-│   └── handler/                    # Request handlers
-├── middleware/                     # P2P network layer
-│   ├── swarm.rs                    # BitvmNetworkManager, libp2p configuration
-│   └── behaviour.rs                # Kademlia + Gossipsub behavior
-└── scheduled_tasks/                # Background tasks
-    ├── mod.rs                      # Task exports
-    ├── event_watch_task.rs         # Chain event monitoring (51KB)
-    ├── graph_maintenance_tasks.rs  # Graph state machine (72KB)
-    ├── instance_maintenance_tasks.rs # Instance lifecycle
-    ├── node_maintenance_tasks.rs   # Node health
-    └── spv_maintenance_tasks.rs    # SPV updates
+├── vk.rs                            # Verification key management
+├── metrics_service.rs               # Prometheus metrics
+├── rpc_service/                     # REST API implementation
+│   ├── mod.rs                       # Service orchestration
+│   ├── bitvm.rs                     # BitVM-specific endpoints
+│   ├── routes.rs                    # HTTP route definitions
+│   ├── validation.rs                # Input validation
+│   └── handler/                     # Request handlers
+├── middleware/                      # P2P network layer
+│   ├── swarm.rs                     # BitvmNetworkManager, libp2p configuration
+│   ├── behaviour.rs                 # Kademlia + Gossipsub + GetGraph behaviour
+│   ├── get_graph.rs                 # GetGraph request-response codec
+│   ├── publisher.rs                 # Bounded access to the swarm from other tasks
+│   └── connection_gate.rs           # Inbound connection limits
+└── scheduled_tasks/                 # Background tasks
+    ├── mod.rs                       # Maintenance tick
+    ├── event_watch_task.rs          # Chain event monitoring
+    ├── instance_maintenance_tasks.rs # Peg-in request monitor, swap timeouts
+    ├── node_maintenance_tasks.rs    # Node health
+    └── spv_maintenance_tasks.rs     # SPV updates
 ```
+
+The execution engine itself lives in `crates/engine`; its tables (`engine_inbox`, `engine_aggregate`, `engine_outbox`, `engine_job`) in `crates/store`.
 
 ---
 
@@ -885,8 +884,16 @@ real graph raw data in the database.
 | `GOAT_PROOF_BUILD_URL` | No | Proof Builder RPC endpoint | - |
 | `NODE_NAME` | No | Node display name | `ZKM` |
 | `OPERATOR_NODE_SERVICE_FEE` | No | Operator service fee rate | `0.001` |
-| `ENABLE_COMMITTEE_INSTANCE_KEY_DELETE` | No | Enable scheduled deletion of committee instance key envelopes | `false` |
+| `ENABLE_COMMITTEE_INSTANCE_KEY_DELETE` | No | Delete the committee instance key envelope when the instance fails (except `Timeout`) or 32 blocks after the Peg-In-Confirm confirmed; off, the intent is only logged | `false` |
 | `COMMITTEE_INSTANCE_KEY_DELETE_TIMELOCK_BLOCKS` | No | Number of BTC blocks to wait after pegin-confirm confirmation before deleting key envelope | `32` |
+| `PEGIN_ABANDON_BUFFER_BLOCKS` | No | Blocks after `Prepare height + connector_z` before an instance whose Peg-In-Confirm is neither confirmed nor in the mempool is abandoned | `18` / `14` / `3` / `6` by network |
+| `OPERATOR_GRAPH_START_CUTOFF_BLOCKS` | No | Operators start no new graph for an instance past `Prepare height + cutoff` | `⌊2·connector_z/3⌋` |
+| `ENGINE_WORKER_COUNT` / `ENGINE_CPU_POOL_SLOTS` / `ENGINE_PEGOUT_POOL_SLOTS` / `ENGINE_NETWORK_POOL_SLOTS` | No | Execution engine: aggregate workers, concurrent CPU-bound setup jobs, concurrent CPU-bound peg-out jobs (own slots, so a graph build never delays a challenge), concurrent network jobs | `1` / `1` / `1` / `4` |
+| `ENGINE_APPLY_TIMEOUT_SECS` / `ENGINE_RECHECK_INTERVAL_SECS` | No | Execution engine: apply budget (also the SQLite busy timeout) and the re-check of waiting events | `120` / `60` |
+| `P2P_MAX_JSON_MESSAGE_BYTES` | No | Largest JSON gossip message accepted | `2 MiB` |
+| `P2P_INBOX_MAX_QUEUED_BYTES` | No | Payload bytes of admitted network events the engine inbox may hold (per-class and per-peer quotas derive from it) | `2 GiB` |
+| `P2P_MAX_INCOMING_CONNECTIONS` / `P2P_INBOUND_REGISTERED_RESERVE` | No | Inbound connection ceiling and the slots reserved for registered peers | `512` / `128` |
+| `P2P_RESERVED_PEERS` / `P2P_TRUSTED_OPERATOR_BINDINGS` | No | Peers that always get a connection slot; configured operator key bindings | empty |
 
 ### Relayer Configuration
 
@@ -932,6 +939,7 @@ Prometheus metrics are not served by the business RPC listener. Set
 | `/v1/swaps/:escrow_hash` | GET | Get swap escrow details |
 | `/challenge` | POST | Submit challenge |
 | `/metrics` | GET | Prometheus metrics (dedicated metrics listener only) |
+| `/v1/debug/status`, `/v1/debug/engine` | GET | Node status and the execution engine snapshot (rows by state, waiting and poisoned aggregates); `rpc-debug-endpoints` feature only |
 
 ---
 

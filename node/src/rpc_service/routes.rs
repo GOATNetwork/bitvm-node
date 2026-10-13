@@ -30,15 +30,6 @@ pub(crate) mod v1 {
     pub const DEBUG_STATUS: &str = "/v1/debug/status";
     // TODO(auth): Restrict debug endpoints before exposing the RPC outside trusted operators.
     #[cfg(feature = "rpc-debug-endpoints")]
-    pub const DEBUG_GRAPH_MESSAGES: &str = "/v1/debug/graphs/{:id}/messages";
-    // TODO(auth): Restrict debug endpoints before exposing the RPC outside trusted operators.
-    #[cfg(feature = "rpc-debug-endpoints")]
-    pub const DEBUG_INSTANCE_MESSAGES: &str = "/v1/debug/instances/{:id}/messages";
-    // TODO(auth): Restrict debug endpoints before exposing the RPC outside trusted operators.
-    #[cfg(feature = "rpc-debug-endpoints")]
-    pub const DEBUG_MESSAGE_DETAILS: &str = "/v1/debug/messages/{:id}";
-    // TODO(auth): Restrict debug endpoints before exposing the RPC outside trusted operators.
-    #[cfg(feature = "rpc-debug-endpoints")]
     pub const DEBUG_ENGINE: &str = "/v1/debug/engine";
     // pub const PROOFS_BASE: &str = "/v1/proofs";
     pub const PROOFS_CHAIN_PROOFS_DESC: &str = "/v1/proofs/chain_proofs_desc";

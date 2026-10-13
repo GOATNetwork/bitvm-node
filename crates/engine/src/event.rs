@@ -70,6 +70,9 @@ pub struct NewEvent {
     pub kind: String,
     pub source: EventSource,
     pub author: String,
+    /// How admission classified the author of a network event; the storage
+    /// quota is accounted per class. Empty for every other source.
+    pub admission_class: String,
     pub payload: Vec<u8>,
     /// For heavy messages: who to ACK once the material is durably applied or parked.
     pub ack: Option<EngineAckTarget>,
@@ -89,6 +92,7 @@ impl NewEvent {
             kind: kind.into(),
             source,
             author: String::new(),
+            admission_class: String::new(),
             payload,
             ack: None,
         }
@@ -96,6 +100,11 @@ impl NewEvent {
 
     pub fn with_author(mut self, author: impl Into<String>) -> Self {
         self.author = author.into();
+        self
+    }
+
+    pub fn with_admission_class(mut self, class: impl Into<String>) -> Self {
+        self.admission_class = class.into();
         self
     }
 
@@ -114,6 +123,7 @@ impl NewEvent {
             kind: self.kind,
             source: self.source.as_str().to_string(),
             author: self.author,
+            admission_class: self.admission_class,
             payload: self.payload,
             ack: self.ack,
         }

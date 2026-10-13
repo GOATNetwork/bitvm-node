@@ -1,6 +1,4 @@
-use crate::action::{
-    GOATMessage, GOATMessageContent, LocalMessageKey, NodeInfo, SolderingProofReady, send_to_peer,
-};
+use crate::action::{GOATMessage, GOATMessageContent, NodeInfo, SolderingProofReady, send_to_peer};
 use crate::env::*;
 use crate::error::SpecialError;
 use crate::middleware::AllBehaviours;
@@ -94,8 +92,8 @@ use proof_builder::{
 };
 use store::{
     BridgeOutGlobalStats, ByteArray32, Graph, GraphRawData, GraphStatus, GraphStatusSource,
-    GraphStatusTransitionOutcome, Instance, InstanceBridgeInStatus, Message, MessageState, Node,
-    PeginGraphProcessData, PeginInstanceProcessData, SerializableTxid, UInt64Array3,
+    GraphStatusTransitionOutcome, Instance, InstanceBridgeInStatus, Node, PeginGraphProcessData,
+    PeginInstanceProcessData, SerializableTxid, UInt64Array3,
 };
 use stun_client::{Attribute, Class, Client};
 use tracing::{error, info, warn};
@@ -108,7 +106,6 @@ use zkm_verifier::{
     load_ark_public_inputs_from_bytes,
 };
 
-pub const SELF_SENDER: &str = "self";
 const BABE_SETUP_STATE_ORPHAN_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Path of the committee instance key envelope for `instance_id`.
@@ -3592,46 +3589,6 @@ pub async fn outpoint_spent_txin(
     }
 }
 
-pub async fn upsert_message(
-    storage_processor: &mut StorageProcessor<'_>,
-    is_update: bool,
-    from_peer: String,
-    actor: Actor,
-    message_content: GOATMessageContent,
-    weight: i64,
-    lock_time: i64,
-) -> Result<bool> {
-    let key = LocalMessageKey::from_content(actor.clone(), &message_content)?;
-    let business_id = key.business_id();
-    let message_id = key.message_id();
-    let msg_type = message_content.kind();
-    let message = GOATMessage::new(actor.clone(), message_content.clone());
-    if is_update || storage_processor.find_messages_by_id(&message_id).await?.is_none() {
-        return storage_processor
-            .upsert_message(Message {
-                message_id,
-                business_id,
-                actor: actor.to_string(),
-                from_peer,
-                msg_type: msg_type.to_string(),
-                content: message.serialize_message().await?,
-                weight,
-                lock_time_until: current_time_secs() + lock_time,
-                state: MessageState::Pending.to_string(),
-                message_version: 0,
-                attempt_count: 0,
-                abandon_count: 0,
-                last_error: None,
-                created_at: 0,
-            })
-            .await;
-    } else {
-        info!("{message_id} is already created for create action");
-    }
-
-    Ok(false)
-}
-
 /// Tell the proof builder that this watchtower's proof for the graph is no
 /// longer needed: the operator asserted, the watchtower window is over.
 /// Returns whether the builder accepted it; without a builder host, `false`.
@@ -4010,29 +3967,6 @@ pub fn reflect_goat_address(addr_op: Option<String>) -> (bool, Option<String>) {
         return (true, Some(addr.to_string()));
     }
     (false, None)
-}
-
-/// Sweep the local queue and list the messages the dispatcher may attempt now.
-///
-/// Returns `(candidates, quarantined)`. Nothing returned here is claimed yet:
-/// the dispatcher claims each row immediately before dispatching it, so a
-/// crash mid-dispatch is charged to that one row rather than to the whole
-/// batch. Expired rows are retired and exhausted rows quarantined first.
-pub async fn list_batch_local_msg(
-    local_db: &LocalDB,
-    max_abandons: i64,
-    limit: i64,
-) -> Result<(Vec<Message>, u64)> {
-    let mut tx = local_db.start_transaction().await?;
-    let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
-    let expired_before = current_time - MESSAGE_EXPIRE_TIME;
-    tx.set_messages_expired(expired_before).await?;
-    tx.delete_old_messages(expired_before).await?;
-    let quarantined = tx.quarantine_local_messages(current_time, max_abandons).await?;
-    let messages =
-        tx.list_claimable_local_messages(current_time, expired_before, limit, max_abandons).await?;
-    tx.commit().await?;
-    Ok((messages, quarantined))
 }
 
 pub async fn operator_scan_ready_proof(
@@ -5609,18 +5543,10 @@ pub(crate) async fn obsolete_graph(
             None,
         )
         .await?;
-    if !matches!(
+    Ok(matches!(
         outcome,
         GraphStatusTransitionOutcome::Applied | GraphStatusTransitionOutcome::AlreadyCurrent
-    ) {
-        return Ok(false);
-    }
-
-    // `None` means no message-type filter: cancel every durable pending message
-    // for this terminal graph so stale retries cannot consume queue capacity or
-    // trigger a later graph action.
-    storage_processor.cancel_messages_by_business_id(&graph_id, None).await?;
-    Ok(true)
+    ))
 }
 
 /// Mark every non-terminal graph for an already claimed instance as obsolete.

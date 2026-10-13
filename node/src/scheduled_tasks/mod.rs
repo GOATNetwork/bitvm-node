@@ -13,7 +13,6 @@ use crate::env::{
     is_enable_update_spv_contract, is_relayer,
 };
 use crate::metrics_service::MetricsState;
-use crate::rpc_service::current_time_secs;
 use crate::scheduled_tasks::babe_setup_state_cleanup_task::babe_setup_state_cleanup_monitor;
 use crate::scheduled_tasks::instance_maintenance_tasks::{
     pegin_request_monitor, swap_escrow_timeout_monitor,
@@ -388,40 +387,6 @@ pub async fn run_maintenance_tasks(
                             warn!(event = "metrics_alert_health", "alert health probe timed out");
                         }
                     });
-                    let queue_started_at = Instant::now();
-                    match local_db.acquire().await {
-                        Ok(mut storage) => match storage
-                            .get_message_queue_stats(&actor.to_string(), current_time_secs())
-                            .await
-                        {
-                            Ok(stats) => info!(
-                                event = "message_queue_snapshot",
-                                role = %actor,
-                                pending_ready = stats.pending_ready,
-                                pending_locked = stats.pending_locked,
-                                failed = stats.failed,
-                                oldest_pending_at = ?stats.oldest_pending_at,
-                                elapsed_ms = queue_started_at.elapsed().as_millis() as u64,
-                                "local message queue snapshot"
-                            ),
-                            Err(error) => error!(
-                                event = "db_operation_result",
-                                operation = "get_message_queue_stats",
-                                outcome = "failed",
-                                elapsed_ms = queue_started_at.elapsed().as_millis() as u64,
-                                error = %error,
-                                "failed to collect local message queue snapshot"
-                            ),
-                        },
-                        Err(error) => error!(
-                            event = "db_operation_result",
-                            operation = "acquire_db_for_message_queue_snapshot",
-                            outcome = "failed",
-                            elapsed_ms = queue_started_at.elapsed().as_millis() as u64,
-                            error = %error,
-                            "failed to acquire local database for message queue snapshot"
-                        ),
-                    }
                 }
             }
             _ = cancellation_token.cancelled() => {

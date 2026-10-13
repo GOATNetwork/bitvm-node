@@ -2,8 +2,12 @@
 #![allow(clippy::single_match)]
 #![allow(clippy::collapsible_else_if)]
 
+//! Wire messages of the node and the gossip entry point: the envelope, the
+//! message kinds and their routing table, admission of an inbound gossip
+//! message into the engine inbox or the control queue, and the single
+//! publish function every sender goes through.
+
 use crate::aggregates::graph::inbound_event;
-use crate::env::{MESSAGE_EXPIRE_TIME, get_p2p_inbox_batch_size};
 use crate::handle::{HandlerContext, dispatch as handle_dispatch};
 use crate::metrics_service::MetricsState;
 use crate::middleware::AllBehaviours;
@@ -11,19 +15,13 @@ use crate::middleware::publisher::MessagePublisher;
 use crate::rpc_service::current_time_secs;
 use crate::utils::*;
 use alloy::primitives::Address as EvmAddress;
-use anyhow::{Context, Result, bail};
-use bitcoin::{PublicKey, Txid, XOnlyPublicKey};
+use anyhow::{Context, Result};
+use bitcoin::{PublicKey, XOnlyPublicKey};
 use bitvm_lib::actors::Actor;
-use bitvm_lib::babe_adapter::{BabeBundleBuilder, CACSetupPackage};
+use bitvm_lib::babe_adapter::CACSetupPackage;
 use bitvm_lib::committee::*;
 use bitvm_lib::types::SimplifiedBitvmGcGraph;
-use client::goat_chain::DisproveTxType;
-use client::http_client::async_client::HttpAsyncClient;
-use client::{
-    btc_chain::{BTCClient, BtcRpcTimeoutError},
-    goat_chain::GOATClient,
-};
-use futures::FutureExt;
+use client::goat_chain::GOATClient;
 use libp2p::gossipsub::MessageId;
 use libp2p::{PeerId, Swarm, gossipsub};
 use musig2::{PartialSignature, PubNonce};
@@ -33,14 +31,11 @@ use secp256k1::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::fmt;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use store::localdb::LocalDB;
-use store::{MessageState, P2pInboxMessage};
 use strum::{Display, EnumDiscriminants, EnumIter, EnumString, IntoStaticStr};
-use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -50,35 +45,6 @@ pub struct GOATMessage {
 }
 
 const GOAT_MESSAGE_BIN_PREFIX: &[u8] = b"GOATBIN1";
-const TRANSIENT_PEGIN_RETRY_DELAY_SECS: usize = 30;
-const P2P_INBOX_LEASE_SECS: i64 = 5 * 60;
-const P2P_INBOX_ENQUEUE_ATTEMPTS: usize = 3;
-
-/// Budget for claims that never reported an outcome. Small on purpose: reaching
-/// this means the node went down mid-dispatch more than once on the same
-/// payload, which is the signature of a message that reproducibly kills it.
-const QUEUE_MAX_ABANDONS: i64 = 3;
-/// How long a claimed local message stays claimed before another tick may take
-/// it over. Heavy work is routed through the durable P2P inbox instead, so local
-/// handlers are expected to be short.
-const LOCAL_MESSAGE_LEASE_SECS: i64 = 10 * 60;
-/// Backoff applied to a local message whose handler returned a non-transient error.
-const LOCAL_MESSAGE_RETRY_DELAY_SECS: i64 = 600;
-const LOCAL_MESSAGE_BATCH_SIZE: i64 = 50;
-/// Delay applied per recorded abandon before a payload may run again, so a
-/// supervisor restart after a panic or an unclean exit does not replay it at
-/// full speed.
-const QUEUE_ABANDON_BACKOFF_SECS: i64 = 60;
-/// Maximum retained Quarantined payload bytes.
-const P2P_INBOX_QUARANTINE_MAX_BYTES: i64 = 256 * 1024 * 1024;
-/// Ceiling on terminal (`Processed`/`Failed`/`Quarantined`) inbox rows kept for
-/// diagnostics; the oldest beyond it are deleted.
-const P2P_INBOX_TERMINAL_MAX_ROWS: i64 = 100_000;
-/// Maximum terminal rows removed per cleanup pass.
-const P2P_INBOX_TERMINAL_PURGE_BATCH: i64 = 4_096;
-/// Minimum listed-batch shares for Registered and Unregistered senders.
-const P2P_INBOX_UNREGISTERED_BATCH_DIVISOR: i64 = 4;
-const P2P_INBOX_REGISTERED_BATCH_DIVISOR: i64 = 4;
 /// A `node` row of an unregistered peer may be evicted to make room for a new
 /// one once it has gone this long without a refresh: three missed heartbeats.
 pub const NODE_TABLE_EVICTABLE_AFTER_SECS: i64 = 3 * crate::env::HEARTBEAT_INTERVAL_SECOND as i64;
@@ -88,304 +54,20 @@ pub const NODE_TABLE_MAX_UNREGISTERED_ROWS: i64 = 4_096;
 /// refreshed for this long; live nodes refresh theirs on every heartbeat.
 const NODE_TABLE_STALE_SECS: i64 = 7 * 24 * 60 * 60;
 const NODE_TABLE_PURGE_INTERVAL: Duration = Duration::from_secs(60 * 60);
-/// How long each durable queue may start work in a business-worker tick.
-/// Individual handlers have a separate timeout; swarm runs on another thread.
-const P2P_INBOX_DRAIN_BUDGET: Duration = Duration::from_secs(4);
 /// Maximum accepted binding timestamp lead.
 pub const NODE_INFO_BINDING_MAX_FUTURE_SECS: i64 = 10 * 60;
-/// A dispatch future erased behind a box to keep the enclosing task's state
-/// machine reasonably small.
-type BoxedDispatch<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + 'a>>;
-
-enum DispatchExecution<T> {
-    Completed(T),
-    Shutdown,
-    Panicked(String),
-}
-
-struct LocalMessageClaim {
-    message_id: String,
-    message_version: i64,
-}
-
-/// Identify the current inbox message by kind, business reference and qualifier.
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct DispatchFingerprint {
-    kind: MessageKind,
-    business_ref: BusinessRef,
-    qualifier: MessageQualifier,
-}
-
-impl DispatchFingerprint {
-    fn of(content: &GOATMessageContent) -> Self {
-        Self {
-            kind: content.kind(),
-            business_ref: content.business_ref(),
-            qualifier: content.qualifier(),
-        }
-    }
-}
-
-struct InboxDispatchContext {
-    fingerprint: DispatchFingerprint,
-    retry: std::cell::RefCell<Option<anyhow::Error>>,
-}
-
-tokio::task_local! {
-    static ACTIVE_LOCAL_MESSAGE_CLAIM: LocalMessageClaim;
-    static ACTIVE_INBOX_DISPATCH: InboxDispatchContext;
-}
-
-async fn track_inbox_retry(
-    fingerprint: DispatchFingerprint,
-    dispatch: impl std::future::Future<Output = Result<()>>,
-) -> Result<()> {
-    ACTIVE_INBOX_DISPATCH
-        .scope(InboxDispatchContext { fingerprint, retry: Default::default() }, async {
-            let result = dispatch.await;
-            // Apply self-deferral after handler compensation, including when compensation returns an error.
-            match ACTIVE_INBOX_DISPATCH.with(|active| active.retry.borrow_mut().take()) {
-                Some(retry) => {
-                    if let Err(error) = &result {
-                        tracing::warn!(
-                            event = "p2p_inbox",
-                            outcome = "deferred_despite_error",
-                            error = %error,
-                            "handler failed after asking to be retried; keeping the retry"
-                        );
-                    }
-                    Err(retry)
-                }
-                None => result,
-            }
-        })
-        .await
-}
-
-fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
-    if let Some(message) = payload.downcast_ref::<&'static str>() {
-        (*message).to_owned()
-    } else if let Some(message) = payload.downcast_ref::<String>() {
-        message.clone()
-    } else {
-        "non-string panic payload".to_owned()
-    }
-}
-
-/// Catch only at the worker-supervisor boundary. A panic is returned separately
-/// so the caller can record an abandon and stop the node; it is never converted
-/// into an ordinary handler error or followed by more business work.
-async fn supervise_dispatch<F, T>(future: F, shutdown: &CancellationToken) -> DispatchExecution<T>
-where
-    F: std::future::Future<Output = T>,
-{
-    match std::panic::AssertUnwindSafe(async {
-        tokio::select! {
-            biased;
-            _ = shutdown.cancelled() => None,
-            result = future => Some(result),
-        }
-    })
-    .catch_unwind()
-    .await
-    {
-        Ok(Some(result)) => DispatchExecution::Completed(result),
-        Ok(None) => DispatchExecution::Shutdown,
-        Err(payload) => DispatchExecution::Panicked(panic_payload_message(payload.as_ref())),
-    }
-}
-
-/// Log a per-message bookkeeping failure without aborting the rest of the batch.
-///
-/// Propagating here used to abandon every message still claimed in the batch.
-/// Those rows stay `Processing` until their lease lapses and are then charged an
-/// abandon they never earned — so one transient storage blip could push a whole
-/// batch of healthy messages toward quarantine.
-fn log_queue_bookkeeping_failure(
-    queue: &'static str,
-    message_id: &str,
-    operation: &str,
-    error: &anyhow::Error,
-) {
-    tracing::error!(
-        event = queue,
-        outcome = "bookkeeping_failed",
-        message_id,
-        operation,
-        error = %error,
-        "failed to persist a message outcome; leaving it claimed for its lease to lapse"
-    );
-}
+/// Budget of one control message (NodeInfo, ACK): they touch the registry and
+/// the engine outbox only.
+const IMMEDIATE_DISPATCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Delivery semantics for externally received P2P messages.
 ///
-/// Protocol-state messages remain durable. Ephemeral messages carry
-/// recoverable peer state or graph synchronization data and can be resent.
+/// Durable messages are recorded as engine inbox events of their aggregate.
+/// Immediate messages carry recoverable peer state or ACKs and can be resent.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum P2PMessageDelivery {
     Inbox,
     Immediate,
-}
-
-/// Stable retry categories shared by P2P inbox consumers and protocol
-/// handlers. A handler must opt into retrying; all other failures are treated
-/// as terminal and retained as `Failed` inbox records.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RetryableDispatchReason {
-    StorageBusy,
-    ExternalRpcUnavailable,
-    PayloadNotReady,
-    DependencyPending,
-    PublishFailed,
-    ResourceLocked,
-}
-
-impl RetryableDispatchReason {
-    pub const fn code(self) -> &'static str {
-        match self {
-            Self::StorageBusy => "storage_busy",
-            Self::ExternalRpcUnavailable => "external_rpc_unavailable",
-            Self::PayloadNotReady => "payload_not_ready",
-            Self::DependencyPending => "dependency_pending",
-            Self::PublishFailed => "publish_failed",
-            Self::ResourceLocked => "resource_locked",
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct RetryableDispatchError {
-    pub reason: RetryableDispatchReason,
-    pub retry_after_secs: Option<i64>,
-    detail: String,
-}
-
-impl fmt::Display for RetryableDispatchError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "retryable {}: {}", self.reason.code(), self.detail)
-    }
-}
-
-impl std::error::Error for RetryableDispatchError {}
-
-pub fn retryable_dispatch_error(
-    reason: RetryableDispatchReason,
-    retry_after_secs: Option<i64>,
-    detail: impl fmt::Display,
-) -> anyhow::Error {
-    anyhow::Error::new(RetryableDispatchError {
-        reason,
-        retry_after_secs,
-        detail: detail.to_string(),
-    })
-}
-
-fn is_retryable_http_status(status: u16) -> bool {
-    status == 429 || (500..=599).contains(&status)
-}
-
-fn is_retryable_reqwest_error(error: &reqwest::Error) -> bool {
-    error.is_timeout()
-        || error.is_connect()
-        || error.status().is_some_and(|status| is_retryable_http_status(status.as_u16()))
-}
-
-/// Only classify transport-level RPC failures. Contract reverts, malformed
-/// responses and application errors are intentionally left terminal.
-pub(crate) fn is_retryable_external_rpc_error(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        // Inspect contract transport errors before traversing their transparent sources.
-        if let Some(alloy::contract::Error::TransportError(error)) =
-            cause.downcast_ref::<alloy::contract::Error>()
-        {
-            return error.is_transport_error();
-        }
-        if let Some(error) = cause.downcast_ref::<reqwest::Error>() {
-            return is_retryable_reqwest_error(error);
-        }
-        if cause.downcast_ref::<BtcRpcTimeoutError>().is_some() {
-            return true;
-        }
-        if let Some(error) = cause.downcast_ref::<esplora_client::Error>() {
-            return match error {
-                // esplora-client uses reqwest 0.11 while this crate uses
-                // reqwest 0.12, so this check must remain inline instead of
-                // sharing the 0.12 helper above.
-                esplora_client::Error::Reqwest(error) => {
-                    error.is_timeout()
-                        || error.is_connect()
-                        || error
-                            .status()
-                            .is_some_and(|status| is_retryable_http_status(status.as_u16()))
-                }
-                esplora_client::Error::HttpResponse { status, .. } => {
-                    is_retryable_http_status(*status)
-                }
-                _ => false,
-            };
-        }
-        if let Some(error) = cause.downcast_ref::<alloy::transports::TransportError>() {
-            // GOAT uses an HTTP Alloy provider. A transport error means the
-            // request did not receive a valid RPC result; RPC ErrorResp is
-            // deliberately excluded by this predicate.
-            return error.is_transport_error();
-        }
-        false
-    })
-}
-
-fn classify_retryable_dispatch_error(error: anyhow::Error) -> anyhow::Error {
-    if error.chain().any(|cause| cause.downcast_ref::<RetryableDispatchError>().is_some())
-        || !is_retryable_external_rpc_error(&error)
-    {
-        return error;
-    }
-    retryable_dispatch_error(RetryableDispatchReason::ExternalRpcUnavailable, None, error)
-}
-
-#[derive(Clone, Copy, Debug)]
-pub enum MessageDeferReason {
-    TransientStorageRetry,
-    RecoveryRepublish,
-    PreviousGraphPending,
-    CommitteeNoncesPending,
-    CommitteeNonceConsensusPending,
-    CommitteeEndorsementsPending,
-    BitcoinTransactionPending,
-    BitcoinConfirmationPending,
-    GoatSpvPending,
-    ProofPending,
-    ProtocolInputsPending,
-    TimelockPending,
-    WithdrawKickoffPending,
-    ChainStatePending,
-    ValidationRetry,
-    GraphSyncPending,
-    HandlerError,
-}
-
-impl MessageDeferReason {
-    pub const fn code(self) -> &'static str {
-        match self {
-            Self::TransientStorageRetry => "transient_storage_retry",
-            Self::RecoveryRepublish => "recovery_republish",
-            Self::PreviousGraphPending => "previous_graph_pending",
-            Self::CommitteeNoncesPending => "committee_nonces_pending",
-            Self::CommitteeNonceConsensusPending => "committee_nonce_consensus_pending",
-            Self::CommitteeEndorsementsPending => "committee_endorsements_pending",
-            Self::BitcoinTransactionPending => "bitcoin_transaction_pending",
-            Self::BitcoinConfirmationPending => "bitcoin_confirmation_pending",
-            Self::GoatSpvPending => "goat_spv_pending",
-            Self::ProofPending => "proof_pending",
-            Self::ProtocolInputsPending => "protocol_inputs_pending",
-            Self::TimelockPending => "timelock_pending",
-            Self::WithdrawKickoffPending => "withdraw_kickoff_pending",
-            Self::ChainStatePending => "chain_state_pending",
-            Self::ValidationRetry => "validation_retry",
-            Self::GraphSyncPending => "graph_sync_pending",
-            Self::HandlerError => "handler_error",
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -403,85 +85,18 @@ impl BusinessRef {
             Self::Unscoped => None,
         }
     }
-
-    fn key_part(self) -> String {
-        match self {
-            Self::Instance { instance_id } => format!("instance:{instance_id}"),
-            Self::Graph { graph_id, .. } => format!("graph:{graph_id}"),
-            Self::Unscoped => "unscoped".to_owned(),
-        }
-    }
 }
 
 pub trait HasBusinessRef {
     fn business_ref(&self) -> BusinessRef;
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum MessageQualifier {
-    Singleton,
-    Watchtower(usize),
-    Verifier(usize),
-    Disprove { kind: DisproveTxType, index: usize },
-}
-
-impl MessageQualifier {
-    fn key_part(&self) -> String {
-        match self {
-            Self::Singleton => "singleton".to_owned(),
-            Self::Watchtower(index) => format!("watchtower:{index}"),
-            Self::Verifier(index) => format!("verifier:{index}"),
-            Self::Disprove { kind, index } => format!("disprove:{kind}:{index}"),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LocalMessageKey {
-    actor: Actor,
-    kind: MessageKind,
-    business_ref: BusinessRef,
-    qualifier: MessageQualifier,
-}
-
-impl LocalMessageKey {
-    pub fn from_content(actor: Actor, content: &GOATMessageContent) -> Result<Self> {
-        let business_ref = content.business_ref();
-        if business_ref.primary_id().is_none() {
-            bail!("cannot persist unscoped {} as a local message", content.event_type());
-        }
-        Ok(Self { actor, kind: content.kind(), business_ref, qualifier: content.qualifier() })
-    }
-
-    pub fn business_id(&self) -> Uuid {
-        match self.business_ref {
-            BusinessRef::Instance { instance_id } => instance_id,
-            BusinessRef::Graph { graph_id, .. } => graph_id,
-            BusinessRef::Unscoped => unreachable!("unscoped messages cannot have a local key"),
-        }
-    }
-
-    pub fn message_id(&self) -> String {
-        format!(
-            "local:v1:{}:{}:{}:{}",
-            self.actor,
-            self.business_ref.key_part(),
-            self.kind,
-            self.qualifier.key_part(),
-        )
-    }
-}
-
 #[derive(Serialize, Deserialize, Clone, EnumDiscriminants, MessageBusinessRef)]
 #[strum_discriminants(name(MessageKind))]
 #[strum_discriminants(derive(Hash, Display, EnumString, EnumIter, IntoStaticStr))]
 pub enum GOATMessageContent {
-    #[business_ref(instance)]
-    PeginRequest(PeginRequest),
     #[business_ref(graph)]
     CreateGraph(CreateGraph),
-    #[business_ref(instance)]
-    ConfirmInstance(ConfirmInstance),
     #[business_ref(graph)]
     InitGraph(InitGraph),
     #[business_ref(graph)]
@@ -510,96 +125,20 @@ pub enum GOATMessageContent {
     PeginConfirmNonceConsensus(PeginConfirmNonceConsensus),
     #[business_ref(instance)]
     PeginConfirmPartialSig(PeginConfirmPartialSig),
-    #[business_ref(instance)]
-    PostReady(PostReady),
-    #[business_ref(graph)]
-    KickoffReady(KickoffReady),
-    #[business_ref(graph)]
-    KickoffSent(KickoffSent),
-    #[business_ref(graph)]
-    PreKickoffSent(PreKickoffSent),
-    #[business_ref(graph)]
-    ChallengeSent(ChallengeSent),
-    #[business_ref(graph)]
-    WatchtowerChallengeInitSent(WatchtowerChallengeInitSent),
-    #[business_ref(graph)]
-    WatchtowerChallengeSent(WatchtowerChallengeSent),
-    #[business_ref(graph)]
-    WatchtowerChallengeTimeout(WatchtowerChallengeTimeout),
-    #[business_ref(graph)]
-    NackReady(NackReady),
-    #[business_ref(graph)]
-    OperatorCommitPubinReady(OperatorCommitPubinReady),
-    #[business_ref(graph)]
-    OperatorCommitPubinTimeout(OperatorCommitPubinTimeout),
-    #[business_ref(graph)]
-    AssertReady(AssertReady),
-    #[business_ref(graph)]
-    AssertSent(AssertSent),
-    #[business_ref(graph)]
-    ChallengeAssertSent(ChallengeAssertSent),
-    #[business_ref(graph)]
-    WronglyChallengeTimeout(WronglyChallengeTimeout),
-    #[business_ref(graph)]
-    DisproveSent(DisproveSent),
-    #[business_ref(graph)]
-    Take1Ready(Take1Ready),
-    #[business_ref(graph)]
-    Take1Sent(Take1Sent),
-    #[business_ref(graph)]
-    Take2Ready(Take2Ready),
-    #[business_ref(graph)]
-    Take2Sent(Take2Sent),
     #[business_ref(unscoped)]
     RequestNodeInfo(NodeInfo),
     #[business_ref(unscoped)]
     ResponseNodeInfo(NodeInfo),
-    #[business_ref(unscoped)]
-    InstanceDiscarded(InstanceDiscarded),
-    #[business_ref(unscoped)]
-    Tick,
 }
 
 impl MessageKind {
-    const fn is_pegin(self) -> bool {
-        matches!(
-            self,
-            Self::PeginRequest
-                | Self::ConfirmInstance
-                | Self::CreateGraph
-                | Self::InitGraph
-                | Self::GenCircuits
-                | Self::CutCircuits
-                | Self::SolderingProofReady
-                | Self::VerifierGraphParamsEndorsement
-                | Self::NonceGeneration
-                | Self::AggNonceConsensus
-                | Self::CommitteePresign
-                | Self::EndorseGraph
-                | Self::GraphFinalize
-                | Self::PeginConfirmNonce
-                | Self::PeginConfirmNonceConsensus
-                | Self::PeginConfirmPartialSig
-                | Self::PostReady
-        )
-    }
-}
-
-impl MessageKind {
-    /// Receiver roles handled by `dispatch` or, for the graph-phase kinds, by
-    /// the Graph aggregate (`aggregates::graph::route_action`).
+    /// Receiver roles that take the kind: the control dispatcher for the
+    /// immediate kinds, the Graph aggregate (`aggregates::graph::route_action`)
+    /// for the graph phases, the Instance aggregate
+    /// (`aggregates::instance::route_action`) for the PeginConfirm round.
     pub fn handled_by(self, actor: &Actor) -> bool {
-        use Actor::Committee;
         match self {
-            // Every role has an arm (a role-specific one or the default).
-            Self::PeginRequest
-            | Self::ConfirmInstance
-            | Self::GraphSetupAck
-            | Self::RequestNodeInfo
-            | Self::ResponseNodeInfo
-            // Not dispatched through the role table; keep them as they are.
-            | Self::InstanceDiscarded
-            | Self::Tick => true,
+            Self::GraphSetupAck | Self::RequestNodeInfo | Self::ResponseNodeInfo => true,
             Self::InitGraph
             | Self::GenCircuits
             | Self::CutCircuits
@@ -620,28 +159,6 @@ impl MessageKind {
                 let kind: &'static str = self.into();
                 crate::aggregates::instance::engine_handles(kind, actor)
             }
-            Self::PostReady => matches!(actor, Committee),
-            // Peg-out runs on the Graph aggregate from chain scans (step 4);
-            // these local events are no longer dispatched by anyone.
-            Self::KickoffReady
-            | Self::KickoffSent
-            | Self::PreKickoffSent
-            | Self::ChallengeSent
-            | Self::DisproveSent
-            | Self::Take1Sent
-            | Self::Take2Sent
-            | Self::WatchtowerChallengeSent
-            | Self::WatchtowerChallengeTimeout
-            | Self::OperatorCommitPubinReady
-            | Self::AssertReady
-            | Self::ChallengeAssertSent
-            | Self::Take1Ready
-            | Self::Take2Ready
-            | Self::WatchtowerChallengeInitSent
-            | Self::NackReady
-            | Self::OperatorCommitPubinTimeout
-            | Self::AssertSent
-            | Self::WronglyChallengeTimeout => false,
         }
     }
 }
@@ -686,48 +203,8 @@ impl GOATMessageContent {
     pub fn event_type(&self) -> &'static str {
         self.kind().into()
     }
-
-    pub fn qualifier(&self) -> MessageQualifier {
-        match self {
-            Self::WatchtowerChallengeSent(message) => {
-                MessageQualifier::Watchtower(message.watchtower_index)
-            }
-            Self::ChallengeAssertSent(message) => {
-                MessageQualifier::Verifier(message.verifier_index)
-            }
-            Self::WronglyChallengeTimeout(message) => {
-                MessageQualifier::Verifier(message.verifier_index)
-            }
-            Self::DisproveSent(message) => {
-                MessageQualifier::Disprove { kind: message.disprove_type, index: message.index }
-            }
-            _ => MessageQualifier::Singleton,
-        }
-    }
 }
 
-fn is_retryable_sqlite_error(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        let message = cause.to_string().to_ascii_lowercase();
-        message.contains("database is locked")
-            || message.contains("database is busy")
-            || message.contains("sqlite_busy")
-    })
-}
-
-/// Pegin
-
-#[derive(Serialize, Deserialize, Clone)]
-pub struct PeginRequest {
-    pub instance_id: Uuid,
-    pub pegin_request_tx_hash: String, // goat tx hash
-    pub pegin_request_height: i64,
-    pub pegin_timestamp: i64,
-}
-#[derive(Serialize, Deserialize, Clone)]
-pub struct ConfirmInstance {
-    pub instance_id: Uuid,
-}
 #[derive(Serialize, Deserialize, Clone)]
 pub struct InitGraph {
     pub instance_id: Uuid,
@@ -891,120 +368,6 @@ pub struct PeginConfirmPartialSig {
     pub partial_sig: PartialSignature,
     pub endorse_sig: Vec<u8>, // ECDSA signature signed with committee evm keypair
 }
-#[derive(Serialize, Deserialize, Clone)]
-pub struct PostReady {
-    pub instance_id: Uuid,
-}
-
-/// Pegout
-
-#[derive(Serialize, Deserialize, Clone)]
-pub struct KickoffReady {
-    pub instance_id: Uuid,
-    pub graph_id: Uuid,
-}
-#[derive(Serialize, Deserialize, Clone)]
-pub struct KickoffSent {
-    pub instance_id: Uuid,
-    pub graph_id: Uuid,
-}
-#[derive(Serialize, Deserialize, Clone)]
-pub struct PreKickoffSent {
-    pub instance_id: Uuid,
-    pub graph_id: Uuid,
-}
-#[derive(Serialize, Deserialize, Clone)]
-pub struct ChallengeSent {
-    pub instance_id: Uuid,
-    pub graph_id: Uuid,
-    pub challenge_txid: Txid,
-}
-#[derive(Serialize, Deserialize, Clone)]
-pub struct WatchtowerChallengeInitSent {
-    pub instance_id: Uuid,
-    pub graph_id: Uuid,
-}
-#[derive(Serialize, Deserialize, Clone)]
-pub struct WatchtowerChallengeSent {
-    pub instance_id: Uuid,
-    pub graph_id: Uuid,
-    pub watchtower_index: usize,
-}
-#[derive(Serialize, Deserialize, Clone)]
-pub struct WatchtowerChallengeTimeout {
-    pub instance_id: Uuid,
-    pub graph_id: Uuid,
-}
-#[derive(Serialize, Deserialize, Clone)]
-pub struct NackReady {
-    pub instance_id: Uuid,
-    pub graph_id: Uuid,
-}
-#[derive(Serialize, Deserialize, Clone)]
-pub struct OperatorCommitPubinReady {
-    pub instance_id: Uuid,
-    pub graph_id: Uuid,
-}
-#[derive(Serialize, Deserialize, Clone)]
-pub struct OperatorCommitPubinTimeout {
-    pub instance_id: Uuid,
-    pub graph_id: Uuid,
-}
-#[derive(Serialize, Deserialize, Clone)]
-pub struct AssertReady {
-    pub instance_id: Uuid,
-    pub graph_id: Uuid,
-}
-#[derive(Serialize, Deserialize, Clone)]
-pub struct AssertSent {
-    pub instance_id: Uuid,
-    pub graph_id: Uuid,
-    pub assert_txid: Txid,
-}
-#[derive(Serialize, Deserialize, Clone)]
-pub struct ChallengeAssertSent {
-    pub instance_id: Uuid,
-    pub graph_id: Uuid,
-    pub challenge_assert_txid: Txid,
-    pub verifier_index: usize,
-}
-#[derive(Serialize, Deserialize, Clone)]
-pub struct WronglyChallengeTimeout {
-    pub instance_id: Uuid,
-    pub graph_id: Uuid,
-    pub challenge_assert_txid: Txid,
-    pub verifier_index: usize,
-}
-#[derive(Serialize, Deserialize, Clone)]
-pub struct DisproveSent {
-    pub instance_id: Uuid,
-    pub graph_id: Uuid,
-    pub disprove_type: DisproveTxType,
-    pub index: usize, // nack txns index or assert timeout txns index, ignored for other disprove types
-    pub challenge_start_txid: Option<Txid>,
-    pub challenge_finish_txid: Txid,
-}
-#[derive(Serialize, Deserialize, Clone)]
-pub struct Take1Ready {
-    pub instance_id: Uuid,
-    pub graph_id: Uuid,
-}
-#[derive(Serialize, Deserialize, Clone)]
-pub struct Take1Sent {
-    pub instance_id: Uuid,
-    pub graph_id: Uuid,
-}
-#[derive(Serialize, Deserialize, Clone)]
-pub struct Take2Ready {
-    pub instance_id: Uuid,
-    pub graph_id: Uuid,
-}
-#[derive(Serialize, Deserialize, Clone)]
-pub struct Take2Sent {
-    pub instance_id: Uuid,
-    pub graph_id: Uuid,
-}
-
 /// Others
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
@@ -1074,12 +437,6 @@ pub fn verify_node_info_binding(node_info: &NodeInfo) -> Option<XOnlyPublicKey> 
         .map(|()| xonly)
 }
 
-#[derive(Serialize, Deserialize, Clone)]
-pub struct InstanceDiscarded {
-    // (graph_id, instance_id, OperatorPubkey)
-    pub graph_infos: Vec<(Uuid, Uuid, String)>,
-}
-
 impl GOATMessage {
     pub fn new(actor: Actor, content: GOATMessageContent) -> Self {
         Self { actor, content }
@@ -1087,10 +444,6 @@ impl GOATMessage {
 
     pub fn content(&self) -> &GOATMessageContent {
         &self.content
-    }
-
-    pub fn default_message_id() -> MessageId {
-        MessageId(b"__inner_message_id__".to_vec())
     }
 
     pub async fn serialize_message(&self) -> Result<Vec<u8>> {
@@ -1156,10 +509,7 @@ fn report_gossip_validation(
 pub async fn handle_inbound_p2p_message(
     swarm: &mut Swarm<AllBehaviours>,
     local_db: &LocalDB,
-    _btc_client: &Arc<BTCClient>,
     goat_client: &Arc<GOATClient>,
-    _http_client: &HttpAsyncClient,
-    _soldering_builder: &Option<Arc<BabeBundleBuilder>>,
     actor: Actor,
     from_peer_id: PeerId,
     propagation_source: PeerId,
@@ -1215,11 +565,11 @@ pub async fn handle_inbound_p2p_message(
             refresh_peer_timestamp_throttled(local_db, from_peer_id, now).await;
             Ok(())
         }
-        // Persist durable messages before allowing forwarding: graph-phase
-        // and PeginConfirm round messages as engine inbox events (the engine
-        // ACKs heavy ones once they are durably applied), the rest in the
-        // P2P inbox.
-        InboundVerdict::Enqueue { message: decoded, class, content_hash } => {
+        // Record durable messages before allowing forwarding: graph-phase
+        // messages for the Graph aggregate, PeginConfirm round messages for
+        // the Instance aggregate. The engine deduplicates by content id and
+        // ACKs heavy messages once they are durably applied.
+        InboundVerdict::Enqueue { message: decoded, class } => {
             let author = from_peer_id.to_string();
             let event =
                 match inbound_event(&actor, &author, &crate::env::get_peer_id(), &decoded, message)
@@ -1230,27 +580,26 @@ pub async fn handle_inbound_p2p_message(
                     ),
                     Err(error) => Err(error),
                 };
-            let persisted = match event {
+            let recorded = match event {
                 Ok(Some(event)) => {
-                    record_graph_message(local_db, event, &decoded, from_peer_id, message.len())
-                        .await
-                }
-                Ok(None) => {
-                    enqueue_p2p_message(
+                    record_engine_message(
                         local_db,
-                        actor,
-                        from_peer_id,
-                        id.clone(),
-                        message,
+                        event.with_admission_class(class.to_string()),
                         &decoded,
-                        class,
-                        content_hash,
+                        from_peer_id,
+                        message.len(),
                     )
                     .await
                 }
+                // Kept by `handled_by` but routed by no aggregate: a table
+                // mismatch, not a bad message.
+                Ok(None) => Err(anyhow::anyhow!(
+                    "{} is handled by {actor} but no aggregate routes it",
+                    decoded.content.event_type()
+                )),
                 Err(error) => Err(error),
             };
-            if let Err(error) = persisted {
+            if let Err(error) = recorded {
                 report_gossip_validation(
                     swarm,
                     &id,
@@ -1261,14 +610,6 @@ pub async fn handle_inbound_p2p_message(
             }
             report_gossip_validation(swarm, &id, &propagation_source, MessageAcceptance::Accept);
             metrics_state.record_p2p_receive(true);
-            refresh_peer_timestamp_throttled(local_db, from_peer_id, now).await;
-            Ok(())
-        }
-        // Forward duplicates with rate-limited logs.
-        InboundVerdict::Duplicate(_) => {
-            report_gossip_validation(swarm, &id, &propagation_source, MessageAcceptance::Accept);
-            metrics_state.record_p2p_receive(true);
-            p2p_admission::record_drop(p2p_admission::DropReason::DuplicatePayload);
             refresh_peer_timestamp_throttled(local_db, from_peer_id, now).await;
             Ok(())
         }
@@ -1291,50 +632,49 @@ pub async fn handle_inbound_p2p_message(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Dispatch a control message (NodeInfo, ACK) on the control worker.
 pub(crate) async fn dispatch_immediate_message(
     publisher: &mut (dyn MessagePublisher + Sync),
     local_db: &LocalDB,
-    btc_client: &Arc<BTCClient>,
     goat_client: &Arc<GOATClient>,
-    http_client: &HttpAsyncClient,
-    soldering_builder: &Option<Arc<BabeBundleBuilder>>,
-    actor: Actor,
     from_peer_id: PeerId,
-    id: MessageId,
     message: GOATMessage,
     metrics_state: &MetricsState,
 ) -> Result<()> {
-    let kind = message.content.event_type();
-    match tokio::time::timeout(
-        crate::env::get_p2p_handler_timeout(),
-        dispatch_decoded_p2p_message(
-            publisher,
-            local_db,
-            btc_client,
-            goat_client,
-            http_client,
-            soldering_builder,
-            actor,
-            from_peer_id,
-            id,
-            message,
-            metrics_state,
-        ),
+    let message_type = message.content.event_type();
+    let started_at = Instant::now();
+    let mut handler_ctx = HandlerContext { publisher, local_db, goat_client, from_peer_id };
+    let result = match tokio::time::timeout(
+        IMMEDIATE_DISPATCH_TIMEOUT,
+        handle_dispatch(&mut handler_ctx, message.content()),
     )
     .await
     {
         Ok(result) => result,
-        Err(_) => {
-            tracing::warn!(
-                event = "p2p_message",
-                outcome = "handler_timeout",
-                message_type = kind,
-                "ephemeral message exceeded business worker budget"
-            );
-            Ok(())
-        }
+        Err(_) => Err(anyhow::anyhow!("control message exceeded its dispatch budget")),
+    };
+    metrics_state
+        .record_message_dispatch(message_type, if result.is_ok() { "success" } else { "failed" });
+    match &result {
+        Ok(()) => tracing::debug!(
+            event = "message_dispatch_result",
+            outcome = "handled",
+            message_type,
+            from_peer_id = %from_peer_id,
+            elapsed_ms = started_at.elapsed().as_millis() as u64,
+            "control message dispatched"
+        ),
+        Err(err) => tracing::warn!(
+            event = "message_dispatch_result",
+            outcome = "failed",
+            message_type,
+            from_peer_id = %from_peer_id,
+            elapsed_ms = started_at.elapsed().as_millis() as u64,
+            error = %err,
+            "control message dispatch failed"
+        ),
     }
+    result
 }
 
 /// Count relay strikes and temporarily ban repeat offenders.
@@ -1382,10 +722,10 @@ async fn refresh_peer_timestamp_throttled(local_db: &LocalDB, from_peer_id: Peer
     }
 }
 
-/// Record an admitted graph-phase message for its Graph aggregate. The
-/// engine deduplicates by content and ACKs a heavy message again when its
-/// material is already applied or parked.
-async fn record_graph_message(
+/// Record an admitted durable message as an inbox event of its aggregate.
+/// The engine deduplicates by content id and ACKs a heavy message again when
+/// its material is already applied or parked.
+async fn record_engine_message(
     local_db: &LocalDB,
     event: engine::NewEvent,
     decoded: &GOATMessage,
@@ -1393,338 +733,26 @@ async fn record_graph_message(
     content_size: usize,
 ) -> Result<()> {
     let outcome = match crate::engine_bridge::engine_handle() {
-        Some(engine) => engine.submit(event).await.context("record inbound graph message")?,
+        Some(engine) => engine.submit(event).await.context("record inbound message")?,
         None => {
             crate::engine_bridge::submit_event(local_db, event)
                 .await
-                .context("record inbound graph message")?;
+                .context("record inbound message")?;
             engine::SubmitOutcome::Inserted
         }
     };
+    if matches!(outcome, engine::SubmitOutcome::Duplicate { .. }) {
+        crate::p2p_admission::record_drop(crate::p2p_admission::DropReason::DuplicatePayload);
+    }
     tracing::info!(
         event = "engine_inbox",
         outcome = ?outcome,
         message_type = decoded.content.event_type(),
         from_peer_id = %from_peer_id,
         content_size,
-        "received graph message"
+        "received durable message"
     );
     Ok(())
-}
-
-/// Persist a decoded durable P2P message. Protocol work runs from the inbox on
-/// a regular tick.
-#[allow(clippy::too_many_arguments)]
-async fn enqueue_p2p_message(
-    local_db: &LocalDB,
-    actor: Actor,
-    from_peer_id: PeerId,
-    id: MessageId,
-    message: &[u8],
-    decoded: &GOATMessage,
-    admission_class: store::P2pInboxAdmissionClass,
-    content_hash: [u8; 32],
-) -> Result<()> {
-    let message_id = hex::encode(&id.0);
-    let inbox_message = P2pInboxMessage {
-        message_id: message_id.clone(),
-        business_id: decoded.content.business_ref().primary_id(),
-        actor: actor.to_string(),
-        from_peer: from_peer_id.to_string(),
-        msg_type: decoded.content.event_type().to_owned(),
-        content: message.to_vec(),
-        content_size: message.len() as i64,
-        admission_class: admission_class.to_string(),
-        content_hash: Some(content_hash.to_vec()),
-        ..Default::default()
-    };
-    let mut inserted = None;
-    for attempt in 1..=P2P_INBOX_ENQUEUE_ATTEMPTS {
-        let result = async {
-            let mut storage = local_db.acquire().await?;
-            storage.insert_p2p_inbox_message(&inbox_message).await
-        }
-        .await;
-        match result {
-            Ok(value) => {
-                inserted = Some(value);
-                break;
-            }
-            Err(error)
-                if is_retryable_sqlite_error(&error) && attempt < P2P_INBOX_ENQUEUE_ATTEMPTS =>
-            {
-                tracing::warn!(
-                    event = "p2p_inbox",
-                    outcome = "enqueue_retry",
-                    message_id = %message_id,
-                    attempt,
-                    error = %error,
-                    "retrying transient P2P inbox insert"
-                );
-                tokio::time::sleep(Duration::from_millis(50 * attempt as u64)).await;
-            }
-            Err(error) => return Err(error).context("persist inbound P2P message"),
-        }
-    }
-    let inserted = inserted.expect("P2P inbox insert loop exits only after success or error");
-    // Aggregate unregistered admission logs; log registered messages individually.
-    if admission_class.is_registered() {
-        tracing::info!(
-            event = "p2p_inbox",
-            outcome = if inserted { "enqueued" } else { "duplicate" },
-            message_id = %message_id,
-            message_type = %inbox_message.msg_type,
-            from_peer_id = %from_peer_id,
-            content_size = message.len(),
-            "received P2P message"
-        );
-    } else {
-        crate::p2p_admission::record_admitted_unregistered();
-        tracing::debug!(
-            event = "p2p_inbox",
-            outcome = if inserted { "enqueued" } else { "duplicate" },
-            message_id = %message_id,
-            message_type = %inbox_message.msg_type,
-            from_peer_id = %from_peer_id,
-            content_size = message.len(),
-            "received P2P message"
-        );
-    }
-    Ok(())
-}
-
-fn p2p_retry_delay_secs(attempt_count: i64) -> i64 {
-    match attempt_count {
-        ..=1 => 10,
-        2 => 30,
-        3 => 60,
-        4 => 120,
-        _ => 300,
-    }
-}
-
-fn p2p_retryable_dispatch_error(
-    error: &anyhow::Error,
-) -> Option<(RetryableDispatchReason, Option<i64>)> {
-    if let Some(retryable) =
-        error.chain().find_map(|cause| cause.downcast_ref::<RetryableDispatchError>())
-    {
-        return Some((retryable.reason, retryable.retry_after_secs));
-    }
-    if is_retryable_sqlite_error(error) {
-        return Some((RetryableDispatchReason::StorageBusy, None));
-    }
-    None
-}
-
-fn log_stale_p2p_inbox_lease(message_id: &str, lease_token: &str, operation: &str) {
-    tracing::warn!(
-        event = "p2p_inbox",
-        outcome = "stale_lease",
-        message_id,
-        lease_token,
-        operation,
-        "ignored P2P inbox state update from a stale lease"
-    );
-}
-
-async fn fail_p2p_inbox_without_aborting_batch(
-    local_db: &LocalDB,
-    message_id: &str,
-    lease_token: &str,
-    error: &str,
-) {
-    let result = async {
-        let mut storage = local_db.acquire().await?;
-        storage.fail_p2p_inbox_message(message_id, lease_token, error).await
-    }
-    .await;
-    match result {
-        Ok(true) => {}
-        Ok(false) => log_stale_p2p_inbox_lease(message_id, lease_token, "fail"),
-        Err(error) => log_queue_bookkeeping_failure("p2p_inbox", message_id, "fail", &error),
-    }
-}
-
-async fn defer_p2p_inbox_without_aborting_batch(
-    local_db: &LocalDB,
-    message_id: &str,
-    lease_token: &str,
-    next_retry_at: i64,
-    reason: &str,
-) {
-    let result = async {
-        let mut storage = local_db.acquire().await?;
-        storage.defer_p2p_inbox_message(message_id, lease_token, next_retry_at, reason).await
-    }
-    .await;
-    match result {
-        Ok(true) => {}
-        Ok(false) => log_stale_p2p_inbox_lease(message_id, lease_token, "defer"),
-        Err(error) => log_queue_bookkeeping_failure("p2p_inbox", message_id, "defer", &error),
-    }
-}
-
-async fn abandon_p2p_inbox_after_panic(
-    local_db: &LocalDB,
-    message_id: &str,
-    lease_token: &str,
-    detail: &str,
-) {
-    let error = format!("handler panicked: {detail}");
-    let result = async {
-        let mut storage = local_db.acquire().await?;
-        storage
-            .abandon_p2p_inbox_message(
-                message_id,
-                lease_token,
-                current_time_secs(),
-                QUEUE_ABANDON_BACKOFF_SECS,
-                &error,
-            )
-            .await
-    }
-    .await;
-    match result {
-        Ok(true) => {}
-        Ok(false) => log_stale_p2p_inbox_lease(message_id, lease_token, "abandon"),
-        Err(error) => log_queue_bookkeeping_failure("p2p_inbox", message_id, "abandon", &error),
-    }
-}
-
-async fn abandon_local_message_after_panic(
-    local_db: &LocalDB,
-    message_id: &str,
-    message_version: i64,
-    detail: &str,
-) {
-    let error = format!("handler panicked: {detail}");
-    let result = async {
-        let mut storage = local_db.acquire().await?;
-        storage
-            .abandon_local_message(
-                message_id,
-                message_version,
-                current_time_secs(),
-                QUEUE_ABANDON_BACKOFF_SECS,
-                &error,
-            )
-            .await
-    }
-    .await;
-    match result {
-        Ok(true) => {}
-        Ok(false) => tracing::warn!(
-            event = "local_message_queue",
-            outcome = "stale_claim",
-            message_id,
-            message_version,
-            operation = "abandon",
-            "ignored local message update from a stale claim"
-        ),
-        Err(error) => {
-            log_queue_bookkeeping_failure("local_message_queue", message_id, "abandon", &error)
-        }
-    }
-}
-
-/// Claim one listed inbox row immediately before dispatching it.
-///
-/// `None` means the row is no longer claimable or the claim could not be
-/// persisted; either way it is skipped this tick and listed again on the next.
-async fn claim_p2p_inbox_candidate(
-    local_db: &LocalDB,
-    message_id: &str,
-) -> Option<P2pInboxMessage> {
-    let now = current_time_secs();
-    let result = async {
-        let mut storage = local_db.acquire().await?;
-        storage.claim_p2p_inbox_message(message_id, now, now + P2P_INBOX_LEASE_SECS).await
-    }
-    .await;
-    match result {
-        Ok(Some(message)) => Some(message),
-        Ok(None) => {
-            tracing::debug!(
-                event = "p2p_inbox",
-                outcome = "claim_skipped",
-                message_id,
-                "listed inbox message is no longer claimable"
-            );
-            None
-        }
-        Err(error) => {
-            tracing::error!(
-                event = "p2p_inbox",
-                outcome = "claim_failed",
-                message_id,
-                error = %error,
-                "failed to claim a listed inbox message; it stays queued for the next tick"
-            );
-            None
-        }
-    }
-}
-
-/// Claim one listed local message immediately before dispatching it. See
-/// [`claim_p2p_inbox_candidate`].
-async fn claim_local_candidate(
-    local_db: &LocalDB,
-    candidate: &store::Message,
-) -> Option<store::Message> {
-    let now = current_time_secs();
-    let result = async {
-        let mut storage = local_db.acquire().await?;
-        storage
-            .claim_local_message(
-                &candidate.message_id,
-                candidate.message_version,
-                now,
-                now + LOCAL_MESSAGE_LEASE_SECS,
-            )
-            .await
-    }
-    .await;
-    match result {
-        Ok(Some(message)) => Some(message),
-        Ok(None) => {
-            tracing::debug!(
-                event = "local_message_queue",
-                outcome = "claim_skipped",
-                queued_message_id = %candidate.message_id,
-                message_version = candidate.message_version,
-                "listed local message is no longer claimable"
-            );
-            None
-        }
-        Err(error) => {
-            tracing::error!(
-                event = "local_message_queue",
-                outcome = "claim_failed",
-                queued_message_id = %candidate.message_id,
-                error = %error,
-                "failed to claim a listed local message; it stays queued for the next tick"
-            );
-            None
-        }
-    }
-}
-
-/// Charge and release every queue claim left behind by a previous process.
-///
-/// Run once at startup, before any dispatcher starts. The database is
-/// process-local, so a `Processing` row at this point is an attempt that never
-/// reported an outcome. Waiting for its lease to lapse instead kept the row
-/// locked for minutes while every producer touching it backed off with
-/// ResourceLocked; a graceful shutdown never leaves such rows behind.
-pub async fn reclaim_stale_queue_claims(local_db: &LocalDB) -> Result<(u64, u64)> {
-    let now = current_time_secs();
-    let mut storage = local_db.start_immediate_transaction().await?;
-    let local = storage.reclaim_processing_local_messages(now, QUEUE_ABANDON_BACKOFF_SECS).await?;
-    let inbox =
-        storage.reclaim_processing_p2p_inbox_messages(now, QUEUE_ABANDON_BACKOFF_SECS).await?;
-    storage.commit().await?;
-    Ok((local, inbox))
 }
 
 /// Restore persisted operator bindings, re-verify signatures and refresh stake asynchronously.
@@ -1903,849 +931,7 @@ pub async fn run_p2p_admission_maintenance(local_db: &LocalDB, goat_client: &Arc
     }
 }
 
-/// Drain inbox batches until caught up or the message-start budget is exhausted.
-#[allow(clippy::too_many_arguments)]
-async fn handle_p2p_inbox_messages(
-    swarm: &mut (dyn MessagePublisher + Sync),
-    local_db: &LocalDB,
-    btc_client: &Arc<BTCClient>,
-    goat_client: &Arc<GOATClient>,
-    http_client: &HttpAsyncClient,
-    soldering_builder: &Option<Arc<BabeBundleBuilder>>,
-    actor: Actor,
-    metrics_state: &MetricsState,
-    shutdown: &CancellationToken,
-) -> Result<bool> {
-    let started_at = Instant::now();
-    let deadline = started_at + P2P_INBOX_DRAIN_BUDGET;
-    let mut first_batch = true;
-    // A backlogged worker comes straight back here; the retention sweeps keep
-    // the cadence of the tick they were written for.
-    let housekeeping = inbox_housekeeping_due(started_at);
-    let mut total_claimed = 0;
-    loop {
-        let batch = drain_p2p_inbox_batch(
-            swarm,
-            local_db,
-            btc_client,
-            goat_client,
-            http_client,
-            soldering_builder,
-            actor.clone(),
-            metrics_state,
-            shutdown,
-            first_batch,
-            first_batch && housekeeping,
-            deadline,
-        )
-        .await?;
-        first_batch = false;
-        total_claimed += batch.claimed;
-        // Stop when fewer messages were claimed than requested.
-        let full_batch = (batch.claimed as i64) >= get_p2p_inbox_batch_size();
-        if !full_batch || Instant::now() >= deadline || shutdown.is_cancelled() {
-            // Continue immediately only when a productive pass stopped on its budget.
-            return Ok(!shutdown.is_cancelled()
-                && total_claimed > 0
-                && (batch.cut_short || full_batch));
-        }
-    }
-}
-
-/// Whether the inbox retention sweeps should run in this pass: once per regular
-/// tick interval, however often a backlog brings the worker back.
-fn inbox_housekeeping_due(now: Instant) -> bool {
-    static LAST_RUN: Mutex<Option<Instant>> = Mutex::new(None);
-    let mut last_run = LAST_RUN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let interval = Duration::from_secs(crate::env::REGULAR_TASK_INTERVAL_SECOND);
-    if last_run.is_some_and(|last_run| now.saturating_duration_since(last_run) < interval) {
-        return false;
-    }
-    *last_run = Some(now);
-    true
-}
-
-struct InboxBatch {
-    claimed: usize,
-    /// The budget ran out with listed rows still unserved.
-    cut_short: bool,
-}
-
-/// List and dispatch one inbox batch.
-#[allow(clippy::too_many_arguments)]
-async fn drain_p2p_inbox_batch(
-    swarm: &mut (dyn MessagePublisher + Sync),
-    local_db: &LocalDB,
-    btc_client: &Arc<BTCClient>,
-    goat_client: &Arc<GOATClient>,
-    http_client: &HttpAsyncClient,
-    soldering_builder: &Option<Arc<BabeBundleBuilder>>,
-    actor: Actor,
-    metrics_state: &MetricsState,
-    shutdown: &CancellationToken,
-    first_batch: bool,
-    housekeeping: bool,
-    deadline: Instant,
-) -> Result<InboxBatch> {
-    let now = current_time_secs();
-    let mut storage = local_db.start_immediate_transaction().await?;
-    let (mut quarantined, mut purged, mut expired, mut trimmed, mut capped) = (0, 0, 0, 0, 0);
-    if housekeeping {
-        // Quarantine rows whose dispatch repeatedly failed to report any outcome.
-        // Returned retryable errors do not consume this budget.
-        quarantined = storage.quarantine_p2p_inbox_messages(now, QUEUE_MAX_ABANDONS).await?;
-        // Bound terminal metadata and the temporary payload retained for manual
-        // inspection of quarantined rows.
-        purged = storage.purge_terminal_p2p_inbox_messages(now - MESSAGE_EXPIRE_TIME).await?;
-        // Expire Pending rows by age, using the shorter unregistered retention.
-        expired = storage
-            .expire_pending_p2p_inbox_messages(
-                Some(store::P2pInboxAdmissionClass::Unregistered),
-                now - crate::p2p_admission::UNREGISTERED_PENDING_TTL_SECS,
-            )
-            .await?
-            + storage.expire_pending_p2p_inbox_messages(None, now - MESSAGE_EXPIRE_TIME).await?;
-        // Cap quarantined payload bytes and terminal row count.
-        trimmed =
-            storage.trim_quarantined_p2p_inbox_payloads(P2P_INBOX_QUARANTINE_MAX_BYTES).await?;
-        capped = storage
-            .purge_p2p_inbox_over_terminal_cap(
-                P2P_INBOX_TERMINAL_MAX_ROWS,
-                P2P_INBOX_TERMINAL_PURGE_BATCH,
-            )
-            .await?;
-    }
-    // Only list here. Each row is claimed right before its own dispatch so a
-    // crash mid-dispatch is charged to that row alone.
-    let batch_size = get_p2p_inbox_batch_size();
-    let candidates = storage
-        .list_claimable_p2p_inbox_messages_by_class(
-            now,
-            batch_size,
-            (batch_size / P2P_INBOX_REGISTERED_BATCH_DIVISOR).max(1),
-            (batch_size / P2P_INBOX_UNREGISTERED_BATCH_DIVISOR).max(1),
-            QUEUE_MAX_ABANDONS,
-            &[],
-        )
-        .await?;
-    storage.commit().await?;
-    let mut claimed = 0;
-    let mut cut_short = false;
-
-    if quarantined > 0 {
-        tracing::warn!(
-            event = "p2p_inbox",
-            outcome = "quarantined",
-            quarantined,
-            max_abandons = QUEUE_MAX_ABANDONS,
-            "quarantined inbox messages that repeatedly abandoned their lease"
-        );
-    }
-    if purged > 0 {
-        tracing::info!(
-            event = "p2p_inbox",
-            outcome = "purged",
-            purged,
-            "removed terminal inbox rows past their retention window"
-        );
-    }
-    if expired > 0 {
-        tracing::warn!(
-            event = "p2p_inbox",
-            outcome = "expired",
-            expired,
-            "retired inbox messages that stayed pending past their retention window"
-        );
-    }
-    if trimmed > 0 || capped > 0 {
-        tracing::info!(
-            event = "p2p_inbox",
-            outcome = "capacity_trimmed",
-            trimmed_quarantine_payloads = trimmed,
-            deleted_terminal_rows = capped,
-            "trimmed retained inbox data over its capacity limits"
-        );
-    }
-
-    // Serve listed classes using the persistent weighted rotation.
-    let mut queues: [std::collections::VecDeque<store::P2pInboxMessage>; 3] = Default::default();
-    for candidate in candidates {
-        queues[crate::p2p_admission::InboxSchedule::queue_of(&candidate.admission_class)]
-            .push_back(candidate);
-    }
-    loop {
-        // Check the budget before each claim; always allow the first message to make progress.
-        if (claimed > 0 || !first_batch) && Instant::now() >= deadline {
-            cut_short = queues.iter().any(|queue| !queue.is_empty());
-            break;
-        }
-        let Some(candidate) = crate::p2p_admission::inbox_schedule().next(&mut queues) else {
-            break;
-        };
-        let Some(message) = claim_p2p_inbox_candidate(local_db, &candidate.message_id).await else {
-            continue;
-        };
-        claimed += 1;
-        let from_peer_id = match PeerId::from_str(&message.from_peer) {
-            Ok(peer_id) => peer_id,
-            Err(error) => {
-                fail_p2p_inbox_without_aborting_batch(
-                    local_db,
-                    &message.message_id,
-                    &message.lease_token,
-                    &format!("invalid stored source peer: {error}"),
-                )
-                .await;
-                continue;
-            }
-        };
-        let decoded = match GOATMessage::deserialize_message(&message.content).await {
-            Ok(message) => message,
-            Err(error) => {
-                fail_p2p_inbox_without_aborting_batch(
-                    local_db,
-                    &message.message_id,
-                    &message.lease_token,
-                    &error.to_string(),
-                )
-                .await;
-                continue;
-            }
-        };
-        // After persistence, sender authorization belongs to the handler, not the admission cache.
-        let fingerprint = DispatchFingerprint::of(decoded.content());
-        let raw_message_id = match hex::decode(&message.message_id) {
-            Ok(message_id) => MessageId(message_id),
-            Err(error) => {
-                fail_p2p_inbox_without_aborting_batch(
-                    local_db,
-                    &message.message_id,
-                    &message.lease_token,
-                    &format!("invalid stored message id: {error}"),
-                )
-                .await;
-                continue;
-            }
-        };
-
-        // Keep the deeply nested dispatch future out of the enclosing task's
-        // inline state machine.
-        let dispatch: BoxedDispatch<'_> = Box::pin(dispatch_decoded_p2p_message(
-            swarm,
-            local_db,
-            btc_client,
-            goat_client,
-            http_client,
-            soldering_builder,
-            actor.clone(),
-            from_peer_id,
-            raw_message_id,
-            decoded,
-            metrics_state,
-        ));
-        let handler_budget = crate::env::get_p2p_handler_timeout();
-        let dispatch = track_inbox_retry(fingerprint, dispatch);
-        let dispatch = tokio::time::timeout(handler_budget, dispatch);
-        let result = match supervise_dispatch(dispatch, shutdown).await {
-            DispatchExecution::Completed(Ok(result)) => result,
-            // Cancel an expired handler at its current await and retry its persisted work.
-            DispatchExecution::Completed(Err(_elapsed)) => {
-                tracing::warn!(
-                    event = "p2p_inbox",
-                    outcome = "handler_timeout",
-                    message_id = %message.message_id,
-                    message_type = %message.msg_type,
-                    from_peer_id = %from_peer_id,
-                    budget_secs = handler_budget.as_secs(),
-                    attempt_count = message.attempt_count + 1,
-                    "P2P message handler exceeded its execution budget; deferred for retry"
-                );
-                defer_p2p_inbox_without_aborting_batch(
-                    local_db,
-                    &message.message_id,
-                    &message.lease_token,
-                    current_time_secs() + p2p_retry_delay_secs(message.attempt_count + 1),
-                    "handler_timeout",
-                )
-                .await;
-                continue;
-            }
-            DispatchExecution::Shutdown => {
-                defer_p2p_inbox_without_aborting_batch(
-                    local_db,
-                    &message.message_id,
-                    &message.lease_token,
-                    current_time_secs(),
-                    "graceful_shutdown",
-                )
-                .await;
-                return Ok(InboxBatch { claimed, cut_short: false });
-            }
-            DispatchExecution::Panicked(detail) => {
-                tracing::error!(
-                    event = "p2p_dispatch_panic",
-                    outcome = "node_shutdown",
-                    message_id = %message.message_id,
-                    message_type = %message.msg_type,
-                    detail,
-                    "P2P message handler panicked; recorded an abandon and stopping the node"
-                );
-                abandon_p2p_inbox_after_panic(
-                    local_db,
-                    &message.message_id,
-                    &message.lease_token,
-                    &detail,
-                )
-                .await;
-                shutdown.cancel();
-                bail!("P2P message handler panicked: {detail}");
-            }
-        };
-        metrics_state.record_message_dispatch(
-            &message.msg_type,
-            if result.is_ok() { "success" } else { "failed" },
-        );
-        if let Err(error) = finish_p2p_inbox_attempt(
-            local_db,
-            metrics_state,
-            &message.message_id,
-            &message.lease_token,
-            &message.msg_type,
-            message.attempt_count,
-            result,
-        )
-        .await
-        {
-            log_queue_bookkeeping_failure("p2p_inbox", &message.message_id, "finish", &error);
-        }
-    }
-    Ok(InboxBatch { claimed, cut_short })
-}
-
-async fn finish_p2p_inbox_attempt(
-    local_db: &LocalDB,
-    metrics_state: &MetricsState,
-    message_id: &str,
-    lease_token: &str,
-    message_type: &str,
-    attempt_count: i64,
-    result: Result<()>,
-) -> Result<()> {
-    let mut storage = local_db.acquire().await?;
-    match result {
-        Ok(()) => {
-            if !storage.complete_p2p_inbox_message(message_id, lease_token).await? {
-                log_stale_p2p_inbox_lease(message_id, lease_token, "complete");
-            }
-        }
-        Err(error) => {
-            let Some((reason, requested_retry_after_secs)) = p2p_retryable_dispatch_error(&error)
-            else {
-                if !storage
-                    .fail_p2p_inbox_message(message_id, lease_token, &error.to_string())
-                    .await?
-                {
-                    log_stale_p2p_inbox_lease(message_id, lease_token, "fail");
-                }
-                tracing::warn!(
-                    event = "p2p_inbox",
-                    outcome = "failed",
-                    message_id,
-                    message_type,
-                    attempt_count,
-                    error = %error,
-                    "cached P2P message failed permanently"
-                );
-                return Ok(());
-            };
-            let retry_after_secs =
-                requested_retry_after_secs.unwrap_or_else(|| p2p_retry_delay_secs(attempt_count));
-            if !storage
-                .retry_p2p_inbox_message(
-                    message_id,
-                    lease_token,
-                    current_time_secs() + retry_after_secs,
-                    &error.to_string(),
-                )
-                .await?
-            {
-                log_stale_p2p_inbox_lease(message_id, lease_token, "retry");
-            }
-            metrics_state.record_message_retry();
-            tracing::warn!(
-                event = "p2p_inbox",
-                outcome = "deferred",
-                reason = reason.code(),
-                message_id,
-                message_type,
-                attempt_count,
-                retry_after_secs,
-                error = %error,
-                "deferred cached P2P message for retry"
-            );
-        }
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-pub async fn handle_self_p2p_msg(
-    swarm: &mut (dyn MessagePublisher + Sync),
-    local_db: &LocalDB,
-    btc_client: &Arc<BTCClient>,
-    goat_client: &Arc<GOATClient>,
-    http_client: &HttpAsyncClient,
-    soldering_builder: &Option<Arc<BabeBundleBuilder>>,
-    actor: Actor,
-    from_peer_id: PeerId,
-    id: MessageId,
-    message: &[u8],
-    metrics_state: &MetricsState,
-    shutdown: &CancellationToken,
-) -> Result<bool> {
-    if id != GOATMessage::default_message_id() {
-        tracing::warn!(
-            event = "local_message_queue",
-            outcome = "unexpected_message_id",
-            message_id = ?id,
-            "ignoring local queue trigger with an unexpected message id"
-        );
-        return Ok(false);
-    }
-    let message = GOATMessage::deserialize_message(message).await?;
-    tracing::info!(
-        event = "local_message_queue",
-        outcome = "trigger_received",
-        role = %message.actor,
-        message_type = message.content.event_type(),
-        message_id = ?id,
-        from_peer_id = %from_peer_id,
-        "received local queue trigger"
-    );
-
-    let (candidates, quarantined) =
-        list_batch_local_msg(local_db, QUEUE_MAX_ABANDONS, LOCAL_MESSAGE_BATCH_SIZE).await?;
-    if quarantined > 0 {
-        tracing::warn!(
-            event = "local_message_queue",
-            outcome = "quarantined",
-            quarantined,
-            max_abandons = QUEUE_MAX_ABANDONS,
-            "retired local messages that kept failing to report an outcome"
-        );
-    }
-    tracing::info!(
-        event = "local_message_queue",
-        outcome = "batch_listed",
-        role = %actor,
-        batch_size = candidates.len(),
-        "listed claimable local messages"
-    );
-    let local_deadline = Instant::now() + P2P_INBOX_DRAIN_BUDGET;
-    let listed_full_batch = candidates.len() as i64 >= LOCAL_MESSAGE_BATCH_SIZE;
-    let mut local_dispatched = 0_usize;
-    let mut local_cut_short = false;
-    for (index, candidate) in candidates.into_iter().enumerate() {
-        if index > 0 && Instant::now() >= local_deadline {
-            local_cut_short = true;
-            break;
-        }
-        // Claim right before dispatch so a crash mid-dispatch is charged to
-        // this row alone, and so a producer that re-armed the row since it was
-        // listed wins: the stale version is skipped until the next tick.
-        let Some(message) = claim_local_candidate(local_db, &candidate).await else {
-            continue;
-        };
-        local_dispatched += 1;
-        let queue_wait_secs = current_time_secs().saturating_sub(message.created_at);
-        let started_at = Instant::now();
-        let claim = LocalMessageClaim {
-            message_id: message.message_id.clone(),
-            message_version: message.message_version,
-        };
-        let dispatch: BoxedDispatch<'_> = Box::pin(ACTIVE_LOCAL_MESSAGE_CLAIM.scope(
-            claim,
-            recv_and_dispatch(
-                swarm,
-                local_db,
-                btc_client,
-                goat_client,
-                http_client,
-                soldering_builder,
-                actor.clone(),
-                from_peer_id,
-                id.clone(),
-                &message.content,
-                metrics_state,
-            ),
-        ));
-        let dispatch = tokio::time::timeout(crate::env::get_p2p_handler_timeout(), dispatch);
-        let result = match supervise_dispatch(dispatch, shutdown).await {
-            DispatchExecution::Completed(Ok(result)) => result,
-            DispatchExecution::Completed(Err(_)) => Err(retryable_dispatch_error(
-                RetryableDispatchReason::ExternalRpcUnavailable,
-                None,
-                "local handler execution budget exceeded",
-            )),
-            DispatchExecution::Shutdown => return Ok(false),
-            DispatchExecution::Panicked(detail) => {
-                tracing::error!(
-                    event = "local_message_dispatch_panic",
-                    outcome = "node_shutdown",
-                    queued_message_id = %message.message_id,
-                    business_id = %message.business_id,
-                    message_type = %message.msg_type,
-                    detail,
-                    "local message handler panicked; recorded an abandon and stopping the node"
-                );
-                abandon_local_message_after_panic(
-                    local_db,
-                    &message.message_id,
-                    message.message_version,
-                    &detail,
-                )
-                .await;
-                shutdown.cancel();
-                bail!("local message handler panicked: {detail}");
-            }
-        };
-        match result {
-            Ok(_) => {
-                let mut storage_processor = match local_db.acquire().await {
-                    Ok(storage_processor) => storage_processor,
-                    Err(error) => {
-                        log_queue_bookkeeping_failure(
-                            "local_message_queue",
-                            &message.message_id,
-                            "acquire",
-                            &error,
-                        );
-                        continue;
-                    }
-                };
-                let state_updated = match storage_processor
-                    .complete_local_message(&message.message_id, message.message_version)
-                    .await
-                {
-                    Ok(state_updated) => state_updated,
-                    Err(error) => {
-                        log_queue_bookkeeping_failure(
-                            "local_message_queue",
-                            &message.message_id,
-                            "complete",
-                            &error,
-                        );
-                        continue;
-                    }
-                };
-                if state_updated {
-                    tracing::info!(
-                        event = "local_message_queue",
-                        outcome = "processed",
-                        role = %actor,
-                        business_id = %message.business_id,
-                        queued_message_id = %message.message_id,
-                        message_type = %message.msg_type,
-                        queue_wait_secs,
-                        elapsed_ms = started_at.elapsed().as_millis() as u64,
-                        "processed local message"
-                    );
-                } else {
-                    // A row that is Pending under our claim version was
-                    // rescheduled by the handler itself. Only now, after the
-                    // handler returned, is that a reported outcome, so only now
-                    // does its consecutive-abandon counter reset.
-                    match storage_processor
-                        .confirm_local_message_self_defer(
-                            &message.message_id,
-                            message.message_version,
-                        )
-                        .await
-                    {
-                        Ok(true) => {
-                            tracing::debug!(
-                                event = "local_message_queue",
-                                outcome = "self_deferred",
-                                role = %actor,
-                                business_id = %message.business_id,
-                                queued_message_id = %message.message_id,
-                                message_type = %message.msg_type,
-                                queue_wait_secs,
-                                elapsed_ms = started_at.elapsed().as_millis() as u64,
-                                "local message handler rescheduled its own queue entry"
-                            );
-                        }
-                        Ok(false) => {
-                            let current_state = storage_processor
-                                .find_messages_by_id(&message.message_id)
-                                .await
-                                .ok()
-                                .flatten()
-                                .map(|message| message.state);
-                            tracing::warn!(
-                                event = "local_message_queue",
-                                outcome = "state_update_conflict",
-                                role = %actor,
-                                business_id = %message.business_id,
-                                queued_message_id = %message.message_id,
-                                message_type = %message.msg_type,
-                                current_state = ?current_state,
-                                queue_wait_secs,
-                                elapsed_ms = started_at.elapsed().as_millis() as u64,
-                                "local message handler completed but its processed state was not persisted"
-                            );
-                        }
-                        Err(error) => log_queue_bookkeeping_failure(
-                            "local_message_queue",
-                            &message.message_id,
-                            "confirm_self_defer",
-                            &error,
-                        ),
-                    }
-                }
-            }
-            Err(err) => {
-                let is_transient = is_retryable_sqlite_error(&err);
-                let requested_retry_delay =
-                    p2p_retryable_dispatch_error(&err).and_then(|(_, delay)| delay);
-                let lock_time: i64 = requested_retry_delay.unwrap_or_else(|| {
-                    if is_transient
-                        && MessageKind::from_str(&message.msg_type).is_ok_and(MessageKind::is_pegin)
-                    {
-                        TRANSIENT_PEGIN_RETRY_DELAY_SECS as i64
-                    } else {
-                        LOCAL_MESSAGE_RETRY_DELAY_SECS
-                    }
-                });
-                let mut storage_processor = match local_db.acquire().await {
-                    Ok(storage_processor) => storage_processor,
-                    Err(error) => {
-                        log_queue_bookkeeping_failure(
-                            "local_message_queue",
-                            &message.message_id,
-                            "acquire",
-                            &error,
-                        );
-                        continue;
-                    }
-                };
-                if let Err(reason_error) = storage_processor
-                    .upsert_message_debug_reason(
-                        &message.message_id,
-                        MessageDeferReason::HandlerError.code(),
-                        &err.to_string(),
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        event = "local_message_queue",
-                        outcome = "debug_reason_store_failed",
-                        queued_message_id = %message.message_id,
-                        error = %reason_error,
-                        "failed to persist local message debug reason"
-                    );
-                }
-                let deferred = storage_processor
-                    .defer_local_message(
-                        &message.message_id,
-                        message.message_version,
-                        current_time_secs() + lock_time,
-                        &err.to_string(),
-                    )
-                    .await;
-                match deferred {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        // The handler may have rescheduled its own row before
-                        // returning the error; that is still a reported outcome.
-                        match storage_processor
-                            .confirm_local_message_self_defer(
-                                &message.message_id,
-                                message.message_version,
-                            )
-                            .await
-                        {
-                            Ok(true) => tracing::debug!(
-                                event = "local_message_queue",
-                                outcome = "self_deferred",
-                                queued_message_id = %message.message_id,
-                                error = %err,
-                                "local message handler rescheduled its own queue entry before failing"
-                            ),
-                            Ok(false) => tracing::warn!(
-                                event = "local_message_queue",
-                                outcome = "stale_claim",
-                                queued_message_id = %message.message_id,
-                                message_version = message.message_version,
-                                operation = "defer",
-                                "ignored local message update from a stale claim"
-                            ),
-                            Err(error) => log_queue_bookkeeping_failure(
-                                "local_message_queue",
-                                &message.message_id,
-                                "confirm_self_defer",
-                                &error,
-                            ),
-                        }
-                        continue;
-                    }
-                    Err(error) => {
-                        log_queue_bookkeeping_failure(
-                            "local_message_queue",
-                            &message.message_id,
-                            "defer",
-                            &error,
-                        );
-                        continue;
-                    }
-                }
-                metrics_state.record_message_retry();
-                tracing::warn!(
-                    event = "local_message_queue",
-                    outcome = "deferred",
-                    role = %actor,
-                    business_id = %message.business_id,
-                    queued_message_id = %message.message_id,
-                    message_type = %message.msg_type,
-                    retry_after_secs = lock_time,
-                    attempt_count = message.attempt_count + 1,
-                    queue_wait_secs,
-                    elapsed_ms = started_at.elapsed().as_millis() as u64,
-                    error = %err,
-                    "failed to process local message; deferred for retry"
-                );
-            }
-        }
-    }
-    // A queue that failed reports no backlog: asking for another pass at once
-    // would spin on whatever made it fail.
-    let local_backlog = local_dispatched > 0 && (local_cut_short || listed_full_batch);
-    let inbox_backlog = match handle_p2p_inbox_messages(
-        swarm,
-        local_db,
-        btc_client,
-        goat_client,
-        http_client,
-        soldering_builder,
-        actor,
-        metrics_state,
-        shutdown,
-    )
-    .await
-    {
-        Ok(backlog) => backlog,
-        Err(error) => {
-            tracing::error!(error = %error, "failed to drain the durable P2P inbox");
-            if shutdown.is_cancelled() {
-                return Err(error);
-            }
-            false
-        }
-    };
-    Ok(local_backlog || inbox_backlog)
-}
-
-/// Filter the message and dispatch message to different handlers, like rpc handler, or other peers
-///     * database: inner_rpc: Write or Read.
-///     * peers: send
-/// TODO: we should create a trait for all the actions of different roles to simplify this function.
-#[allow(clippy::too_many_arguments)]
-pub async fn recv_and_dispatch(
-    swarm: &mut (dyn MessagePublisher + Sync),
-    local_db: &LocalDB,
-    btc_client: &Arc<BTCClient>,
-    goat_client: &Arc<GOATClient>,
-    http_client: &HttpAsyncClient,
-    soldering_builder: &Option<Arc<BabeBundleBuilder>>,
-    actor: Actor,
-    from_peer_id: PeerId,
-    id: MessageId,
-    message: &[u8],
-    metrics_state: &MetricsState,
-) -> Result<()> {
-    let message = GOATMessage::deserialize_message(message).await?;
-    dispatch_decoded_p2p_message(
-        swarm,
-        local_db,
-        btc_client,
-        goat_client,
-        http_client,
-        soldering_builder,
-        actor,
-        from_peer_id,
-        id,
-        message,
-        metrics_state,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn dispatch_decoded_p2p_message(
-    swarm: &mut (dyn MessagePublisher + Sync),
-    local_db: &LocalDB,
-    btc_client: &Arc<BTCClient>,
-    goat_client: &Arc<GOATClient>,
-    http_client: &HttpAsyncClient,
-    soldering_builder: &Option<Arc<BabeBundleBuilder>>,
-    actor: Actor,
-    from_peer_id: PeerId,
-    id: MessageId,
-    message: GOATMessage,
-    metrics_state: &MetricsState,
-) -> Result<()> {
-    // Determine whether the message comes from this node itself to optionally skip validations.
-    // Not `get_local_node_info()`: that signs a fresh binding on every call, and
-    // this runs for every dispatched message.
-    let is_self_peer = crate::env::get_peer_id() == from_peer_id.to_string();
-    let message_type = message.content.event_type();
-    let role = actor.to_string();
-    let from_peer_id_string = from_peer_id.to_string();
-    let started_at = Instant::now();
-    let mut handler_ctx = HandlerContext {
-        swarm,
-        local_db,
-        btc_client,
-        goat_client,
-        http_client,
-        soldering_builder,
-        metrics_state,
-        actor,
-        from_peer_id,
-        id,
-        is_self_peer,
-    };
-    let result = handle_dispatch(&mut handler_ctx, message.content())
-        .await
-        .map_err(classify_retryable_dispatch_error);
-    metrics_state
-        .record_message_dispatch(message_type, if result.is_ok() { "success" } else { "failed" });
-    match &result {
-        Ok(()) => tracing::info!(
-            event = "message_dispatch_result",
-            outcome = "handled",
-            role,
-            message_type,
-            from_peer_id = %from_peer_id_string,
-            is_self_peer,
-            elapsed_ms = started_at.elapsed().as_millis() as u64,
-            "message dispatch completed"
-        ),
-        Err(err) => tracing::warn!(
-            event = "message_dispatch_result",
-            outcome = "failed",
-            role,
-            message_type,
-            from_peer_id = %from_peer_id_string,
-            is_self_peer,
-            elapsed_ms = started_at.elapsed().as_millis() as u64,
-            error = %err,
-            "message dispatch failed"
-        ),
-    }
-    result
-}
-
+/// Publish one message on its role topic; every sender goes through here.
 pub async fn send_to_peer(
     swarm: &mut dyn MessagePublisher,
     message: GOATMessage,
@@ -2812,263 +998,14 @@ pub async fn send_to_peer(
                 error = %err,
                 "failed to publish protocol message"
             );
-            Err(retryable_dispatch_error(
-                RetryableDispatchReason::PublishFailed,
-                Some(10),
-                format!("publish {message_type} to {target_actor}: {err}"),
-            ))
+            Err(anyhow::anyhow!("publish {message_type} to {target_actor}: {err}"))
         }
     }
-}
-
-/// Defer the message currently being dispatched, or enqueue a new local task.
-pub async fn defer_or_enqueue_message(
-    local_db: &LocalDB,
-    message: &GOATMessage,
-    delay_secs: usize,
-    reason: MessageDeferReason,
-    reason_detail: &str,
-) -> Result<()> {
-    if defer_current_inbox(message, delay_secs, reason_detail) {
-        return Ok(());
-    }
-
-    let actor = message.actor.clone();
-    let content: GOATMessageContent = message.content().clone();
-    let key = LocalMessageKey::from_content(actor.clone(), &content)?;
-    let business_id = key.business_id();
-    let message_type = message.content.event_type();
-    let target_message_id = key.message_id();
-    let active_claim = ACTIVE_LOCAL_MESSAGE_CLAIM
-        .try_with(|claim| (claim.message_id.clone(), claim.message_version))
-        .ok();
-    let mut storage_processor = local_db.start_immediate_transaction().await?;
-
-    let queued_message_id = if let Some((message_id, message_version)) =
-        active_claim.filter(|(message_id, _)| message_id == &target_message_id)
-    {
-        let deferred = storage_processor
-            .self_defer_local_message(
-                &message_id,
-                message_version,
-                current_time_secs() + delay_secs as i64,
-                reason_detail,
-            )
-            .await?;
-        if !deferred {
-            return Err(retryable_dispatch_error(
-                RetryableDispatchReason::ResourceLocked,
-                Some(delay_secs.max(1) as i64),
-                format!(
-                    "local message {business_id}:{message_type} is no longer owned by this claim"
-                ),
-            ));
-        }
-        message_id
-    } else {
-        let upserted = upsert_message(
-            &mut storage_processor,
-            true,
-            SELF_SENDER.to_string(),
-            actor,
-            content,
-            0,
-            delay_secs as i64,
-        )
-        .await?;
-        if !upserted {
-            let current = storage_processor.find_messages_by_id(&target_message_id).await?;
-            if current
-                .as_ref()
-                .is_some_and(|message| message.state == MessageState::Processing.to_string())
-            {
-                return Err(retryable_dispatch_error(
-                    RetryableDispatchReason::ResourceLocked,
-                    Some(delay_secs.max(1) as i64),
-                    format!(
-                        "local message {business_id}:{message_type} is owned by another active claim"
-                    ),
-                ));
-            }
-        }
-        target_message_id
-    };
-    let persist_result = storage_processor
-        .upsert_message_debug_reason(&queued_message_id, reason.code(), reason_detail)
-        .await;
-    if let Err(error) = persist_result {
-        tracing::warn!(
-            event = "local_message_queue",
-            outcome = "debug_reason_store_failed",
-            error = %error,
-            "failed to persist local message defer reason"
-        );
-    }
-    storage_processor.commit().await?;
-    if delay_secs > 0
-        && let Some(metrics_state) = crate::metrics_service::node_metrics_state()
-    {
-        metrics_state.record_message_retry();
-    }
-    Ok(())
-}
-
-fn defer_current_inbox(message: &GOATMessage, delay_secs: usize, reason_detail: &str) -> bool {
-    ACTIVE_INBOX_DISPATCH
-        .try_with(|active| {
-            if DispatchFingerprint::of(message.content()) != active.fingerprint {
-                return false;
-            }
-            *active.retry.borrow_mut() = Some(retryable_dispatch_error(
-                RetryableDispatchReason::DependencyPending,
-                Some(delay_secs.max(1) as i64),
-                reason_detail.to_owned(),
-            ));
-            true
-        })
-        .unwrap_or(false)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn inbox_retention_sweeps_keep_the_tick_cadence_under_backlog() {
-        let start = Instant::now();
-        // Whatever an earlier test left behind, two calls inside one interval
-        // cannot both be due.
-        let first = inbox_housekeeping_due(start);
-        let second = inbox_housekeeping_due(start + Duration::from_secs(1));
-        assert!(!(first && second));
-        assert!(!second);
-        let interval = Duration::from_secs(crate::env::REGULAR_TASK_INTERVAL_SECOND);
-        assert!(inbox_housekeeping_due(start + interval + Duration::from_secs(2)));
-    }
-
-    #[tokio::test]
-    async fn inbox_dependency_retry_never_collapses_into_local_queue() {
-        let local_db = store::create_local_db("sqlite::memory:").await;
-        let message = GOATMessage::new(
-            Actor::Committee,
-            GOATMessageContent::KickoffReady(KickoffReady {
-                instance_id: Uuid::new_v4(),
-                graph_id: Uuid::new_v4(),
-            }),
-        );
-        let mut compensated = false;
-        let result = track_inbox_retry(DispatchFingerprint::of(message.content()), async {
-            defer_or_enqueue_message(
-                &local_db,
-                &message,
-                30,
-                MessageDeferReason::PreviousGraphPending,
-                "wait for graph",
-            )
-            .await?;
-            // Some handlers rebroadcast a prerequisite only after asking
-            // for deferral. An early Err would skip that recovery action.
-            compensated = true;
-            Ok(())
-        })
-        .await;
-        assert!(compensated);
-        assert!(result.unwrap_err().downcast_ref::<RetryableDispatchError>().is_some());
-        let key = LocalMessageKey::from_content(Actor::Committee, message.content()).unwrap();
-        assert!(
-            local_db
-                .acquire()
-                .await
-                .unwrap()
-                .find_messages_by_id(&key.message_id())
-                .await
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    /// Verify self-deferral survives later handler errors; other events still use the local queue.
-    #[tokio::test]
-    async fn deferral_survives_a_later_error_and_other_events_stay_local() {
-        let local_db = store::create_local_db("sqlite::memory:").await;
-        let (instance_id, graph_id) = (Uuid::new_v4(), Uuid::new_v4());
-        let dispatched = GOATMessage::new(
-            Actor::Committee,
-            GOATMessageContent::KickoffReady(KickoffReady { instance_id, graph_id }),
-        );
-        // The handler builds its own copy, under its own role: same message.
-        let own_copy = GOATMessage::new(Actor::Operator, dispatched.content().clone());
-        let other_event = GOATMessage::new(
-            Actor::Committee,
-            GOATMessageContent::KickoffSent(KickoffSent { instance_id, graph_id }),
-        );
-
-        let result = track_inbox_retry(DispatchFingerprint::of(dispatched.content()), async {
-            defer_or_enqueue_message(
-                &local_db,
-                &other_event,
-                30,
-                MessageDeferReason::ChainStatePending,
-                "a different event",
-            )
-            .await?;
-            defer_or_enqueue_message(
-                &local_db,
-                &own_copy,
-                45,
-                MessageDeferReason::PreviousGraphPending,
-                "wait for graph",
-            )
-            .await?;
-            bail!("compensation failed after the deferral was recorded")
-        })
-        .await;
-        let retry = result.unwrap_err();
-        let retry = retry
-            .downcast_ref::<RetryableDispatchError>()
-            .expect("the recorded deferral wins over the later, non-retryable error");
-        assert_eq!(retry.retry_after_secs, Some(45));
-
-        let mut storage = local_db.acquire().await.unwrap();
-        let own_key = LocalMessageKey::from_content(Actor::Operator, own_copy.content()).unwrap();
-        assert!(storage.find_messages_by_id(&own_key.message_id()).await.unwrap().is_none());
-        let other_key =
-            LocalMessageKey::from_content(Actor::Committee, other_event.content()).unwrap();
-        assert!(
-            storage.find_messages_by_id(&other_key.message_id()).await.unwrap().is_some(),
-            "an event of another kind is not the dispatched message"
-        );
-    }
-
-    /// Verify handler timeout, completion and shutdown outcomes.
-    #[tokio::test]
-    async fn handler_budget_cuts_off_an_overrunning_dispatch() {
-        let shutdown = CancellationToken::new();
-        let budget = Duration::from_millis(100);
-
-        let overrunning = async {
-            tokio::time::sleep(Duration::from_secs(3600)).await;
-            Ok::<(), anyhow::Error>(())
-        };
-        let outcome =
-            supervise_dispatch(tokio::time::timeout(budget, overrunning), &shutdown).await;
-        assert!(matches!(outcome, DispatchExecution::Completed(Err(_))), "cut off at the budget");
-
-        let prompt = async {
-            tokio::time::sleep(Duration::from_millis(1)).await;
-            Ok::<(), anyhow::Error>(())
-        };
-        let outcome = supervise_dispatch(tokio::time::timeout(budget, prompt), &shutdown).await;
-        assert!(matches!(outcome, DispatchExecution::Completed(Ok(Ok(())))));
-
-        shutdown.cancel();
-        let outcome = supervise_dispatch(
-            tokio::time::timeout(budget, std::future::pending::<Result<()>>()),
-            &shutdown,
-        )
-        .await;
-        assert!(matches!(outcome, DispatchExecution::Shutdown));
-    }
 
     #[test]
     fn soldering_proof_ready_is_descriptor_only() {
@@ -3094,299 +1031,14 @@ mod tests {
         assert!(!object.contains_key("verifier_pubkey"));
     }
 
-    #[tokio::test]
-    async fn genuine_transient_errors_are_still_retryable() {
-        let error = anyhow::anyhow!("database is locked");
-        assert!(
-            p2p_retryable_dispatch_error(&error).is_some(),
-            "a real SQLite-busy error must remain retryable"
-        );
-    }
-
     #[test]
-    fn contract_revert_is_not_a_retryable_transport_failure() {
-        let response =
-            serde_json::from_str(r#"{"code":3,"message":"execution reverted"}"#).unwrap();
-        let error = anyhow::Error::new(alloy::contract::Error::TransportError(
-            alloy::transports::TransportError::ErrorResp(response),
-        ))
-        .context("validate SyncGraph instance parameters");
-        assert!(!is_retryable_external_rpc_error(&error));
-        assert!(
-            classify_retryable_dispatch_error(error)
-                .downcast_ref::<RetryableDispatchError>()
-                .is_none()
-        );
-    }
+    fn every_wire_kind_is_routed_or_immediate() {
+        use strum::IntoEnumIterator;
 
-    #[tokio::test]
-    async fn dispatch_supervisor_distinguishes_shutdown_and_panic() {
-        let shutdown = CancellationToken::new();
-        shutdown.cancel();
-        assert!(matches!(
-            supervise_dispatch(std::future::pending::<()>(), &shutdown).await,
-            DispatchExecution::Shutdown
-        ));
-
-        let running = CancellationToken::new();
-        let result = supervise_dispatch(
-            async {
-                panic!("poison message");
-            },
-            &running,
-        )
-        .await;
-        assert!(matches!(
-            result,
-            DispatchExecution::Panicked(detail) if detail == "poison message"
-        ));
-    }
-
-    #[tokio::test]
-    async fn non_owner_requeue_reports_processing_conflict() {
-        let local_db = store::create_local_db("sqlite::memory:").await;
-        let instance_id = Uuid::new_v4();
-        let message = GOATMessage::new(
-            Actor::Operator,
-            GOATMessageContent::PostReady(PostReady { instance_id }),
-        );
-        defer_or_enqueue_message(
-            &local_db,
-            &message,
-            0,
-            MessageDeferReason::HandlerError,
-            "initial",
-        )
-        .await
-        .unwrap();
-
-        let claimed = {
-            let mut storage = local_db.acquire().await.unwrap();
-            storage
-                .claim_local_messages(
-                    current_time_secs() + 1,
-                    current_time_secs() + 300,
-                    0,
-                    1,
-                    QUEUE_MAX_ABANDONS,
-                )
-                .await
-                .unwrap()
-        };
-        assert_eq!(claimed.len(), 1);
-
-        let error = defer_or_enqueue_message(
-            &local_db,
-            &message,
-            30,
-            MessageDeferReason::HandlerError,
-            "retry",
-        )
-        .await
-        .unwrap_err();
-        let retryable = error
-            .chain()
-            .find_map(|cause| cause.downcast_ref::<RetryableDispatchError>())
-            .expect("Processing conflict must be retryable");
-        assert_eq!(retryable.reason, RetryableDispatchReason::ResourceLocked);
-        assert_eq!(retryable.retry_after_secs, Some(30));
-
-        let mut storage = local_db.acquire().await.unwrap();
-        let stored = storage.find_messages_by_id(&claimed[0].message_id).await.unwrap().unwrap();
-        assert_eq!(stored.state, MessageState::Processing.to_string());
-        assert_eq!(stored.message_version, claimed[0].message_version);
-    }
-
-    #[tokio::test]
-    async fn owner_requeue_uses_content_derived_message_id() {
-        let local_db = store::create_local_db("sqlite::memory:").await;
-        let instance_id = Uuid::new_v4();
-        let message = GOATMessage::new(
-            Actor::Operator,
-            GOATMessageContent::PostReady(PostReady { instance_id }),
-        );
-        let message_id = LocalMessageKey::from_content(message.actor.clone(), &message.content)
-            .unwrap()
-            .message_id();
-        {
-            let mut storage = local_db.acquire().await.unwrap();
-            assert!(
-                upsert_message(
-                    &mut storage,
-                    false,
-                    SELF_SENDER.to_owned(),
-                    message.actor.clone(),
-                    message.content.clone(),
-                    0,
-                    0,
-                )
-                .await
-                .unwrap()
-            );
+        let roles = [Actor::Committee, Actor::Operator, Actor::Verifier, Actor::Watchtower];
+        for kind in MessageKind::iter() {
+            let handled = roles.iter().any(|role| kind.handled_by(role));
+            assert!(handled, "{kind} is kept by no role: it would only ever be relayed");
         }
-        let claimed = {
-            let mut storage = local_db.acquire().await.unwrap();
-            storage
-                .claim_local_messages(
-                    current_time_secs() + 1,
-                    current_time_secs() + 300,
-                    0,
-                    1,
-                    QUEUE_MAX_ABANDONS,
-                )
-                .await
-                .unwrap()
-                .pop()
-                .unwrap()
-        };
-        assert_eq!(claimed.message_id, message_id);
-
-        // Two earlier attempts died mid-dispatch; the row carries their abandons
-        // into this claim, and the handler's own reschedule must not erase them.
-        {
-            let mut storage = local_db.acquire().await.unwrap();
-            for _ in 0..2 {
-                assert!(
-                    storage
-                        .abandon_local_message(
-                            &message_id,
-                            claimed.message_version,
-                            current_time_secs(),
-                            0,
-                            "died mid-dispatch",
-                        )
-                        .await
-                        .unwrap()
-                );
-            }
-        }
-        let claimed = {
-            let mut storage = local_db.acquire().await.unwrap();
-            storage
-                .claim_local_messages(
-                    current_time_secs() + 301,
-                    current_time_secs() + 600,
-                    0,
-                    1,
-                    QUEUE_MAX_ABANDONS,
-                )
-                .await
-                .unwrap()
-                .pop()
-                .unwrap()
-        };
-        assert_eq!(claimed.abandon_count, 2);
-
-        ACTIVE_LOCAL_MESSAGE_CLAIM
-            .scope(
-                LocalMessageClaim {
-                    message_id: claimed.message_id.clone(),
-                    message_version: claimed.message_version,
-                },
-                defer_or_enqueue_message(
-                    &local_db,
-                    &message,
-                    30,
-                    MessageDeferReason::HandlerError,
-                    "retry subtyped message",
-                ),
-            )
-            .await
-            .unwrap();
-
-        let mut storage = local_db.acquire().await.unwrap();
-        let stored = storage.find_messages_by_id(&message_id).await.unwrap().unwrap();
-        assert_eq!(stored.state, MessageState::Pending.to_string());
-        assert_eq!(stored.abandon_count, 2, "a self-defer must keep the abandon count");
-
-        // The dispatcher confirms the self-defer once the handler has returned.
-        assert!(
-            storage
-                .confirm_local_message_self_defer(&message_id, claimed.message_version)
-                .await
-                .unwrap()
-        );
-        assert_eq!(
-            storage.find_messages_by_id(&message_id).await.unwrap().unwrap().abandon_count,
-            0
-        );
-    }
-
-    #[tokio::test]
-    async fn local_claim_is_not_deferred_by_another_actor_message() {
-        let local_db = store::create_local_db("sqlite::memory:").await;
-        let instance_id = Uuid::new_v4();
-        let claimed_message = GOATMessage::new(
-            Actor::Operator,
-            GOATMessageContent::PostReady(PostReady { instance_id }),
-        );
-        let other_actor_message =
-            GOATMessage::new(Actor::Committee, claimed_message.content.clone());
-        let claimed_id =
-            LocalMessageKey::from_content(claimed_message.actor.clone(), claimed_message.content())
-                .unwrap()
-                .message_id();
-        let other_id = LocalMessageKey::from_content(
-            other_actor_message.actor.clone(),
-            other_actor_message.content(),
-        )
-        .unwrap()
-        .message_id();
-        {
-            let mut storage = local_db.acquire().await.unwrap();
-            upsert_message(
-                &mut storage,
-                false,
-                SELF_SENDER.to_owned(),
-                claimed_message.actor.clone(),
-                claimed_message.content.clone(),
-                0,
-                0,
-            )
-            .await
-            .unwrap();
-        }
-        let claimed = local_db
-            .acquire()
-            .await
-            .unwrap()
-            .claim_local_messages(
-                current_time_secs() + 1,
-                current_time_secs() + 300,
-                0,
-                1,
-                QUEUE_MAX_ABANDONS,
-            )
-            .await
-            .unwrap()
-            .pop()
-            .unwrap();
-
-        ACTIVE_LOCAL_MESSAGE_CLAIM
-            .scope(
-                LocalMessageClaim {
-                    message_id: claimed.message_id.clone(),
-                    message_version: claimed.message_version,
-                },
-                defer_or_enqueue_message(
-                    &local_db,
-                    &other_actor_message,
-                    30,
-                    MessageDeferReason::HandlerError,
-                    "other actor",
-                ),
-            )
-            .await
-            .unwrap();
-
-        let mut storage = local_db.acquire().await.unwrap();
-        assert_eq!(
-            storage.find_messages_by_id(&claimed_id).await.unwrap().unwrap().state,
-            MessageState::Processing.to_string()
-        );
-        assert_eq!(
-            storage.find_messages_by_id(&other_id).await.unwrap().unwrap().state,
-            MessageState::Pending.to_string()
-        );
     }
 }

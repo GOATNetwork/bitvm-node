@@ -347,6 +347,7 @@ impl Harness {
                     kind: EVENT_L2_MINTED.to_string(),
                     source: "local".to_string(),
                     author: String::new(),
+                    admission_class: String::new(),
                     payload: Vec::new(),
                     ack: None,
                 },

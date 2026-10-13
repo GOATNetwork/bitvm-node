@@ -1,37 +1,30 @@
+//! Control message handling: ACKs update the engine outbox, and NodeInfo
+//! messages update peer information and registration. Durable business messages
+//! are submitted to the engine.
+
 use crate::action::*;
-use crate::metrics_service::MetricsState;
 use crate::middleware::publisher::MessagePublisher;
 use crate::rpc_service::current_time_secs;
 use crate::utils::*;
 use anyhow::Result;
 use bitvm_lib::actors::Actor;
-use bitvm_lib::babe_adapter::BabeBundleBuilder;
-use client::http_client::async_client::HttpAsyncClient;
-use client::{btc_chain::BTCClient, goat_chain::GOATClient};
+use client::goat_chain::GOATClient;
 use libp2p::PeerId;
-use libp2p::gossipsub::MessageId;
 use std::str::FromStr;
 use std::sync::Arc;
 use store::localdb::LocalDB;
 
 pub struct HandlerContext<'a> {
-    /// `Sync` so handlers may hold the context across awaits in a `Send` job.
-    pub swarm: &'a mut (dyn MessagePublisher + Sync),
+    /// `Sync` so handlers may hold the context across awaits in a `Send` task.
+    pub publisher: &'a mut (dyn MessagePublisher + Sync),
     pub local_db: &'a LocalDB,
-    pub btc_client: &'a Arc<BTCClient>,
     pub goat_client: &'a Arc<GOATClient>,
-    pub http_client: &'a HttpAsyncClient,
-    pub soldering_builder: &'a Option<Arc<BabeBundleBuilder>>,
-    pub metrics_state: &'a MetricsState,
-    pub actor: Actor,
     pub from_peer_id: PeerId,
-    pub id: MessageId,
-    pub is_self_peer: bool,
 }
 
 pub async fn dispatch(ctx: &mut HandlerContext<'_>, content: &GOATMessageContent) -> Result<()> {
-    match (content, &ctx.actor) {
-        (GOATMessageContent::GraphSetupAck(GraphSetupAck { delivery_id }), _) => {
+    match content {
+        GOATMessageContent::GraphSetupAck(GraphSetupAck { delivery_id }) => {
             // ACKs settle the engine outbox.
             let Some(engine) = crate::engine_bridge::engine_handle() else {
                 return Ok(());
@@ -45,10 +38,10 @@ pub async fn dispatch(ctx: &mut HandlerContext<'_>, content: &GOATMessageContent
             );
             Ok(())
         }
-        (GOATMessageContent::RequestNodeInfo(node_info), _) => {
+        GOATMessageContent::RequestNodeInfo(node_info) => {
             handle_request_node_info(ctx, node_info).await
         }
-        (GOATMessageContent::ResponseNodeInfo(node_info), _) => {
+        GOATMessageContent::ResponseNodeInfo(node_info) => {
             handle_response_node_info(ctx, node_info).await
         }
         _ => Ok(()),
@@ -170,7 +163,7 @@ async fn handle_request_node_info(
     // and staying silent would break discovery for a misconfigured peer.
     // Coalesce recent requests into one broadcast response.
     if crate::p2p_admission::node_info_response_gate().try_respond(std::time::Instant::now()) {
-        publish_node_info_response(ctx.swarm).await?;
+        publish_node_info_response(ctx.publisher).await?;
     }
     Ok(())
 }

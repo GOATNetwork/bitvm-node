@@ -1,6 +1,8 @@
-use crate::action::{
-    GOATMessage, GOATMessageContent, handle_inbound_p2p_message, handle_self_p2p_msg, send_to_peer,
-};
+//! The swarm's message handler: admission of inbound gossip, the control
+//! worker for `NodeInfo` and ACKs, the admission maintenance task and the
+//! direct `GetGraph` service. Protocol work runs on the engine.
+
+use crate::action::{GOATMessage, GOATMessageContent, handle_inbound_p2p_message, send_to_peer};
 use crate::env::get_local_node_info;
 use crate::metrics_service::MetricsState;
 use crate::middleware::get_graph::{GetGraphRequest, GetGraphResponse};
@@ -8,25 +10,20 @@ use crate::middleware::publisher::NetworkPublisher;
 use crate::middleware::swarm::{BitvmSwarmWrapper, P2pMessageHandler, TickMessageType};
 use crate::utils::detect_heart_beat;
 use bitvm_lib::actors::Actor;
-use bitvm_lib::babe_adapter::BabeBundleBuilder;
-use client::http_client::async_client::HttpAsyncClient;
-use client::{btc_chain::BTCClient, goat_chain::GOATClient};
+use client::goat_chain::GOATClient;
 use futures::FutureExt;
 use libp2p::PeerId;
 use libp2p::gossipsub::MessageId;
 use libp2p::request_response::ResponseChannel;
 use std::sync::{Arc, OnceLock};
 use store::localdb::LocalDB;
-use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone)]
 pub struct BitvmNodeProcessor {
     pub local_db: LocalDB,
-    pub btc_client: Arc<BTCClient>,
     pub goat_client: Arc<GOATClient>,
-    pub http_client: Arc<HttpAsyncClient>,
-    pub soldering_builder: Option<Arc<BabeBundleBuilder>>,
     pub metrics_state: MetricsState,
     pub shutdown_token: CancellationToken,
     pub worker: Arc<OnceLock<WorkerControl>>,
@@ -42,7 +39,6 @@ pub struct ImmediateMessage {
 pub struct WorkerControl {
     immediate: mpsc::Sender<ImmediateMessage>,
     bytes: Arc<Semaphore>,
-    tick: Arc<Notify>,
     joins: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
@@ -100,105 +96,43 @@ impl WorkerControl {
 }
 
 impl BitvmNodeProcessor {
-    fn worker(&self, swarm: &BitvmSwarmWrapper, actor: Actor) -> &WorkerControl {
+    fn worker(&self, swarm: &BitvmSwarmWrapper) -> &WorkerControl {
         self.worker.get_or_init(|| {
-            // Run sequential business dispatch on a separate thread.
+            // Control dispatch (NodeInfo, ACKs) runs on its own thread, off
+            // the network loop; the engine runs everything else.
             let (tx, rx) = mpsc::channel(16);
-            let tick = Arc::new(Notify::new());
             let mut processor = self.clone();
             processor.worker = Default::default();
             let publisher = swarm.publisher();
-            let worker_tick = tick.clone();
             let control_processor = processor.clone();
             let control_publisher = publisher.clone();
-            let control_actor = actor.clone();
             let control_join = spawn_isolated_worker(
                 "bitvm-control",
                 self.shutdown_token.clone(),
                 move || async move {
-                    control_processor
-                        .run_immediate_worker(control_publisher, control_actor, rx)
-                        .await;
+                    control_processor.run_immediate_worker(control_publisher, rx).await;
                 },
             );
-            let maintenance_join =
-                tokio::spawn(processor.clone().run_admission_maintenance(publisher.clone()));
-            let join = spawn_isolated_worker(
-                "bitvm-business",
-                self.shutdown_token.clone(),
-                move || async move {
-                    processor.run_worker(publisher, actor, worker_tick).await;
-                },
-            );
+            let maintenance_join = tokio::spawn(processor.run_admission_maintenance(publisher));
             WorkerControl {
                 immediate: tx,
                 bytes: Arc::new(Semaphore::new(16 * 1024 * 1024)),
-                tick,
-                joins: tokio::sync::Mutex::new(vec![join, control_join, maintenance_join]),
+                joins: tokio::sync::Mutex::new(vec![control_join, maintenance_join]),
             }
         })
-    }
-
-    async fn run_worker(&self, mut publisher: NetworkPublisher, actor: Actor, tick: Arc<Notify>) {
-        let mut backlog = false;
-        loop {
-            // Coalesce tick notifications and continue immediately while backlogged.
-            // Each pass serves local messages and outbox before inbox.
-            if backlog {
-                tokio::task::yield_now().await;
-            } else {
-                tick.notified().await;
-            }
-            let data =
-                GOATMessage::new(actor.clone(), GOATMessageContent::Tick).serialize_message().await;
-            let result = match data {
-                Ok(data) => {
-                    handle_self_p2p_msg(
-                        &mut publisher,
-                        &self.local_db,
-                        &self.btc_client,
-                        &self.goat_client,
-                        &self.http_client,
-                        &self.soldering_builder,
-                        actor.clone(),
-                        crate::env::get_peer_id().parse().expect("configured peer id"),
-                        GOATMessage::default_message_id(),
-                        &data,
-                        &self.metrics_state,
-                        &self.shutdown_token,
-                    )
-                    .await
-                }
-                Err(error) => Err(error),
-            };
-            backlog = match result {
-                Ok(backlog) => backlog,
-                Err(error) => {
-                    tracing::error!(event = "p2p_worker", error = %error, "business dispatch failed");
-                    false
-                }
-            };
-        }
     }
 
     async fn run_immediate_worker(
         &self,
         mut publisher: NetworkPublisher,
-        actor: Actor,
         mut immediate: mpsc::Receiver<ImmediateMessage>,
     ) {
-        // Control queue: NodeInfo and ACK only; graph sync uses the durable inbox.
         while let Some(message) = immediate.recv().await {
             if let Err(error) = crate::action::dispatch_immediate_message(
                 &mut publisher,
                 &self.local_db,
-                &self.btc_client,
                 &self.goat_client,
-                &self.http_client,
-                &self.soldering_builder,
-                actor.clone(),
                 message.source,
-                message.id,
                 message.message,
                 &self.metrics_state,
             )
@@ -223,7 +157,7 @@ impl BitvmNodeProcessor {
                 _ = clock.tick() => {}
             }
             // A pass is cut short by shutdown too: `graceful_shutdown` joins
-            // this task before it releases the queue claims.
+            // this task.
             tokio::select! {
                 biased;
                 _ = self.shutdown_token.cancelled() => return,
@@ -247,14 +181,11 @@ impl P2pMessageHandler for BitvmNodeProcessor {
         id: MessageId,
         message: &[u8],
     ) -> anyhow::Result<()> {
-        let worker = self.worker(swarm, actor.clone());
+        let worker = self.worker(swarm);
         handle_inbound_p2p_message(
             swarm,
             &self.local_db,
-            &self.btc_client,
             &self.goat_client,
-            &self.http_client,
-            &self.soldering_builder,
             actor,
             from_peer_id,
             propagation_source,
@@ -286,7 +217,9 @@ impl P2pMessageHandler for BitvmNodeProcessor {
                 Ok(())
             }
             TickMessageType::RegularlyAction => {
-                self.worker(swarm, actor).tick.notify_one();
+                // Nothing runs on the tick any more: the engine schedules its
+                // own work and the admission maintenance has its own timer.
+                let _ = (swarm, actor);
                 Ok(())
             }
         }
@@ -374,17 +307,6 @@ impl P2pMessageHandler for BitvmNodeProcessor {
                 join.await?;
             }
         }
-        let mut storage = self.local_db.start_immediate_transaction().await?;
-        let local_released = storage.release_processing_local_messages().await?;
-        let inbox_released = storage.release_processing_p2p_inbox_messages().await?;
-        storage.commit().await?;
-        tracing::info!(
-            event = "message_queue_shutdown",
-            outcome = "claims_released",
-            local_released,
-            inbox_released,
-            "released active queue claims without charging abandon counters"
-        );
         Ok(())
     }
 }
@@ -425,14 +347,16 @@ mod tests {
         let control = super::WorkerControl {
             immediate: tx,
             bytes: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
-            tick: Default::default(),
             joins: Default::default(),
         };
         let source = libp2p::PeerId::random();
         let message = || {
-            super::GOATMessage::new(bitvm_lib::actors::Actor::All, super::GOATMessageContent::Tick)
+            super::GOATMessage::new(
+                bitvm_lib::actors::Actor::All,
+                super::GOATMessageContent::RequestNodeInfo(crate::action::NodeInfo::default()),
+            )
         };
-        let id = || super::GOATMessage::default_message_id();
+        let id = || libp2p::gossipsub::MessageId(b"test".to_vec());
         assert!(!control.enqueue(source, id(), message(), 5));
         assert!(control.enqueue(source, id(), message(), 4));
         assert!(!control.enqueue(source, id(), message(), 1));
@@ -552,10 +476,6 @@ mod tests {
                 &propagation_source,
                 libp2p::gossipsub::MessageAcceptance::Accept,
             );
-            if id == GOATMessage::default_message_id() {
-                tracing::info!("recv_and_dispatch receive local message");
-                return Ok(());
-            }
             let message = GOATMessage::deserialize_message(message).await?;
             let content: &GOATMessageContent = message.content();
             if let (GOATMessageContent::RequestNodeInfo(node_info), _) = (content, actor) {
@@ -817,7 +737,6 @@ mod tests {
     }
 
     async fn relay_scenario() {
-        use crate::action::KickoffSent;
         use crate::middleware::behaviour::MAX_GOSSIPSUB_TRANSMIT_SIZE;
 
         init();
@@ -837,12 +756,7 @@ mod tests {
 
         let relay = super::BitvmNodeProcessor {
             local_db: relay_db.clone(),
-            btc_client: std::sync::Arc::new(client::btc_chain::BTCClient::new_mock_client().0),
             goat_client: std::sync::Arc::new(client::goat_chain::GOATClient::new_mock_client().0),
-            http_client: std::sync::Arc::new(
-                client::http_client::async_client::HttpAsyncClient::new(None),
-            ),
-            soldering_builder: None,
             metrics_state: crate::metrics_service::MetricsState::new(std::sync::Arc::new(
                 std::sync::Mutex::new(Registry::default()),
             )),
@@ -880,12 +794,23 @@ mod tests {
         });
 
         let scenario = async {
+            // A committee round value: the Committee relay keeps it as an
+            // engine inbox event of its graph.
             let protocol_message = |graph_id: uuid::Uuid| {
+                let secp = bitcoin::secp256k1::Secp256k1::new();
+                let keypair = bitcoin::secp256k1::Keypair::from_secret_key(
+                    &secp,
+                    &bitcoin::secp256k1::SecretKey::from_slice(&[7; 32]).unwrap(),
+                );
+                let digest = bitcoin::secp256k1::Message::from_digest([3; 32]);
                 GOATMessage::new(
                     Actor::Committee,
-                    GOATMessageContent::KickoffSent(KickoffSent {
+                    GOATMessageContent::AggNonceConsensus(crate::action::AggNonceConsensus {
                         instance_id: uuid::Uuid::new_v4(),
                         graph_id,
+                        committee_pubkey: bitcoin::PublicKey::new(keypair.public_key()),
+                        consensus_hash: [3; 32],
+                        signature: secp.sign_schnorr(&digest, &keypair),
                     }),
                 )
             };
@@ -924,13 +849,17 @@ mod tests {
             }
 
             let mut storage = relay_db.acquire().await.unwrap();
-            let queued = storage.p2p_inbox_class_totals().await.unwrap();
+            let queued = storage.engine_inbox_class_totals().await.unwrap();
             let (rows, bytes): (i64, i64) = queued
                 .iter()
                 .fold((0, 0), |(rows, bytes), usage| (rows + usage.rows, bytes + usage.bytes));
             assert!(rows <= 2, "only the two protocol messages may be queued, found {rows}");
+            // An inbox event wraps the raw bytes in the admitted envelope
+            // (author peer id, instance id); the junk payloads are kilobytes
+            // to megabytes larger than that.
+            let envelope_overhead = 2 * 128;
             assert!(
-                bytes <= (first.len() + sentinel.len()) as i64,
+                bytes <= (first.len() + sentinel.len() + envelope_overhead) as i64,
                 "the relay persisted {bytes} bytes; junk must never reach the inbox"
             );
         };

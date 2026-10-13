@@ -67,8 +67,6 @@ pub const ENV_MIN_REQUIRED_VERIFIER: &str = "MIN_REQUIRED_VERIFIER";
 pub const ENV_VERIFIER_CANDIDATE_BACKUP_COUNT: &str = "VERIFIER_CANDIDATE_BACKUP_COUNT";
 pub const ENV_VERIFIER_CANDIDATE_COLLECTION_WINDOW_SECS: &str =
     "VERIFIER_CANDIDATE_COLLECTION_WINDOW_SECS";
-pub const ENV_P2P_GRAPH_SETUP_RETRY_INTERVAL_SECS: &str = "P2P_GRAPH_SETUP_RETRY_INTERVAL_SECS";
-pub const ENV_P2P_GRAPH_SETUP_RETRY_WINDOW_SECS: &str = "P2P_GRAPH_SETUP_RETRY_WINDOW_SECS";
 pub const ENV_EXTERNAL_SOCKET_ADDR: &str = "EXTERNAL_SOCKET_ADDR";
 pub const COMMITTEE_INSTANCE_KEYS_DIR: &str = "cache/committee-instance-keys/";
 pub const SCRIPT_CACHE_FILE_NAME: &str = "cache/partial_script.bin";
@@ -81,8 +79,6 @@ pub const DEFAULT_CONFIRMATION_TARGET: u16 = 1;
 pub const DEFAULT_MIN_REQUIRED_VERIFIER: usize = 1;
 pub const DEFAULT_VERIFIER_CANDIDATE_BACKUP_COUNT: usize = 2;
 pub const DEFAULT_VERIFIER_CANDIDATE_COLLECTION_WINDOW_SECS: i64 = 15;
-pub const DEFAULT_P2P_GRAPH_SETUP_RETRY_INTERVAL_SECS: i64 = 10;
-pub const DEFAULT_P2P_GRAPH_SETUP_RETRY_WINDOW_SECS: i64 = 600;
 
 pub const ENV_BITCOIN_NETWORK: &str = "BITCOIN_NETWORK";
 pub const ENV_GOAT_NETWORK: &str = "GOAT_NETWORK";
@@ -130,17 +126,6 @@ pub const CHALLENGE_RATE: u64 = 0; // 0%
 
 const COMMITTEE_MEMBER_NUMBER: usize = 2;
 
-pub const MESSAGE_BROADCAST_MAX_TIMES: i64 = 3;
-pub const MESSAGE_RESEND_INTERVAL_SECOND: i64 = 60 * 5;
-pub const MESSAGE_EXPIRE_TIME: i64 = 3600 * 24 * 15; // 15 days for test
-
-pub const MESSAGE_SAVE_INTERVAL_SECOND: i64 = 3600 * 24 * 3;
-
-pub const GRAPH_OPERATOR_DATA_UPLOAD_TIME_EXPIRED: i64 = 3600 * 48;
-
-pub const SYNC_GRAPH_INTERVAL: u64 = 3;
-pub const SYNC_GRAPH_MAX_WAIT_SECS: u64 = 30;
-
 // use to judge load history event thread is dead
 pub const LOAD_HISTORY_EVENT_NO_WOKING_MAX_SECS: i64 = 600;
 
@@ -151,8 +136,6 @@ pub const ENV_INSTANCE_MAINTENANCE_BATCH_SIZE: &str = "INSTANCE_MAINTENANCE_BATC
 pub const DEFAULT_INSTANCE_MAINTENANCE_BATCH_SIZE: u32 = 50;
 pub const ENV_MAINTENANCE_RUN_TIMEOUT_SECS: &str = "MAINTENANCE_RUN_TIMEOUT_SECS";
 pub const DEFAULT_MAINTENANCE_RUN_TIMEOUT_SECS: u64 = 60;
-pub const ENV_P2P_INBOX_BATCH_SIZE: &str = "P2P_INBOX_BATCH_SIZE";
-pub const DEFAULT_P2P_INBOX_BATCH_SIZE: i64 = 16;
 /// Maximum decoded JSON gossip size.
 pub const ENV_P2P_MAX_JSON_MESSAGE_BYTES: &str = "P2P_MAX_JSON_MESSAGE_BYTES";
 pub const DEFAULT_P2P_MAX_JSON_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
@@ -175,12 +158,8 @@ pub const ENV_P2P_RESERVED_PEERS: &str = "P2P_RESERVED_PEERS";
 /// Stake is verified on chain at startup.
 pub const ENV_P2P_TRUSTED_OPERATOR_BINDINGS: &str = "P2P_TRUSTED_OPERATOR_BINDINGS";
 /// Longest wait between two re-publishes of a signing-round outbox row.
-pub const ENV_P2P_PROTOCOL_RETRY_MAX_SECS: &str = "P2P_PROTOCOL_RETRY_MAX_SECS";
-pub const DEFAULT_P2P_PROTOCOL_RETRY_MAX_SECS: i64 = 600;
 /// Handler execution timeout on the business/control worker.
 /// Timeout cancels at an await; durable messages are retried.
-pub const ENV_P2P_HANDLER_TIMEOUT_SECS: &str = "P2P_HANDLER_TIMEOUT_SECS";
-pub const DEFAULT_P2P_HANDLER_TIMEOUT_SECS: u64 = 300;
 /// Comma-separated peer IDs whose persisted replay marks are cleared at startup.
 pub const ENV_P2P_REPLAY_MARK_RESET_PEERS: &str = "P2P_REPLAY_MARK_RESET_PEERS";
 pub const ENV_P2P_MAX_PENDING_INCOMING_CONNECTIONS: &str = "P2P_MAX_PENDING_INCOMING_CONNECTIONS";
@@ -676,22 +655,6 @@ pub fn get_verifier_candidate_collection_window_secs() -> i64 {
         .unwrap_or(DEFAULT_VERIFIER_CANDIDATE_COLLECTION_WINDOW_SECS)
 }
 
-pub fn get_p2p_graph_setup_retry_interval_secs() -> i64 {
-    std::env::var(ENV_P2P_GRAPH_SETUP_RETRY_INTERVAL_SECS)
-        .ok()
-        .and_then(|value| value.parse::<i64>().ok())
-        .map(|value| value.clamp(1, 300))
-        .unwrap_or(DEFAULT_P2P_GRAPH_SETUP_RETRY_INTERVAL_SECS)
-}
-
-pub fn get_p2p_graph_setup_retry_window_secs() -> i64 {
-    std::env::var(ENV_P2P_GRAPH_SETUP_RETRY_WINDOW_SECS)
-        .ok()
-        .and_then(|value| value.parse::<i64>().ok())
-        .map(|value| value.clamp(10, 3600))
-        .unwrap_or(DEFAULT_P2P_GRAPH_SETUP_RETRY_WINDOW_SECS)
-}
-
 pub fn get_soldering_proof_payload_store_path() -> anyhow::Result<String> {
     let value = std::env::var(ENV_SOLDERING_PROOF_PAYLOAD_STORE_PATH)
         .map_err(|_| anyhow::anyhow!("{ENV_SOLDERING_PROOF_PAYLOAD_STORE_PATH} needs to be set"))?;
@@ -779,14 +742,6 @@ pub fn get_maintenance_run_timeout_secs() -> u64 {
         .unwrap_or(DEFAULT_MAINTENANCE_RUN_TIMEOUT_SECS)
 }
 
-pub fn get_p2p_inbox_batch_size() -> i64 {
-    std::env::var(ENV_P2P_INBOX_BATCH_SIZE)
-        .ok()
-        .and_then(|value| value.parse::<i64>().ok())
-        .map(|size| size.clamp(1, 128))
-        .unwrap_or(DEFAULT_P2P_INBOX_BATCH_SIZE)
-}
-
 pub fn get_p2p_max_json_message_bytes() -> usize {
     std::env::var(ENV_P2P_MAX_JSON_MESSAGE_BYTES)
         .ok()
@@ -830,24 +785,6 @@ pub fn parse_reserved_peers(value: &str) -> std::collections::HashSet<libp2p::Pe
             parsed
         })
         .collect()
-}
-
-/// Signing-round retry ceiling of the legacy outbox, clamped to 30–3600 seconds.
-pub fn get_p2p_protocol_retry_max_secs() -> i64 {
-    std::env::var(ENV_P2P_PROTOCOL_RETRY_MAX_SECS)
-        .ok()
-        .and_then(|value| value.parse::<i64>().ok())
-        .map(|secs| secs.clamp(30, 3600))
-        .unwrap_or(DEFAULT_P2P_PROTOCOL_RETRY_MAX_SECS)
-}
-
-pub fn get_p2p_handler_timeout() -> std::time::Duration {
-    let secs = std::env::var(ENV_P2P_HANDLER_TIMEOUT_SECS)
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .map(|secs| secs.clamp(5, 3600))
-        .unwrap_or(DEFAULT_P2P_HANDLER_TIMEOUT_SECS);
-    std::time::Duration::from_secs(secs)
 }
 
 /// Parse `P2P_TRUSTED_OPERATOR_BINDINGS`. A malformed entry is reported and

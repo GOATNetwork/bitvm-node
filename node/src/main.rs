@@ -26,7 +26,7 @@ use bitvm_noded::{
 };
 
 use anyhow::Result;
-use bitvm_noded::action::{load_persisted_peer_bindings, reclaim_stale_queue_claims};
+use bitvm_noded::action::load_persisted_peer_bindings;
 use bitvm_noded::metrics_service::{MetricsState, set_node_metrics_state};
 use bitvm_noded::middleware::swarm::{BitvmNetworkManager, BitvmSwarmConfig};
 use bitvm_noded::p2p_msg_handler::BitvmNodeProcessor;
@@ -200,18 +200,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let local_db =
         store::create_local_db_with_busy_timeout(&opt.db_path, engine_bridge::db_busy_timeout())
             .await;
-    // Claims left by a previous process are provably abandoned: charge and
-    // release them before any dispatcher can wait on their leases.
-    let (reclaimed_local, reclaimed_inbox) = reclaim_stale_queue_claims(&local_db).await?;
-    if reclaimed_local + reclaimed_inbox > 0 {
-        tracing::warn!(
-            event = "message_queue_startup",
-            outcome = "claims_reclaimed",
-            reclaimed_local,
-            reclaimed_inbox,
-            "reclaimed queue claims left behind by a previous process"
-        );
-    }
     // The execution engine's metrics must be registered before the registry is shared.
     let engine_metrics = engine_bridge::register_engine_metrics(&mut metric_registry);
     let metric_registry = Arc::new(Mutex::new(metric_registry));
@@ -258,10 +246,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
     let handler = BitvmNodeProcessor {
         local_db: local_db.clone(),
-        btc_client: btc_client.clone(),
         goat_client,
-        http_client,
-        soldering_builder,
         metrics_state: metrics_state.clone(),
         shutdown_token: cancellation_token.clone(),
         worker: Default::default(),

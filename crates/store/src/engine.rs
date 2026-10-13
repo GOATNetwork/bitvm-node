@@ -55,7 +55,7 @@ pub struct EngineAckTarget {
     pub delivery_id: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct NewEngineInboxEvent {
     pub event_id: String,
     pub aggregate_kind: String,
@@ -63,6 +63,9 @@ pub struct NewEngineInboxEvent {
     pub kind: String,
     pub source: String,
     pub author: String,
+    /// How admission classified the author of a network event (empty for
+    /// local, chain and job events); the storage quota is kept per class.
+    pub admission_class: String,
     pub payload: Vec<u8>,
     pub ack: Option<EngineAckTarget>,
 }
@@ -92,6 +95,7 @@ pub struct EngineInboxEvent {
     pub kind: String,
     pub source: String,
     pub author: String,
+    pub admission_class: String,
     pub payload: Option<Vec<u8>>,
     pub payload_size: i64,
     pub state: String,
@@ -119,8 +123,9 @@ impl EngineInboxEvent {
 }
 
 const ENGINE_INBOX_COLUMNS: &str = "seq, event_id, aggregate_kind, aggregate_id, shard_key, kind, \
-     source, author, payload, payload_size, state, attempts, next_at, waiting_ref, waiting_detail, \
-     ack_peer, ack_delivery_id, last_error, created_at, updated_at, applied_at";
+     source, author, admission_class, payload, payload_size, state, attempts, next_at, \
+     waiting_ref, waiting_detail, ack_peer, ack_delivery_id, last_error, created_at, updated_at, \
+     applied_at";
 
 fn engine_inbox_event_from_row(row: &SqliteRow) -> Result<EngineInboxEvent, sqlx::Error> {
     Ok(EngineInboxEvent {
@@ -132,6 +137,7 @@ fn engine_inbox_event_from_row(row: &SqliteRow) -> Result<EngineInboxEvent, sqlx
         kind: row.try_get("kind")?,
         source: row.try_get("source")?,
         author: row.try_get("author")?,
+        admission_class: row.try_get("admission_class")?,
         payload: row.try_get("payload")?,
         payload_size: row.try_get("payload_size")?,
         state: row.try_get("state")?,
@@ -386,6 +392,17 @@ pub enum EngineJobFinishOutcome {
     Missing,
 }
 
+/// Queued inbox usage for one admission class, with the share attributable to
+/// the author being admitted.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct InboxClassUsage {
+    pub admission_class: String,
+    pub rows: i64,
+    pub bytes: i64,
+    pub peer_rows: i64,
+    pub peer_bytes: i64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EngineStateCount {
     pub table: String,
@@ -414,10 +431,10 @@ impl<'a> StorageProcessor<'a> {
         };
         let inserted = sqlx::query(
             "INSERT OR IGNORE INTO engine_inbox \
-             (event_id, aggregate_kind, aggregate_id, shard_key, kind, source, author, payload, \
-              payload_size, state, attempts, next_at, ack_peer, ack_delivery_id, created_at, \
-              updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'Pending', 0, ?, ?, ?, ?, ?) \
+             (event_id, aggregate_kind, aggregate_id, shard_key, kind, source, author, \
+              admission_class, payload, payload_size, state, attempts, next_at, ack_peer, \
+              ack_delivery_id, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Pending', 0, ?, ?, ?, ?, ?) \
              RETURNING seq",
         )
         .bind(&event.event_id)
@@ -427,6 +444,7 @@ impl<'a> StorageProcessor<'a> {
         .bind(&event.kind)
         .bind(&event.source)
         .bind(&event.author)
+        .bind(&event.admission_class)
         .bind(&event.payload)
         .bind(event.payload.len() as i64)
         .bind(now)
@@ -1504,6 +1522,62 @@ impl<'a> StorageProcessor<'a> {
         .rows_affected())
     }
 
+    // ------------------------------------------------------------------ quota
+
+    /// Queued network events (`Pending`, waiting or `Failed`: the rows that
+    /// still hold a payload) per admission class.
+    pub async fn engine_inbox_class_totals(&mut self) -> anyhow::Result<Vec<InboxClassUsage>> {
+        let rows = sqlx::query(
+            "SELECT admission_class, COUNT(*) AS total_rows, \
+                    COALESCE(SUM(payload_size), 0) AS total_bytes \
+             FROM engine_inbox \
+             WHERE source = 'network' AND state IN ('Pending', 'Failed') \
+             GROUP BY admission_class",
+        )
+        .fetch_all(self.conn())
+        .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(InboxClassUsage {
+                    admission_class: row.try_get("admission_class")?,
+                    rows: row.try_get("total_rows")?,
+                    bytes: row.try_get("total_bytes")?,
+                    ..Default::default()
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(Into::into)
+    }
+
+    /// One author's queued network events per class; `rows` and `bytes`
+    /// stay zero.
+    pub async fn engine_inbox_peer_usage(
+        &mut self,
+        author: &str,
+    ) -> anyhow::Result<Vec<InboxClassUsage>> {
+        let rows = sqlx::query(
+            "SELECT admission_class, COUNT(*) AS peer_rows, \
+                    COALESCE(SUM(payload_size), 0) AS peer_bytes \
+             FROM engine_inbox \
+             WHERE source = 'network' AND state IN ('Pending', 'Failed') AND author = ? \
+             GROUP BY admission_class",
+        )
+        .bind(author)
+        .fetch_all(self.conn())
+        .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(InboxClassUsage {
+                    admission_class: row.try_get("admission_class")?,
+                    peer_rows: row.try_get("peer_rows")?,
+                    peer_bytes: row.try_get("peer_bytes")?,
+                    ..Default::default()
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(Into::into)
+    }
+
     // ---------------------------------------------------------------- metrics
 
     pub async fn engine_state_counts(&mut self) -> anyhow::Result<Vec<EngineStateCount>> {
@@ -1554,12 +1628,78 @@ mod tests {
             kind: "ping".to_string(),
             source: "local".to_string(),
             author: String::new(),
+            admission_class: String::new(),
             payload: b"payload".to_vec(),
             ack: Some(EngineAckTarget {
                 peer: "peer-a".to_string(),
                 delivery_id: "d1".to_string(),
             }),
         }
+    }
+
+    fn network_event(id: &str, author: &str, class: &str, bytes: usize) -> NewEngineInboxEvent {
+        NewEngineInboxEvent {
+            event_id: id.to_string(),
+            aggregate_kind: "graph".to_string(),
+            aggregate_id: "g".to_string(),
+            kind: "CreateGraph".to_string(),
+            source: "network".to_string(),
+            author: author.to_string(),
+            admission_class: class.to_string(),
+            payload: vec![0; bytes],
+            ack: None,
+        }
+    }
+
+    /// The quota sees what an author currently makes the node store: rows
+    /// that still hold a payload, by class, with the author's own share.
+    #[tokio::test]
+    async fn inbox_usage_counts_queued_network_rows_per_class_and_author() {
+        let db = setup_db().await;
+        let mut s = db.acquire().await.unwrap();
+        for (id, author, class, bytes) in [
+            ("a1", "alice", "Unregistered", 10),
+            ("a2", "alice", "Registered", 20),
+            ("b1", "bob", "Unregistered", 40),
+            ("c1", "carol", "Committee", 80),
+        ] {
+            s.insert_engine_inbox_event(&network_event(id, author, class, bytes), 1).await.unwrap();
+        }
+        // A local event and an applied network event hold no payload.
+        s.insert_engine_inbox_event(&event("local", "x"), 1).await.unwrap();
+        s.insert_engine_inbox_event(&network_event("done", "bob", "Unregistered", 160), 1)
+            .await
+            .unwrap();
+        assert!(s.mark_engine_inbox_applied("done", 2).await.unwrap());
+        // Waiting and failed rows keep theirs.
+        assert!(s.mark_engine_inbox_waiting("b1", "dep", "x", 100, 2).await.unwrap());
+        assert!(s.mark_engine_inbox_failed("c1", "bad", 2).await.unwrap());
+
+        let mut totals = s.engine_inbox_class_totals().await.unwrap();
+        totals.sort_by(|a, b| a.admission_class.cmp(&b.admission_class));
+        let total = |class: &str| -> (i64, i64) {
+            totals
+                .iter()
+                .find(|usage| usage.admission_class == class)
+                .map(|usage| (usage.rows, usage.bytes))
+                .unwrap_or((0, 0))
+        };
+        assert_eq!(total("Unregistered"), (2, 50));
+        assert_eq!(total("Registered"), (1, 20));
+        assert_eq!(total("Committee"), (1, 80));
+        assert!(totals.iter().all(|usage| usage.peer_rows == 0 && usage.peer_bytes == 0));
+
+        let alice = s.engine_inbox_peer_usage("alice").await.unwrap();
+        let share = |class: &str| -> (i64, i64) {
+            alice
+                .iter()
+                .find(|usage| usage.admission_class == class)
+                .map(|usage| (usage.peer_rows, usage.peer_bytes))
+                .unwrap_or((0, 0))
+        };
+        assert_eq!(share("Unregistered"), (1, 10));
+        assert_eq!(share("Registered"), (1, 20));
+        assert!(s.engine_inbox_peer_usage("nobody").await.unwrap().is_empty());
     }
 
     #[test]

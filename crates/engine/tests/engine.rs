@@ -1022,6 +1022,7 @@ async fn startup_recovery_rearms_events_and_reclaims_leases() {
                 kind: "set_status".into(),
                 source: "local".into(),
                 author: String::new(),
+                admission_class: String::new(),
                 payload: b"recovered".to_vec(),
                 ack: None,
             },

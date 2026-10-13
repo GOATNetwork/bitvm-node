@@ -21,8 +21,7 @@ use crate::rpc_service::handler::{
 };
 #[cfg(feature = "rpc-debug-endpoints")]
 use crate::rpc_service::handler::{
-    get_debug_engine, get_debug_message_details, get_debug_status, get_graph_debug_messages,
-    get_instance_debug_messages, send_challenge, send_verifier_challenge,
+    get_debug_engine, get_debug_status, send_challenge, send_verifier_challenge,
 };
 use anyhow::Context;
 use axum::body::Body;
@@ -182,9 +181,6 @@ pub(crate) fn build_business_router(app_state: Arc<AppState>) -> Router {
     #[cfg(feature = "rpc-debug-endpoints")]
     let public_routes = public_routes
         .route(routes::v1::DEBUG_STATUS, get(get_debug_status))
-        .route(routes::v1::DEBUG_GRAPH_MESSAGES, get(get_graph_debug_messages))
-        .route(routes::v1::DEBUG_INSTANCE_MESSAGES, get(get_instance_debug_messages))
-        .route(routes::v1::DEBUG_MESSAGE_DETAILS, get(get_debug_message_details))
         .route(routes::v1::DEBUG_ENGINE, get(get_debug_engine));
 
     let signed_routes = Router::new().route(routes::v1::PEGOUT, post(pegout));
@@ -593,12 +589,6 @@ mod tests {
         let id = Uuid::new_v4();
 
         let status = client.get(format!("http://{addr}/v1/debug/status")).send().await?;
-        let graph_messages =
-            client.get(format!("http://{addr}/v1/debug/graphs/{id}/messages")).send().await?;
-        let instance_messages =
-            client.get(format!("http://{addr}/v1/debug/instances/{id}/messages")).send().await?;
-        let message_details =
-            client.get(format!("http://{addr}/v1/debug/messages/missing")).send().await?;
         let engine = client.get(format!("http://{addr}/v1/debug/engine")).send().await?;
         let verifier_challenge = client
             .post(format!("http://{addr}/v1/graphs/{id}/send-verifier-challenge"))
@@ -607,21 +597,13 @@ mod tests {
 
         if cfg!(feature = "rpc-debug-endpoints") {
             assert_eq!(status.status().as_u16(), 200);
-            assert_eq!(graph_messages.status().as_u16(), 200);
-            assert_eq!(instance_messages.status().as_u16(), 200);
-            assert_eq!(message_details.status().as_u16(), 404);
-            let message_body: Value = message_details.json().await?;
-            assert_eq!(message_body["error"], "DEBUG_MESSAGE_NOT_FOUND");
-            // The engine is not enabled on the mock node.
+            // The engine is not running on the mock node.
             assert_eq!(engine.status().as_u16(), 404);
             let engine_body: Value = engine.json().await?;
-            assert_eq!(engine_body["error"], "ENGINE_DISABLED");
+            assert_eq!(engine_body["error"], "ENGINE_UNAVAILABLE");
             assert_eq!(verifier_challenge.status().as_u16(), 401);
         } else {
             assert_eq!(status.status().as_u16(), 404);
-            assert_eq!(graph_messages.status().as_u16(), 404);
-            assert_eq!(instance_messages.status().as_u16(), 404);
-            assert_eq!(message_details.status().as_u16(), 404);
             assert_eq!(engine.status().as_u16(), 404);
             assert_eq!(verifier_challenge.status().as_u16(), 404);
         }

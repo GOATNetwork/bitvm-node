@@ -15,7 +15,7 @@ use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::metrics::histogram::{Histogram, exponential_buckets};
-use store::{GraphStatus, InstanceBridgeInStatus, MessageState, SwapEscrowStatus};
+use store::{GraphStatus, InstanceBridgeInStatus, SwapEscrowStatus};
 use tokio::time::Instant;
 
 const METRICS_CONTENT_TYPE: &str = "application/openmetrics-text;charset=utf-8;version=1.0.0";
@@ -134,10 +134,6 @@ pub struct MetricsState {
     message_dispatch_total: Family<MessageDispatchLabels, Counter>,
     instances: Family<InstanceLabels, Gauge>,
     graphs: Family<StatusLabels, Gauge>,
-    messages: Family<StatusLabels, Gauge>,
-    oldest_pending_message_age_seconds: Gauge,
-    p2p_inbox_messages: Family<StatusLabels, Gauge>,
-    oldest_pending_p2p_inbox_age_seconds: Gauge,
     ready: Gauge,
     db_busy_retries_total: Counter,
     db_errors_total: Counter,
@@ -148,7 +144,6 @@ pub struct MetricsState {
     fee_wallet_balance_sats: Gauge,
     fee_wallet_spendable_utxos: Gauge,
     graph_validation_total: Family<OutcomeLabels, Counter>,
-    message_retry_total: Counter,
     p2p_publish_total: Family<OutcomeLabels, Counter>,
     p2p_receive_total: Family<OutcomeLabels, Counter>,
     p2p_oversized_messages_total: Counter,
@@ -197,10 +192,6 @@ impl MetricsState {
         let message_dispatch_total = Family::default();
         let instances = Family::default();
         let graphs = Family::default();
-        let messages = Family::default();
-        let oldest_pending_message_age_seconds = Gauge::default();
-        let p2p_inbox_messages = Family::default();
-        let oldest_pending_p2p_inbox_age_seconds = Gauge::default();
         let ready = Gauge::default();
         let db_busy_retries_total = Counter::default();
         let db_errors_total = Counter::default();
@@ -211,7 +202,6 @@ impl MetricsState {
         let fee_wallet_balance_sats = Gauge::default();
         let fee_wallet_spendable_utxos = Gauge::default();
         let graph_validation_total = Family::default();
-        let message_retry_total = Counter::default();
         let p2p_publish_total = Family::default();
         let p2p_receive_total = Family::default();
         let p2p_oversized_messages_total = Counter::default();
@@ -286,26 +276,6 @@ impl MetricsState {
             );
             registry.register("bitvm_node_graphs", "Number of graphs by status", graphs.clone());
             registry.register(
-                "bitvm_node_messages",
-                "Number of queued messages by state",
-                messages.clone(),
-            );
-            registry.register(
-                "bitvm_node_oldest_pending_message_age_seconds",
-                "Age in seconds of the oldest pending message",
-                oldest_pending_message_age_seconds.clone(),
-            );
-            registry.register(
-                "bitvm_node_p2p_inbox_messages",
-                "Number of durable P2P inbox messages by state",
-                p2p_inbox_messages.clone(),
-            );
-            registry.register(
-                "bitvm_node_oldest_pending_p2p_inbox_age_seconds",
-                "Age in seconds of the oldest pending durable P2P inbox message",
-                oldest_pending_p2p_inbox_age_seconds.clone(),
-            );
-            registry.register(
                 "bitvm_node_ready",
                 "Whether the node is ready to process work",
                 ready.clone(),
@@ -354,11 +324,6 @@ impl MetricsState {
                 "bitvm_node_graph_validation",
                 "Total graph validation outcomes",
                 graph_validation_total.clone(),
-            );
-            registry.register(
-                "bitvm_node_message_retry",
-                "Total deferred protocol messages",
-                message_retry_total.clone(),
             );
             registry.register(
                 "bitvm_node_p2p_publish",
@@ -483,10 +448,6 @@ impl MetricsState {
             message_dispatch_total,
             instances,
             graphs,
-            messages,
-            oldest_pending_message_age_seconds,
-            p2p_inbox_messages,
-            oldest_pending_p2p_inbox_age_seconds,
             ready,
             db_busy_retries_total,
             db_errors_total,
@@ -497,7 +458,6 @@ impl MetricsState {
             fee_wallet_balance_sats,
             fee_wallet_spendable_utxos,
             graph_validation_total,
-            message_retry_total,
             p2p_publish_total,
             p2p_receive_total,
             p2p_oversized_messages_total,
@@ -608,10 +568,6 @@ impl MetricsState {
             .inc();
     }
 
-    pub fn record_message_retry(&self) {
-        self.message_retry_total.inc();
-    }
-
     pub fn record_p2p_publish(&self, success: bool) {
         self.p2p_publish_total.get_or_create(&OutcomeLabels { outcome: outcome(success) }).inc();
     }
@@ -717,11 +673,6 @@ impl MetricsState {
     fn apply_database_metrics(&self, counts: &[store::MetricsStateCount]) {
         self.instances.clear();
         self.graphs.clear();
-        self.messages.clear();
-        self.oldest_pending_message_age_seconds.set(0);
-        self.p2p_inbox_messages.clear();
-        self.oldest_pending_p2p_inbox_age_seconds.set(0);
-        let now = current_time_secs();
 
         for count in counts {
             match count.category.as_str() {
@@ -740,32 +691,6 @@ impl MetricsState {
                 "graph" => {
                     let status = known_status::<GraphStatus>(&count.state);
                     self.graphs.get_or_create(&StatusLabels { status }).inc_by(count.count);
-                }
-                "message" => {
-                    let status = known_status::<MessageState>(&count.state);
-                    self.messages
-                        .get_or_create(&StatusLabels { status: status.clone() })
-                        .inc_by(count.count);
-                    if status == "Pending" {
-                        self.oldest_pending_message_age_seconds.set(
-                            count
-                                .oldest_created_at
-                                .map_or(0, |created_at| now.saturating_sub(created_at).max(0)),
-                        );
-                    }
-                }
-                "p2p_inbox" => {
-                    let status = known_status::<MessageState>(&count.state);
-                    self.p2p_inbox_messages
-                        .get_or_create(&StatusLabels { status: status.clone() })
-                        .inc_by(count.count);
-                    if status == "Pending" {
-                        self.oldest_pending_p2p_inbox_age_seconds.set(
-                            count
-                                .oldest_created_at
-                                .map_or(0, |created_at| now.saturating_sub(created_at).max(0)),
-                        );
-                    }
                 }
                 _ => {}
             }
@@ -925,8 +850,8 @@ mod tests {
                 last_success_at: None,
             },
             store::MetricsStateCount {
-                category: "p2p_inbox".to_string(),
-                state: "Pending".to_string(),
+                category: "instance".to_string(),
+                state: "Presigned".to_string(),
                 count: 4,
                 oldest_created_at: Some(current_time_secs() - 30),
                 last_success_at: None,
@@ -941,8 +866,7 @@ mod tests {
         assert!(!output.contains("bitvm_node_graphs{status=\"OperatorPresigned\"}"));
         assert!(!output.contains("unexpected-id-like-value"));
         assert!(!output.contains("another-unexpected-value"));
-        assert!(output.contains("bitvm_node_p2p_inbox_messages{status=\"Pending\"} 4"));
-        assert!(output.contains("bitvm_node_oldest_pending_p2p_inbox_age_seconds 30"));
+        assert!(output.contains("bitvm_node_instances{flow=\"bridge_in\",status=\"Presigned\"} 4"));
     }
 
     #[test]
@@ -950,7 +874,7 @@ mod tests {
         let state = MetricsState::new(Arc::new(Mutex::new(Registry::default())));
         state.record_task_run("maintenance", "success", Duration::from_millis(25));
         state.record_task_run("history_sync", "failed", Duration::from_millis(5));
-        state.record_message_dispatch("Tick", "success");
+        state.record_message_dispatch("RequestNodeInfo", "success");
 
         let output = encoded(&state);
         assert!(
@@ -958,7 +882,7 @@ mod tests {
                 .contains("bitvm_node_task_runs_total{task=\"maintenance\",outcome=\"success\"} 1")
         );
         assert!(output.contains(
-            "bitvm_node_message_dispatch_total{message_type=\"Tick\",outcome=\"success\"} 1"
+            "bitvm_node_message_dispatch_total{message_type=\"RequestNodeInfo\",outcome=\"success\"} 1"
         ));
         assert!(
             !output

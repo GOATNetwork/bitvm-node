@@ -10,12 +10,30 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use client::goat_chain::GOATClient;
 use libp2p::PeerId;
-use sha2::{Digest, Sha256};
+use store::InboxClassUsage;
 use store::localdb::LocalDB;
-use store::{P2pInboxAdmissionClass, P2pInboxClassUsage};
+use strum::{Display, EnumString};
 
 use crate::action::{GOATMessage, GOATMessageContent, P2PMessageDelivery};
 use crate::middleware::behaviour::MAX_GOSSIPSUB_TRANSMIT_SIZE;
+
+/// How admission classifies the author of a message: a committee member
+/// registered by peer id on chain, a verifier (on-chain peer id registry) or
+/// an operator (staked master key bound to the peer id by a NodeInfo binding
+/// proof), or anyone else. Rate limits and the storage quota are per class.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Display, EnumString)]
+pub enum SenderClass {
+    Committee,
+    Registered,
+    Unregistered,
+}
+
+impl SenderClass {
+    /// Whether the sender's identity is backed by an on-chain registration.
+    pub const fn is_registered(self) -> bool {
+        !matches!(self, Self::Unregistered)
+    }
+}
 
 /// Pending retention for unregistered senders; registered senders use the normal retention window.
 pub const UNREGISTERED_PENDING_TTL_SECS: i64 = 2 * 60 * 60;
@@ -147,7 +165,8 @@ pub enum DropReason {
     /// Not a drop: a message from an unregistered sender that was queued. Only
     /// counted for the log summary, never exported as a drop metric.
     AdmittedUnregistered,
-    /// Duplicate queued payload, recorded in the periodic summary.
+    /// Not a drop: the engine already held the event (same author and
+    /// content); recorded in the periodic summary.
     DuplicatePayload,
 }
 
@@ -222,9 +241,9 @@ pub fn check_envelope(
 /// Whether one more queued row of `content_len` bytes from a sender of `class`
 /// fits. `usage` is the queued state *before* the row is added.
 pub fn check_inbox_quota(
-    class: P2pInboxAdmissionClass,
+    class: SenderClass,
     content_len: usize,
-    usage: &[P2pInboxClassUsage],
+    usage: &[InboxClassUsage],
     limits: &InboundLimits,
 ) -> Result<(), DropReason> {
     let content_len = content_len as i64;
@@ -233,8 +252,8 @@ pub fn check_inbox_quota(
     if !limits.global.admits(total_rows + 1, total_bytes + content_len) {
         return Err(DropReason::GlobalQuota);
     }
-    if class != P2pInboxAdmissionClass::Committee {
-        let committee = P2pInboxAdmissionClass::Committee.to_string();
+    if class != SenderClass::Committee {
+        let committee = SenderClass::Committee.to_string();
         let (rows, bytes) = usage
             .iter()
             .filter(|usage| usage.admission_class != committee)
@@ -259,7 +278,7 @@ pub fn check_inbox_quota(
     }
 
     if !class.is_registered() {
-        let class_name = P2pInboxAdmissionClass::Unregistered.to_string();
+        let class_name = SenderClass::Unregistered.to_string();
         let (class_rows, class_bytes) = usage
             .iter()
             .find(|usage| usage.admission_class == class_name)
@@ -269,57 +288,6 @@ pub fn check_inbox_quota(
         }
     }
     Ok(())
-}
-
-/// Persistent C/R/C/U rotation; empty classes yield their turn.
-#[derive(Debug, Default)]
-pub struct InboxSchedule {
-    position: usize,
-}
-
-/// Indices into the per-class queues of [`InboxSchedule::next`].
-pub const SCHEDULE_COMMITTEE: usize = 0;
-pub const SCHEDULE_REGISTERED: usize = 1;
-pub const SCHEDULE_UNREGISTERED: usize = 2;
-
-const SCHEDULE_ROTA: [usize; 4] =
-    [SCHEDULE_COMMITTEE, SCHEDULE_REGISTERED, SCHEDULE_COMMITTEE, SCHEDULE_UNREGISTERED];
-
-impl InboxSchedule {
-    /// The queue a row of `admission_class` belongs to.
-    pub fn queue_of(admission_class: &str) -> usize {
-        if admission_class == P2pInboxAdmissionClass::Committee.to_string() {
-            SCHEDULE_COMMITTEE
-        } else if admission_class == P2pInboxAdmissionClass::Registered.to_string() {
-            SCHEDULE_REGISTERED
-        } else {
-            SCHEDULE_UNREGISTERED
-        }
-    }
-
-    /// Advance the rotation only for a row about to be dispatched.
-    pub fn next<T>(&mut self, queues: &mut [std::collections::VecDeque<T>; 3]) -> Option<T> {
-        for step in 0..SCHEDULE_ROTA.len() {
-            let position = (self.position + step) % SCHEDULE_ROTA.len();
-            if let Some(row) = queues[SCHEDULE_ROTA[position]].pop_front() {
-                self.position = (position + 1) % SCHEDULE_ROTA.len();
-                return Some(row);
-            }
-        }
-        None
-    }
-}
-
-static INBOX_SCHEDULE: LazyLock<Mutex<InboxSchedule>> =
-    LazyLock::new(|| Mutex::new(InboxSchedule::default()));
-
-/// The process-wide rota. Only the inbox worker, on the swarm loop, touches it.
-pub fn inbox_schedule() -> std::sync::MutexGuard<'static, InboxSchedule> {
-    INBOX_SCHEDULE.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-pub fn content_hash(data: &[u8]) -> [u8; 32] {
-    Sha256::digest(data).into()
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -596,23 +564,23 @@ impl PeerRegistry {
         self.lock().verifiers.contains(&peer.to_bytes())
     }
 
-    pub fn sender_class(&self, peer: &PeerId, now: Instant) -> P2pInboxAdmissionClass {
+    pub fn sender_class(&self, peer: &PeerId, now: Instant) -> SenderClass {
         let state = self.lock();
         if state.committee.get(peer).is_some_and(|entry| entry.is_registered(now)) {
-            P2pInboxAdmissionClass::Committee
+            SenderClass::Committee
         } else if state.verifiers.contains(&peer.to_bytes())
             || state.operators.get(peer).is_some_and(|binding| binding.is_registered(now))
         {
-            P2pInboxAdmissionClass::Registered
+            SenderClass::Registered
         } else {
-            P2pInboxAdmissionClass::Unregistered
+            SenderClass::Unregistered
         }
     }
 
     /// Whether `peer` is a committee member, from the cache. For handlers whose
     /// authorisation is the committee specifically, not any registered sender.
     pub fn is_committee(&self, peer: &PeerId, now: Instant) -> bool {
-        self.sender_class(peer, now) == P2pInboxAdmissionClass::Committee
+        self.sender_class(peer, now) == SenderClass::Committee
     }
 
     /// Cached role verdict. Only fresh negative answers are Denied; missing or stale answers are Unknown.
@@ -1497,7 +1465,7 @@ impl InboundRateLimiter {
         &self,
         direct_peer: &PeerId,
         author: &PeerId,
-        class: P2pInboxAdmissionClass,
+        class: SenderClass,
         bytes: i64,
         now: Instant,
     ) -> Result<(), DropReason> {
@@ -1519,11 +1487,8 @@ impl InboundRateLimiter {
 
         let charge_unregistered = !class.is_registered();
         // The shared tiers keep a reserve only the committee may draw on.
-        let reserve = if class == P2pInboxAdmissionClass::Committee {
-            0.0
-        } else {
-            self.limits.committee_reserve
-        };
+        let reserve =
+            if class == SenderClass::Committee { 0.0 } else { self.limits.committee_reserve };
         let direct_ok = direct_tier.peek_above(&mut direct, bytes, reserve, now);
         let author_ok = author_tier.peek(&mut author_bucket, bytes, now);
         let unregistered_ok = !charge_unregistered
@@ -2087,15 +2052,15 @@ static REPLAY_GUARD: LazyLock<ReplayGuard> = LazyLock::new(ReplayGuard::default)
 /// How long the per-class inbox totals are served from memory.
 const INBOX_CLASS_TOTALS_TTL: Duration = Duration::from_secs(2);
 
-/// Cache per-class queue totals and increment them on admission.
-/// Worker removals are reflected at the next cache refresh.
+/// Cache per-class engine inbox totals and increment them on admission.
+/// Applies and purges are reflected at the next cache refresh.
 #[derive(Debug, Default)]
 pub struct InboxUsageCache {
-    totals: Mutex<Option<(Instant, Vec<P2pInboxClassUsage>)>>,
+    totals: Mutex<Option<(Instant, Vec<InboxClassUsage>)>>,
 }
 
 impl InboxUsageCache {
-    fn fresh(&self, now: Instant) -> Option<Vec<P2pInboxClassUsage>> {
+    fn fresh(&self, now: Instant) -> Option<Vec<InboxClassUsage>> {
         let totals = self.totals.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         totals
             .as_ref()
@@ -2103,13 +2068,13 @@ impl InboxUsageCache {
             .map(|(_, totals)| totals.clone())
     }
 
-    fn store(&self, totals: Vec<P2pInboxClassUsage>, now: Instant) {
+    fn store(&self, totals: Vec<InboxClassUsage>, now: Instant) {
         *self.totals.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
             Some((now, totals));
     }
 
     /// Count a row that is about to be queued.
-    fn note_admitted(&self, class: P2pInboxAdmissionClass, bytes: i64) {
+    fn note_admitted(&self, class: SenderClass, bytes: i64) {
         let mut totals = self.totals.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some((_, totals)) = totals.as_mut() else {
             return;
@@ -2120,7 +2085,7 @@ impl InboxUsageCache {
                 usage.rows += 1;
                 usage.bytes += bytes;
             }
-            None => totals.push(P2pInboxClassUsage {
+            None => totals.push(InboxClassUsage {
                 admission_class: class,
                 rows: 1,
                 bytes,
@@ -2135,16 +2100,16 @@ impl InboxUsageCache {
         storage: &mut store::localdb::StorageProcessor<'_>,
         from_peer: &str,
         now: Instant,
-    ) -> Result<Vec<P2pInboxClassUsage>> {
+    ) -> Result<Vec<InboxClassUsage>> {
         let mut usage = match self.fresh(now) {
             Some(totals) => totals,
             None => {
-                let totals = storage.p2p_inbox_class_totals().await?;
+                let totals = storage.engine_inbox_class_totals().await?;
                 self.store(totals.clone(), now);
                 totals
             }
         };
-        for peer in storage.p2p_inbox_peer_usage(from_peer).await? {
+        for peer in storage.engine_inbox_peer_usage(from_peer).await? {
             match usage.iter_mut().find(|total| total.admission_class == peer.admission_class) {
                 Some(total) => {
                     total.peer_rows = peer.peer_rows;
@@ -2216,10 +2181,9 @@ pub enum InboundVerdict {
     Immediate(GOATMessage),
     /// Forward without persistence, dispatch or ACK.
     Forward,
-    /// Persist for the inbox worker.
-    Enqueue { message: GOATMessage, class: P2pInboxAdmissionClass, content_hash: [u8; 32] },
-    /// The same sender already has this exact payload queued.
-    Duplicate(GOATMessage),
+    /// Record as an engine inbox event of its aggregate; the engine
+    /// deduplicates by content id.
+    Enqueue { message: GOATMessage, class: SenderClass },
 }
 
 /// Evaluate admission without swarm or chain access; propagate database errors.
@@ -2280,24 +2244,20 @@ pub async fn evaluate_inbound_message(
         return Ok(InboundVerdict::Forward);
     }
 
-    let content_hash = content_hash(data);
     let from_peer = source.to_string();
     let mut storage = local_db.acquire().await?;
-    if storage.has_queued_p2p_inbox_payload(&from_peer, &content_hash).await? {
-        return Ok(InboundVerdict::Duplicate(message));
-    }
     let usage = gates.usage_cache.usage(&mut storage, &from_peer, now).await?;
     if let Err(reason) = check_inbox_quota(class, data.len(), &usage, gates.limits) {
         return Ok(InboundVerdict::Drop(reason));
     }
     gates.usage_cache.note_admitted(class, data.len() as i64);
-    Ok(InboundVerdict::Enqueue { message, class, content_hash })
+    Ok(InboundVerdict::Enqueue { message, class })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::action::{ConfirmInstance, KickoffSent};
+    use crate::action::{AggNonceConsensus, InitGraph, sign_init_graph};
     use bitvm_lib::actors::Actor;
     use uuid::Uuid;
 
@@ -2311,13 +2271,8 @@ mod tests {
         unregistered_peer: Quota { rows: 2, bytes: 2000 },
     };
 
-    fn usage(
-        class: P2pInboxAdmissionClass,
-        rows: i64,
-        bytes: i64,
-        peer: (i64, i64),
-    ) -> P2pInboxClassUsage {
-        P2pInboxClassUsage {
+    fn usage(class: SenderClass, rows: i64, bytes: i64, peer: (i64, i64)) -> InboxClassUsage {
+        InboxClassUsage {
             admission_class: class.to_string(),
             rows,
             bytes,
@@ -2387,15 +2342,40 @@ mod tests {
         }
     }
 
-    /// A durable message every role stores.
-    async fn durable_bytes() -> Vec<u8> {
-        GOATMessage::new(
-            Actor::All,
-            GOATMessageContent::ConfirmInstance(ConfirmInstance { instance_id: Uuid::new_v4() }),
+    fn test_keypair(seed: u8) -> bitcoin::secp256k1::Keypair {
+        bitcoin::secp256k1::Keypair::from_secret_key(
+            &bitcoin::secp256k1::Secp256k1::new(),
+            &bitcoin::secp256k1::SecretKey::from_slice(&[seed; 32]).unwrap(),
         )
-        .serialize_message()
-        .await
-        .unwrap()
+    }
+
+    /// A committee round value: a durable message a committee node stores.
+    fn committee_vote() -> GOATMessage {
+        let keypair = test_keypair(7);
+        let digest = bitcoin::secp256k1::Message::from_digest([3; 32]);
+        GOATMessage::new(
+            Actor::Committee,
+            GOATMessageContent::AggNonceConsensus(AggNonceConsensus {
+                instance_id: Uuid::new_v4(),
+                graph_id: Uuid::new_v4(),
+                committee_pubkey: bitcoin::PublicKey::new(keypair.public_key()),
+                consensus_hash: [3; 32],
+                signature: bitcoin::secp256k1::Secp256k1::new().sign_schnorr(&digest, &keypair),
+            }),
+        )
+    }
+
+    /// A durable message a committee node stores (the tests run as Committee).
+    async fn durable_bytes() -> Vec<u8> {
+        committee_vote().serialize_message().await.unwrap()
+    }
+
+    /// An operator's recruitment: kept by verifiers, relayed by everyone else.
+    fn init_graph() -> GOATMessage {
+        let keypair = test_keypair(5);
+        let init: InitGraph =
+            sign_init_graph(Uuid::new_v4(), Uuid::new_v4(), &keypair, PeerId::random().to_bytes());
+        GOATMessage::new(Actor::Verifier, GOATMessageContent::InitGraph(init))
     }
 
     #[test]
@@ -2472,7 +2452,7 @@ mod tests {
 
     #[test]
     fn quota_is_charged_per_sender_per_class_and_globally() {
-        use P2pInboxAdmissionClass::{Registered, Unregistered};
+        use SenderClass::{Registered, Unregistered};
 
         assert_eq!(check_inbox_quota(Unregistered, 100, &[], &SMALL), Ok(()));
 
@@ -2526,7 +2506,7 @@ mod tests {
         let (verifier, member, stranger) = (PeerId::random(), PeerId::random(), PeerId::random());
 
         // Nothing is known yet: everyone is unregistered, and lookups are due.
-        assert_eq!(registry.sender_class(&member, now), P2pInboxAdmissionClass::Unregistered);
+        assert_eq!(registry.sender_class(&member, now), SenderClass::Unregistered);
         assert_eq!(
             registry.plan_refresh(Some(&member), now),
             RefreshPlan { verifier_set: true, committee_peer: true }
@@ -2540,11 +2520,11 @@ mod tests {
         registry.record_verifier_set(Some(vec![verifier.to_bytes()]), now);
         registry.record_committee_peer(&member, Some(true), now);
         assert!(registry.is_verifier(&verifier));
-        assert_eq!(registry.sender_class(&verifier, now), P2pInboxAdmissionClass::Registered);
-        assert_eq!(registry.sender_class(&member, now), P2pInboxAdmissionClass::Committee);
+        assert_eq!(registry.sender_class(&verifier, now), SenderClass::Registered);
+        assert_eq!(registry.sender_class(&member, now), SenderClass::Committee);
         assert!(registry.is_committee(&member, now));
         assert!(!registry.is_committee(&verifier, now), "registered, but not the committee");
-        assert_eq!(registry.sender_class(&stranger, now), P2pInboxAdmissionClass::Unregistered);
+        assert_eq!(registry.sender_class(&stranger, now), SenderClass::Unregistered);
         assert_eq!(
             registry.plan_refresh(Some(&verifier), now),
             RefreshPlan::default(),
@@ -2554,7 +2534,7 @@ mod tests {
         // Past its TTL the member is re-validated but keeps its class meanwhile.
         // The verifier set has aged out by then as well.
         let later = now + COMMITTEE_POSITIVE_TTL;
-        assert_eq!(registry.sender_class(&member, later), P2pInboxAdmissionClass::Committee);
+        assert_eq!(registry.sender_class(&member, later), SenderClass::Committee);
         assert_eq!(
             registry.plan_refresh(Some(&member), later),
             RefreshPlan { verifier_set: true, committee_peer: true }
@@ -2562,12 +2542,12 @@ mod tests {
         registry.record_committee_peer(&member, None, later);
         assert_eq!(
             registry.sender_class(&member, later),
-            P2pInboxAdmissionClass::Committee,
+            SenderClass::Committee,
             "a failed lookup leaves the cached answer in place"
         );
         assert_eq!(
             registry.sender_class(&member, now + COMMITTEE_STALE_LIMIT),
-            P2pInboxAdmissionClass::Unregistered,
+            SenderClass::Unregistered,
             "but it is not trusted forever"
         );
 
@@ -2643,7 +2623,7 @@ mod tests {
         registry.observe_operator_binding(&peer, pubkey, 1);
         assert_eq!(
             registry.sender_class(&peer, now),
-            P2pInboxAdmissionClass::Unregistered,
+            SenderClass::Unregistered,
             "a proven binding alone is not enough; stake is unconfirmed"
         );
         assert!(registry.plan_operator_refresh(&peer, pubkey, now));
@@ -2652,22 +2632,22 @@ mod tests {
             "a lookup already in flight is not started twice"
         );
         registry.record_operator_stake(&peer, pubkey, Some(true), now);
-        assert_eq!(registry.sender_class(&peer, now), P2pInboxAdmissionClass::Registered);
+        assert_eq!(registry.sender_class(&peer, now), SenderClass::Registered);
 
         // Verify one key registers only one peer.
         let new_peer = PeerId::random();
         registry.observe_operator_binding(&new_peer, pubkey, 2);
         registry.record_operator_stake(&new_peer, pubkey, Some(true), now);
-        assert_eq!(registry.sender_class(&new_peer, now), P2pInboxAdmissionClass::Registered);
+        assert_eq!(registry.sender_class(&new_peer, now), SenderClass::Registered);
         assert_eq!(
             registry.sender_class(&peer, now),
-            P2pInboxAdmissionClass::Unregistered,
+            SenderClass::Unregistered,
             "the superseded peer id loses the class"
         );
 
         // An older binding for a key already owned by another peer is ignored.
         registry.observe_operator_binding(&peer, pubkey, 1);
-        assert_eq!(registry.sender_class(&peer, now), P2pInboxAdmissionClass::Unregistered);
+        assert_eq!(registry.sender_class(&peer, now), SenderClass::Unregistered);
     }
 
     /// The rate budget rejects a flood before decode, charges every tier, and
@@ -2718,7 +2698,7 @@ mod tests {
         let limiter = InboundRateLimiter::new(limits);
         let now = Instant::now();
         let relay = PeerId::random();
-        use P2pInboxAdmissionClass::{Registered, Unregistered};
+        use SenderClass::{Registered, Unregistered};
 
         // One unregistered author is capped at its own 2 MiB byte burst.
         let a = PeerId::random();
@@ -2794,32 +2774,32 @@ mod tests {
 
         let first = durable_bytes().await;
         let verdict = gates.evaluate(&local_db, &limits, &source, 2, &first, now).await;
-        let InboundVerdict::Enqueue { class, content_hash, .. } = verdict else {
+        let InboundVerdict::Enqueue { class, .. } = verdict else {
             panic!("an empty inbox admits the first message");
         };
-        assert_eq!(class, P2pInboxAdmissionClass::Unregistered);
+        assert_eq!(class, SenderClass::Unregistered);
+        // What admission recorded: a queued network event of this author.
         let mut storage = local_db.acquire().await.unwrap();
         storage
-            .insert_p2p_inbox_message(&store::P2pInboxMessage {
-                message_id: "first".to_string(),
-                actor: "Committee".to_string(),
-                from_peer: source.to_string(),
-                msg_type: "ConfirmInstance".to_string(),
-                content: first.clone(),
-                content_size: first.len() as i64,
-                admission_class: class.to_string(),
-                content_hash: Some(content_hash.to_vec()),
-                ..Default::default()
-            })
+            .insert_engine_inbox_event(
+                &store::NewEngineInboxEvent {
+                    event_id: "first".to_string(),
+                    aggregate_kind: "graph".to_string(),
+                    aggregate_id: "g".to_string(),
+                    kind: "AggNonceConsensus".to_string(),
+                    source: "network".to_string(),
+                    author: source.to_string(),
+                    admission_class: class.to_string(),
+                    payload: first.clone(),
+                    ack: None,
+                },
+                1,
+            )
             .await
             .unwrap();
         drop(storage);
 
-        // Verify duplicate detection precedes quota enforcement.
-        let verdict = gates.evaluate(&local_db, &limits, &source, 3, &first, now).await;
-        assert!(matches!(verdict, InboundVerdict::Duplicate(_)));
-
-        // A different payload from the same sender is over its row quota ...
+        // Another payload from the same sender is over its row quota ...
         let second = durable_bytes().await;
         let verdict = gates.evaluate(&local_db, &limits, &source, 4, &second, now).await;
         assert!(matches!(verdict, InboundVerdict::Drop(DropReason::SenderQuota)));
@@ -2827,10 +2807,7 @@ mod tests {
         // ... unless the sender turns out to be registered.
         gates.registry.record_committee_peer(&source, Some(true), now);
         let verdict = gates.evaluate(&local_db, &limits, &source, 5, &second, now).await;
-        assert!(matches!(
-            verdict,
-            InboundVerdict::Enqueue { class: P2pInboxAdmissionClass::Committee, .. }
-        ));
+        assert!(matches!(verdict, InboundVerdict::Enqueue { class: SenderClass::Committee, .. }));
     }
 
     /// Verify replay neither passes admission nor consumes rate budget.
@@ -2904,10 +2881,10 @@ mod tests {
         registry.observe_operator_binding(&peer, pubkey, 100);
         assert!(registry.plan_operator_refresh(&peer, pubkey, now));
         assert_eq!(registry.record_operator_stake(&peer, pubkey, Some(true), now), Some(true));
-        assert_eq!(registry.sender_class(&peer, now), P2pInboxAdmissionClass::Registered);
+        assert_eq!(registry.sender_class(&peer, now), SenderClass::Registered);
 
         registry.observe_operator_binding(&peer, pubkey, 400);
-        assert_eq!(registry.sender_class(&peer, now), P2pInboxAdmissionClass::Registered);
+        assert_eq!(registry.sender_class(&peer, now), SenderClass::Registered);
         assert!(
             !registry.plan_operator_refresh(&peer, pubkey, now),
             "the verdict is still fresh, so no lookup is due"
@@ -2916,7 +2893,7 @@ mod tests {
         // Keep the newest binding timestamp.
         let usurper = PeerId::random();
         registry.observe_operator_binding(&usurper, pubkey, 300);
-        assert_eq!(registry.sender_class(&peer, now), P2pInboxAdmissionClass::Registered);
+        assert_eq!(registry.sender_class(&peer, now), SenderClass::Registered);
         assert!(!registry.plan_operator_refresh(&usurper, pubkey, now));
 
         // Every definite verdict is handed back for persisting, changed or not.
@@ -2977,8 +2954,8 @@ mod tests {
         let (member, operator) = (PeerId::random(), PeerId::random());
         registry.seed_verified_committee_peer(&member, now);
         registry.seed_verified_operator(&operator, &key(0), 1, now);
-        assert_eq!(registry.sender_class(&member, now), P2pInboxAdmissionClass::Committee);
-        assert_eq!(registry.sender_class(&operator, now), P2pInboxAdmissionClass::Registered);
+        assert_eq!(registry.sender_class(&member, now), SenderClass::Committee);
+        assert_eq!(registry.sender_class(&operator, now), SenderClass::Registered);
 
         // Spend both discovery budgets on strangers.
         registry.record_verifier_set(Some(vec![]), now);
@@ -3000,7 +2977,7 @@ mod tests {
         );
         // Revoke restored registrations after a negative chain answer.
         assert_eq!(registry.record_committee_peer(&member, Some(false), now), Some(false));
-        assert_eq!(registry.sender_class(&member, now), P2pInboxAdmissionClass::Unregistered);
+        assert_eq!(registry.sender_class(&member, now), SenderClass::Unregistered);
     }
 
     /// A flood of fresh identities must neither grow the bucket table nor evict
@@ -3022,7 +2999,7 @@ mod tests {
         });
         let now = Instant::now();
         let relay = PeerId::random();
-        use P2pInboxAdmissionClass::{Registered, Unregistered};
+        use SenderClass::{Registered, Unregistered};
 
         for _ in 0..4 {
             assert!(limiter.charge(&relay, &PeerId::random(), Unregistered, 1, now).is_ok());
@@ -3108,13 +3085,7 @@ mod tests {
 
         // A small message wrapped in the binary envelope: well-formed, but it
         // is not the payload the envelope exists for.
-        let message = GOATMessage::new(
-            Actor::Committee,
-            GOATMessageContent::KickoffSent(KickoffSent {
-                instance_id: Uuid::new_v4(),
-                graph_id: Uuid::new_v4(),
-            }),
-        );
+        let message = committee_vote();
         let mut wrapped = b"GOATBIN1".to_vec();
         wrapped.extend(bincode::serialize(&message).unwrap());
 
@@ -3280,9 +3251,9 @@ mod tests {
         }
         let seeded = seed_registry_from_store(&local_db, &registry, &bindings, now).await.unwrap();
         assert_eq!(seeded, 2, "the kept operator and the committee member");
-        assert_eq!(registry.sender_class(&kept, now), P2pInboxAdmissionClass::Registered);
-        assert_eq!(registry.sender_class(&member, now), P2pInboxAdmissionClass::Committee);
-        assert_eq!(registry.sender_class(&rebound, now), P2pInboxAdmissionClass::Unregistered);
+        assert_eq!(registry.sender_class(&kept, now), SenderClass::Registered);
+        assert_eq!(registry.sender_class(&member, now), SenderClass::Committee);
+        assert_eq!(registry.sender_class(&rebound, now), SenderClass::Unregistered);
 
         // The revocation a re-binding triggers removes the stored row.
         revoke_persisted_operator(&local_db, &rebound).await;
@@ -3292,7 +3263,7 @@ mod tests {
 
     #[test]
     fn committee_reserve_is_closed_to_other_senders() {
-        use P2pInboxAdmissionClass::{Committee, Registered, Unregistered};
+        use SenderClass::{Committee, Registered, Unregistered};
         let limits = InboundLimits { committee_reserve: Quota { rows: 2, bytes: 2000 }, ..SMALL };
 
         // Four rows from staked operators fill everything outside the reserve.
@@ -3474,25 +3445,17 @@ mod tests {
     /// takes no inbox row and no quota.
     #[tokio::test]
     async fn messages_for_another_role_are_forwarded_without_being_stored() {
-        use crate::action::PostReady;
-
         let local_db = store::create_local_db("sqlite::memory:").await;
         let mut gates = TestGates::new(PeerRateLimiter::new(10.0, 1.0, 16));
         let now = Instant::now();
         let source = PeerId::random();
-        let post_ready = GOATMessage::new(
-            Actor::Committee,
-            GOATMessageContent::PostReady(PostReady { instance_id: Uuid::new_v4() }),
-        )
-        .serialize_message()
-        .await
-        .unwrap();
+        let vote = durable_bytes().await;
 
         gates.local_actor = Actor::Verifier;
-        let verdict = gates.evaluate(&local_db, &SMALL, &source, 1, &post_ready, now).await;
+        let verdict = gates.evaluate(&local_db, &SMALL, &source, 1, &vote, now).await;
         assert!(matches!(verdict, InboundVerdict::Forward), "a verifier node has no handler");
         gates.local_actor = Actor::Committee;
-        let verdict = gates.evaluate(&local_db, &SMALL, &source, 2, &post_ready, now).await;
+        let verdict = gates.evaluate(&local_db, &SMALL, &source, 2, &vote, now).await;
         assert!(matches!(verdict, InboundVerdict::Enqueue { .. }));
     }
 
@@ -3528,7 +3491,6 @@ mod tests {
         assert!(MessageKind::InitGraph.handled_by(&Actor::Verifier));
         assert!(!MessageKind::InitGraph.handled_by(&Actor::Committee));
         assert!(MessageKind::GraphFinalize.handled_by(&Actor::Watchtower));
-        assert!(!MessageKind::KickoffSent.handled_by(&Actor::Committee));
     }
 
     /// Verify committee-only reserves in shared rate tiers.
@@ -3549,7 +3511,7 @@ mod tests {
         });
         let now = Instant::now();
         let relay = PeerId::random();
-        use P2pInboxAdmissionClass::{Committee, Registered, Unregistered};
+        use SenderClass::{Committee, Registered, Unregistered};
 
         // Six of eight messages are open to everyone ...
         for _ in 0..6 {
@@ -3576,9 +3538,8 @@ mod tests {
     /// Verify unregistered forward-only traffic is rate-limited.
     #[tokio::test]
     async fn forwarding_for_unregistered_authors_is_budgeted() {
-        use crate::action::NackReady;
-
         let local_db = store::create_local_db("sqlite::memory:").await;
+        // A committee node relays the operator's recruitment to verifiers.
         let mut gates = TestGates::new(PeerRateLimiter::new(10.0, 1.0, 16));
         let tier = TierRate { msg_burst: 2, msg_per_sec: 0, byte_burst: 1 << 20, byte_per_sec: 0 };
         gates.rate_limiter = InboundRateLimiter::new(RateLimits {
@@ -3586,21 +3547,15 @@ mod tests {
             ..RateLimits::defaults()
         });
         let now = Instant::now();
-        let nack_ready = |graph_id| {
-            GOATMessage::new(
-                Actor::Verifier,
-                GOATMessageContent::NackReady(NackReady { instance_id: Uuid::new_v4(), graph_id }),
-            )
-        };
 
         for sequence_number in 0..2 {
-            let data = nack_ready(Uuid::new_v4()).serialize_message().await.unwrap();
+            let data = init_graph().serialize_message().await.unwrap();
             let verdict = gates
                 .evaluate(&local_db, &SMALL, &PeerId::random(), sequence_number, &data, now)
                 .await;
             assert!(matches!(verdict, InboundVerdict::Forward));
         }
-        let data = nack_ready(Uuid::new_v4()).serialize_message().await.unwrap();
+        let data = init_graph().serialize_message().await.unwrap();
         let verdict = gates.evaluate(&local_db, &SMALL, &PeerId::random(), 9, &data, now).await;
         assert!(matches!(verdict, InboundVerdict::Drop(DropReason::ForwardRate)));
 
@@ -3619,7 +3574,7 @@ mod tests {
         assert_eq!(MessageKind::NonceGeneration.sender_role(), SenderRole::Committee);
         assert_eq!(MessageKind::GenCircuits.sender_role(), SenderRole::Verifier);
         assert_eq!(MessageKind::InitGraph.sender_role(), SenderRole::Operator);
-        assert_eq!(MessageKind::KickoffSent.sender_role(), SenderRole::Any);
+        assert_eq!(MessageKind::GraphFinalize.sender_role(), SenderRole::Any);
         // Keep the prefilter no stricter than handler authorization.
         assert_eq!(MessageKind::SolderingProofReady.sender_role(), SenderRole::Any);
 
@@ -3727,77 +3682,6 @@ mod tests {
         );
     }
 
-    /// Verify weighted rotation with persistent backlog and one dispatch per tick.
-    #[test]
-    fn rota_serves_every_class_across_ticks_when_each_tick_runs_one_message() {
-        use std::collections::VecDeque;
-
-        /// One tick as the worker runs it: list a batch by shares, then serve it
-        /// through the rota until the budget (in messages) is spent. The first
-        /// message always runs.
-        fn tick(schedule: &mut InboxSchedule, backlog: [usize; 3], budget: usize) -> Vec<usize> {
-            let shares = [8, 4, 4];
-            let mut queues: [VecDeque<usize>; 3] = Default::default();
-            for class in 0..3 {
-                queues[class].extend(std::iter::repeat_n(class, backlog[class].min(shares[class])));
-            }
-            let mut served = Vec::new();
-            loop {
-                if !served.is_empty() && served.len() >= budget {
-                    break;
-                }
-                let Some(class) = schedule.next(&mut queues) else {
-                    break;
-                };
-                served.push(class);
-            }
-            served
-        }
-
-        let mut schedule = InboxSchedule::default();
-        let mut served = [0usize; 3];
-        let mut last_served = [0usize; 3];
-        let mut longest_wait = [0usize; 3];
-        for tick_number in 1..=400 {
-            for class in tick(&mut schedule, [100, 100, 100], 1) {
-                served[class] += 1;
-                longest_wait[class] = longest_wait[class].max(tick_number - last_served[class]);
-                last_served[class] = tick_number;
-            }
-        }
-        assert_eq!(served, [200, 100, 100], "committee twice as often, nobody starved");
-        assert!(longest_wait.iter().all(|wait| *wait <= 4), "{longest_wait:?}");
-
-        // Compare against restarting rotation at each tick.
-        let mut served = [0usize; 3];
-        for _ in 0..400 {
-            for class in tick(&mut InboxSchedule::default(), [100, 100, 100], 1) {
-                served[class] += 1;
-            }
-        }
-        assert_eq!(served, [400, 0, 0]);
-
-        // A class with nothing to claim passes its turn on instead of wasting it.
-        let mut schedule = InboxSchedule::default();
-        let mut served = [0usize; 3];
-        for _ in 0..300 {
-            for class in tick(&mut schedule, [100, 0, 100], 1) {
-                served[class] += 1;
-            }
-        }
-        assert_eq!(served, [200, 0, 100]);
-
-        // With budget to spare a tick serves the batch interleaved, and the next
-        // tick picks up where this one stopped.
-        let mut schedule = InboxSchedule::default();
-        assert_eq!(tick(&mut schedule, [100, 100, 100], 6), [0, 1, 0, 2, 0, 1]);
-        assert_eq!(tick(&mut schedule, [100, 100, 100], 2), [0, 2]);
-        assert_eq!(InboxSchedule::queue_of("Committee"), SCHEDULE_COMMITTEE);
-        assert_eq!(InboxSchedule::queue_of("Registered"), SCHEDULE_REGISTERED);
-        assert_eq!(InboxSchedule::queue_of("Unregistered"), SCHEDULE_UNREGISTERED);
-        assert_eq!(InboxSchedule::queue_of(""), SCHEDULE_UNREGISTERED, "unclassified is untrusted");
-    }
-
     /// Verify configured bindings still require confirmed stake.
     #[test]
     fn trusted_operator_binding_needs_the_chain_but_not_the_budget() {
@@ -3827,7 +3711,7 @@ mod tests {
             due.len()
         );
         registry.record_operator_stake(&trusted, &trusted_key, Some(true), now);
-        assert_eq!(registry.sender_class(&trusted, now), P2pInboxAdmissionClass::Registered);
+        assert_eq!(registry.sender_class(&trusted, now), SenderClass::Registered);
 
         // The operator's own signed announcement later keeps the verdict ...
         registry.observe_operator_binding(&trusted, &trusted_key, 500);
