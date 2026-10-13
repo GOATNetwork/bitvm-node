@@ -16,7 +16,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteRow};
 use sqlx::types::Uuid;
 use sqlx::{Row, Sqlite, SqliteConnection, SqlitePool, Transaction, migrate::MigrateDatabase};
 use std::str::FromStr;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn get_current_timestamp_secs() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64
@@ -121,8 +121,22 @@ pub struct MessageQueueStats {
 }
 
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
+/// sqlx's own default, made explicit: how long a statement waits for SQLite's
+/// write lock before failing with "database is locked".
+pub const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
 impl LocalDB {
     pub async fn new(path: &str, is_mem: bool) -> LocalDB {
+        Self::new_with_busy_timeout(path, is_mem, DEFAULT_BUSY_TIMEOUT).await
+    }
+
+    /// `busy_timeout` must cover the longest write transaction the process
+    /// holds (the engine's apply), or every other writer fails while it runs.
+    pub async fn new_with_busy_timeout(
+        path: &str,
+        is_mem: bool,
+        busy_timeout: Duration,
+    ) -> LocalDB {
         if !Sqlite::database_exists(path).await.unwrap_or(false) {
             tracing::info!("Creating database {}", path);
             match Sqlite::create_database(path).await {
@@ -137,7 +151,10 @@ impl LocalDB {
             tracing::info!("Database already exists");
         }
 
-        let mut options = SqliteConnectOptions::from_str(path).unwrap().create_if_missing(true);
+        let mut options = SqliteConnectOptions::from_str(path)
+            .unwrap()
+            .create_if_missing(true)
+            .busy_timeout(busy_timeout);
         if !is_mem {
             // File-backed nodes run event watchers, P2P handlers, and maintenance tasks
             // concurrently. WAL allows their readers to proceed while a short write commits.
@@ -5160,7 +5177,14 @@ impl<'a> StorageProcessor<'a> {
 // }
 
 pub async fn create_local_db(db_path: &str) -> LocalDB {
-    let local_db = LocalDB::new(db_path, true).await;
+    create_local_db_with_busy_timeout(db_path, DEFAULT_BUSY_TIMEOUT).await
+}
+
+pub async fn create_local_db_with_busy_timeout(db_path: &str, busy_timeout: Duration) -> LocalDB {
+    // Only in-memory databases skip WAL; a file-backed node needs its readers
+    // to proceed while the engine holds the write lock.
+    let is_mem = db_path.contains(":memory:");
+    let local_db = LocalDB::new_with_busy_timeout(db_path, is_mem, busy_timeout).await;
     local_db.migrate().await;
     local_db
 }
