@@ -61,6 +61,7 @@ jobs:
           java -jar "$JAR" -config GraphLifecycleFixed.cfg GraphLifecycle.tla
           java -jar "$JAR" -config GraphLifecycleFineGrainedFixed.cfg GraphLifecycleFineGrainedFixed.tla
           java -jar "$JAR" -config InstancePresignedFixed.cfg InstancePresigned.tla
+          java -jar "$JAR" -config InstanceLifecycle.cfg InstanceLifecycle.tla
           java -jar "$JAR" -config Take2DisproveRace.cfg Take2DisproveRace.tla
           java -jar "$JAR" -config MultiActorRace.cfg MultiActorRace.tla
           java -jar "$JAR" -config InstanceBridgeOutRaceFixed.cfg InstanceBridgeOutRace.tla

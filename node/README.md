@@ -257,22 +257,27 @@ stateDiagram-v2
     UserInited --> NoEnoughCommitteesAnswered: Window timeout
     UserInited --> UserDiscarded: UTXO spent
 
-    CommitteesAnswered --> UserBroadcastPeginPrepare: User broadcasts
-    UserBroadcastPeginPrepare --> Presigned: All committees signed
-    UserBroadcastPeginPrepare --> PresignedFailed: Signing failed
+    CommitteesAnswered --> UserBroadcastPeginPrepare: Peg-In-Prepare confirmed
+    UserBroadcastPeginPrepare --> Presigned: Enough graphs finalized
+    UserBroadcastPeginPrepare --> UserDiscarded: Prepare reorged, UTXO spent
 
-    Presigned --> RelayerL1Broadcasted: Relayer broadcasts
+    Presigned --> RelayerL1Broadcasted: Peg-In-Confirm confirmed
+    UserBroadcastPeginPrepare --> RelayerL1Broadcasted: Peg-In-Confirm confirmed
     RelayerL1Broadcasted --> RelayerL2Minted: L2 minting success
-    RelayerL1Broadcasted --> RelayerL2MintedFailed: L2 minting failed
 
-    UserBroadcastPeginPrepare --> Timeout: Timeout
-    Timeout --> UserCanceled: User cancels
+    UserBroadcastPeginPrepare --> UserCanceled: Peg-In-Cancel confirmed
+    Presigned --> UserCanceled: Peg-In-Cancel confirmed
+    UserBroadcastPeginPrepare --> Timeout: Abandon height, Confirm not visible
+    Presigned --> Timeout: Abandon height, Confirm not visible
+    Timeout --> UserCanceled: Peg-In-Cancel confirmed
 
     RelayerL2Minted --> [*]
     UserCanceled --> [*]
+    UserDiscarded --> [*]
+    NoEnoughCommitteesAnswered --> [*]
 ```
 
-**Description**: This state diagram shows the complete lifecycle of a bridge-in instance, from initial request through committee validation, signing, and final minting on L2.
+**Description**: This state diagram shows the complete lifecycle of a bridge-in instance, from initial request through committee validation, signing, and final minting on L2. Every deadline is a Bitcoin height: from `Prepare height + connector_z` (T0) no node signs for the instance and the user may cancel; `PEGIN_ABANDON_BUFFER_BLOCKS` later the instance is abandoned (`Timeout`) unless the Peg-In-Confirm is confirmed or visible in the mempool. `Timeout` is a failure terminal that keeps the committee key for manual handling; the other failure states delete it (see `docs/node-protocol.md` §10.2).
 
 ### Peg-out (Bridge-Out)
 
