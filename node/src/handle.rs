@@ -8131,6 +8131,8 @@ mod tests {
                 instance_id,
                 status: GraphStatus::OperatorPresigned.to_string(),
                 definition_hash: "definition".to_owned(),
+                // One definition per (operator, nonce): the second row takes the next slot.
+                kickoff_index: 1,
                 ..Default::default()
             })
             .await

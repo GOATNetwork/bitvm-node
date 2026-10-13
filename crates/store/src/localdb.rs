@@ -1570,6 +1570,37 @@ impl<'a> StorageProcessor<'a> {
         .await?)
     }
 
+    /// Every open setup session of an instance (one per local operator).
+    pub async fn list_pending_graph_inits_by_instance(
+        &mut self,
+        instance_id: &Uuid,
+    ) -> anyhow::Result<Vec<PendingGraphInit>> {
+        Ok(sqlx::query_as::<_, PendingGraphInit>(
+            "SELECT instance_id, operator_pubkey, graph_id, created_at, updated_at
+             FROM pending_graph_init
+             WHERE instance_id = ?",
+        )
+        .bind(instance_id)
+        .fetch_all(self.conn())
+        .await?)
+    }
+
+    /// Every open setup session of an operator.
+    pub async fn list_pending_graph_inits_by_operator(
+        &mut self,
+        operator_pubkey: &str,
+    ) -> anyhow::Result<Vec<PendingGraphInit>> {
+        Ok(sqlx::query_as::<_, PendingGraphInit>(
+            "SELECT instance_id, operator_pubkey, graph_id, created_at, updated_at
+             FROM pending_graph_init
+             WHERE operator_pubkey = ?
+             ORDER BY created_at ASC, graph_id ASC",
+        )
+        .bind(operator_pubkey)
+        .fetch_all(self.conn())
+        .await?)
+    }
+
     pub async fn find_pending_graph_init_by_graph_id(
         &mut self,
         graph_id: &Uuid,
@@ -1831,6 +1862,22 @@ impl<'a> StorageProcessor<'a> {
         } else {
             GraphStatusTransitionOutcome::Rejected { current }
         })
+    }
+
+    /// The one graph an operator may hold in a slot.
+    pub async fn find_graph_by_operator_slot(
+        &mut self,
+        operator_pubkey: &str,
+        graph_nonce: i64,
+    ) -> anyhow::Result<Option<Graph>> {
+        let row = sqlx::query_as::<_, Graph>(
+            "SELECT * FROM graph WHERE operator_pubkey = ? AND kickoff_index = ?",
+        )
+        .bind(operator_pubkey)
+        .bind(graph_nonce)
+        .fetch_optional(self.conn())
+        .await?;
+        Ok(row)
     }
 
     pub async fn find_graph(&mut self, graph_id: &Uuid) -> anyhow::Result<Option<Graph>> {
@@ -5321,7 +5368,7 @@ mod tests {
         .await
         .unwrap();
         sqlx::query(
-            "INSERT INTO graph (graph_id, instance_id, status, created_at, updated_at) VALUES ('graph-1', 'in-1', 'Created', 40, 40), ('graph-2', 'in-2', 'Created', 25, 25)",
+            "INSERT INTO graph (graph_id, instance_id, status, kickoff_index, created_at, updated_at) VALUES ('graph-1', 'in-1', 'Created', 0, 40, 40), ('graph-2', 'in-2', 'Created', 1, 25, 25)",
         )
         .execute(s.conn())
         .await

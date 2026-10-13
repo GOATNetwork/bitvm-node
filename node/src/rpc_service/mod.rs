@@ -1031,7 +1031,8 @@ mod tests {
         graphs.push(Graph {
             graph_id: finalized_graph_id,
             instance_id: bridge_in_instance_id,
-            kickoff_index: 0,
+            // One definition per (operator, nonce): the second fixture takes the next slot.
+            kickoff_index: 1,
             from_addr: graph_from.clone(),
             to_addr: graph_to.clone(),
             amount: bridge_in_amount,

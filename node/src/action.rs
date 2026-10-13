@@ -4103,6 +4103,9 @@ mod tests {
         )
     }
 
+    /// Every test graph takes its own operator slot (`(operator, nonce)` is unique).
+    static NEXT_SLOT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
     async fn store_graph_row(db: &LocalDB, instance_id: Uuid, graph_id: Uuid, status: GraphStatus) {
         let mut storage = db.acquire().await.unwrap();
         storage
@@ -4111,6 +4114,7 @@ mod tests {
                 instance_id,
                 status: GraphStatus::OperatorPresigned.to_string(),
                 definition_hash: "definition".to_owned(),
+                kickoff_index: NEXT_SLOT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                 ..Default::default()
             })
             .await
