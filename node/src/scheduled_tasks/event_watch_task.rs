@@ -1,3 +1,4 @@
+use crate::aggregates::graph::graph_posted_event;
 use crate::aggregates::instance::l2_minted_event;
 use crate::engine_bridge::record_event_in;
 use crate::env;
@@ -1060,6 +1061,9 @@ async fn handle_post_graph_data_events<'a>(
                     GraphStatus::OperatorDataPushed,
                 )
                 .await?;
+                // Posted: the Graph aggregate closes every delivery of the graph.
+                record_event_in(storage_processor, graph_posted_event(instance_id, graph_id)?)
+                    .await?;
             }
             _ => warn!("failed to parse graph event identifiers: {event:?}"),
         }

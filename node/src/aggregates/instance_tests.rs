@@ -14,7 +14,10 @@ use indexmap::IndexMap;
 use std::sync::Arc;
 use std::time::Duration;
 use store::localdb::LocalDB;
-use store::{Graph, GraphStatus, Instance, InstanceBridgeInStatus, NewEngineOutboxMessage};
+use store::{
+    Graph, GraphStatus, Instance, InstanceBridgeInStatus, NewEngineInboxEvent, NewEngineJob,
+    NewEngineOutboxMessage,
+};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -50,6 +53,18 @@ impl JobRunner for StubPost {
     }
 }
 
+struct StubStartPeginConfirm;
+
+#[async_trait]
+impl JobRunner for StubStartPeginConfirm {
+    async fn run(&self, _ctx: JobContext) -> JobOutcome {
+        JobOutcome::Done(b"started".to_vec())
+    }
+}
+
+/// Every test graph takes its own operator slot (`(operator, nonce)` is unique).
+static NEXT_SLOT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
 fn fast_config() -> EngineConfig {
     EngineConfig {
         worker_count: 1,
@@ -64,9 +79,6 @@ fn fast_config() -> EngineConfig {
         ..EngineConfig::default()
     }
 }
-
-/// Every test graph takes its own operator slot (`(operator, nonce)` is unique).
-static NEXT_SLOT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
 async fn start(actor: Actor, relayer: bool, key_delete_enabled: bool) -> Harness {
     let dir = tempfile::tempdir().unwrap();
@@ -85,6 +97,7 @@ async fn start(actor: Actor, relayer: bool, key_delete_enabled: bool) -> Harness
         )
         .job_runner(INSTANCE_KIND, JOB_DELETE_INSTANCE_KEY, Arc::new(StubKeyDelete))
         .job_runner(INSTANCE_KIND, JOB_POST_PEGIN_DATA, Arc::new(StubPost))
+        .job_runner(INSTANCE_KIND, JOB_START_PEGIN_CONFIRM, Arc::new(StubStartPeginConfirm))
         .build();
     let handle = engine.handle();
     let cancel = CancellationToken::new();
@@ -168,6 +181,83 @@ impl Harness {
 
     async fn submit(&self, event: NewEvent) {
         self.handle.submit(event).await.unwrap();
+    }
+
+    /// A setup session of the operator's graph that has no row yet, with an
+    /// open delivery and a pending job of that graph.
+    async fn insert_pending_session(&self, instance_id: Uuid, graph_id: Uuid) -> (String, String) {
+        use crate::aggregates::graph::GRAPH_KIND;
+        let mut storage = self.db.acquire().await.unwrap();
+        storage.upsert_pending_graph_init(&instance_id, "operator", &graph_id).await.unwrap();
+        let outbox_id = format!("graph:{graph_id}:InitGraph");
+        storage
+            .insert_engine_outbox_message(
+                &NewEngineOutboxMessage {
+                    outbox_id: outbox_id.clone(),
+                    aggregate_kind: GRAPH_KIND.to_string(),
+                    aggregate_id: graph_id.to_string(),
+                    phase_ref: "Setup".to_string(),
+                    kind: "InitGraph".to_string(),
+                    topic: "topic".to_string(),
+                    payload: b"init".to_vec(),
+                    ack_set: None,
+                    first_at: 1,
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        let job_id = format!("job:{graph_id}");
+        let far = crate::rpc_service::current_time_secs() + 3_600;
+        storage
+            .insert_engine_job(
+                &NewEngineJob {
+                    job_id: job_id.clone(),
+                    aggregate_kind: GRAPH_KIND.to_string(),
+                    aggregate_id: graph_id.to_string(),
+                    phase: "graph".to_string(),
+                    action: "freeze_candidates".to_string(),
+                    pool: "Network".to_string(),
+                    params: Vec::new(),
+                    deadline_at: None,
+                    first_at: far,
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        (outbox_id, job_id)
+    }
+
+    /// An instance event of a missing instance, parked on `wake_ref` as a
+    /// waiting start would be; once woken it re-parks on its own ref.
+    async fn insert_parked_event(&self, wake_ref: &str) -> String {
+        let event_id = format!("parked:{}", Uuid::new_v4());
+        let now = crate::rpc_service::current_time_secs();
+        let mut storage = self.db.acquire().await.unwrap();
+        storage
+            .insert_engine_inbox_event(
+                &NewEngineInboxEvent {
+                    event_id: event_id.clone(),
+                    aggregate_kind: INSTANCE_KIND.to_string(),
+                    aggregate_id: Uuid::new_v4().to_string(),
+                    kind: EVENT_L2_MINTED.to_string(),
+                    source: "local".to_string(),
+                    author: String::new(),
+                    payload: Vec::new(),
+                    ack: None,
+                },
+                now,
+            )
+            .await
+            .unwrap();
+        assert!(
+            storage
+                .mark_engine_inbox_waiting(&event_id, wake_ref, "test", now + 3_600, now)
+                .await
+                .unwrap()
+        );
+        event_id
     }
 
     async fn waiting_ref(&self, event_id: &str) -> Option<String> {
@@ -570,5 +660,44 @@ async fn a_missing_instance_row_parks_the_event_until_it_exists() {
     t.insert(&instance).await;
     t.handle.notify(&[instance_ref(id).wake_ref()]).await.unwrap();
     t.wait_status(id, UserCanceled).await;
+    t.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_instance_releases_its_pending_setup_session() {
+    use InstanceBridgeInStatus::*;
+    let t = start(Actor::Operator, false, false).await;
+    let id = t.insert(&instance_row(CommitteesAnswered, 0)).await;
+    let graph_id = Uuid::new_v4();
+    let (outbox_id, job_id) = t.insert_pending_session(id, graph_id).await;
+    // The next start of this operator waits on the slot the session is taking.
+    let slot = crate::aggregates::graph::slot_ref("operator", 0);
+    let parked = t.insert_parked_event(&slot).await;
+    assert_eq!(t.waiting_ref(&parked).await.as_deref(), Some(slot.as_str()));
+
+    let mut snapshot = at(10, CommitteesAnswered);
+    snapshot.inputs_available = Some(false);
+    t.snapshot(id, snapshot).await;
+    t.wait_status(id, UserDiscarded).await;
+
+    // The session is gone with its delivery and job, and the slot is released:
+    // the parked event was woken, re-applied, and parked on its own ref.
+    assert!(
+        t.db.acquire()
+            .await
+            .unwrap()
+            .find_pending_graph_init_by_graph_id(&graph_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(t.outbox_state(&outbox_id).await, "Closed");
+    let job = t.db.acquire().await.unwrap().find_engine_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(job.state, "Cancelled");
+    wait_for(|| async {
+        let woken = t.waiting_ref(&parked).await;
+        (woken.as_deref() != Some(slot.as_str())).then_some(())
+    })
+    .await;
     t.stop().await;
 }

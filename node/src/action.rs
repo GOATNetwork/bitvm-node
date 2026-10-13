@@ -2,26 +2,22 @@
 #![allow(clippy::single_match)]
 #![allow(clippy::collapsible_else_if)]
 
-use crate::env::{
-    MESSAGE_EXPIRE_TIME, get_p2p_graph_setup_retry_interval_secs,
-    get_p2p_graph_setup_retry_window_secs, get_p2p_inbox_batch_size,
-};
-use crate::handle::{
-    HandlerContext, HeavyTaskContext, dispatch as handle_dispatch, heavy_task_from_content,
-    run_heavy_task,
-};
+use crate::aggregates::graph::{graph_pull_event, inbound_event};
+use crate::aggregates::graph_fetch::GraphLookup;
+use crate::env::{MESSAGE_EXPIRE_TIME, get_p2p_inbox_batch_size};
+use crate::handle::{HandlerContext, dispatch as handle_dispatch};
 use crate::metrics_service::MetricsState;
 use crate::middleware::AllBehaviours;
 use crate::middleware::publisher::MessagePublisher;
 use crate::rpc_service::current_time_secs;
 use crate::utils::*;
 use alloy::primitives::Address as EvmAddress;
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use bitcoin::{PublicKey, Txid, XOnlyPublicKey};
 use bitvm_lib::actors::Actor;
 use bitvm_lib::babe_adapter::{BabeBundleBuilder, CACSetupPackage};
 use bitvm_lib::committee::*;
-use bitvm_lib::types::{BitvmGcGraph, SimplifiedBitvmGcGraph};
+use bitvm_lib::types::SimplifiedBitvmGcGraph;
 use client::goat_chain::DisproveTxType;
 use client::http_client::async_client::HttpAsyncClient;
 use client::{
@@ -40,10 +36,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt;
 use std::str::FromStr;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use store::localdb::LocalDB;
-use store::{Graph, GraphStatus, InstanceBridgeInStatus, MessageState, P2pInboxMessage};
+use store::{InstanceBridgeInStatus, MessageState, P2pInboxMessage};
 use strum::{Display, EnumDiscriminants, EnumIter, EnumString, IntoStaticStr};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -57,7 +53,6 @@ pub struct GOATMessage {
 const GOAT_MESSAGE_BIN_PREFIX: &[u8] = b"GOATBIN1";
 const TRANSIENT_PEGIN_RETRY_DELAY_SECS: usize = 30;
 const P2P_INBOX_LEASE_SECS: i64 = 5 * 60;
-const P2P_INBOX_LEASE_RENEW_INTERVAL_SECS: u64 = 60;
 const P2P_INBOX_ENQUEUE_ATTEMPTS: usize = 3;
 
 /// Budget for claims that never reported an outcome. Small on purpose: reaching
@@ -233,62 +228,6 @@ fn log_queue_bookkeeping_failure(
 pub enum P2PMessageDelivery {
     Inbox,
     Immediate,
-}
-
-struct ActiveHeavyTask {
-    message_id: String,
-    lease_token: String,
-}
-
-static ACTIVE_HEAVY_TASK: LazyLock<Mutex<Option<ActiveHeavyTask>>> =
-    LazyLock::new(|| Mutex::new(None));
-
-struct HeavyTaskPermit {
-    message_id: String,
-    lease_token: String,
-}
-
-/// Ensure a panicking background task cannot leave its detached lease renewer
-/// running forever. Once renewal stops, the durable row becomes claimable and
-/// the unfinished execution is counted as an abandon.
-struct LeaseRenewalGuard(CancellationToken);
-
-impl Drop for LeaseRenewalGuard {
-    fn drop(&mut self) {
-        self.0.cancel();
-    }
-}
-
-impl Drop for HeavyTaskPermit {
-    fn drop(&mut self) {
-        if let Ok(mut active) = ACTIVE_HEAVY_TASK.lock()
-            && active.as_ref().is_some_and(|active| {
-                active.message_id == self.message_id && active.lease_token == self.lease_token
-            })
-        {
-            *active = None;
-        }
-    }
-}
-
-fn active_heavy_task_message_ids() -> Vec<String> {
-    ACTIVE_HEAVY_TASK
-        .lock()
-        .ok()
-        .and_then(|active| active.as_ref().map(|active| vec![active.message_id.clone()]))
-        .unwrap_or_default()
-}
-
-fn try_acquire_heavy_task_permit(message_id: &str, lease_token: &str) -> Option<HeavyTaskPermit> {
-    let mut active = ACTIVE_HEAVY_TASK.lock().ok()?;
-    if active.is_some() {
-        return None;
-    }
-    *active = Some(ActiveHeavyTask {
-        message_id: message_id.to_owned(),
-        lease_token: lease_token.to_owned(),
-    });
-    Some(HeavyTaskPermit { message_id: message_id.to_owned(), lease_token: lease_token.to_owned() })
 }
 
 /// Stable retry categories shared by P2P inbox consumers and protocol
@@ -618,10 +557,6 @@ pub enum GOATMessageContent {
     RequestNodeInfo(NodeInfo),
     #[business_ref(unscoped)]
     ResponseNodeInfo(NodeInfo),
-    #[business_ref(graph)]
-    SyncGraphRequest(SyncGraphRequest),
-    #[business_ref(graph)]
-    SyncGraph(SyncGraph),
     #[business_ref(unscoped)]
     InstanceDiscarded(InstanceDiscarded),
     #[business_ref(unscoped)]
@@ -654,7 +589,8 @@ impl MessageKind {
 }
 
 impl MessageKind {
-    /// Receiver roles handled by `dispatch` and `heavy_task_from_content`.
+    /// Receiver roles handled by `dispatch` or, for the graph-phase kinds, by
+    /// the Graph aggregate (`aggregates::graph::route_action`).
     pub fn handled_by(self, actor: &Actor) -> bool {
         use Actor::{Committee, Operator, Verifier, Watchtower};
         match self {
@@ -662,7 +598,6 @@ impl MessageKind {
             Self::PeginRequest
             | Self::ConfirmInstance
             | Self::GraphSetupAck
-            | Self::GraphFinalize
             | Self::KickoffSent
             | Self::PreKickoffSent
             | Self::ChallengeSent
@@ -671,23 +606,27 @@ impl MessageKind {
             | Self::Take2Sent
             | Self::RequestNodeInfo
             | Self::ResponseNodeInfo
-            | Self::SyncGraph
             // Not dispatched through the role table; keep them as they are.
             | Self::InstanceDiscarded
             | Self::Tick => true,
-            Self::InitGraph | Self::CutCircuits => matches!(actor, Verifier),
-            Self::CreateGraph => matches!(actor, Verifier | Committee),
-            Self::GenCircuits | Self::SolderingProofReady | Self::EndorseGraph => {
-                matches!(actor, Operator)
-            }
-            Self::NonceGeneration | Self::CommitteePresign => matches!(actor, Committee | Operator),
-            Self::VerifierGraphParamsEndorsement
+            Self::InitGraph
+            | Self::GenCircuits
+            | Self::CutCircuits
+            | Self::SolderingProofReady
+            | Self::CreateGraph
+            | Self::VerifierGraphParamsEndorsement
+            | Self::NonceGeneration
             | Self::AggNonceConsensus
-            | Self::PeginConfirmNonce
+            | Self::CommitteePresign
+            | Self::EndorseGraph
+            | Self::GraphFinalize => {
+                let kind: &'static str = self.into();
+                crate::aggregates::graph::engine_handles(kind, actor)
+            }
+            Self::PeginConfirmNonce
             | Self::PeginConfirmNonceConsensus
             | Self::PeginConfirmPartialSig
-            | Self::PostReady
-            | Self::SyncGraphRequest => matches!(actor, Committee),
+            | Self::PostReady => matches!(actor, Committee),
             Self::KickoffReady
             | Self::WatchtowerChallengeSent
             | Self::WatchtowerChallengeTimeout
@@ -716,8 +655,7 @@ impl MessageKind {
             | Self::EndorseGraph
             | Self::PeginConfirmNonce
             | Self::PeginConfirmNonceConsensus
-            | Self::PeginConfirmPartialSig
-            | Self::SyncGraph => SenderRole::Committee,
+            | Self::PeginConfirmPartialSig => SenderRole::Committee,
             Self::GenCircuits | Self::VerifierGraphParamsEndorsement => SenderRole::Verifier,
             Self::InitGraph => SenderRole::Operator,
             _ => SenderRole::Any,
@@ -872,143 +810,6 @@ pub struct GraphSetupAck {
     pub delivery_id: String,
 }
 
-fn graph_setup_payload_hash(payload: &[u8]) -> [u8; 32] {
-    Sha256::digest(payload).into()
-}
-
-fn graph_setup_delivery_id(
-    sender_peer_id: &str,
-    recipient_peer_id: &str,
-    payload_hash: &[u8; 32],
-) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(b"goat/graph-setup-delivery/v2");
-    for field in [sender_peer_id.as_bytes(), recipient_peer_id.as_bytes(), payload_hash.as_slice()]
-    {
-        hasher.update((field.len() as u64).to_be_bytes());
-        hasher.update(field);
-    }
-    format!("graph-setup-v2:{}", hex::encode(hasher.finalize()))
-}
-
-fn graph_setup_ack_required(content: &GOATMessageContent) -> bool {
-    matches!(
-        content,
-        GOATMessageContent::GenCircuits(_)
-            | GOATMessageContent::CutCircuits(_)
-            | GOATMessageContent::SolderingProofReady(_)
-            | GOATMessageContent::CreateGraph(_)
-    )
-}
-
-pub fn graph_setup_outbox_id(
-    content: &GOATMessageContent,
-    ack_peer_id: Option<&str>,
-) -> Option<String> {
-    match content {
-        GOATMessageContent::InitGraph(message) => Some(format!("init-graph:{}", message.graph_id)),
-        GOATMessageContent::GenCircuits(message) => Some(format!(
-            "gen-circuits:{}:{}:{}",
-            message.instance_id, message.graph_id, message.verifier_pubkey
-        )),
-        GOATMessageContent::CutCircuits(message) => Some(format!(
-            "cut-circuits:{}:{}:{}",
-            message.instance_id, message.graph_id, message.verifier_pubkey
-        )),
-        GOATMessageContent::SolderingProofReady(message) => Some(format!(
-            "soldering-proof-ready:{}:{}:{}",
-            message.graph_id,
-            message.candidate_index,
-            hex::encode(message.payload_hash),
-        )),
-        GOATMessageContent::CreateGraph(message) => {
-            let id = format!("create-graph:{}", message.graph_id);
-            Some(match ack_peer_id.filter(|peer_id| !peer_id.is_empty()) {
-                Some(peer_id) => format!("{id}:{peer_id}"),
-                None => id,
-            })
-        }
-        _ => None,
-    }
-}
-
-fn graph_setup_delivery_finished(content: &GOATMessageContent, graph: Option<&Graph>) -> bool {
-    match content {
-        GOATMessageContent::CreateGraph(_) => graph.is_some_and(|graph| {
-            GraphStatus::from_str(&graph.status)
-                .is_ok_and(|status| status != GraphStatus::OperatorPresigned)
-        }),
-        _ => graph.is_some(),
-    }
-}
-
-fn graph_setup_ack(
-    content: &GOATMessageContent,
-    sender_peer_id: &PeerId,
-    payload: &[u8],
-) -> Option<GraphSetupAck> {
-    if !graph_setup_ack_required(content) {
-        return None;
-    }
-    // Bind to the authenticated gossip author, never an identity from the payload.
-    let sender_peer_id = sender_peer_id.to_string();
-    let recipient_peer_id = crate::env::get_peer_id();
-    let payload_hash = graph_setup_payload_hash(payload);
-    Some(GraphSetupAck {
-        delivery_id: graph_setup_delivery_id(&sender_peer_id, &recipient_peer_id, &payload_hash),
-    })
-}
-
-pub async fn enqueue_graph_setup_outbox_message(
-    local_db: &LocalDB,
-    message: GOATMessage,
-    ack_peer_id: Option<&str>,
-) -> Result<String> {
-    let sender_peer_id = crate::env::get_peer_id();
-    enqueue_graph_setup_outbox_message_from_peer(local_db, message, ack_peer_id, &sender_peer_id)
-        .await
-}
-
-pub(crate) async fn enqueue_graph_setup_outbox_message_from_peer(
-    local_db: &LocalDB,
-    message: GOATMessage,
-    ack_peer_id: Option<&str>,
-    sender: &str,
-) -> Result<String> {
-    let serialized = message.serialize_message().await?;
-    let recipient = if graph_setup_ack_required(&message.content) {
-        let ack_peer_id = ack_peer_id.context("graph setup ACK requires a recipient peer")?;
-        Some(
-            PeerId::from_str(ack_peer_id)
-                .context("invalid graph setup ACK recipient peer id")?
-                .to_string(),
-        )
-    } else {
-        None
-    };
-    let outbox_id = graph_setup_outbox_id(&message.content, recipient.as_deref())
-        .ok_or_else(|| anyhow!("not a graph setup message"))?;
-    let delivery_id = recipient.as_ref().map(|recipient| {
-        graph_setup_delivery_id(sender, recipient, &graph_setup_payload_hash(&serialized))
-    });
-    let now = current_time_secs();
-    local_db
-        .acquire()
-        .await?
-        .enqueue_p2p_outbox_retry_message(
-            &outbox_id,
-            delivery_id.as_deref(),
-            message.content.event_type(),
-            &serialized,
-            now + get_p2p_graph_setup_retry_window_secs(),
-            get_p2p_graph_setup_retry_interval_secs(),
-            recipient.as_deref(),
-            // Only the outbox ever sends these, so the row is due at once.
-            0,
-        )
-        .await?;
-    Ok(outbox_id)
-}
 #[derive(Serialize, Deserialize, Clone)]
 pub struct VerifierGraphParamsEndorsement {
     pub instance_id: Uuid,
@@ -1272,19 +1073,6 @@ pub fn verify_node_info_binding(node_info: &NodeInfo) -> Option<XOnlyPublicKey> 
 }
 
 #[derive(Serialize, Deserialize, Clone)]
-pub struct SyncGraphRequest {
-    pub instance_id: Uuid,
-    pub graph_id: Uuid,
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-pub struct SyncGraph {
-    pub instance_id: Uuid,
-    pub graph_id: Uuid,
-    pub graph: SimplifiedBitvmGcGraph,
-}
-
-#[derive(Serialize, Deserialize, Clone)]
 pub struct InstanceDiscarded {
     // (graph_id, instance_id, OperatorPubkey)
     pub graph_infos: Vec<(Uuid, Uuid, String)>,
@@ -1425,20 +1213,37 @@ pub async fn handle_inbound_p2p_message(
             refresh_peer_timestamp_throttled(local_db, from_peer_id, now).await;
             Ok(())
         }
-        // Persist durable messages before allowing forwarding.
+        // Persist durable messages before allowing forwarding: graph-phase
+        // messages as engine inbox events (the engine ACKs heavy ones once
+        // they are durably applied), the rest in the P2P inbox.
         InboundVerdict::Enqueue { message: decoded, class, content_hash } => {
-            if let Err(error) = enqueue_p2p_message(
-                local_db,
-                actor,
-                from_peer_id,
-                id.clone(),
-                message,
+            let persisted = match inbound_event(
+                &actor,
+                &from_peer_id.to_string(),
+                &crate::env::get_peer_id(),
                 &decoded,
-                class,
-                content_hash,
-            )
-            .await
-            {
+                message,
+            ) {
+                Ok(Some(event)) => {
+                    record_graph_message(local_db, event, &decoded, from_peer_id, message.len())
+                        .await
+                }
+                Ok(None) => {
+                    enqueue_p2p_message(
+                        local_db,
+                        actor,
+                        from_peer_id,
+                        id.clone(),
+                        message,
+                        &decoded,
+                        class,
+                        content_hash,
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            };
+            if let Err(error) = persisted {
                 report_gossip_validation(
                     swarm,
                     &id,
@@ -1450,16 +1255,14 @@ pub async fn handle_inbound_p2p_message(
             report_gossip_validation(swarm, &id, &propagation_source, MessageAcceptance::Accept);
             metrics_state.record_p2p_receive(true);
             refresh_peer_timestamp_throttled(local_db, from_peer_id, now).await;
-            maybe_send_graph_setup_ack(swarm, &decoded, from_peer_id, message, now).await;
             Ok(())
         }
-        // Forward duplicates with rate-limited ACKs and logs.
-        InboundVerdict::Duplicate(decoded) => {
+        // Forward duplicates with rate-limited logs.
+        InboundVerdict::Duplicate(_) => {
             report_gossip_validation(swarm, &id, &propagation_source, MessageAcceptance::Accept);
             metrics_state.record_p2p_receive(true);
             p2p_admission::record_drop(p2p_admission::DropReason::DuplicatePayload);
             refresh_peer_timestamp_throttled(local_db, from_peer_id, now).await;
-            maybe_send_graph_setup_ack(swarm, &decoded, from_peer_id, message, now).await;
             Ok(())
         }
         InboundVerdict::Immediate(decoded) => {
@@ -1483,7 +1286,7 @@ pub async fn handle_inbound_p2p_message(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn dispatch_immediate_message(
-    publisher: &mut dyn MessagePublisher,
+    publisher: &mut (dyn MessagePublisher + Sync),
     local_db: &LocalDB,
     btc_client: &Arc<BTCClient>,
     goat_client: &Arc<GOATClient>,
@@ -1572,31 +1375,34 @@ async fn refresh_peer_timestamp_throttled(local_db: &LocalDB, from_peer_id: Peer
     }
 }
 
-/// Rate-limit graph-setup ACKs by delivery identity (including both peers).
-async fn maybe_send_graph_setup_ack(
-    swarm: &mut dyn MessagePublisher,
+/// Record an admitted graph-phase message for its Graph aggregate. The
+/// engine deduplicates by content and ACKs a heavy message again when its
+/// material is already applied or parked.
+async fn record_graph_message(
+    local_db: &LocalDB,
+    event: engine::NewEvent,
     decoded: &GOATMessage,
     from_peer_id: PeerId,
-    payload: &[u8],
-    now: Instant,
-) {
-    let Some(ack) = graph_setup_ack(&decoded.content, &from_peer_id, payload) else {
-        return;
+    content_size: usize,
+) -> Result<()> {
+    let outcome = match crate::engine_bridge::engine_handle() {
+        Some(engine) => engine.submit(event).await.context("record inbound graph message")?,
+        None => {
+            crate::engine_bridge::submit_event(local_db, event)
+                .await
+                .context("record inbound graph message")?;
+            engine::SubmitOutcome::Inserted
+        }
     };
-    if !crate::p2p_admission::dedup_ack_gate().allow(&ack.delivery_id, now) {
-        return;
-    }
-    if let Err(error) =
-        send_to_peer(swarm, GOATMessage::new(Actor::All, GOATMessageContent::GraphSetupAck(ack)))
-            .await
-    {
-        tracing::debug!(
-            event = "p2p_graph_setup_ack",
-            outcome = "publish_failed",
-            error = %error,
-            "inbound graph-setup message remains durable; sender will retry"
-        );
-    }
+    tracing::info!(
+        event = "engine_inbox",
+        outcome = ?outcome,
+        message_type = decoded.content.event_type(),
+        from_peer_id = %from_peer_id,
+        content_size,
+        "received graph message"
+    );
+    Ok(())
 }
 
 /// Persist a decoded durable P2P message. Protocol work runs from the inbox on
@@ -2090,54 +1896,10 @@ pub async fn run_p2p_admission_maintenance(local_db: &LocalDB, goat_client: &Arc
     }
 }
 
-async fn renew_p2p_inbox_lease_until_cancelled(
-    local_db: LocalDB,
-    message_id: String,
-    lease_token: String,
-    cancellation: CancellationToken,
-) -> bool {
-    let mut interval =
-        tokio::time::interval(Duration::from_secs(P2P_INBOX_LEASE_RENEW_INTERVAL_SECS));
-    interval.tick().await;
-    loop {
-        tokio::select! {
-            _ = cancellation.cancelled() => return true,
-            _ = interval.tick() => {
-                let renewal = match local_db.acquire().await {
-                    Ok(mut storage) => storage
-                        .renew_p2p_inbox_lease(
-                            &message_id,
-                            &lease_token,
-                            current_time_secs() + P2P_INBOX_LEASE_SECS,
-                        )
-                        .await,
-                    Err(error) => Err(error),
-                };
-                match renewal {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        log_stale_p2p_inbox_lease(&message_id, &lease_token, "renew");
-                        return false;
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            event = "p2p_inbox",
-                            outcome = "lease_renew_failed",
-                            message_id,
-                            error = %error,
-                            "failed to renew P2P inbox lease; will retry before expiry"
-                        );
-                    }
-                }
-            }
-        }
-    }
-}
-
 /// Drain inbox batches until caught up or the message-start budget is exhausted.
 #[allow(clippy::too_many_arguments)]
 async fn handle_p2p_inbox_messages(
-    swarm: &mut dyn MessagePublisher,
+    swarm: &mut (dyn MessagePublisher + Sync),
     local_db: &LocalDB,
     btc_client: &Arc<BTCClient>,
     goat_client: &Arc<GOATClient>,
@@ -2205,7 +1967,7 @@ struct InboxBatch {
 /// List and dispatch one inbox batch.
 #[allow(clippy::too_many_arguments)]
 async fn drain_p2p_inbox_batch(
-    swarm: &mut dyn MessagePublisher,
+    swarm: &mut (dyn MessagePublisher + Sync),
     local_db: &LocalDB,
     btc_client: &Arc<BTCClient>,
     goat_client: &Arc<GOATClient>,
@@ -2219,7 +1981,6 @@ async fn drain_p2p_inbox_batch(
     deadline: Instant,
 ) -> Result<InboxBatch> {
     let now = current_time_secs();
-    let active_heavy_task_ids = active_heavy_task_message_ids();
     let mut storage = local_db.start_immediate_transaction().await?;
     let (mut quarantined, mut purged, mut expired, mut trimmed, mut capped) = (0, 0, 0, 0, 0);
     if housekeeping {
@@ -2257,7 +2018,7 @@ async fn drain_p2p_inbox_batch(
             (batch_size / P2P_INBOX_REGISTERED_BATCH_DIVISOR).max(1),
             (batch_size / P2P_INBOX_UNREGISTERED_BATCH_DIVISOR).max(1),
             QUEUE_MAX_ABANDONS,
-            &active_heavy_task_ids,
+            &[],
         )
         .await?;
     storage.commit().await?;
@@ -2346,146 +2107,6 @@ async fn drain_p2p_inbox_batch(
         };
         // After persistence, sender authorization belongs to the handler, not the admission cache.
         let fingerprint = DispatchFingerprint::of(decoded.content());
-        let heavy_task = heavy_task_from_content(decoded.content(), &actor);
-
-        if let Some(heavy_task) = heavy_task {
-            let local_db = local_db.clone();
-            let btc_client = Arc::clone(btc_client);
-            let goat_client = Arc::clone(goat_client);
-            let soldering_builder = soldering_builder.clone();
-            let metrics_state = metrics_state.clone();
-            let message_id = message.message_id.clone();
-            let lease_token = message.lease_token.clone();
-            let attempt_count = message.attempt_count;
-            let task_type = message.msg_type.clone();
-            let task_type_for_task = task_type.clone();
-            let task_kind = heavy_task.kind();
-            let graph_id = heavy_task.graph_id();
-            let Some(permit) = try_acquire_heavy_task_permit(&message_id, &lease_token) else {
-                let retry_after_secs = 5;
-                defer_p2p_inbox_without_aborting_batch(
-                    &local_db,
-                    &message_id,
-                    &lease_token,
-                    current_time_secs() + retry_after_secs,
-                    RetryableDispatchReason::ResourceLocked.code(),
-                )
-                .await;
-                tracing::debug!(
-                    event = "p2p_inbox",
-                    outcome = "deferred",
-                    reason = RetryableDispatchReason::ResourceLocked.code(),
-                    message_id,
-                    retry_after_secs,
-                    task_kind,
-                    "deferred heavy task while the worker is busy"
-                );
-                continue;
-            };
-            let shutdown = shutdown.clone();
-            tokio::spawn(async move {
-                let _permit = permit;
-                let lease_cancellation = CancellationToken::new();
-                let _lease_guard = LeaseRenewalGuard(lease_cancellation.clone());
-                let lease_renewal = tokio::spawn(renew_p2p_inbox_lease_until_cancelled(
-                    local_db.clone(),
-                    message_id.clone(),
-                    lease_token.clone(),
-                    lease_cancellation.clone(),
-                ));
-                let context = HeavyTaskContext {
-                    local_db: local_db.clone(),
-                    btc_client,
-                    goat_client,
-                    soldering_builder,
-                    metrics_state: metrics_state.clone(),
-                    from_peer_id,
-                };
-                // Set the inbox task-local context explicitly for the spawned heavy task.
-                let execution = supervise_dispatch(
-                    track_inbox_retry(fingerprint, run_heavy_task(&context, heavy_task)),
-                    &shutdown,
-                )
-                .await;
-                lease_cancellation.cancel();
-                let lease_is_current = match lease_renewal.await {
-                    Ok(lease_is_current) => lease_is_current,
-                    Err(error) => {
-                        tracing::error!(error = %error, message_id, "P2P inbox lease renewal task failed");
-                        false
-                    }
-                };
-                match execution {
-                    DispatchExecution::Completed(result) => {
-                        if !lease_is_current {
-                            return;
-                        }
-                        // Apply the same RPC retry classification as inline dispatch.
-                        let result = result.map_err(classify_retryable_dispatch_error);
-                        metrics_state.record_message_dispatch(
-                            &task_type_for_task,
-                            if result.is_ok() { "success" } else { "failed" },
-                        );
-                        if let Err(error) = finish_p2p_inbox_attempt(
-                            &local_db,
-                            &metrics_state,
-                            &message_id,
-                            &lease_token,
-                            &task_type_for_task,
-                            attempt_count,
-                            result,
-                        )
-                        .await
-                        {
-                            tracing::error!(error = %error, message_id, "failed to persist heavy task result");
-                        }
-                    }
-                    DispatchExecution::Shutdown => {
-                        if lease_is_current {
-                            defer_p2p_inbox_without_aborting_batch(
-                                &local_db,
-                                &message_id,
-                                &lease_token,
-                                current_time_secs(),
-                                "graceful_shutdown",
-                            )
-                            .await;
-                        }
-                    }
-                    DispatchExecution::Panicked(detail) => {
-                        metrics_state.record_message_dispatch(&task_type_for_task, "failed");
-                        tracing::error!(
-                            event = "heavy_task_panic",
-                            outcome = "node_shutdown",
-                            message_id,
-                            graph_id = %graph_id,
-                            message_type = %task_type_for_task,
-                            task_kind,
-                            detail,
-                            "heavy task panicked; recorded an abandon and stopping the node"
-                        );
-                        abandon_p2p_inbox_after_panic(
-                            &local_db,
-                            &message_id,
-                            &lease_token,
-                            &detail,
-                        )
-                        .await;
-                        shutdown.cancel();
-                    }
-                }
-            });
-            tracing::info!(
-                event = "p2p_inbox",
-                outcome = "heavy_task_started",
-                message_id = %message.message_id,
-                graph_id = %graph_id,
-                message_type = %task_type,
-                task_kind,
-                "started background heavy task"
-            );
-            continue;
-        }
         let raw_message_id = match hex::decode(&message.message_id) {
             Ok(message_id) => MessageId(message_id),
             Err(error) => {
@@ -2676,68 +2297,10 @@ async fn handle_p2p_outbox_messages(
             event = "p2p_outbox",
             outcome = "retry_window_expired",
             expired,
-            "outbound messages reached the end of their retry window: graph-setup messages without the expected ACK, signing-round messages without their round closing"
+            "outbound messages reached the end of their retry window: signing-round messages without their round closing"
         );
     }
-    recover_exhausted_setup(local_db).await?;
     drain_p2p_outbox(swarm, local_db, deadline).await
-}
-
-/// Recovery is driven by durable delivery state even when no new gossip arrives.
-async fn recover_exhausted_setup(local_db: &LocalDB) -> Result<()> {
-    let now = current_time_secs();
-    let Some((id, bytes, created_at, ack_peer_id)) =
-        local_db.acquire().await?.next_exhausted_setup(now).await?
-    else {
-        return Ok(());
-    };
-    let decoded = GOATMessage::deserialize_message(&bytes).await;
-    let mut storage = local_db.start_immediate_transaction().await?;
-    let mut resume = false;
-    let mut canonical = id.clone();
-    if let Ok(message) = decoded
-        && let Some(key) = graph_setup_outbox_id(&message.content, Some(&ack_peer_id))
-        && let BusinessRef::Graph { instance_id, graph_id } = message.content.business_ref()
-    {
-        canonical = key;
-        let instance = storage.find_instance(&instance_id).await?;
-        let graph = storage.find_graph(&graph_id).await?;
-        resume = now - created_at < MESSAGE_EXPIRE_TIME
-            && !graph_setup_delivery_finished(&message.content, graph.as_ref())
-            && instance.is_some_and(|row| {
-                matches!(
-                    InstanceBridgeInStatus::from_str(&row.status),
-                    Ok(InstanceBridgeInStatus::UserBroadcastPeginPrepare
-                        | InstanceBridgeInStatus::Presigned
-                        | InstanceBridgeInStatus::RelayerL1Broadcasted
-                        | InstanceBridgeInStatus::RelayerL2Minted)
-                )
-            });
-    }
-    storage
-        .recover_setup_delivery(
-            &id,
-            &canonical,
-            now,
-            get_p2p_graph_setup_retry_window_secs(),
-            resume,
-        )
-        .await?;
-    storage.commit().await?;
-    tracing::info!(event = "setup_delivery_recovery", message_id = %id, resume,
-        "settled exhausted setup delivery");
-    Ok(())
-}
-
-fn setup_retry_interval_secs(publish_count: i64, base: i64, id: &str) -> i64 {
-    let base = base.max(1);
-    let delay = base
-        .saturating_mul(1_i64 << publish_count.saturating_sub(1).clamp(0, 20))
-        .min(base.max(60));
-    // Stable jitter keeps retries reproducible across restarts without synchronizing peers.
-    let jitter =
-        id.bytes().fold(publish_count as u64, |n, b| n.wrapping_mul(31).wrapping_add(b as u64)) % 7;
-    delay + jitter as i64
 }
 
 async fn drain_p2p_outbox(
@@ -2814,25 +2377,6 @@ async fn publish_p2p_outbox_row(
             return Ok(OutboxRowOutcome::Closed);
         }
     };
-    if let Some(canonical_id) = graph_setup_outbox_id(&outbound.content, Some(&message.ack_peer_id))
-        && let BusinessRef::Graph { instance_id, graph_id } = outbound.content.business_ref()
-    {
-        let mut storage = local_db.acquire().await?;
-        let instance = storage.find_instance(&instance_id).await?;
-        let graph = storage.find_graph(&graph_id).await?;
-        let failed = instance.as_ref().is_some_and(|row| {
-            InstanceBridgeInStatus::from_str(&row.status).is_ok_and(|status| {
-                SigningRound::GraphSigning.delivery_finished(None, Some(&status))
-            })
-        });
-        if failed
-            || graph_setup_delivery_finished(&outbound.content, graph.as_ref())
-            || current_time_secs() - message.created_at >= MESSAGE_EXPIRE_TIME
-        {
-            storage.cancel_p2p_outbox_message(&canonical_id).await?;
-            return Ok(OutboxRowOutcome::Closed);
-        }
-    }
     let signing_round = if message.message_id.starts_with(PROTOCOL_OUTBOX_PREFIX) {
         let round = SigningRound::of(&outbound.content)
             .filter(|_| outbound.content.business_ref() != BusinessRef::Unscoped);
@@ -2868,17 +2412,10 @@ async fn publish_p2p_outbox_row(
     match result {
         Ok(_) => {
             if message.retry_until > 0 {
-                let interval = match signing_round {
-                    Some(round) => protocol_retry_interval_secs(
-                        message.publish_count + 1,
-                        round.retry_ceiling_secs(crate::env::get_p2p_protocol_retry_max_secs()),
-                    ),
-                    None => setup_retry_interval_secs(
-                        message.publish_count + 1,
-                        message.retry_interval_secs,
-                        &message.message_id,
-                    ),
-                };
+                let interval = protocol_retry_interval_secs(
+                    message.publish_count + 1,
+                    crate::env::get_p2p_protocol_retry_max_secs(),
+                );
                 let next_retry_at = current_time_secs() + interval;
                 storage.schedule_p2p_outbox_retry(&message.message_id, next_retry_at).await?;
                 tracing::info!(
@@ -2927,7 +2464,7 @@ async fn publish_p2p_outbox_row(
 
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_self_p2p_msg(
-    swarm: &mut dyn MessagePublisher,
+    swarm: &mut (dyn MessagePublisher + Sync),
     local_db: &LocalDB,
     btc_client: &Arc<BTCClient>,
     goat_client: &Arc<GOATClient>,
@@ -3292,7 +2829,7 @@ pub async fn handle_self_p2p_msg(
 /// TODO: we should create a trait for all the actions of different roles to simplify this function.
 #[allow(clippy::too_many_arguments)]
 pub async fn recv_and_dispatch(
-    swarm: &mut dyn MessagePublisher,
+    swarm: &mut (dyn MessagePublisher + Sync),
     local_db: &LocalDB,
     btc_client: &Arc<BTCClient>,
     goat_client: &Arc<GOATClient>,
@@ -3323,7 +2860,7 @@ pub async fn recv_and_dispatch(
 
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_decoded_p2p_message(
-    swarm: &mut dyn MessagePublisher,
+    swarm: &mut (dyn MessagePublisher + Sync),
     local_db: &LocalDB,
     btc_client: &Arc<BTCClient>,
     goat_client: &Arc<GOATClient>,
@@ -3387,106 +2924,13 @@ async fn dispatch_decoded_p2p_message(
     result
 }
 
-pub(crate) async fn try_finalize_graph(
-    swarm: &mut dyn MessagePublisher,
-    local_db: &LocalDB,
-    goat_client: &GOATClient,
-    instance_id: Uuid,
-    graph_id: Uuid,
-    graph: Option<&SimplifiedBitvmGcGraph>,
-    broadcast_graph_finalize: bool,
-) -> Result<Option<(BitvmGcGraph, FinalizedGraphStoreOutcome)>> {
-    let endorsements =
-        get_committee_endorsements_for_graph(local_db, instance_id, graph_id).await?;
-    let params_endorsements =
-        get_committee_params_endorsements_for_graph(local_db, instance_id, graph_id).await?;
-    let pub_nonoces = get_committee_pub_nonces_for_graph(local_db, instance_id, graph_id).await?;
-    let partial_sigs =
-        get_committee_partial_sigs_for_graph(local_db, instance_id, graph_id).await?;
-    let committee_pubkeys = goat_client.gateway_get_committee_pubkeys(&instance_id).await?;
-    if endorsements.len() == committee_pubkeys.len()
-        && params_endorsements.len() == committee_pubkeys.len()
-        && pub_nonoces.len() == committee_pubkeys.len()
-        && partial_sigs.len() == committee_pubkeys.len()
-    {
-        let mut graph = match graph {
-            Some(g) => BitvmGcGraph::from_simplified(g)?,
-            None => {
-                let g = get_graph(local_db, instance_id, graph_id)
-                    .await?
-                    .ok_or_else(|| anyhow!("Graph not found for {instance_id}:{graph_id}"))?;
-                BitvmGcGraph::from_simplified(&g)?
-            }
-        };
-        if graph.parameters.instance_parameters.instance_id != instance_id
-            || graph.parameters.graph_id != graph_id
-        {
-            bail!(
-                "refuse to finalize graph {instance_id}:{graph_id} with mismatched graph parameters {}:{}",
-                graph.parameters.instance_parameters.instance_id,
-                graph.parameters.graph_id
-            );
-        }
-        // Reuse stored committee signatures when retrying graph finalization.
-        if !graph.committee_pre_signed() {
-            let pub_nonces = order_committee_values(
-                &committee_pubkeys,
-                pub_nonoces,
-                "graph committee pub nonces",
-            )?;
-            let agg_nonces = nonces_aggregation(&pub_nonces)?;
-            let partial_sigs = order_committee_values(
-                &committee_pubkeys,
-                partial_sigs,
-                "graph committee partial sigs",
-            )?;
-            let committee_sig_for_graph =
-                signature_aggregation(&partial_sigs, &agg_nonces, &graph)?;
-            push_committee_pre_signatures(&mut graph, &committee_sig_for_graph)?;
-        }
-        let simplified_graph = graph.to_simplified()?;
-        let store_outcome = store_finalized_graph_if_needed(local_db, &simplified_graph).await?;
-        mark_graph_as_endorsed(local_db, instance_id, graph_id).await?;
-        notify_graph_endorsed(local_db, instance_id, graph_id).await?;
-        // Throttle GraphFinalize recovery and stamp the gate only on success.
-        let gate = crate::p2p_admission::protocol_republish_gate();
-        let gate_key = format!("graph-finalize:{graph_id}");
-        let now = Instant::now();
-        if broadcast_graph_finalize && !gate.is_cooling(&gate_key, now) {
-            let message_content = GOATMessageContent::GraphFinalize(GraphFinalize {
-                instance_id,
-                graph_id,
-                graph_nonce: graph.parameters.graph_nonce,
-                endorse_sigs: endorsements,
-                params_endorse_sigs: params_endorsements,
-                graph: simplified_graph,
-            });
-            send_protocol_message(
-                swarm,
-                local_db,
-                GOATMessage::new(Actor::All, message_content),
-                StoredValue::Fresh,
-            )
-            .await?;
-            gate.allow(&gate_key, now);
-        }
-        return Ok(Some((graph, store_outcome)));
-    }
-    Ok(None)
-}
-
 const PROTOCOL_OUTBOX_PREFIX: &str = "protocol:";
 
-/// The rounds whose messages are kept in the outbox and re-published until the
-/// round is over, whatever traffic arrives or does not.
+/// The round whose messages are kept in the outbox and re-published until the
+/// round is over, whatever traffic arrives or does not. The graph rounds live
+/// in the Graph aggregate's outbox (docs/node-protocol.md §10.7.2).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SigningRound {
-    /// NonceGeneration, AggNonceConsensus, CommitteePresign and EndorseGraph:
-    /// what the operator needs to assemble GraphFinalize.
-    GraphSigning,
-    /// The operator's GraphFinalize, the only source of the finalized graph
-    /// until a relayer has posted it.
-    GraphFinalize,
     /// The committee's PeginConfirm nonce, consensus and partial-signature rounds.
     PeginConfirm,
 }
@@ -3494,11 +2938,6 @@ pub(crate) enum SigningRound {
 impl SigningRound {
     pub(crate) fn of(content: &GOATMessageContent) -> Option<Self> {
         match content {
-            GOATMessageContent::NonceGeneration(_)
-            | GOATMessageContent::AggNonceConsensus(_)
-            | GOATMessageContent::CommitteePresign(_)
-            | GOATMessageContent::EndorseGraph(_) => Some(Self::GraphSigning),
-            GOATMessageContent::GraphFinalize(_) => Some(Self::GraphFinalize),
             GOATMessageContent::PeginConfirmNonce(_)
             | GOATMessageContent::PeginConfirmNonceConsensus(_)
             | GOATMessageContent::PeginConfirmPartialSig(_) => Some(Self::PeginConfirm),
@@ -3506,21 +2945,8 @@ impl SigningRound {
         }
     }
 
-    /// Retry ceiling; GraphFinalize uses six times the ordinary signing-round ceiling.
-    fn retry_ceiling_secs(self, configured_max_secs: i64) -> i64 {
-        match self {
-            Self::GraphFinalize => configured_max_secs.saturating_mul(6),
-            Self::GraphSigning | Self::PeginConfirm => configured_max_secs,
-        }
-    }
-
     /// Check delivery completion from local state; unknown statuses remain open.
-    /// Graph rounds close by graph status, not another operator's instance progress.
-    fn delivery_finished(
-        self,
-        graph: Option<GraphStatus>,
-        instance: Option<&InstanceBridgeInStatus>,
-    ) -> bool {
+    fn delivery_finished(self, instance: Option<&InstanceBridgeInStatus>) -> bool {
         use InstanceBridgeInStatus as Instance;
         // The failure set F closes every round (docs/node-protocol.md §10.4).
         if instance.is_some_and(|status| status.is_failed()) {
@@ -3530,40 +2956,11 @@ impl SigningRound {
             Self::PeginConfirm => {
                 matches!(instance, Some(Instance::RelayerL1Broadcasted | Instance::RelayerL2Minted))
             }
-            // A finalized or posted graph proves every member's values reached
-            // the operator. An obsoleted one will never be posted or used.
-            Self::GraphSigning => graph.is_some_and(|status| match status {
-                GraphStatus::OperatorPresigned => false,
-                GraphStatus::CommitteePresigned
-                | GraphStatus::OperatorDataPushed
-                | GraphStatus::PreKickoff
-                | GraphStatus::OperatorKickOff
-                | GraphStatus::Challenge
-                | GraphStatus::Disprove
-                | GraphStatus::Obsoleted
-                | GraphStatus::Skipped
-                | GraphStatus::OperatorTake1
-                | GraphStatus::OperatorTake2 => true,
-            }),
-            // Keep GraphFinalize delivery open until the graph is posted or retired.
-            Self::GraphFinalize => graph.is_some_and(|status| match status {
-                GraphStatus::OperatorPresigned | GraphStatus::CommitteePresigned => false,
-                GraphStatus::OperatorDataPushed
-                | GraphStatus::PreKickoff
-                | GraphStatus::OperatorKickOff
-                | GraphStatus::Challenge
-                | GraphStatus::Disprove
-                | GraphStatus::Obsoleted
-                | GraphStatus::Skipped
-                | GraphStatus::OperatorTake1
-                | GraphStatus::OperatorTake2 => true,
-            }),
         }
     }
 }
 
-/// [`SigningRound::delivery_finished`] over the local graph and instance rows.
-/// Reads the rows only: loading the graph itself re-verifies its signatures.
+/// [`SigningRound::delivery_finished`] over the local instance row.
 pub(crate) async fn protocol_delivery_finished(
     local_db: &LocalDB,
     content: &GOATMessageContent,
@@ -3571,25 +2968,19 @@ pub(crate) async fn protocol_delivery_finished(
     let Some(round) = SigningRound::of(content) else {
         return Ok(false);
     };
-    let (instance_id, graph_id) = match content.business_ref() {
-        BusinessRef::Graph { instance_id, graph_id } => (instance_id, Some(graph_id)),
-        BusinessRef::Instance { instance_id } => (instance_id, None),
+    let instance_id = match content.business_ref() {
+        BusinessRef::Instance { instance_id } | BusinessRef::Graph { instance_id, .. } => {
+            instance_id
+        }
         BusinessRef::Unscoped => return Ok(false),
     };
-    let mut storage = local_db.acquire().await?;
-    let instance = storage
+    let instance = local_db
+        .acquire()
+        .await?
         .find_instance(&instance_id)
         .await?
         .and_then(|instance| InstanceBridgeInStatus::from_str(&instance.status).ok());
-    let graph = match graph_id {
-        Some(graph_id) => storage
-            .find_graph(&graph_id)
-            .await?
-            .filter(|graph| graph.instance_id == instance_id)
-            .and_then(|graph| GraphStatus::from_str(&graph.status).ok()),
-        None => None,
-    };
-    Ok(round.delivery_finished(graph, instance.as_ref()))
+    Ok(round.delivery_finished(instance.as_ref()))
 }
 
 /// Wait before the next re-publish of a signing-round row that has gone out of
@@ -3851,11 +3242,10 @@ fn defer_current_inbox(message: &GOATMessage, delay_secs: usize, reason_detail: 
         .unwrap_or(false)
 }
 
-/// Helper: try to get graph. If missing, send SyncGraphRequest and defer current handling.
+/// Try to get the graph. If missing, ask the Graph aggregate to pull the
+/// definition (docs/node-protocol.md §10.5) and defer the current handling.
 pub(crate) async fn get_graph_or_defer(
-    swarm: &mut dyn MessagePublisher,
     local_db: &LocalDB,
-    goat_client: &GOATClient,
     instance_id: Uuid,
     graph_id: Uuid,
     message: &GOATMessage,
@@ -3863,31 +3253,35 @@ pub(crate) async fn get_graph_or_defer(
     match get_graph(local_db, instance_id, graph_id).await? {
         Some(g) => Ok(Some(g)),
         None => {
-            // Ask for sync and push to local queue with a short retry delay
-            let sync_request_outcome = if let Err(error) =
-                try_send_sync_graph_request(swarm, goat_client, instance_id, graph_id).await
-            {
-                tracing::warn!(
-                    event = "graph_resolution",
-                    outcome = "sync_request_failed",
-                    instance_id = %instance_id,
-                    graph_id = %graph_id,
-                    message_type = message.content.event_type(),
-                    error_class = "p2p",
-                    error = %error,
-                    "failed to request graph synchronization"
-                );
-                "failed"
-            } else {
-                "submitted"
+            let pull = match graph_pull_event(
+                graph_id,
+                GraphLookup::Id { instance_id, graph_id, finalized: false },
+            ) {
+                Ok(event) => crate::engine_bridge::submit_event(local_db, event).await,
+                Err(error) => Err(error),
             };
-            let delay_secs: usize = 60; // 1 min default retry
+            let pull_outcome = match pull {
+                Ok(()) => "submitted",
+                Err(error) => {
+                    tracing::warn!(
+                        event = "graph_resolution",
+                        outcome = "pull_request_failed",
+                        instance_id = %instance_id,
+                        graph_id = %graph_id,
+                        message_type = message.content.event_type(),
+                        error = %error,
+                        "failed to ask for the graph definition"
+                    );
+                    "failed"
+                }
+            };
+            let delay_secs: usize = 60;
             if let Err(error) = defer_or_enqueue_message(
                 local_db,
                 message,
                 delay_secs,
                 MessageDeferReason::GraphSyncPending,
-                "graph is missing locally; requested SyncGraph from a relayer",
+                "graph is missing locally; asked the Graph aggregate to pull it",
             )
             .await
             {
@@ -3910,33 +3304,13 @@ pub(crate) async fn get_graph_or_defer(
                 instance_id = %instance_id,
                 graph_id = %graph_id,
                 message_type = message.content.event_type(),
-                sync_request_outcome,
+                pull_outcome,
                 retry_after_secs = delay_secs,
-                "graph missing locally; requested sync and deferred message"
+                "graph missing locally; asked for it and deferred the message"
             );
             Ok(None)
         }
     }
-}
-
-pub async fn try_send_sync_graph_request(
-    swarm: &mut dyn MessagePublisher,
-    goat_client: &GOATClient,
-    instance_id: Uuid,
-    graph_id: Uuid,
-) -> Result<()> {
-    validate_graph_id_on_goat(goat_client, instance_id, graph_id).await?;
-    // Record the graph request before publishing it.
-    if !crate::p2p_admission::requested_graphs().insert(&graph_id.to_string(), Instant::now()) {
-        bail!(
-            "too many graph sync requests outstanding; {instance_id}:{graph_id} is retried later"
-        );
-    }
-    let message_content =
-        GOATMessageContent::SyncGraphRequest(SyncGraphRequest { instance_id, graph_id });
-    let message = GOATMessage::new(Actor::All, message_content);
-    send_to_peer(swarm, message).await?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -3957,20 +3331,7 @@ mod tests {
     #[tokio::test]
     async fn signing_round_survives_publish_failure_without_reopening_completed_delivery() {
         let db = store::create_local_db("sqlite::memory:").await;
-        let key = Keypair::from_secret_key(
-            SECP256K1,
-            &secp256k1::SecretKey::from_slice(&[7; 32]).unwrap(),
-        );
-        let message = GOATMessage::new(
-            Actor::Committee,
-            GOATMessageContent::AggNonceConsensus(AggNonceConsensus {
-                instance_id: Uuid::new_v4(),
-                graph_id: Uuid::new_v4(),
-                committee_pubkey: key.public_key().into(),
-                consensus_hash: [3; 32],
-                signature: SECP256K1.sign_schnorr(&SecpMessage::from_digest([3; 32]), &key),
-            }),
-        );
+        let message = committee_vote(Uuid::new_v4());
         assert!(
             send_protocol_message(
                 &mut UnavailablePublisher,
@@ -4017,15 +3378,14 @@ mod tests {
 
     async fn queued_outbox_fixture() -> LocalDB {
         let db = store::create_local_db("sqlite::memory:").await;
-        let content =
-            committee_vote(Uuid::new_v4(), Uuid::new_v4()).serialize_message().await.unwrap();
+        let content = committee_vote(Uuid::new_v4()).serialize_message().await.unwrap();
         for index in 0..3 {
             db.acquire()
                 .await
                 .unwrap()
                 .enqueue_p2p_outbox_message(
                     &format!("budget-{index}"),
-                    "AggNonceConsensus",
+                    "PeginConfirmNonceConsensus",
                     &content,
                 )
                 .await
@@ -4086,16 +3446,15 @@ mod tests {
         assert_unclaimed_outbox_rows(&db, 2).await;
     }
 
-    fn committee_vote(instance_id: Uuid, graph_id: Uuid) -> GOATMessage {
+    fn committee_vote(instance_id: Uuid) -> GOATMessage {
         let key = Keypair::from_secret_key(
             SECP256K1,
             &secp256k1::SecretKey::from_slice(&[7; 32]).unwrap(),
         );
         GOATMessage::new(
             Actor::Committee,
-            GOATMessageContent::AggNonceConsensus(AggNonceConsensus {
+            GOATMessageContent::PeginConfirmNonceConsensus(PeginConfirmNonceConsensus {
                 instance_id,
-                graph_id,
                 committee_pubkey: key.public_key().into(),
                 consensus_hash: [3; 32],
                 signature: SECP256K1.sign_schnorr(&SecpMessage::from_digest([3; 32]), &key),
@@ -4103,30 +3462,21 @@ mod tests {
         )
     }
 
-    /// Every test graph takes its own operator slot (`(operator, nonce)` is unique).
-    static NEXT_SLOT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
-
-    async fn store_graph_row(db: &LocalDB, instance_id: Uuid, graph_id: Uuid, status: GraphStatus) {
+    async fn store_instance_row(db: &LocalDB, instance_id: Uuid, status: InstanceBridgeInStatus) {
         let mut storage = db.acquire().await.unwrap();
-        storage
-            .upsert_graph_definition(&store::Graph {
-                graph_id,
+        let inserted = storage
+            .insert_instance_if_absent(&store::Instance {
                 instance_id,
-                status: GraphStatus::OperatorPresigned.to_string(),
-                definition_hash: "definition".to_owned(),
-                kickoff_index: NEXT_SLOT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                status: status.to_string(),
                 ..Default::default()
             })
             .await
             .unwrap();
-        if status != GraphStatus::OperatorPresigned {
+        if !inserted {
             storage
-                .transition_graph_status(
-                    instance_id,
-                    graph_id,
-                    status,
-                    store::GraphStatusSource::Definition,
-                    None,
+                .update_instance(
+                    &store::localdb::InstanceUpdate::new_with_instance_id(instance_id)
+                        .with_status(status.to_string()),
                 )
                 .await
                 .unwrap();
@@ -4141,51 +3491,49 @@ mod tests {
         assert_eq!(protocol_retry_interval_secs(5, 10), 30);
         assert_eq!(protocol_retry_interval_secs(i64::MAX, 600), 600);
         assert_eq!(protocol_retry_interval_secs(-1, 600), 30);
-        // The whole graph backs off further than the small round messages.
-        assert_eq!(SigningRound::GraphSigning.retry_ceiling_secs(600), 600);
-        assert_eq!(SigningRound::GraphFinalize.retry_ceiling_secs(600), 3_600);
         assert_eq!(protocol_retry_interval_secs(9, 3_600), 3_600);
     }
 
     #[test]
-    fn a_graph_round_is_closed_by_its_graph_and_not_by_the_instance() {
-        use GraphStatus as G;
+    fn the_pegin_confirm_round_is_closed_by_its_instance() {
         use InstanceBridgeInStatus as I;
-        // The instance moves on with the first graph; a second operator's graph
-        // is still mid-round then, and must keep its retries.
-        for instance in [I::Presigned, I::RelayerL1Broadcasted, I::RelayerL2Minted] {
-            for round in [SigningRound::GraphSigning, SigningRound::GraphFinalize] {
-                assert!(!round.delivery_finished(Some(G::OperatorPresigned), Some(&instance)));
-                assert!(!round.delivery_finished(None, Some(&instance)));
-            }
+        // PeginConfirm is the instance's round: open until the relayer has
+        // broadcast the transaction, whatever the graphs do.
+        assert!(!SigningRound::PeginConfirm.delivery_finished(None));
+        for open in [I::UserBroadcastPeginPrepare, I::Presigned] {
+            assert!(!SigningRound::PeginConfirm.delivery_finished(Some(&open)));
         }
-        // This node holding the finalized graph closes its own round values, but
-        // says nothing about whether a relayer has the GraphFinalize.
-        assert!(SigningRound::GraphSigning.delivery_finished(Some(G::CommitteePresigned), None));
-        assert!(!SigningRound::GraphFinalize.delivery_finished(Some(G::CommitteePresigned), None));
-        for posted in [G::OperatorDataPushed, G::PreKickoff, G::OperatorTake1, G::Obsoleted] {
-            assert!(SigningRound::GraphSigning.delivery_finished(Some(posted), None));
-            assert!(SigningRound::GraphFinalize.delivery_finished(Some(posted), None));
+        for done in [I::RelayerL1Broadcasted, I::RelayerL2Minted] {
+            assert!(SigningRound::PeginConfirm.delivery_finished(Some(&done)));
         }
-        // PeginConfirm is the instance's round.
-        assert!(!SigningRound::PeginConfirm.delivery_finished(None, Some(&I::Presigned)));
-        assert!(!SigningRound::PeginConfirm.delivery_finished(None, None));
-        assert!(SigningRound::PeginConfirm.delivery_finished(None, Some(&I::RelayerL1Broadcasted)));
         // A failed instance closes everything.
         for failed in I::FAILED {
-            assert!(
-                SigningRound::GraphSigning
-                    .delivery_finished(Some(G::OperatorPresigned), Some(&failed))
-            );
-            assert!(SigningRound::GraphFinalize.delivery_finished(None, Some(&failed)));
-            assert!(SigningRound::PeginConfirm.delivery_finished(None, Some(&failed)));
+            assert!(SigningRound::PeginConfirm.delivery_finished(Some(&failed)));
         }
+        // The graph rounds are the Graph aggregate's, not the outbox's.
+        let key = Keypair::from_secret_key(
+            SECP256K1,
+            &secp256k1::SecretKey::from_slice(&[7; 32]).unwrap(),
+        );
+        let graph_round = GOATMessageContent::EndorseGraph(EndorseGraph {
+            instance_id: Uuid::new_v4(),
+            graph_id: Uuid::new_v4(),
+            committee_pubkey: key.public_key().into(),
+            committee_sig_for_graph: vec![],
+            committee_sig_for_params: vec![],
+            committee_evm_address: EvmAddress::ZERO,
+        });
+        assert_eq!(SigningRound::of(&graph_round), None);
+        assert_eq!(
+            SigningRound::of(&committee_vote(Uuid::new_v4()).content),
+            Some(SigningRound::PeginConfirm)
+        );
     }
 
     #[tokio::test]
     async fn a_published_signing_message_is_not_sent_again_until_its_first_interval() {
         let db = store::create_local_db("sqlite::memory:").await;
-        let message = committee_vote(Uuid::new_v4(), Uuid::new_v4());
+        let message = committee_vote(Uuid::new_v4());
         let mut publisher = RecordingPublisher::default();
         send_protocol_message(&mut publisher, &db, message.clone(), StoredValue::Fresh)
             .await
@@ -4221,7 +3569,7 @@ mod tests {
         // The first run stored its value and was cut off before the outbox row:
         // nothing was ever published, and the retry is the only one who can.
         let db = store::create_local_db("sqlite::memory:").await;
-        let message = committee_vote(Uuid::new_v4(), Uuid::new_v4());
+        let message = committee_vote(Uuid::new_v4());
         let mut publisher = RecordingPublisher::default();
         send_protocol_message(&mut publisher, &db, message.clone(), StoredValue::Found)
             .await
@@ -4232,7 +3580,7 @@ mod tests {
         assert_eq!(state.unwrap().0, "Pending");
 
         // A failed publish leaves the row due at once rather than an interval away.
-        let other = committee_vote(Uuid::new_v4(), Uuid::new_v4());
+        let other = committee_vote(Uuid::new_v4());
         assert!(
             send_protocol_message(&mut UnavailablePublisher, &db, other, StoredValue::Found)
                 .await
@@ -4252,9 +3600,9 @@ mod tests {
     #[tokio::test]
     async fn a_closed_outbox_row_is_published_past_only_while_the_round_is_open() {
         let db = store::create_local_db("sqlite::memory:").await;
-        let (instance_id, graph_id) = (Uuid::new_v4(), Uuid::new_v4());
-        store_graph_row(&db, instance_id, graph_id, GraphStatus::OperatorPresigned).await;
-        let message = committee_vote(instance_id, graph_id);
+        let instance_id = Uuid::new_v4();
+        store_instance_row(&db, instance_id, InstanceBridgeInStatus::Presigned).await;
+        let message = committee_vote(instance_id);
         assert!(
             send_protocol_message(
                 &mut UnavailablePublisher,
@@ -4278,27 +3626,24 @@ mod tests {
             .unwrap();
         assert_eq!(publisher.0.len(), 1);
 
-        // Once the graph is finalized here, nobody needs the vote any more.
-        store_graph_row(&db, instance_id, graph_id, GraphStatus::CommitteePresigned).await;
+        // Once the Peg-In-Confirm is broadcast, nobody needs the vote any more.
+        store_instance_row(&db, instance_id, InstanceBridgeInStatus::RelayerL1Broadcasted).await;
         send_protocol_message(&mut publisher, &db, message, StoredValue::Found).await.unwrap();
         assert_eq!(publisher.0.len(), 1);
     }
 
     #[tokio::test]
-    async fn the_outbox_stops_a_round_by_its_graph_and_survives_a_bad_row() {
+    async fn the_outbox_stops_a_round_by_its_instance_and_survives_a_bad_row() {
         let db = store::create_local_db("sqlite::memory:").await;
-        let (instance_id, open_graph, finalized_graph) =
+        let (open_instance, done_instance, unknown_instance) =
             (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
-        store_graph_row(&db, instance_id, open_graph, GraphStatus::OperatorPresigned).await;
-        store_graph_row(&db, instance_id, finalized_graph, GraphStatus::CommitteePresigned).await;
-        // A graph row of another instance must not close this one's round.
-        let foreign_graph = Uuid::new_v4();
-        store_graph_row(&db, Uuid::new_v4(), foreign_graph, GraphStatus::CommitteePresigned).await;
-        for graph_id in [open_graph, finalized_graph, foreign_graph] {
+        store_instance_row(&db, open_instance, InstanceBridgeInStatus::Presigned).await;
+        store_instance_row(&db, done_instance, InstanceBridgeInStatus::RelayerL1Broadcasted).await;
+        for instance_id in [open_instance, done_instance, unknown_instance] {
             let _ = send_protocol_message(
                 &mut UnavailablePublisher,
                 &db,
-                committee_vote(instance_id, graph_id),
+                committee_vote(instance_id),
                 StoredValue::Fresh,
             )
             .await;
@@ -4309,9 +3654,9 @@ mod tests {
             .await
             .unwrap()
             .enqueue_p2p_outbox_retry_message(
-                "protocol:AggNonceConsensus:graph:corrupt",
+                "protocol:PeginConfirmNonceConsensus:instance:corrupt",
                 None,
-                "AggNonceConsensus",
+                "PeginConfirmNonceConsensus",
                 b"not a message",
                 now + 600,
                 30,
@@ -4323,18 +3668,17 @@ mod tests {
 
         let mut publisher = RecordingPublisher::default();
         handle_p2p_outbox_messages(&mut publisher, &db).await.unwrap();
-        assert_eq!(publisher.0.len(), 2, "the open round and the foreign-row round publish");
+        assert_eq!(publisher.0.len(), 2, "the open round and the unknown instance's round publish");
 
         let mut storage = db.acquire().await.unwrap();
-        let state =
-            |graph_id: Uuid| protocol_outbox_id(&committee_vote(instance_id, graph_id).content);
-        let open = storage.p2p_outbox_entry_state(&state(open_graph)).await.unwrap().unwrap();
+        let state = |instance_id: Uuid| protocol_outbox_id(&committee_vote(instance_id).content);
+        let open = storage.p2p_outbox_entry_state(&state(open_instance)).await.unwrap().unwrap();
         assert_eq!(open.0, "Pending");
-        let closed =
-            storage.p2p_outbox_entry_state(&state(finalized_graph)).await.unwrap().unwrap();
+        let closed = storage.p2p_outbox_entry_state(&state(done_instance)).await.unwrap().unwrap();
         assert_eq!(closed, ("Processed".to_owned(), 0));
-        let foreign = storage.p2p_outbox_entry_state(&state(foreign_graph)).await.unwrap().unwrap();
-        assert_eq!(foreign.0, "Pending");
+        let unknown =
+            storage.p2p_outbox_entry_state(&state(unknown_instance)).await.unwrap().unwrap();
+        assert_eq!(unknown.0, "Pending");
     }
 
     #[test]
@@ -4355,7 +3699,7 @@ mod tests {
         let local_db = store::create_local_db("sqlite::memory:").await;
         let message = GOATMessage::new(
             Actor::Committee,
-            GOATMessageContent::SyncGraphRequest(SyncGraphRequest {
+            GOATMessageContent::KickoffReady(KickoffReady {
                 instance_id: Uuid::new_v4(),
                 graph_id: Uuid::new_v4(),
             }),
@@ -4398,7 +3742,7 @@ mod tests {
         let (instance_id, graph_id) = (Uuid::new_v4(), Uuid::new_v4());
         let dispatched = GOATMessage::new(
             Actor::Committee,
-            GOATMessageContent::SyncGraphRequest(SyncGraphRequest { instance_id, graph_id }),
+            GOATMessageContent::KickoffReady(KickoffReady { instance_id, graph_id }),
         );
         // The handler builds its own copy, under its own role: same message.
         let own_copy = GOATMessage::new(Actor::Operator, dispatched.content().clone());
@@ -4500,7 +3844,7 @@ mod tests {
 
     #[tokio::test]
     async fn genuine_transient_errors_are_still_retryable() {
-        let error = anyhow!("database is locked");
+        let error = anyhow::anyhow!("database is locked");
         assert!(
             p2p_retryable_dispatch_error(&error).is_some(),
             "a real SQLite-busy error must remain retryable"

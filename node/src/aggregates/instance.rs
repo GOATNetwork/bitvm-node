@@ -53,6 +53,8 @@ pub const EVENT_L2_MINTED: &str = "l2_minted";
 
 pub const JOB_POST_PEGIN_DATA: &str = "post_pegin_data";
 pub const JOB_DELETE_INSTANCE_KEY: &str = "delete_instance_key";
+/// The committee's PeginConfirm round start on entering Presigned.
+pub const JOB_START_PEGIN_CONFIRM: &str = "start_pegin_confirm";
 
 pub const PHASE_ANSWER: &str = "Answer";
 pub const PHASE_AWAIT_PREPARE: &str = "AwaitPrepare";
@@ -253,6 +255,8 @@ pub enum InstanceAlert {
     PostPeginDataRejected,
     /// The committee key envelope could not be deleted.
     KeyDeleteFailed,
+    /// The committee could not start its PeginConfirm round.
+    PeginConfirmRoundFailed,
 }
 
 impl InstanceAlert {
@@ -262,6 +266,7 @@ impl InstanceAlert {
             InstanceAlert::L2MintedAfterFailure => "l2_minted_after_failure",
             InstanceAlert::PostPeginDataRejected => "post_pegin_data_rejected",
             InstanceAlert::KeyDeleteFailed => "key_delete_failed",
+            InstanceAlert::PeginConfirmRoundFailed => "pegin_confirm_round_failed",
         }
     }
 }
@@ -606,6 +611,20 @@ impl InstanceAggregate {
     ) -> anyhow::Result<()> {
         use InstanceBridgeInStatus::*;
         match next {
+            Presigned => {
+                // The committee's PeginConfirm round starts from the stored
+                // values; the legacy outbox re-publishes them until the round
+                // closes (§10.7.1 Confirm).
+                if self.actor == Actor::Committee {
+                    ctx.effects.enqueue_job(JobSpec::new(
+                        &ctx.aggregate,
+                        PHASE_CONFIRM,
+                        JOB_START_PEGIN_CONFIRM,
+                        JobPool::Network,
+                        Vec::new(),
+                    ));
+                }
+            }
             RelayerL1Broadcasted => {
                 if self.relayer {
                     ctx.effects.enqueue_job(JobSpec::new(
@@ -649,6 +668,50 @@ impl InstanceAggregate {
             format!("instance {failed}"),
         );
         ctx.effects.cancel_phase_jobs(PHASE_POST);
+        ctx.effects.cancel_phase_jobs(PHASE_CONFIRM);
+        // Every graph of the instance: deliveries closed, jobs cancelled, and
+        // its slot settled for the operator's next graph (§10.5).
+        for graph in ctx.storage.get_graphs_by_instance_id(&instance_id).await? {
+            let graph_ref = crate::aggregates::graph::graph_ref(graph.graph_id);
+            ctx.effects.close_outbox(
+                EngineOutboxCloseTarget::Aggregate {
+                    aggregate_kind: graph_ref.kind.clone(),
+                    aggregate_id: graph_ref.id.clone(),
+                },
+                format!("instance {failed}"),
+            );
+            ctx.effects.cancel_jobs_for_aggregate(&graph_ref);
+            ctx.effects.wake(crate::aggregates::graph::slot_ref(
+                &graph.operator_pubkey,
+                graph.kickoff_index as u64,
+            ));
+        }
+        // A setup session that never stored a definition (the operator's own
+        // graph in Setup): its deliveries and jobs go, the session goes, and
+        // the slot it was taking is released to the starts waiting on it.
+        for session in ctx.storage.list_pending_graph_inits_by_instance(&instance_id).await? {
+            let graph_ref = crate::aggregates::graph::graph_ref(session.graph_id);
+            ctx.effects.close_outbox(
+                EngineOutboxCloseTarget::Aggregate {
+                    aggregate_kind: graph_ref.kind.clone(),
+                    aggregate_id: graph_ref.id.clone(),
+                },
+                format!("instance {failed}"),
+            );
+            ctx.effects.cancel_jobs_for_aggregate(&graph_ref);
+            ctx.storage.delete_pending_graph_init(&instance_id, &session.operator_pubkey).await?;
+            let next_slot =
+                crate::aggregates::graph::next_slot(ctx, &session.operator_pubkey).await?;
+            ctx.effects
+                .wake(crate::aggregates::graph::slot_ref(&session.operator_pubkey, next_slot));
+            info!(
+                event = "instance_failed",
+                instance_id = %instance_id,
+                graph_id = %session.graph_id,
+                next_slot,
+                "dropped the setup session of a failed instance"
+            );
+        }
         warn!(
             event = "instance_failed",
             instance_id = %instance_id,
@@ -761,10 +824,25 @@ impl InstanceAggregate {
                     warn!(event = "instance_post", instance_id = %instance_id, outcome = "poisoned", error = %error, "post job panicked");
                 }
             },
+            JOB_START_PEGIN_CONFIRM => match &result.outcome {
+                JobResultOutcome::Done(_) => {
+                    info!(event = "pegin_confirm_round", instance_id = %instance_id, outcome = "started", stale = result.stale, "PeginConfirm round started");
+                }
+                JobResultOutcome::Failed(error) => {
+                    raise_alert(instance_id, InstanceAlert::PeginConfirmRoundFailed, error);
+                }
+                JobResultOutcome::Cancelled => {
+                    debug!(event = "pegin_confirm_round", instance_id = %instance_id, outcome = "cancelled", "PeginConfirm round start cancelled");
+                }
+                JobResultOutcome::Poisoned(error) => {
+                    warn!(event = "pegin_confirm_round", instance_id = %instance_id, outcome = "poisoned", error = %error, "PeginConfirm round start panicked");
+                }
+            },
             other => {
                 return Ok(ApplyOutcome::Rejected(format!("unknown instance job action {other}")));
             }
         }
+        ctx.storage.clear_engine_job_result(&result.job_id, ctx.now).await?;
         ctx.effects.set_status(status.to_string()).set_phase(phase_of(status).to_string());
         Ok(ApplyOutcome::Applied)
     }

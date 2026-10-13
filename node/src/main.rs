@@ -220,15 +220,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let goat_client =
         Arc::new(GOATClient::new(env::goat_config_from_env().await, env::get_goat_network()));
     let btc_client = Arc::new(BTCClient::new(get_network(), get_btc_url_from_env().as_deref()));
-    // The execution engine owns the migrated aggregates (step 2: Instance).
+    let http_client = Arc::new(HttpAsyncClient::new(None));
+    let soldering_builder =
+        actor_needs_soldering_builder(&actor).then(|| Arc::new(BabeBundleBuilder::new()));
+    // The execution engine owns the migrated aggregates (Instance and Graph).
     let (engine, engine_acks) = engine_bridge::build_engine(
         bitvm_network_manager.publisher(),
         engine_metrics,
         engine_bridge::EngineDeps {
             actor: actor.clone(),
+            local_peer: peer_id_string.clone(),
             local_db: local_db.clone(),
             btc_client: btc_client.clone(),
             goat_client: goat_client.clone(),
+            http_client: http_client.clone(),
+            soldering_builder: soldering_builder.clone(),
             metrics_state: metrics_state.clone(),
         },
     );
@@ -254,9 +260,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         local_db: local_db.clone(),
         btc_client: btc_client.clone(),
         goat_client,
-        http_client: Arc::new(HttpAsyncClient::new(None)),
-        soldering_builder: actor_needs_soldering_builder(&actor)
-            .then(|| Arc::new(BabeBundleBuilder::new())),
+        http_client,
+        soldering_builder,
         metrics_state: metrics_state.clone(),
         shutdown_token: cancellation_token.clone(),
         worker: Default::default(),

@@ -1619,8 +1619,6 @@ pub fn node_info_response_gate() -> &'static ResponseGate {
     &NODE_INFO_RESPONSE_GATE
 }
 
-/// Cooldown for duplicate graph-setup ACKs.
-const DEDUP_ACK_COOLDOWN: Duration = Duration::from_secs(8);
 /// Cooldown for peer liveness updates.
 const PEER_TIMESTAMP_COOLDOWN: Duration = Duration::from_secs(30);
 const COOLDOWN_GATE_MAX_ENTRIES: usize = 8_192;
@@ -1692,13 +1690,6 @@ impl CooldownGate {
     fn len(&self) -> usize {
         self.seen.lock().unwrap().stamps.len()
     }
-}
-
-static DEDUP_ACK_GATE: LazyLock<CooldownGate> =
-    LazyLock::new(|| CooldownGate::new(DEDUP_ACK_COOLDOWN, COOLDOWN_GATE_MAX_ENTRIES));
-
-pub fn dedup_ack_gate() -> &'static CooldownGate {
-    &DEDUP_ACK_GATE
 }
 
 static PEER_TIMESTAMP_GATE: LazyLock<CooldownGate> =
@@ -1824,10 +1815,6 @@ pub fn protocol_republish_gate() -> &'static CooldownGate {
     &PROTOCOL_REPUBLISH_GATE
 }
 
-/// How long a graph a relay just answered a sync request for stays on cooldown.
-const SYNC_GRAPH_RESPONSE_COOLDOWN: Duration = Duration::from_secs(60);
-/// TTL for locally requested graph responses.
-const SYNC_GRAPH_REQUEST_TTL: Duration = Duration::from_secs(15 * 60);
 /// How long one peer's identical `GetGraph` request stays on cooldown.
 const GET_GRAPH_RESPONSE_COOLDOWN: Duration = Duration::from_secs(60);
 const GRAPH_SET_MAX_ENTRIES: usize = 16_384;
@@ -1854,45 +1841,6 @@ impl GlobalRate {
         bucket.tokens -= 1.0;
         true
     }
-}
-
-/// A bounded set of keys, each valid until its TTL lapses.
-#[derive(Debug)]
-pub struct TtlSet {
-    entries: Mutex<BoundedStamps>,
-    ttl: Duration,
-    max_entries: usize,
-}
-
-impl TtlSet {
-    fn new(ttl: Duration, max_entries: usize) -> Self {
-        Self { entries: Mutex::new(BoundedStamps::default()), ttl, max_entries }
-    }
-
-    /// Returns false when the set is full of unexpired keys and has no room.
-    pub fn insert(&self, key: &str, now: Instant) -> bool {
-        let mut entries = self.entries.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        entries.stamp(key, self.ttl, self.max_entries, now)
-    }
-
-    /// Whether `key` is still present and unexpired.
-    pub fn contains(&self, key: &str, now: Instant) -> bool {
-        let entries = self.entries.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        entries.is_live(key, self.ttl, now)
-    }
-
-    pub fn remove(&self, key: &str) {
-        let mut entries = self.entries.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        entries.stamps.remove(key);
-    }
-}
-
-static SYNC_GRAPH_RESPONSE_GATE: LazyLock<CooldownGate> =
-    LazyLock::new(|| CooldownGate::new(SYNC_GRAPH_RESPONSE_COOLDOWN, GRAPH_SET_MAX_ENTRIES));
-
-/// Per-graph cooldown for answering `SyncGraphRequest` on the relay side.
-pub fn sync_graph_response_gate() -> &'static CooldownGate {
-    &SYNC_GRAPH_RESPONSE_GATE
 }
 
 static GET_GRAPH_RESPONSE_GATE: LazyLock<CooldownGate> =
@@ -1937,41 +1885,6 @@ static GET_GRAPH_SERVE_SLOTS_SEMAPHORE: LazyLock<std::sync::Arc<tokio::sync::Sem
 
 pub fn get_graph_serve_slots() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
     &GET_GRAPH_SERVE_SLOTS_SEMAPHORE
-}
-
-// Separate aggregate response budgets for registered and unregistered requesters.
-static SYNC_GRAPH_RESPONSE_BUDGET_REGISTERED: LazyLock<GlobalRate> =
-    LazyLock::new(|| GlobalRate::new(32.0, 2.0));
-static SYNC_GRAPH_RESPONSE_BUDGET_UNREGISTERED: LazyLock<GlobalRate> =
-    LazyLock::new(|| GlobalRate::new(8.0, 0.2));
-
-/// Aggregate SyncGraph response budgets by registration class.
-pub fn sync_graph_response_budget(requester_registered: bool) -> &'static GlobalRate {
-    if requester_registered {
-        &SYNC_GRAPH_RESPONSE_BUDGET_REGISTERED
-    } else {
-        &SYNC_GRAPH_RESPONSE_BUDGET_UNREGISTERED
-    }
-}
-
-static REQUESTED_GRAPHS: LazyLock<TtlSet> =
-    LazyLock::new(|| TtlSet::new(SYNC_GRAPH_REQUEST_TTL, GRAPH_SET_MAX_ENTRIES));
-
-/// Outstanding local graph requests.
-pub fn requested_graphs() -> &'static TtlSet {
-    &REQUESTED_GRAPHS
-}
-
-/// How often one requested graph may be put through validation. A `SyncGraph`
-/// costs chain queries, a graph rebuild and two signature sweeps; a sender that
-/// keeps answering the same request with a bad graph gets one try per window.
-const SYNC_GRAPH_VALIDATION_COOLDOWN: Duration = Duration::from_secs(30);
-
-static SYNC_GRAPH_VALIDATION_GATE: LazyLock<CooldownGate> =
-    LazyLock::new(|| CooldownGate::new(SYNC_GRAPH_VALIDATION_COOLDOWN, GRAPH_SET_MAX_ENTRIES));
-
-pub fn sync_graph_validation_gate() -> &'static CooldownGate {
-    &SYNC_GRAPH_VALIDATION_GATE
 }
 
 /// Aggregate drop counters for periodic logging.
@@ -2270,23 +2183,13 @@ pub struct AdmissionGates<'a> {
     /// This node's role. A durable message no handler of this role acts on is
     /// relayed but not stored.
     pub local_actor: &'a bitvm_lib::actors::Actor,
-    /// Graphs this node asked a relayer for. A `SyncGraph` for anything else is
-    /// somebody else's answer.
-    pub requested_graphs: &'a TtlSet,
 }
 
 impl AdmissionGates<'_> {
     /// Whether this node stores an admitted durable message of `kind`, or only
-    /// relays it. `synced_graph` is the graph a `SyncGraph` carries.
-    pub fn keeps(
-        &self,
-        kind: crate::action::MessageKind,
-        synced_graph: Option<uuid::Uuid>,
-        now: Instant,
-    ) -> bool {
+    /// relays it.
+    pub fn keeps(&self, kind: crate::action::MessageKind) -> bool {
         kind.handled_by(self.local_actor)
-            && synced_graph
-                .is_none_or(|graph_id| self.requested_graphs.contains(&graph_id.to_string(), now))
     }
 }
 
@@ -2295,7 +2198,6 @@ impl<'a> AdmissionGates<'a> {
     pub fn global(local_actor: &'a bitvm_lib::actors::Actor) -> Self {
         Self {
             local_actor,
-            requested_graphs: requested_graphs(),
             registry: peer_registry(),
             replay_guard: &REPLAY_GUARD,
             rate_limiter: inbound_rate_limiter(),
@@ -2380,12 +2282,7 @@ pub async fn evaluate_inbound_message(
         return Ok(InboundVerdict::Immediate(message));
     }
 
-    // Forward unsolicited SyncGraph responses without storing them locally.
-    let synced_graph = match &message.content {
-        GOATMessageContent::SyncGraph(sync) => Some(sync.graph_id),
-        _ => None,
-    };
-    if !gates.keeps(message.content.kind(), synced_graph, now) {
+    if !gates.keeps(message.content.kind()) {
         // Apply the unregistered forwarding budget.
         if !class.is_registered()
             && let Err(reason) = gates.rate_limiter.charge_forward(data.len() as i64, now)
@@ -2449,7 +2346,6 @@ mod tests {
         immediate_limiter: PeerRateLimiter,
         usage_cache: InboxUsageCache,
         local_actor: Actor,
-        requested_graphs: TtlSet,
     }
 
     /// A wall clock comfortably ahead of every sequence number the tests use.
@@ -2465,7 +2361,6 @@ mod tests {
     impl TestGates {
         fn new(immediate_limiter: PeerRateLimiter) -> Self {
             Self {
-                requested_graphs: TtlSet::new(SYNC_GRAPH_REQUEST_TTL, 16),
                 local_actor: Actor::Committee,
                 registry: PeerRegistry::default(),
                 replay_guard: ReplayGuard::default(),
@@ -2493,7 +2388,6 @@ mod tests {
                 usage_cache: &self.usage_cache,
                 limits,
                 local_actor: &self.local_actor,
-                requested_graphs: &self.requested_graphs,
             };
             let inbound = InboundGossip {
                 direct_peer: source,
@@ -3451,15 +3345,6 @@ mod tests {
         // Expired keys make room again, once the sweep interval has passed.
         assert!(gate.allow("late", now + Duration::from_secs(61)));
         assert_eq!(gate.len(), 1);
-
-        let set = TtlSet::new(Duration::from_secs(60), 2);
-        assert!(set.insert("a", now));
-        assert!(set.insert("b", now));
-        assert!(!set.insert("c", now), "full of unexpired keys");
-        assert!(set.insert("a", now), "refreshing a member needs no room");
-        set.remove("a");
-        assert!(!set.contains("a", now));
-        assert!(set.insert("c", now));
     }
 
     #[test]
@@ -3635,7 +3520,7 @@ mod tests {
 
         let source = include_str!("handle.rs");
         let dispatcher = {
-            let start = source.find("pub(crate) fn heavy_task_from_content(").unwrap();
+            let start = source.find("pub async fn dispatch(").unwrap();
             let end = source.find("fn make_message(").unwrap();
             &source[start..end]
         };
@@ -3669,7 +3554,7 @@ mod tests {
                 );
             }
         }
-        assert!(arms >= 40, "the scan found only {arms} arms; has dispatch moved?");
+        assert!(arms >= 25, "the scan found only {arms} arms; has dispatch moved?");
     }
 
     /// Verify committee-only reserves in shared rate tiers.
@@ -4099,62 +3984,5 @@ mod tests {
             "malformed entries are skipped, and every spelling is the same key"
         );
         assert!(parse_trusted_operator_bindings("").is_empty());
-    }
-
-    /// Verify only requested SyncGraph responses are kept locally.
-    #[tokio::test]
-    async fn unsolicited_sync_graph_is_relayed_but_not_stored() {
-        use crate::action::{MessageKind, SyncGraphRequest};
-
-        let local_db = store::create_local_db("sqlite::memory:").await;
-        let gates = TestGates::new(PeerRateLimiter::new(10.0, 1.0, 16));
-        let now = Instant::now();
-        let relayer = PeerId::random();
-        gates.registry.record_committee_peer(&relayer, Some(true), now);
-
-        // Exercise SyncGraph admission by message kind and graph ID.
-        for actor in [Actor::Committee, Actor::Operator, Actor::Verifier, Actor::Watchtower] {
-            assert!(MessageKind::SyncGraph.handled_by(&actor));
-        }
-        // ... and the request for one is stored only where it can be answered.
-        let request = GOATMessage::new(
-            Actor::All,
-            GOATMessageContent::SyncGraphRequest(SyncGraphRequest {
-                instance_id: Uuid::new_v4(),
-                graph_id: Uuid::new_v4(),
-            }),
-        )
-        .serialize_message()
-        .await
-        .unwrap();
-        let verdict = gates.evaluate(&local_db, &SMALL, &relayer, 1, &request, now).await;
-        assert!(matches!(verdict, InboundVerdict::Enqueue { .. }), "a committee node answers");
-
-        // The decision itself: an answer is kept only by the node that asked,
-        // and stops being expected once the request has been served.
-        let (asked, unasked) = (Uuid::new_v4(), Uuid::new_v4());
-        assert!(gates.requested_graphs.insert(&asked.to_string(), now));
-        let admission = AdmissionGates {
-            registry: &gates.registry,
-            replay_guard: &gates.replay_guard,
-            rate_limiter: &gates.rate_limiter,
-            immediate_limiter: &gates.immediate_limiter,
-            usage_cache: &gates.usage_cache,
-            limits: &SMALL,
-            local_actor: &gates.local_actor,
-            requested_graphs: &gates.requested_graphs,
-        };
-        assert!(admission.keeps(MessageKind::SyncGraph, Some(asked), now));
-        assert!(!admission.keeps(MessageKind::SyncGraph, Some(unasked), now), "relayed only");
-        assert!(
-            !admission.keeps(MessageKind::SyncGraph, Some(asked), now + SYNC_GRAPH_REQUEST_TTL),
-            "a request that has expired no longer expects an answer"
-        );
-        gates.requested_graphs.remove(&asked.to_string());
-        assert!(!admission.keeps(MessageKind::SyncGraph, Some(asked), now), "already served");
-        // Other kinds are unaffected by the set.
-        assert!(admission.keeps(MessageKind::KickoffSent, None, now));
-        assert!(!admission.keeps(MessageKind::NackReady, None, now), "not a committee message");
-        assert_eq!(DropReason::ControlQueueFull.as_str(), "control_queue_full");
     }
 }

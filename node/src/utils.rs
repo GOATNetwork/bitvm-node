@@ -122,6 +122,51 @@ pub fn committee_instance_keys_envelope_path(instance_id: Uuid) -> PathBuf {
     envelope_path
 }
 
+/// Whether this node signs for an instance: it holds the instance key
+/// envelope and that key is in the instance's committee on Goat. Nodes that
+/// did not answer the peg-in request hold no envelope and take no part in
+/// the instance's signing rounds.
+pub enum CommitteeMembership {
+    Member(bitcoin::key::Keypair),
+    NotMember(String),
+}
+
+pub async fn local_committee_membership(
+    goat_client: &GOATClient,
+    instance_id: Uuid,
+) -> Result<CommitteeMembership> {
+    let envelope_path = committee_instance_keys_envelope_path(instance_id);
+    if !envelope_path.exists() {
+        return Ok(CommitteeMembership::NotMember("no instance key envelope".to_string()));
+    }
+    let committee_master_key = CommitteeMasterKey::new(get_bitvm_key()?);
+    let keypair = match load_committee_instance_keypair(&committee_master_key, instance_id) {
+        Ok(keypair) => keypair,
+        Err(error) if is_io_not_found_error(&error) => {
+            return Ok(CommitteeMembership::NotMember(
+                "instance key envelope vanished".to_string(),
+            ));
+        }
+        Err(error) => return Err(error),
+    };
+    let pubkey: PublicKey = keypair.public_key().into();
+    let committee = goat_client.gateway_get_committee_pubkeys(&instance_id).await?;
+    if !committee.contains(&pubkey) {
+        return Ok(CommitteeMembership::NotMember(format!(
+            "instance key {pubkey} is not in the committee on Goat"
+        )));
+    }
+    Ok(CommitteeMembership::Member(keypair))
+}
+
+pub fn is_io_not_found_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::NotFound)
+    })
+}
+
 pub(crate) fn load_committee_instance_keypair(
     committee_master_key: &CommitteeMasterKey,
     instance_id: Uuid,
@@ -248,11 +293,10 @@ pub async fn validate_graph_instance_parameters(
         let funding_tx = btc_client.get_tx(&input.outpoint.txid).await.with_context(|| {
             format!("failed to load peg-in funding transaction {}", input.outpoint.txid)
         })?;
+        // The parameters already match GoatChain: a transaction the Bitcoin
+        // backend does not know yet is the backend lagging, not a bad graph.
         let Some(funding_tx) = funding_tx else {
-            bail!(SpecialError::InvalidGraph(format!(
-                "peg-in funding transaction {} not found on Bitcoin",
-                input.outpoint.txid
-            )));
+            bail!("peg-in funding transaction {} not found on Bitcoin", input.outpoint.txid);
         };
         let funding_output =
             funding_tx.output.get(input.outpoint.vout as usize).ok_or_else(|| {
@@ -286,9 +330,7 @@ pub async fn validate_graph_instance_parameters(
         .with_context(|| format!("failed to load peg-in deposit transaction {pegin_deposit_txid}"))?
         .is_none()
     {
-        bail!(SpecialError::InvalidGraph(format!(
-            "peg-in deposit transaction {pegin_deposit_txid} not found on Bitcoin"
-        )));
+        bail!("peg-in deposit transaction {pegin_deposit_txid} not found on Bitcoin");
     }
 
     Ok(())
@@ -365,7 +407,7 @@ async fn validate_prekickoff_continuity(
             GraphQuery::default()
                 .with_operator_pubkey(full_graph.parameters.operator_pubkey.to_string())
                 .with_kickoff_index(previous_nonce as i64)
-                .with_limit(2),
+                .with_limit(1),
         )
         .await?;
     if let Some(previous_graph) = graphs.first() {
@@ -376,9 +418,7 @@ async fn validate_prekickoff_continuity(
         )
         .await?
         .ok_or_else(|| {
-            SpecialError::InvalidGraph(format!(
-                "previous graph raw data is missing for graph nonce {previous_nonce}"
-            ))
+            anyhow!("previous graph raw data is missing for graph nonce {previous_nonce}")
         })?;
         let expected_cur_prekickoff =
             BitvmGcGraph::from_simplified(&simplified_graph)?.next_prekickoff;
@@ -391,9 +431,9 @@ async fn validate_prekickoff_continuity(
         }
         Ok(())
     } else {
-        bail!(SpecialError::InvalidGraph(format!(
-            "previous graph is missing for graph nonce {previous_nonce}"
-        )));
+        // Not stored yet: the job retries until the definition arrives by
+        // gossip or a pull, or the graph retires.
+        bail!("previous graph is missing for graph nonce {previous_nonce}");
     }
 }
 
@@ -430,9 +470,10 @@ pub async fn validate_init_graph_base(
     }
 
     // 4) Watchtower config sanity: number of watchtowers should match number of hashlocks and registry size
-    let watchtowers_on_chain = goat_client.committee_mana_get_watchtowers().await.map_err(|e| {
-        SpecialError::InvalidGraph(format!("failed to load watchtowers from chain: {e}"))
-    })?;
+    let watchtowers_on_chain = goat_client
+        .committee_mana_get_watchtowers()
+        .await
+        .context("load the watchtower registry from GoatChain")?;
 
     validate_watchtower_selection(
         &graph.parameters.watchtower_pubkeys,
@@ -444,9 +485,21 @@ pub async fn validate_init_graph_base(
     )?;
 
     // 5) Operator stake sanity: verify operator is registered and has enough locked stake.
-    validate_operator_stake(goat_client, &graph.parameters.operator_pubkey)
+    // The query may fail transiently; only the verdict is a rejection.
+    match operator_stake_status(goat_client, &graph.parameters.operator_pubkey)
         .await
-        .map_err(|error| SpecialError::InvalidGraph(error.to_string()))?;
+        .context("query operator stake")?
+    {
+        OperatorStakeStatus::Staked => {}
+        OperatorStakeStatus::NotRegistered => {
+            bail!(SpecialError::InvalidGraph("operator not registered".to_string()))
+        }
+        OperatorStakeStatus::Insufficient { locked, min } => {
+            bail!(SpecialError::InvalidGraph(format!(
+                "insufficient operator stake: locked={locked}, min={min}"
+            )))
+        }
+    }
 
     Ok(())
 }
@@ -612,9 +665,10 @@ pub async fn validate_finalized_graph(
         bail!(SpecialError::InvalidGraph("unexpected challenge amount".to_string()));
     }
 
-    let watchtowers_on_chain = goat_client.committee_mana_get_watchtowers().await.map_err(|e| {
-        SpecialError::InvalidGraph(format!("failed to load watchtowers from chain: {e}"))
-    })?;
+    let watchtowers_on_chain = goat_client
+        .committee_mana_get_watchtowers()
+        .await
+        .context("load the watchtower registry from GoatChain")?;
     validate_watchtower_selection(
         &graph.parameters.watchtower_pubkeys,
         &watchtowers_on_chain,
@@ -631,7 +685,12 @@ pub async fn validate_finalized_graph(
     let pegin_data = goat_client
         .gateway_get_pegin_data(&instance_id)
         .await
-        .map_err(|e| SpecialError::InvalidGraph(format!("failed to load instance data: {e}")))?;
+        .context("load the instance's peg-in data from GoatChain")?;
+    // One digest per graph; computing it is a GoatChain call and may fail
+    // transiently, while a signature that does not recover is a rejection.
+    let graph_digest = get_graph_digest(goat_client, &full_graph)
+        .await
+        .context("load the graph digest from GoatChain")?;
     if pegin_data.committee_pubkeys.len() != pegin_data.committee_addresses.len() {
         bail!(SpecialError::InvalidGraph(
             "on-chain committee pubkey and address counts differ".to_string()
@@ -684,9 +743,9 @@ pub async fn validate_finalized_graph(
         }
 
         // cryptographically verify the endorsement against the graph digest
-        let ok = verify_graph_endorsement(goat_client, evm_addr, &full_graph, sig).await.map_err(
-            |e| SpecialError::InvalidGraph(format!("failed to verify endorsement: {e}")),
-        )?;
+        let ok = verify_graph_endorsement_digest(evm_addr, &graph_digest, sig).map_err(|e| {
+            SpecialError::InvalidGraph(format!("failed to verify endorsement: {e}"))
+        })?;
         if !ok {
             bail!(SpecialError::InvalidGraph("invalid endorsement signature".to_string()));
         }
@@ -3703,8 +3762,17 @@ pub async fn verify_graph_endorsement(
     signature: &[u8],
 ) -> Result<bool> {
     let graph_digest = get_graph_digest(goat_client, graph).await?;
+    verify_graph_endorsement_digest(evm_address, &graph_digest, signature)
+}
+
+/// Whether `signature` over the graph digest recovers to `evm_address`.
+pub fn verify_graph_endorsement_digest(
+    evm_address: &EvmAddress,
+    graph_digest: &[u8; 32],
+    signature: &[u8],
+) -> Result<bool> {
     let sig = EvmSignature::try_from(signature)?;
-    sig.recover_address_from_prehash(&graph_digest.into())
+    sig.recover_address_from_prehash(&(*graph_digest).into())
         .map(|addr| &addr == evm_address)
         .map_err(|e| e.into())
 }
@@ -4804,6 +4872,22 @@ async fn ingest_graph_definition(
         bail!(SpecialError::InvalidGraph(format!(
             "finalized graph {graph_id} changes the stored operator pre-signatures"
         )));
+    }
+
+    if existing_graph.is_none() {
+        // One definition per operator slot: a second graph for a taken slot is refused for
+        // good, not retried on the unique index.
+        let operator_pubkey = bitvm_graph.parameters.operator_pubkey.to_string();
+        let graph_nonce = bitvm_graph.parameters.graph_nonce;
+        if let Some(holder) =
+            tx.find_graph_by_operator_slot(&operator_pubkey, graph_nonce as i64).await?
+            && holder.graph_id != graph_id
+        {
+            bail!(SpecialError::InvalidGraph(format!(
+                "slot {graph_nonce} of operator {operator_pubkey} is held by graph {}; graph {graph_id} is refused",
+                holder.graph_id
+            )));
+        }
     }
 
     let mut graph = convert_graph(

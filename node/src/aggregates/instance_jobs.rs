@@ -1,40 +1,62 @@
 //! Job runners of the Instance aggregate (docs/node-protocol.md §10.6): the
-//! relayer's Goat post and the committee's instance key deletion. Both check
-//! the external state before acting and are safe to re-run.
+//! relayer's Goat post, the committee's PeginConfirm round start and the
+//! committee's instance key deletion. All check the external state before
+//! acting and are safe to re-run.
 
+use super::graph_setup::permanent_rejection;
 use super::instance::{
-    INSTANCE_KIND, JOB_DELETE_INSTANCE_KEY, JOB_POST_PEGIN_DATA, KeyDeleteResult,
+    INSTANCE_KIND, JOB_DELETE_INSTANCE_KEY, JOB_POST_PEGIN_DATA, JOB_START_PEGIN_CONFIRM,
+    KeyDeleteResult,
 };
-use crate::env::{get_bitvm_key, is_enable_committee_instance_key_delete, is_relayer};
+use crate::action::GOATMessage;
+use crate::env::{get_bitvm_key, get_peer_id, is_enable_committee_instance_key_delete, is_relayer};
+use crate::handle::{HandlerContext, start_pegin_confirm_round};
 use crate::metrics_service::MetricsState;
+use crate::middleware::publisher::NetworkPublisher;
 use crate::utils::{
-    avg_block_time_secs, build_graph_data, committee_instance_keys_envelope_path,
-    get_committee_endorse_sigs_for_pegin, get_committee_endorsements_for_graph, get_graph,
-    get_graph_ids_for_instance, get_instance_parameters,
+    avg_block_time_secs, committee_instance_keys_envelope_path,
+    get_committee_endorse_sigs_for_pegin, get_instance_parameters,
 };
 use anyhow::anyhow;
 use async_trait::async_trait;
+use bitvm_lib::actors::Actor;
+use bitvm_lib::babe_adapter::BabeBundleBuilder;
 use bitvm_lib::keys::CommitteeMasterKey;
-use bitvm_lib::types::BitvmGcGraph;
 use client::btc_chain::BTCClient;
 use client::goat_chain::{GOATClient, PeginStatus};
+use client::http_client::async_client::HttpAsyncClient;
 use engine::{EngineBuilder, JobContext, JobOutcome, JobRunner};
 use goat::transactions::pre_signed::PreSignedTransaction;
+use libp2p::PeerId;
+use std::str::FromStr;
 use std::sync::Arc;
 use store::localdb::LocalDB;
 use tracing::{info, warn};
 use uuid::Uuid;
 
 pub struct InstanceJobDeps {
+    pub actor: Actor,
     pub local_db: LocalDB,
     pub btc_client: Arc<BTCClient>,
     pub goat_client: Arc<GOATClient>,
+    pub http_client: Arc<HttpAsyncClient>,
+    pub soldering_builder: Option<Arc<BabeBundleBuilder>>,
     pub metrics_state: MetricsState,
+    pub publisher: NetworkPublisher,
 }
 
 pub fn register_instance_jobs(builder: EngineBuilder, deps: Arc<InstanceJobDeps>) -> EngineBuilder {
     builder
-        .job_runner(INSTANCE_KIND, JOB_POST_PEGIN_DATA, Arc::new(PostPeginDataRunner { deps }))
+        .job_runner(
+            INSTANCE_KIND,
+            JOB_POST_PEGIN_DATA,
+            Arc::new(PostPeginDataRunner { deps: deps.clone() }),
+        )
+        .job_runner(
+            INSTANCE_KIND,
+            JOB_START_PEGIN_CONFIRM,
+            Arc::new(StartPeginConfirmRunner { deps }),
+        )
         .job_runner(INSTANCE_KIND, JOB_DELETE_INSTANCE_KEY, Arc::new(DeleteInstanceKeyRunner))
 }
 
@@ -51,7 +73,7 @@ fn job_instance_id(ctx: &JobContext) -> Result<Uuid, JobOutcome> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PostOutcome {
-    /// Pegin data and every endorsed graph are on Goat.
+    /// Pegin data is on Goat.
     Done,
     /// A precondition is not met yet; retry after about one block.
     Waiting(String),
@@ -67,11 +89,9 @@ fn is_permanent_post_rejection(error: &anyhow::Error) -> bool {
         .any(|needle| message.contains(needle))
 }
 
-/// `postPeginData` once the Peg-In-Confirm is confirmed, endorsed by every
-/// committee member and covered by the Goat SPV, then `postGraphData` for
-/// every endorsed graph not yet on Goat. Moved from the legacy `PostReady`
-/// handler; the Graph aggregate takes over graph posting in step 3.
-pub async fn post_pegin_and_graph_data(
+/// Submit pegin data after Confirm is confirmed, all committee endorsements are
+/// present and Goat SPV covers it. Graph publishing uses separate Graph jobs.
+pub async fn post_pegin_data(
     deps: &InstanceJobDeps,
     instance_id: Uuid,
 ) -> anyhow::Result<PostOutcome> {
@@ -138,38 +158,6 @@ pub async fn post_pegin_and_graph_data(
             // Already posted.
         }
     }
-
-    let mut missing_endorsements = Vec::new();
-    for graph_id in get_graph_ids_for_instance(&deps.local_db, instance_id).await? {
-        let graph_data = goat_client.gateway_get_graph_data(&graph_id).await?;
-        if graph_data.operator_pubkey != [0u8; 32] {
-            continue;
-        }
-        let endorsement_sigs =
-            get_committee_endorsements_for_graph(&deps.local_db, instance_id, graph_id)
-                .await?
-                .into_iter()
-                .map(|(_, _, sig)| sig)
-                .collect::<Vec<_>>();
-        if endorsement_sigs.len() != committee_pubkeys.len() {
-            missing_endorsements.push(graph_id);
-            continue;
-        }
-        let graph = get_graph(&deps.local_db, instance_id, graph_id)
-            .await?
-            .ok_or_else(|| anyhow!("Graph not found for {instance_id}:{graph_id}"))?;
-        let graph = BitvmGcGraph::from_simplified(&graph)?;
-        let graph_data = build_graph_data(&graph)?;
-        goat_client
-            .gateway_post_graph_data(&instance_id, &graph_id, &graph_data, &endorsement_sigs)
-            .await?;
-        info!(event = "instance_post", instance_id = %instance_id, graph_id = %graph_id, outcome = "graph_posted", "postGraphData sent");
-    }
-    if !missing_endorsements.is_empty() {
-        return Ok(PostOutcome::Waiting(format!(
-            "waiting for committee endorsements of graphs {missing_endorsements:?}"
-        )));
-    }
     Ok(PostOutcome::Done)
 }
 
@@ -184,7 +172,7 @@ impl JobRunner for PostPeginDataRunner {
             Ok(instance_id) => instance_id,
             Err(outcome) => return outcome,
         };
-        match post_pegin_and_graph_data(&self.deps, instance_id).await {
+        match post_pegin_data(&self.deps, instance_id).await {
             Ok(PostOutcome::Done) => JobOutcome::Done(b"posted".to_vec()),
             Ok(PostOutcome::Waiting(reason)) => JobOutcome::Transient {
                 error: reason,
@@ -194,6 +182,54 @@ impl JobRunner for PostPeginDataRunner {
             Err(error) => {
                 JobOutcome::Transient { error: format!("{error:#}"), retry_after_secs: None }
             }
+        }
+    }
+}
+
+// ------------------------------------------------------ pegin confirm round
+
+/// Runs the legacy PeginConfirm round start under a handler context of this
+/// node's own: the round's messages go through the signing-round outbox.
+struct StartPeginConfirmRunner {
+    deps: Arc<InstanceJobDeps>,
+}
+
+#[async_trait]
+impl JobRunner for StartPeginConfirmRunner {
+    async fn run(&self, ctx: JobContext) -> JobOutcome {
+        let instance_id = match job_instance_id(&ctx) {
+            Ok(instance_id) => instance_id,
+            Err(outcome) => return outcome,
+        };
+        if self.deps.actor != Actor::Committee {
+            return JobOutcome::Done(b"not a committee node".to_vec());
+        }
+        let from_peer_id = match PeerId::from_str(&get_peer_id()) {
+            Ok(peer_id) => peer_id,
+            Err(error) => return JobOutcome::Failed(format!("local peer id: {error}")),
+        };
+        let mut publisher = self.deps.publisher.clone();
+        let mut handler = HandlerContext {
+            swarm: &mut publisher,
+            local_db: &self.deps.local_db,
+            btc_client: &self.deps.btc_client,
+            goat_client: &self.deps.goat_client,
+            http_client: &self.deps.http_client,
+            soldering_builder: &self.deps.soldering_builder,
+            metrics_state: &self.deps.metrics_state,
+            actor: Actor::Committee,
+            from_peer_id,
+            id: GOATMessage::default_message_id(),
+            is_self_peer: true,
+        };
+        match start_pegin_confirm_round(&mut handler, instance_id).await {
+            Ok(()) => JobOutcome::Done(b"started".to_vec()),
+            Err(error) => match permanent_rejection(&error) {
+                Some(reason) => JobOutcome::Failed(reason),
+                None => {
+                    JobOutcome::Transient { error: format!("{error:#}"), retry_after_secs: None }
+                }
+            },
         }
     }
 }

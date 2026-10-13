@@ -4,6 +4,8 @@
 //! process-wide handle producers use to record events.
 
 use crate::action::{GOATMessage, GOATMessageContent, GraphSetupAck, send_to_peer};
+use crate::aggregates::graph::{GRAPH_KIND, GraphAggregate};
+use crate::aggregates::graph_jobs::{GraphJobDeps, register_graph_jobs};
 use crate::aggregates::instance::{INSTANCE_KIND, InstanceAggregate};
 use crate::aggregates::instance_jobs::{InstanceJobDeps, register_instance_jobs};
 use crate::env;
@@ -12,8 +14,10 @@ use crate::middleware::publisher::{MessagePublisher, NetworkPublisher};
 use crate::rpc_service::current_time_secs;
 use async_trait::async_trait;
 use bitvm_lib::actors::Actor;
+use bitvm_lib::babe_adapter::BabeBundleBuilder;
 use client::btc_chain::BTCClient;
 use client::goat_chain::GOATClient;
+use client::http_client::async_client::HttpAsyncClient;
 use engine::{
     AckReceiver, AggregateRef, Engine, EngineBuilder, EngineConfig, EngineHandle, EngineMetrics,
     NewEvent, Transport,
@@ -103,29 +107,56 @@ pub fn register_engine_metrics(registry: &mut Registry) -> EngineMetrics {
 /// What the aggregates and their jobs need from the node.
 pub struct EngineDeps {
     pub actor: Actor,
+    pub local_peer: String,
     pub local_db: LocalDB,
     pub btc_client: Arc<BTCClient>,
     pub goat_client: Arc<GOATClient>,
+    pub http_client: Arc<HttpAsyncClient>,
+    pub soldering_builder: Option<Arc<BabeBundleBuilder>>,
     pub metrics_state: MetricsState,
 }
 
-/// Build the engine with the migrated aggregates registered (step 2: Instance).
+/// Register Instance and Graph handlers, jobs and the network transport.
 pub fn build_engine(
     publisher: NetworkPublisher,
     metrics: EngineMetrics,
     deps: EngineDeps,
 ) -> (Engine, AckReceiver) {
     let builder = EngineBuilder::new(deps.local_db.clone(), engine_config_from_env())
-        .transport(Arc::new(GossipTransport::new(publisher)))
+        .transport(Arc::new(GossipTransport::new(publisher.clone())))
         .metrics(metrics)
-        .handler(INSTANCE_KIND, Arc::new(InstanceAggregate::from_env(deps.actor.clone())));
+        .handler(INSTANCE_KIND, Arc::new(InstanceAggregate::from_env(deps.actor.clone())))
+        .handler(
+            GRAPH_KIND,
+            Arc::new(GraphAggregate::new(
+                deps.actor.clone(),
+                env::is_relayer(),
+                deps.local_peer.clone(),
+            )),
+        );
     let builder = register_instance_jobs(
         builder,
         Arc::new(InstanceJobDeps {
+            actor: deps.actor.clone(),
+            local_db: deps.local_db.clone(),
+            btc_client: deps.btc_client.clone(),
+            goat_client: deps.goat_client.clone(),
+            http_client: deps.http_client,
+            soldering_builder: deps.soldering_builder.clone(),
+            metrics_state: deps.metrics_state.clone(),
+            publisher: publisher.clone(),
+        }),
+    );
+    let builder = register_graph_jobs(
+        builder,
+        Arc::new(GraphJobDeps {
             local_db: deps.local_db,
             btc_client: deps.btc_client,
             goat_client: deps.goat_client,
+            soldering_builder: deps.soldering_builder,
             metrics_state: deps.metrics_state,
+            publisher,
+            actor: deps.actor,
         }),
     );
     builder.build()

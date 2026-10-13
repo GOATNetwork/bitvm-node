@@ -1,9 +1,15 @@
 use crate::action::*;
+use crate::aggregates::graph::operator_start_event;
+use crate::aggregates::graph_jobs::signing_nonce_id;
+use crate::aggregates::graph_setup::{
+    build_babe_prover_state, decode_soldering_proof_payload, find_verifier_index_by_pubkey,
+    selected_candidate_for_graph_index, validate_verifier_slot,
+};
 use crate::aggregates::instance::{SigningGate, signing_gate};
+use crate::engine_bridge::submit_event;
 use crate::env::{
-    get_babe_gc_asset_paths, get_bitvm_key, get_node_goat_address,
-    get_operator_graph_start_cutoff_blocks, get_peer_id, get_soldering_proof_payload_store_path,
-    get_verifier_candidate_backup_count, get_verifier_candidate_collection_window_secs, is_relayer,
+    get_bitvm_key, get_operator_graph_start_cutoff_blocks, get_soldering_proof_payload_store_path,
+    is_relayer,
 };
 use crate::error::SpecialError;
 use crate::metrics_service::MetricsState;
@@ -16,26 +22,21 @@ use crate::soldering_payload_store::{
 use crate::utils::*;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use ark_serialize::CanonicalSerialize;
-use bitcoin::{Amount, OutPoint, Txid, hashes::Hash, key::Keypair};
+use bitcoin::{Amount, OutPoint, Txid};
 use bitcoin::{PublicKey, XOnlyPublicKey};
 use bitvm_lib::actors::Actor;
 use bitvm_lib::babe_adapter::{
-    BABE_M_CC, BABE_N_CC, BabeBundleBuilder, BabeChallengeAssertWitness, BabeProverState,
-    CACSetupPackage, ChallengeAssertWitnessRaw, CompactSolderingProofPayload,
-    FinalizedInstanceData, SolderingData, TxAssertWitness, WOTS_SIG_COUNT, assert_wots_message,
-    build_assert_witness, build_real_challenge_assert_witness, build_real_setup_package,
-    derive_finalized_indices, expand_compact_soldering_proof_payload, extract_gc_circuit_data,
-    open_real_setup_and_solder, recover_operator_proof_from_assert_witness,
-    recover_real_wrongly_challenged_witness, verify_real_setup,
+    BabeBundleBuilder, BabeChallengeAssertWitness, ChallengeAssertWitnessRaw, TxAssertWitness,
+    WOTS_SIG_COUNT, assert_wots_message, build_assert_witness, build_real_challenge_assert_witness,
+    expand_compact_soldering_proof_payload, recover_operator_proof_from_assert_witness,
+    recover_real_wrongly_challenged_witness,
 };
 use bitvm_lib::committee::*;
 use bitvm_lib::keys::*;
 use bitvm_lib::operator::*;
-use bitvm_lib::types::{
-    BitvmGcCircuitData, BitvmGcGraph, BitvmGcInstanceParameters, SimplifiedBitvmGcGraph,
-};
+use bitvm_lib::types::{BitvmGcGraph, BitvmGcInstanceParameters};
 use bitvm_lib::verifier::*;
-use client::goat_chain::{DisproveTxType, PeginStatus, WithdrawStatus};
+use client::goat_chain::{DisproveTxType, WithdrawStatus};
 use client::graphs::graph_query::BridgeInRequestEvent;
 use client::http_client::async_client::HttpAsyncClient;
 use client::{btc_chain::BTCClient, goat_chain::GOATClient};
@@ -48,13 +49,13 @@ use libp2p::gossipsub::MessageId;
 use secp256k1::{Message as SecpMessage, SECP256K1};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Instant;
 use store::localdb::LocalDB;
 use store::{GoatTxType, GraphStatus, InstanceBridgeInStatus, SerializableTxid};
 use uuid::Uuid;
 
 pub struct HandlerContext<'a> {
-    pub swarm: &'a mut dyn MessagePublisher,
+    /// `Sync` so handlers may hold the context across awaits in a `Send` job.
+    pub swarm: &'a mut (dyn MessagePublisher + Sync),
     pub local_db: &'a LocalDB,
     pub btc_client: &'a Arc<BTCClient>,
     pub goat_client: &'a Arc<GOATClient>,
@@ -65,114 +66,6 @@ pub struct HandlerContext<'a> {
     pub from_peer_id: PeerId,
     pub id: MessageId,
     pub is_self_peer: bool,
-}
-
-/// Owned resources for work that must not run on the swarm event loop. It
-/// deliberately excludes `Swarm`: heavy work persists its follow-up protocol
-/// notifications to the durable P2P outbox instead.
-pub(crate) struct HeavyTaskContext {
-    pub local_db: LocalDB,
-    pub btc_client: Arc<BTCClient>,
-    pub goat_client: Arc<GOATClient>,
-    pub soldering_builder: Option<Arc<BabeBundleBuilder>>,
-    pub metrics_state: MetricsState,
-    pub from_peer_id: PeerId,
-}
-
-pub(crate) enum HeavyTask {
-    GenerateVerifierSetup(InitGraph),
-    GenerateSolderingProof(CutCircuits),
-    ValidateVerifierGraph(Box<CreateGraph>),
-    VerifySolderingProof(SolderingProofReady),
-}
-
-impl HeavyTask {
-    pub(crate) fn kind(&self) -> &'static str {
-        match self {
-            Self::GenerateVerifierSetup(_) => "generate_verifier_setup",
-            Self::GenerateSolderingProof(_) => "generate_soldering_proof",
-            Self::ValidateVerifierGraph(_) => "validate_verifier_graph",
-            Self::VerifySolderingProof(_) => "verify_soldering_proof",
-        }
-    }
-
-    pub(crate) fn graph_id(&self) -> Uuid {
-        match self {
-            Self::GenerateVerifierSetup(message) => message.graph_id,
-            Self::GenerateSolderingProof(message) => message.graph_id,
-            Self::ValidateVerifierGraph(message) => message.graph_id,
-            Self::VerifySolderingProof(message) => message.graph_id,
-        }
-    }
-}
-
-pub(crate) fn heavy_task_from_content(
-    content: &GOATMessageContent,
-    actor: &Actor,
-) -> Option<HeavyTask> {
-    match (content, actor) {
-        (GOATMessageContent::InitGraph(message), Actor::Verifier) => {
-            Some(HeavyTask::GenerateVerifierSetup(message.clone()))
-        }
-        (GOATMessageContent::CutCircuits(message), Actor::Verifier) => {
-            Some(HeavyTask::GenerateSolderingProof(message.clone()))
-        }
-        (GOATMessageContent::CreateGraph(message), Actor::Verifier) => {
-            Some(HeavyTask::ValidateVerifierGraph(Box::new(message.clone())))
-        }
-        (GOATMessageContent::SolderingProofReady(message), Actor::Operator) => {
-            Some(HeavyTask::VerifySolderingProof(message.clone()))
-        }
-        _ => None,
-    }
-}
-
-pub(crate) async fn run_heavy_task(context: &HeavyTaskContext, task: HeavyTask) -> Result<()> {
-    match task {
-        HeavyTask::GenerateVerifierSetup(message) => {
-            handle_init_graph_verifier(context, message).await
-        }
-        HeavyTask::GenerateSolderingProof(message) => {
-            handle_cut_circuits_verifier(
-                context,
-                message.instance_id,
-                message.graph_id,
-                &message.verifier_pubkey,
-                message.candidate_index,
-                &message.selected_circuit_indexes,
-            )
-            .await
-        }
-        HeavyTask::ValidateVerifierGraph(message) => {
-            handle_create_graph_verifier(
-                context,
-                message.instance_id,
-                message.graph_id,
-                message.graph_nonce,
-                &message.graph,
-            )
-            .await
-        }
-        HeavyTask::VerifySolderingProof(message) => {
-            handle_soldering_proof_ready_operator(
-                context,
-                message.instance_id,
-                message.graph_id,
-                message.candidate_index,
-                message.payload_hash,
-                message.total_len,
-            )
-            .await
-        }
-    }
-}
-
-fn is_io_not_found_error(err: &anyhow::Error) -> bool {
-    err.chain().any(|cause| {
-        cause
-            .downcast_ref::<std::io::Error>()
-            .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::NotFound)
-    })
 }
 
 async fn load_or_create_committee_instance_keypair(
@@ -236,17 +129,15 @@ async fn load_or_create_committee_instance_keypair(
 pub async fn dispatch(ctx: &mut HandlerContext<'_>, content: &GOATMessageContent) -> Result<()> {
     match (content, &ctx.actor) {
         (GOATMessageContent::GraphSetupAck(GraphSetupAck { delivery_id }), _) => {
-            let source_peer_id = ctx.from_peer_id.to_string();
-            let acknowledged = ctx
-                .local_db
-                .acquire()
-                .await?
-                .acknowledge_p2p_outbox_message(delivery_id, &source_peer_id)
-                .await?;
+            // ACKs settle the engine outbox.
+            let Some(engine) = crate::engine_bridge::engine_handle() else {
+                return Ok(());
+            };
+            let outcome = engine.acknowledge(&ctx.from_peer_id.to_string(), delivery_id).await?;
             tracing::debug!(
                 delivery_id,
                 from_peer_id = %ctx.from_peer_id,
-                acknowledged,
+                outcome = ?outcome,
                 "processed GraphSetupAck"
             );
             Ok(())
@@ -290,239 +181,6 @@ pub async fn dispatch(ctx: &mut HandlerContext<'_>, content: &GOATMessageContent
         }
         (GOATMessageContent::ConfirmInstance(ConfirmInstance { instance_id }), _) => {
             handle_confirm_instance_default(ctx, *instance_id).await
-        }
-        (
-            GOATMessageContent::GenCircuits(GenCircuits {
-                instance_id,
-                graph_id,
-                verifier_pubkey,
-                setup_package,
-            }),
-            Actor::Operator,
-        ) => {
-            handle_gen_circuits_operator(
-                ctx,
-                *instance_id,
-                *graph_id,
-                verifier_pubkey,
-                setup_package,
-            )
-            .await
-        }
-        (content, actor) if heavy_task_from_content(content, actor).is_some() => {
-            bail!("heavy task must be dispatched through the durable P2P inbox")
-        }
-        (
-            GOATMessageContent::CreateGraph(CreateGraph {
-                instance_id,
-                graph_id,
-                graph_nonce,
-                graph,
-            }),
-            Actor::Committee,
-        ) => {
-            handle_create_graph_committee(
-                ctx,
-                *instance_id,
-                *graph_id,
-                *graph_nonce,
-                graph,
-                content,
-            )
-            .await
-        }
-        (
-            GOATMessageContent::VerifierGraphParamsEndorsement(VerifierGraphParamsEndorsement {
-                instance_id,
-                graph_id,
-                verifier_pubkey,
-                verifier_index,
-                canonical_graph_params_hash,
-                signature,
-            }),
-            Actor::Committee,
-        ) => {
-            handle_verifier_graph_params_endorsement_committee(
-                ctx,
-                *instance_id,
-                *graph_id,
-                verifier_pubkey,
-                *verifier_index,
-                *canonical_graph_params_hash,
-                signature,
-                content,
-            )
-            .await
-        }
-        (
-            GOATMessageContent::NonceGeneration(NonceGeneration {
-                instance_id,
-                graph_id,
-                committee_pubkey: received_committee_pubkey,
-                pub_nonces,
-                nonce_sigs,
-            }),
-            Actor::Committee,
-        ) => {
-            handle_nonce_generation_committee(
-                ctx,
-                *instance_id,
-                *graph_id,
-                received_committee_pubkey,
-                pub_nonces,
-                nonce_sigs,
-                content,
-            )
-            .await
-        }
-        (
-            GOATMessageContent::NonceGeneration(NonceGeneration {
-                instance_id,
-                graph_id,
-                committee_pubkey: received_committee_pubkey,
-                pub_nonces,
-                nonce_sigs,
-            }),
-            Actor::Operator,
-        ) => {
-            handle_nonce_generation_operator(
-                ctx,
-                *instance_id,
-                *graph_id,
-                received_committee_pubkey,
-                pub_nonces,
-                nonce_sigs,
-            )
-            .await
-        }
-        (
-            GOATMessageContent::AggNonceConsensus(AggNonceConsensus {
-                instance_id,
-                graph_id,
-                committee_pubkey: received_committee_pubkey,
-                consensus_hash,
-                signature,
-            }),
-            Actor::Committee,
-        ) => {
-            handle_agg_nonce_consensus_committee(
-                ctx,
-                *instance_id,
-                *graph_id,
-                received_committee_pubkey,
-                *consensus_hash,
-                signature,
-                content,
-            )
-            .await
-        }
-        (
-            GOATMessageContent::CommitteePresign(CommitteePresign {
-                instance_id,
-                graph_id,
-                committee_pubkey: received_committee_pubkey,
-                committee_partial_sigs,
-                agg_nonces,
-            }),
-            Actor::Committee,
-        ) => {
-            handle_committee_presign_committee(
-                ctx,
-                *instance_id,
-                *graph_id,
-                received_committee_pubkey,
-                committee_partial_sigs,
-                agg_nonces,
-                content,
-            )
-            .await
-        }
-        (
-            GOATMessageContent::CommitteePresign(CommitteePresign {
-                instance_id,
-                graph_id,
-                committee_pubkey: received_committee_pubkey,
-                committee_partial_sigs,
-                agg_nonces,
-            }),
-            Actor::Operator,
-        ) => {
-            handle_committee_presign_operator(
-                ctx,
-                *instance_id,
-                *graph_id,
-                received_committee_pubkey,
-                committee_partial_sigs,
-                agg_nonces,
-                content,
-            )
-            .await
-        }
-        (
-            GOATMessageContent::EndorseGraph(EndorseGraph {
-                instance_id,
-                graph_id,
-                committee_pubkey: received_committee_pubkey,
-                committee_sig_for_graph,
-                committee_sig_for_params,
-                committee_evm_address,
-            }),
-            Actor::Operator,
-        ) => {
-            handle_endorse_graph_operator(
-                ctx,
-                *instance_id,
-                *graph_id,
-                received_committee_pubkey,
-                committee_sig_for_graph,
-                committee_sig_for_params,
-                committee_evm_address,
-            )
-            .await
-        }
-        (
-            GOATMessageContent::GraphFinalize(GraphFinalize {
-                instance_id,
-                graph_id,
-                graph_nonce,
-                graph,
-                endorse_sigs,
-                params_endorse_sigs,
-            }),
-            Actor::Committee,
-        ) => {
-            handle_graph_finalize_committee(
-                ctx,
-                *instance_id,
-                *graph_id,
-                *graph_nonce,
-                graph,
-                endorse_sigs,
-                params_endorse_sigs,
-            )
-            .await
-        }
-        (
-            GOATMessageContent::GraphFinalize(GraphFinalize {
-                instance_id,
-                graph_id,
-                graph_nonce,
-                graph,
-                endorse_sigs,
-                params_endorse_sigs,
-            }),
-            _,
-        ) => {
-            handle_graph_finalize_default(
-                ctx,
-                *instance_id,
-                *graph_id,
-                *graph_nonce,
-                graph,
-                endorse_sigs,
-                params_endorse_sigs,
-            )
-            .await
         }
         (
             GOATMessageContent::PeginConfirmNonce(PeginConfirmNonce {
@@ -767,13 +425,6 @@ pub async fn dispatch(ctx: &mut HandlerContext<'_>, content: &GOATMessageContent
         (GOATMessageContent::Take2Sent(Take2Sent { instance_id, graph_id }), _) => {
             handle_take2_sent_default(ctx, *instance_id, *graph_id).await
         }
-        (
-            GOATMessageContent::SyncGraphRequest(SyncGraphRequest { instance_id, graph_id }),
-            Actor::Committee,
-        ) => handle_sync_graph_request(ctx, *instance_id, *graph_id).await,
-        (GOATMessageContent::SyncGraph(SyncGraph { instance_id, graph_id, graph }), _) => {
-            handle_sync_graph(ctx, *instance_id, *graph_id, graph).await
-        }
         (GOATMessageContent::RequestNodeInfo(node_info), _) => {
             handle_request_node_info(ctx, node_info).await
         }
@@ -803,32 +454,6 @@ async fn publish_stored(
     Ok(())
 }
 
-/// Check local graph-signing completion; missing, foreign and Obsoleted rows are not complete.
-async fn graph_signing_round_is_over(
-    local_db: &LocalDB,
-    instance_id: Uuid,
-    graph_id: Uuid,
-) -> Result<bool> {
-    let Some(row) = local_db.acquire().await?.find_graph(&graph_id).await? else {
-        return Ok(false);
-    };
-    if row.instance_id != instance_id {
-        return Ok(false);
-    }
-    Ok(GraphStatus::from_str(&row.status).is_ok_and(|status| match status {
-        GraphStatus::OperatorPresigned | GraphStatus::Obsoleted => false,
-        GraphStatus::CommitteePresigned
-        | GraphStatus::OperatorDataPushed
-        | GraphStatus::PreKickoff
-        | GraphStatus::OperatorKickOff
-        | GraphStatus::Challenge
-        | GraphStatus::Disprove
-        | GraphStatus::Skipped
-        | GraphStatus::OperatorTake1
-        | GraphStatus::OperatorTake2 => true,
-    }))
-}
-
 /// The committee key this node signs with for `instance_id`.
 fn local_committee_pubkey(instance_id: Uuid) -> Result<PublicKey> {
     let committee_master_key = CommitteeMasterKey::new(get_bitvm_key()?);
@@ -855,243 +480,6 @@ fn make_message(ctx: &HandlerContext<'_>, content: &GOATMessageContent) -> GOATM
     GOATMessage::new(ctx.actor.clone(), content.clone())
 }
 
-fn build_signed_init_graph(
-    instance_id: Uuid,
-    graph_id: Uuid,
-    operator_keypair: &Keypair,
-) -> Result<InitGraph> {
-    let operator_peer_id = PeerId::from_str(&get_peer_id())
-        .context("decode local operator peer id for InitGraph")?
-        .to_bytes();
-    Ok(sign_init_graph(instance_id, graph_id, operator_keypair, operator_peer_id))
-}
-
-/// A graph-bearing message has two identity representations: its envelope and
-/// the signed graph parameters. Never use one to read/write local state while
-/// using the other to reconstruct or scan the graph.
-fn message_identity_matches(
-    message_kind: &str,
-    message_instance_id: Uuid,
-    message_graph_id: Uuid,
-    message_graph_nonce: Option<u64>,
-    graph_instance_id: Uuid,
-    graph_graph_id: Uuid,
-    graph_nonce: u64,
-) -> bool {
-    let nonce_matches = message_graph_nonce.is_none_or(|nonce| nonce == graph_nonce);
-    if message_instance_id == graph_instance_id
-        && message_graph_id == graph_graph_id
-        && nonce_matches
-    {
-        return true;
-    }
-
-    tracing::warn!(
-        "Ignore {message_kind}: message identity {message_instance_id}:{message_graph_id}:{message_graph_nonce:?} does not match graph parameters {graph_instance_id}:{graph_graph_id}:{graph_nonce}"
-    );
-    false
-}
-
-/// Closes a bounded candidate collection window and assigns provisional slots.
-/// Final graph slots are assigned only after valid soldering proofs are collected.
-fn freeze_operator_candidates(state: &mut OperatorBabeSetupState) -> Result<()> {
-    if state.candidate_verifier_pubkeys.is_some() {
-        return Ok(());
-    }
-    if state.candidates.len() < min_required_verifier() {
-        bail!(
-            "cannot freeze {} verifier candidates before reaching target {}",
-            state.candidates.len(),
-            min_required_verifier()
-        );
-    }
-    let mut verifier_peer_ids = std::collections::HashSet::new();
-    for candidate in &state.candidates {
-        if !verifier_peer_ids.insert(&candidate.verifier_peer_id) {
-            bail!("cannot freeze duplicate verifier peer id");
-        }
-    }
-    state.candidates.sort_by_key(|candidate| candidate.verifier_pubkey.to_bytes());
-    for (candidate_index, candidate) in state.candidates.iter_mut().enumerate() {
-        candidate.candidate_index = Some(candidate_index);
-        candidate.selected_circuit_indexes =
-            derive_finalized_indices(&candidate.setup_package, BABE_M_CC)?;
-    }
-    state.candidate_verifier_pubkeys =
-        Some(state.candidates.iter().map(|candidate| candidate.verifier_pubkey).collect());
-    Ok(())
-}
-
-fn seal_selected_verifiers(
-    state: &mut OperatorBabeSetupState,
-    selected_verifier_pubkeys: Vec<PublicKey>,
-) -> Result<()> {
-    if let Some(existing) = &state.selected_verifier_pubkeys {
-        if existing != &selected_verifier_pubkeys {
-            bail!("refuse to replace the sealed verifier selection");
-        }
-        return Ok(());
-    }
-    if selected_verifier_pubkeys.len() != min_required_verifier() {
-        bail!(
-            "selected verifier count {} does not match required {}",
-            selected_verifier_pubkeys.len(),
-            min_required_verifier()
-        );
-    }
-    if selected_verifier_pubkeys.windows(2).any(|pair| pair[0].to_bytes() >= pair[1].to_bytes()) {
-        bail!("selected verifier public keys must be unique and canonically ordered");
-    }
-    if selected_verifier_pubkeys.iter().any(|selected| {
-        !state.candidates.iter().any(|candidate| candidate.verifier_pubkey == *selected)
-    }) {
-        bail!("sealed verifier selection contains a non-candidate public key");
-    }
-    state.selected_verifier_pubkeys = Some(selected_verifier_pubkeys);
-    Ok(())
-}
-
-fn selected_gc_data(state: &OperatorBabeSetupState) -> Result<Vec<BitvmGcCircuitData>> {
-    let selected = state
-        .selected_verifier_pubkeys
-        .as_ref()
-        .ok_or_else(|| anyhow!("verifier selection is not sealed"))?;
-    selected
-        .iter()
-        .map(|verifier_pubkey| {
-            state
-                .candidates
-                .iter()
-                .find(|candidate| candidate.verifier_pubkey == *verifier_pubkey)
-                .and_then(|candidate| candidate.gc_data.clone())
-                .ok_or_else(|| {
-                    anyhow!("missing verified GC data for sealed verifier {verifier_pubkey}")
-                })
-        })
-        .collect()
-}
-
-fn selected_candidate_for_graph_index(
-    state: &OperatorBabeSetupState,
-    verifier_index: usize,
-) -> Result<&OperatorVerifierCandidate> {
-    let verifier_pubkey = state
-        .selected_verifier_pubkeys
-        .as_ref()
-        .and_then(|selected| selected.get(verifier_index))
-        .ok_or_else(|| anyhow!("missing sealed verifier slot {verifier_index}"))?;
-    state
-        .candidates
-        .iter()
-        .find(|candidate| candidate.verifier_pubkey == *verifier_pubkey)
-        .ok_or_else(|| anyhow!("missing candidate for sealed verifier slot {verifier_index}"))
-}
-
-/// Stores verified proof data against its immutable candidate slot.
-fn record_candidate_gc_data(
-    state: &mut OperatorBabeSetupState,
-    verifier_pubkey: PublicKey,
-    candidate_index: usize,
-    setup_package: &CACSetupPackage,
-    gc_data: BitvmGcCircuitData,
-    prover_state: &BabeProverState,
-    soldering_proof_ready: SolderingProofReady,
-) -> Result<()> {
-    if gc_data.verifier_pubkey != verifier_pubkey {
-        bail!("GC slot owner does not match soldering proof verifier");
-    }
-    let candidate = state
-        .candidates
-        .iter_mut()
-        .find(|candidate| candidate.verifier_pubkey == verifier_pubkey)
-        .ok_or_else(|| anyhow!("selected verifier candidate is missing"))?;
-    if candidate.candidate_index != Some(candidate_index) {
-        bail!("candidate index does not match soldering proof slot");
-    }
-    if candidate.setup_package != *setup_package {
-        bail!("soldering proof setup package does not match selected verifier candidate");
-    }
-    if prover_state.package != *setup_package {
-        bail!("BABE prover state setup package does not match selected verifier candidate");
-    }
-    if candidate.selected_circuit_indexes != prover_state.soldering.finalized_indices {
-        bail!("BABE prover state finalized indices do not match selected verifier cut");
-    }
-    if soldering_proof_ready.candidate_index != candidate_index {
-        bail!("soldering proof reference candidate index does not match selected verifier");
-    }
-    if prover_state.finalized.len() != BABE_M_CC || prover_state.h_msgs.len() != BABE_M_CC {
-        bail!("BABE prover state must contain exactly {BABE_M_CC} finalized instances and hashes");
-    }
-    if prover_state.h_msgs != gc_data.final_msg_hashlocks {
-        bail!("BABE prover state hashes do not match GC slot hashes");
-    }
-    if let Some(existing) = &candidate.gc_data
-        && existing != &gc_data
-    {
-        bail!("conflicting GC data received for verifier candidate");
-    }
-    if let Some(existing) = &candidate.soldering_proof_ready
-        && existing != &soldering_proof_ready
-    {
-        bail!("conflicting soldering proof reference received for verifier candidate");
-    }
-    if candidate.gc_data.is_none() {
-        candidate.gc_data = Some(gc_data);
-    }
-    if candidate.soldering_proof_ready.is_none() {
-        candidate.soldering_proof_ready = Some(soldering_proof_ready);
-    }
-    Ok(())
-}
-
-fn build_babe_prover_state(
-    setup_package: &CACSetupPackage,
-    finalized: Vec<FinalizedInstanceData>,
-    soldering: SolderingData,
-) -> Result<BabeProverState> {
-    let h_msgs = finalized
-        .iter()
-        .map(|finalized| {
-            setup_package
-                .commits
-                .get(finalized.index)
-                .map(|commit| commit.h_msg)
-                .ok_or_else(|| anyhow!("finalized BABE instance index is out of range"))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    Ok(BabeProverState { package: setup_package.clone(), finalized, soldering, h_msgs })
-}
-
-fn validate_verifier_slot_lengths(
-    verifier_index: usize,
-    gc_data_len: usize,
-    verifier_asserts_len: usize,
-    disproves_len: usize,
-) -> Result<()> {
-    if gc_data_len == 0 {
-        bail!("graph has no verifier GC slots");
-    }
-    if gc_data_len != verifier_asserts_len || gc_data_len != disproves_len {
-        bail!(
-            "graph verifier branch lengths differ: gc_data={gc_data_len}, verifier_asserts={verifier_asserts_len}, disproves={disproves_len}"
-        );
-    }
-    if verifier_index >= gc_data_len {
-        bail!("verifier index {verifier_index} out of range for {gc_data_len} slots");
-    }
-    Ok(())
-}
-
-fn validate_verifier_slot(graph: &BitvmGcGraph, verifier_index: usize) -> Result<()> {
-    validate_verifier_slot_lengths(
-        verifier_index,
-        graph.parameters.gc_data.len(),
-        graph.verifier_asserts.len(),
-        graph.disproves.len(),
-    )
-}
-
 fn validate_watchtower_branches(graph: &BitvmGcGraph) -> Result<usize> {
     let watchtower_num = graph.parameters.watchtower_pubkeys.len();
     if watchtower_num == 0 {
@@ -1110,22 +498,6 @@ fn validate_watchtower_branches(graph: &BitvmGcGraph) -> Result<usize> {
         );
     }
     Ok(watchtower_num)
-}
-
-fn find_verifier_index_by_pubkey(
-    gc_data: &[BitvmGcCircuitData],
-    verifier_pubkey: &PublicKey,
-) -> Result<Option<usize>> {
-    let matches = gc_data
-        .iter()
-        .enumerate()
-        .filter_map(|(index, data)| (data.verifier_pubkey == *verifier_pubkey).then_some(index))
-        .collect::<Vec<_>>();
-    match matches.as_slice() {
-        [] => Ok(None),
-        [index] => Ok(Some(*index)),
-        _ => bail!("graph contains duplicate slots for verifier {verifier_pubkey}"),
-    }
 }
 
 fn validate_challenge_witness_index(
@@ -1229,27 +601,6 @@ fn should_ignore_invalid_pegin_data(e: &anyhow::Error, instance_id: Uuid) -> boo
     false
 }
 
-fn should_ignore_invalid_graph(
-    e: &anyhow::Error,
-    instance_id: Uuid,
-    graph_id: Uuid,
-    context: &str,
-    from_peer: Option<&PeerId>,
-) -> bool {
-    if let Some(SpecialError::InvalidGraph(err_msg)) = e.downcast_ref::<SpecialError>() {
-        if let Some(peer_id) = from_peer {
-            tracing::warn!(
-                "Ignore {context} for {instance_id}:{graph_id} from {}: {err_msg}",
-                peer_id.to_string()
-            );
-        } else {
-            tracing::warn!("Ignore {context} for {instance_id}:{graph_id}: {err_msg}");
-        }
-        return true;
-    }
-    false
-}
-
 fn should_ignore_committee_error(
     e: &anyhow::Error,
     instance_id: Uuid,
@@ -1311,34 +662,6 @@ async fn ensure_self_or_valid_committee(
     Ok(true)
 }
 
-async fn ensure_self_or_valid_committee_with_evm(
-    ctx: &HandlerContext<'_>,
-    instance_id: Uuid,
-    graph_id: Option<Uuid>,
-    received_committee_pubkey: &PublicKey,
-    committee_evm_address: &alloy::primitives::Address,
-    context: &str,
-) -> Result<bool> {
-    if ctx.is_self_peer {
-        return Ok(true);
-    }
-    if let Err(e) = validate_committee_with_evm_address(
-        ctx.goat_client,
-        &ctx.from_peer_id,
-        instance_id,
-        received_committee_pubkey,
-        committee_evm_address,
-    )
-    .await
-    {
-        if should_ignore_committee_error(&e, instance_id, graph_id, ctx, context) {
-            return Ok(false);
-        }
-        bail!(e);
-    }
-    Ok(true)
-}
-
 async fn refresh_and_compensate(
     ctx: &HandlerContext<'_>,
     instance_id: Uuid,
@@ -1368,20 +691,6 @@ async fn refresh_and_compensate(
     Ok((graph_status, sub_status, refresh.status_transition_accepted))
 }
 
-async fn refresh_newly_finalized_graph(
-    ctx: &HandlerContext<'_>,
-    instance_id: Uuid,
-    graph_id: Uuid,
-    graph: &BitvmGcGraph,
-) -> Result<()> {
-    // Reconcile every verified GraphFinalize, including a duplicate. A prior
-    // attempt may have stored the finalized definition but failed before its
-    // first chain scan completed.
-    refresh_and_compensate(ctx, instance_id, graph_id, graph, GraphStatus::CommitteePresigned)
-        .await?;
-    Ok(())
-}
-
 async fn get_graph_for_refresh(
     ctx: &HandlerContext<'_>,
     instance_id: Uuid,
@@ -1399,16 +708,7 @@ async fn get_graph_for_refresh_or_defer(
     graph_id: Uuid,
     message: &GOATMessage,
 ) -> Result<Option<BitvmGcGraph>> {
-    let graph = match get_graph_or_defer(
-        ctx.swarm,
-        ctx.local_db,
-        ctx.goat_client,
-        instance_id,
-        graph_id,
-        message,
-    )
-    .await?
-    {
+    let graph = match get_graph_or_defer(ctx.local_db, instance_id, graph_id, message).await? {
         Some(g) => g,
         None => return Ok(None),
     };
@@ -1564,105 +864,17 @@ async fn handle_pegin_request_default(
     Ok(())
 }
 
-async fn defer_confirm_instance_until_previous_graph_presigned(
-    ctx: &mut HandlerContext<'_>,
-    instance_id: Uuid,
-    successor_nonce: u64,
-    operator_pubkey: &PublicKey,
-) -> Result<bool> {
-    if successor_nonce == 0 {
-        return Ok(false);
-    }
-
-    let previous_nonce = successor_nonce - 1;
-    let retry_message = GOATMessage::new(
-        Actor::Operator,
-        GOATMessageContent::ConfirmInstance(ConfirmInstance { instance_id }),
-    );
-    let Some((previous_instance_id, previous_graph_id)) =
-        get_graph_id_by_nonce(ctx.local_db, previous_nonce, operator_pubkey).await?
-    else {
-        defer_or_enqueue_message(
-            ctx.local_db,
-            &retry_message,
-            60,
-            MessageDeferReason::PreviousGraphPending,
-            "previous graph nonce is not available locally",
-        )
-        .await?;
-        tracing::warn!(
-            "Defer ConfirmInstance for {instance_id}: previous graph with nonce {previous_nonce} is not available locally"
-        );
-        return Ok(true);
-    };
-    let Some(previous_graph) =
-        get_graph(ctx.local_db, previous_instance_id, previous_graph_id).await?
-    else {
-        if let Err(error) = try_send_sync_graph_request(
-            ctx.swarm,
-            ctx.goat_client,
-            previous_instance_id,
-            previous_graph_id,
-        )
-        .await
-        {
-            tracing::warn!(
-                "Failed to send SyncGraphRequest for previous graph {previous_instance_id}:{previous_graph_id}: {error}"
-            );
-        }
-        defer_or_enqueue_message(
-            ctx.local_db,
-            &retry_message,
-            60,
-            MessageDeferReason::PreviousGraphPending,
-            "previous graph definition is not available locally",
-        )
-        .await?;
-        tracing::info!(
-            "Defer ConfirmInstance for {instance_id}: waiting for previous graph raw data {previous_instance_id}:{previous_graph_id}"
-        );
-        return Ok(true);
-    };
-    if previous_graph.committee_pre_signed() {
-        return Ok(false);
-    }
-
-    defer_or_enqueue_message(
-        ctx.local_db,
-        &retry_message,
-        60,
-        MessageDeferReason::PreviousGraphPending,
-        "previous graph is waiting for committee pre-signatures",
-    )
-    .await?;
-    let message_content = GOATMessageContent::CreateGraph(CreateGraph {
-        instance_id: previous_instance_id,
-        graph_id: previous_graph_id,
-        graph_nonce: previous_graph.parameters.graph_nonce,
-        graph: previous_graph,
-    });
-    send_protocol_message(
-        ctx.swarm,
-        ctx.local_db,
-        GOATMessage::new(Actor::All, message_content),
-        StoredValue::Fresh,
-    )
-    .await?;
-    tracing::info!(
-        "Defer ConfirmInstance for {instance_id}: re-broadcast previous CreateGraph {previous_instance_id}:{previous_graph_id} until it is committee pre-signed"
-    );
-    Ok(true)
-}
-
 #[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id))]
 async fn handle_confirm_instance_operator(
     ctx: &mut HandlerContext<'_>,
     instance_id: Uuid,
 ) -> Result<()> {
-    // triggered by PeginDeposit tx
-    // 0. check if graph already created
+    // Triggered by the Peg-In-Prepare confirmation. From here the Graph
+    // aggregate owns the setup session (docs/node-protocol.md §10.7.2),
+    // including the wait for the previous slot to settle.
     let operator_master_key = OperatorMasterKey::new(get_bitvm_key()?);
-    let local_operator_pubkey = operator_master_key.master_keypair().public_key().into();
+    let local_operator_pubkey: PublicKey = operator_master_key.master_keypair().public_key().into();
+    // 0. A graph exists already: its deliveries live in the engine outbox.
     if let Some(graph) = get_graph_by_instance_id_and_operator_pubkey(
         ctx.local_db,
         instance_id,
@@ -1670,65 +882,30 @@ async fn handle_confirm_instance_operator(
     )
     .await?
     {
-        if defer_confirm_instance_until_previous_graph_presigned(
-            ctx,
-            instance_id,
-            graph.parameters.graph_nonce,
-            &local_operator_pubkey,
-        )
-        .await?
-        {
-            return Ok(());
-        }
         let graph_id = graph.parameters.graph_id;
-        tracing::info!("Graph already created for {instance_id}, graph_id: {}", graph_id);
-        let message_content = GOATMessageContent::CreateGraph(CreateGraph {
-            instance_id,
-            graph_id,
-            graph_nonce: graph.parameters.graph_nonce,
-            graph,
-        });
-        let msg = GOATMessage::new(Actor::All, message_content);
-        send_protocol_message(ctx.swarm, ctx.local_db, msg, StoredValue::Fresh).await?;
+        tracing::info!("Graph already created for {instance_id}, graph_id: {graph_id}");
+        crate::engine_bridge::wake(&crate::aggregates::graph::graph_ref(graph_id));
         return Ok(());
     }
-
-    let pending_graph_id = {
-        let mut storage = ctx.local_db.acquire().await?;
-        storage
-            .find_pending_graph_init_by_instance_and_operator_pubkey(
-                &instance_id,
-                &local_operator_pubkey.to_string(),
-            )
-            .await?
-            .map(|pending| pending.graph_id)
-    };
+    // 1. A pending session resumes from its saved state; the start event is
+    //    one per graph id, so a repeat is a no-op.
+    let pending_graph_id = ctx
+        .local_db
+        .acquire()
+        .await?
+        .find_pending_graph_init_by_instance_and_operator_pubkey(
+            &instance_id,
+            &local_operator_pubkey.to_string(),
+        )
+        .await?
+        .map(|pending| pending.graph_id);
     if let Some(graph_id) = pending_graph_id {
-        if let Some((next_graph_nonce, _)) =
-            get_current_prekickoff_tx(ctx.local_db, &local_operator_pubkey).await?
-            && defer_confirm_instance_until_previous_graph_presigned(
-                ctx,
-                instance_id,
-                next_graph_nonce,
-                &local_operator_pubkey,
-            )
-            .await?
-        {
-            return Ok(());
-        }
         tracing::info!("Resume pending graph setup for {instance_id}, graph_id: {graph_id}");
-        let message_content = GOATMessageContent::InitGraph(build_signed_init_graph(
-            instance_id,
-            graph_id,
-            &operator_master_key.master_keypair(),
-        )?);
-        enqueue_graph_setup_outbox_message(
+        submit_event(
             ctx.local_db,
-            GOATMessage::new(Actor::Verifier, message_content),
-            None,
+            operator_start_event(instance_id, graph_id, &local_operator_pubkey.to_string())?,
         )
         .await?;
-
         return Ok(());
     }
 
@@ -1741,7 +918,7 @@ async fn handle_confirm_instance_operator(
         );
         return Ok(());
     }
-    // 1. read & check parameters
+    // 2. read & check parameters
     let instance_params = match read_instance_info_from_goat(ctx.goat_client, instance_id).await {
         Ok(v) => v,
         Err(e) => {
@@ -1758,1125 +935,19 @@ async fn handle_confirm_instance_operator(
         );
         bail!("Invalid ConfirmInstance: pegin deposit tx {pegin_deposit_txid} not found on chain");
     }
-
-    if let Some((next_graph_nonce, _)) =
-        get_current_prekickoff_tx(ctx.local_db, &local_operator_pubkey).await?
-        && defer_confirm_instance_until_previous_graph_presigned(
-            ctx,
-            instance_id,
-            next_graph_nonce,
-            &local_operator_pubkey,
-        )
-        .await?
-    {
-        return Ok(());
-    }
-    // after PeginPrepare is confirmed, broadcast InitGraph and let Verifiers generate GC.
-
-    // 2. save the instance data to local db
+    // 3. save the instance data, open the session and start the aggregate.
     store_instance_parameters(ctx.local_db, &instance_params).await?;
     let graph_id = Uuid::new_v4();
-    let mut storage = ctx.local_db.acquire().await?;
-    storage
+    ctx.local_db
+        .acquire()
+        .await?
         .upsert_pending_graph_init(&instance_id, &local_operator_pubkey.to_string(), &graph_id)
         .await?;
-    let message_content = GOATMessageContent::InitGraph(build_signed_init_graph(
-        instance_id,
-        graph_id,
-        &operator_master_key.master_keypair(),
-    )?);
-    enqueue_graph_setup_outbox_message(
+    submit_event(
         ctx.local_db,
-        GOATMessage::new(Actor::Verifier, message_content),
-        None,
+        operator_start_event(instance_id, graph_id, &local_operator_pubkey.to_string())?,
     )
     .await?;
-
-    Ok(())
-}
-
-// Generate garbled circuits and enqueue GenCircuits without blocking the swarm.
-#[tracing::instrument(level = "info", skip_all, fields(instance_id = %message.instance_id, graph_id = %message.graph_id))]
-async fn handle_init_graph_verifier(context: &HeavyTaskContext, message: InitGraph) -> Result<()> {
-    let InitGraph { instance_id, graph_id, operator_pubkey, operator_peer_id, .. } = &message;
-    if operator_peer_id != &context.from_peer_id.to_bytes() {
-        tracing::warn!(
-            instance_id = %instance_id,
-            graph_id = %graph_id,
-            from_peer_id = %context.from_peer_id,
-            "Ignore InitGraph whose signed operator peer id differs from its P2P source"
-        );
-        return Ok(());
-    }
-    if !verify_init_graph_signature(&message) {
-        tracing::warn!(
-            instance_id = %instance_id,
-            graph_id = %graph_id,
-            operator_pubkey = %operator_pubkey,
-            "Ignore InitGraph with invalid operator signature"
-        );
-        return Ok(());
-    }
-    if !matches!(
-        operator_stake_status(&context.goat_client, operator_pubkey).await.map_err(|error| {
-            retryable_dispatch_error(
-                RetryableDispatchReason::ExternalRpcUnavailable,
-                None,
-                format!("InitGraph operator stake lookup failed: {error:#}"),
-            )
-        })?,
-        OperatorStakeStatus::Staked
-    ) {
-        tracing::warn!(
-            instance_id = %instance_id,
-            graph_id = %graph_id,
-            operator_pubkey = %operator_pubkey,
-            "Ignore InitGraph from an operator that does not meet stake requirements"
-        );
-        return Ok(());
-    }
-
-    let verifier_master_key = VerifierMasterKey::new(get_bitvm_key()?);
-    let verifier_pubkey = verifier_master_key.master_keypair().public_key().into();
-
-    let saved_verifier_state = load_babe_setup_state(&context.local_db, *instance_id, *graph_id)?
-        .and_then(|state| state.verifier)
-        .filter(|state| state.verifier_pubkey == verifier_pubkey);
-    let verifier_state = if let Some(saved) = saved_verifier_state {
-        if saved.operator_pubkey != *operator_pubkey || saved.operator_peer_id != *operator_peer_id
-        {
-            tracing::warn!(
-                instance_id = %instance_id,
-                graph_id = %graph_id,
-                expected_operator_peer = %PeerId::from_bytes(&saved.operator_peer_id)
-                    .map(|peer_id| peer_id.to_string())
-                    .unwrap_or_else(|_| "invalid".to_owned()),
-                from_peer_id = %context.from_peer_id,
-                "Ignore InitGraph with a different authenticated operator identity for an existing verifier setup"
-            );
-            return Ok(());
-        }
-        saved
-    } else {
-        get_babe_gc_asset_paths()?;
-        let vk = crate::vk::get_vk().await.context("load Groth16 verifying key for BABE setup")?;
-        let static_input = derive_operator_static_input()?;
-        let (setup_package, private_state) = tokio::task::spawn_blocking(move || {
-            build_real_setup_package(BABE_N_CC, &vk, static_input)
-        })
-        .await
-        .context("real BABE setup task failed")??;
-        tracing::info!("Verifier setup done.");
-        VerifierBabeSetupState {
-            verifier_pubkey,
-            operator_pubkey: *operator_pubkey,
-            operator_peer_id: operator_peer_id.clone(),
-            setup_package,
-            private_state,
-            finalized_indices: vec![],
-            soldering_proof_ready: None,
-        }
-    };
-
-    let setup_package = verifier_state.setup_package.clone();
-    let operator_peer_id = PeerId::from_bytes(&verifier_state.operator_peer_id)
-        .map(|peer_id| peer_id.to_string())
-        .context("decode operator peer id saved from InitGraph")?;
-    update_babe_setup_state(&context.local_db, *instance_id, *graph_id, |state| {
-        state.verifier = Some(verifier_state);
-    })?;
-
-    let gen_circuits = GenCircuits {
-        instance_id: *instance_id,
-        graph_id: *graph_id,
-        verifier_pubkey,
-        setup_package,
-    };
-    let message = GOATMessage::new(Actor::Operator, GOATMessageContent::GenCircuits(gen_circuits));
-    let outbox_id =
-        enqueue_graph_setup_outbox_message(&context.local_db, message, Some(&operator_peer_id))
-            .await?;
-    tracing::info!(
-        event = "verifier_gc_setup",
-        outcome = "enqueued",
-        outbox_id,
-        "enqueued GenCircuits for swarm publication"
-    );
-
-    Ok(())
-}
-
-//  select a subset of GC and broadcast CutCircuits.
-#[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
-async fn handle_gen_circuits_operator(
-    ctx: &mut HandlerContext<'_>,
-    instance_id: Uuid,
-    graph_id: Uuid,
-    verifier_pubkey: &PublicKey,
-    setup_package: &CACSetupPackage,
-) -> Result<()> {
-    let operator_master_key = OperatorMasterKey::new(get_bitvm_key()?);
-    let local_operator_pubkey = operator_master_key.master_keypair().public_key().into();
-    if !pending_graph_belongs_to_operator(
-        ctx.local_db,
-        instance_id,
-        graph_id,
-        &local_operator_pubkey,
-    )
-    .await?
-    {
-        tracing::debug!(
-            "Ignore GenCircuits for {instance_id}:{graph_id}: no local pending graph session"
-        );
-        return Ok(());
-    }
-
-    if setup_package.commits.len() != BABE_N_CC {
-        bail!(
-            "invalid GenCircuits setup package commitment count: expected {BABE_N_CC}, got {}",
-            setup_package.commits.len()
-        );
-    }
-
-    let verifier_peer_id = ctx.from_peer_id.to_bytes();
-    if !ctx.goat_client.committee_mana_is_verifier(&verifier_peer_id).await.with_context(|| {
-        format!(
-            "failed to validate GenCircuits sender {} against the verifier registry",
-            ctx.from_peer_id
-        )
-    })? {
-        tracing::warn!(
-            "Ignore GenCircuits for {instance_id}:{graph_id}: sender {} is not a registered verifier",
-            ctx.from_peer_id
-        );
-        return Ok(());
-    }
-
-    let mut state = load_babe_setup_state(ctx.local_db, instance_id, graph_id)?.unwrap_or_default();
-    let operator_state = state.operator.get_or_insert_with(|| OperatorBabeSetupState {
-        candidate_verifier_pubkeys: None,
-        candidates: vec![],
-        candidate_collection_started_at: None,
-        proof_collection_started_at: None,
-        selected_verifier_pubkeys: None,
-        asserted_operator_proof: None,
-    });
-
-    let was_frozen = operator_state.candidate_verifier_pubkeys.is_some();
-    if let Some(existing) = operator_state
-        .candidates
-        .iter()
-        .find(|candidate| candidate.verifier_peer_id == verifier_peer_id)
-    {
-        if existing.verifier_pubkey != *verifier_pubkey {
-            tracing::warn!(
-                "Ignore GenCircuits for {instance_id}:{graph_id}: verifier peer {} already submitted a different public key",
-                ctx.from_peer_id
-            );
-            return Ok(());
-        }
-        if existing.setup_package != *setup_package {
-            bail!("conflicting GenCircuits setup package for verifier {verifier_pubkey}");
-        }
-    } else if operator_state.candidates.iter().any(|candidate| {
-        XOnlyPublicKey::from(candidate.verifier_pubkey) == XOnlyPublicKey::from(*verifier_pubkey)
-    }) {
-        tracing::warn!(
-            "Ignore GenCircuits for {instance_id}:{graph_id}: verifier public key {verifier_pubkey} is already bound to another peer"
-        );
-        return Ok(());
-    } else if was_frozen {
-        tracing::debug!(
-            "Ignore GenCircuits for {instance_id}:{graph_id}: verifier membership is frozen"
-        );
-
-        return Ok(());
-    } else {
-        if operator_state.candidates.len()
-            >= min_required_verifier().saturating_add(get_verifier_candidate_backup_count())
-        {
-            tracing::debug!(
-                "Ignore GenCircuits for {instance_id}:{graph_id}: candidate collection reached its configured limit"
-            );
-            return Ok(());
-        }
-        operator_state.candidates.push(OperatorVerifierCandidate {
-            verifier_peer_id,
-            verifier_pubkey: *verifier_pubkey,
-            setup_package: setup_package.clone(),
-            candidate_index: None,
-            selected_circuit_indexes: vec![],
-            gc_data: None,
-            soldering_proof_ready: None,
-        });
-        operator_state.candidate_collection_started_at.get_or_insert_with(current_time_secs);
-    }
-
-    if operator_state.candidate_verifier_pubkeys.is_none() {
-        let started_at =
-            operator_state.candidate_collection_started_at.get_or_insert_with(current_time_secs);
-        let elapsed = current_time_secs() - *started_at;
-        let window = get_verifier_candidate_collection_window_secs();
-        let reached_limit = operator_state.candidates.len()
-            >= min_required_verifier().saturating_add(get_verifier_candidate_backup_count());
-        if operator_state.candidates.len() < min_required_verifier()
-            || (!reached_limit && elapsed < window)
-        {
-            let retry_after_secs = (window - elapsed).max(1);
-            let candidate_count = operator_state.candidates.len();
-            save_babe_setup_state(ctx.local_db, instance_id, graph_id, &state)?;
-            return Err(retryable_dispatch_error(
-                RetryableDispatchReason::DependencyPending,
-                Some(retry_after_secs),
-                format!(
-                    "collecting verifier candidates: {}/{} received",
-                    candidate_count,
-                    min_required_verifier(),
-                ),
-            ));
-        }
-    }
-
-    if operator_state.candidate_verifier_pubkeys.is_none() {
-        freeze_operator_candidates(operator_state)?;
-    }
-    // On every retry, enqueue any CutCircuits still owed by the frozen candidate set.
-    let owed = cut_circuits_owed(operator_state, current_time_secs());
-    let sender_peer_id = get_peer_id();
-
-    save_babe_setup_state(ctx.local_db, instance_id, graph_id, &state)?;
-    ensure_cut_circuits_outbox(ctx.local_db, instance_id, graph_id, &owed, &sender_peer_id).await?;
-    Ok(())
-}
-
-/// Candidates still owed CutCircuits, excluding delivered proofs and closed selections.
-fn cut_circuits_owed(state: &OperatorBabeSetupState, now: i64) -> Vec<OperatorVerifierCandidate> {
-    if state.candidate_verifier_pubkeys.is_none() || state.selected_verifier_pubkeys.is_some() {
-        return Vec::new();
-    }
-    let delivered = state.candidates.iter().filter(|candidate| candidate.gc_data.is_some()).count();
-    let window_over = state.proof_collection_started_at.is_some_and(|started_at| {
-        now - started_at >= get_verifier_candidate_collection_window_secs()
-    });
-    if window_over && delivered >= min_required_verifier() {
-        return Vec::new();
-    }
-    state
-        .candidates
-        .iter()
-        .filter(|candidate| {
-            candidate.gc_data.is_none() && candidate.soldering_proof_ready.is_none()
-        })
-        .cloned()
-        .collect()
-}
-
-/// Create missing CutCircuits outbox entries; leave all existing entries unchanged.
-async fn ensure_cut_circuits_outbox(
-    local_db: &LocalDB,
-    instance_id: Uuid,
-    graph_id: Uuid,
-    owed: &[OperatorVerifierCandidate],
-    sender_peer_id: &str,
-) -> Result<()> {
-    for candidate in owed {
-        let message = GOATMessage::new(
-            Actor::Verifier,
-            GOATMessageContent::CutCircuits(CutCircuits {
-                instance_id,
-                graph_id,
-                verifier_pubkey: candidate.verifier_pubkey,
-                candidate_index: candidate
-                    .candidate_index
-                    .context("frozen candidate has no slot assigned")?,
-                selected_circuit_indexes: candidate.selected_circuit_indexes.clone(),
-            }),
-        );
-        let ack_peer_id =
-            PeerId::from_bytes(&candidate.verifier_peer_id).map(|peer_id| peer_id.to_string()).ok();
-        enqueue_graph_setup_outbox_message_from_peer(
-            local_db,
-            message,
-            ack_peer_id.as_deref(),
-            sender_peer_id,
-        )
-        .await?;
-    }
-    Ok(())
-}
-
-// Generate proofs for the chosen GC and enqueue SolderingProofReady.
-#[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
-async fn handle_cut_circuits_verifier(
-    context: &HeavyTaskContext,
-    instance_id: Uuid,
-    graph_id: Uuid,
-    verifier_pubkey: &PublicKey,
-    candidate_index: usize,
-    selected_circuit_indexes: &Vec<usize>,
-) -> Result<()> {
-    let verifier_master_key = VerifierMasterKey::new(get_bitvm_key()?);
-    let local_verifier_pubkey: PublicKey = verifier_master_key.master_keypair().public_key().into();
-    if &local_verifier_pubkey != verifier_pubkey {
-        tracing::debug!(
-            "Ignore CutCircuits for {instance_id}:{graph_id}: target verifier pubkey does not match local verifier"
-        );
-
-        return Ok(());
-    }
-
-    let Some(mut verifier_state) = load_babe_setup_state(&context.local_db, instance_id, graph_id)?
-        .and_then(|state| state.verifier)
-    else {
-        tracing::warn!(
-            "Ignore CutCircuits for {instance_id}:{graph_id}: missing BABE verifier setup state"
-        );
-        return Ok(());
-    };
-
-    if verifier_state.verifier_pubkey != *verifier_pubkey {
-        tracing::warn!(
-            "Ignore CutCircuits for {instance_id}:{graph_id}: verifier pubkey does not match saved BABE setup state"
-        );
-
-        return Ok(());
-    }
-    if verifier_state.operator_peer_id != context.from_peer_id.to_bytes() {
-        tracing::warn!(
-            instance_id = %instance_id,
-            graph_id = %graph_id,
-            from_peer_id = %context.from_peer_id,
-            "Ignore CutCircuits from a peer other than the operator that initiated verifier setup"
-        );
-        return Ok(());
-    }
-
-    if let Some(soldering_proof_ready) = verifier_state.soldering_proof_ready.clone() {
-        if soldering_proof_ready.candidate_index != candidate_index {
-            bail!(
-                "CutCircuits candidate index {candidate_index} conflicts with persisted slot {}",
-                soldering_proof_ready.candidate_index
-            );
-        }
-        if verifier_state.finalized_indices != *selected_circuit_indexes {
-            bail!("CutCircuits finalized indices conflict with persisted selection");
-        }
-        let message = GOATMessage::new(
-            Actor::Operator,
-            GOATMessageContent::SolderingProofReady(soldering_proof_ready),
-        );
-        let operator_peer_id = PeerId::from_bytes(&verifier_state.operator_peer_id)
-            .map(|peer_id| peer_id.to_string())
-            .context("decode operator peer id saved from InitGraph")?;
-        let outbox_id =
-            enqueue_graph_setup_outbox_message(&context.local_db, message, Some(&operator_peer_id))
-                .await?;
-        tracing::info!(
-            event = "verifier_soldering_proof",
-            outcome = "enqueued",
-            outbox_id,
-            "enqueued SolderingProofReady for swarm publication"
-        );
-
-        return Ok(());
-    }
-
-    let setup_package = verifier_state.setup_package.clone();
-    get_babe_gc_asset_paths()?;
-
-    let vk = crate::vk::get_vk().await.context("load Groth16 verifying key for BABE opening")?;
-    let static_input = derive_operator_static_input()?;
-    let private_state = verifier_state.private_state.clone();
-    let selected_indices = selected_circuit_indexes.clone();
-    let package_for_opening = setup_package.clone();
-    let soldering_builder = Arc::clone(
-        context
-            .soldering_builder
-            .as_ref()
-            .context("BABE soldering builder is not initialized for Verifier")?,
-    );
-    let (opened, finalized, soldering) = tokio::task::spawn_blocking(move || {
-        open_real_setup_and_solder(
-            &soldering_builder,
-            &private_state,
-            &package_for_opening,
-            &selected_indices,
-            &vk,
-            static_input,
-        )
-    })
-    .await
-    .context("real BABE opening task failed")??;
-
-    let soldering_proof_ready = save_soldering_proof_payload(
-        instance_id,
-        graph_id,
-        candidate_index,
-        &opened,
-        &finalized,
-        &soldering,
-    )
-    .await?;
-    verifier_state.finalized_indices = selected_circuit_indexes.clone();
-    verifier_state.soldering_proof_ready = Some(soldering_proof_ready.clone());
-
-    let operator_peer_id = PeerId::from_bytes(&verifier_state.operator_peer_id)
-        .map(|peer_id| peer_id.to_string())
-        .context("decode operator peer id saved from InitGraph")?;
-    update_babe_setup_state(&context.local_db, instance_id, graph_id, |state| {
-        state.verifier = Some(verifier_state);
-    })?;
-
-    let message = GOATMessage::new(
-        Actor::Operator,
-        GOATMessageContent::SolderingProofReady(soldering_proof_ready),
-    );
-    let outbox_id =
-        enqueue_graph_setup_outbox_message(&context.local_db, message, Some(&operator_peer_id))
-            .await?;
-    tracing::info!(
-        event = "verifier_soldering_proof",
-        outcome = "enqueued",
-        outbox_id,
-        "enqueued SolderingProofReady for swarm publication"
-    );
-
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn handle_soldering_proof_ready_operator(
-    context: &HeavyTaskContext,
-    instance_id: Uuid,
-    graph_id: Uuid,
-    candidate_index: usize,
-    payload_hash: [u8; 32],
-    total_len: usize,
-) -> Result<()> {
-    if total_len == 0 {
-        bail!("SolderingProofReady total_len must be greater than zero");
-    }
-    let soldering_proof_ready =
-        SolderingProofReady { instance_id, graph_id, candidate_index, payload_hash, total_len };
-    let operator_master_key = OperatorMasterKey::new(get_bitvm_key()?);
-    let local_operator_pubkey = operator_master_key.master_keypair().public_key().into();
-    if !pending_graph_belongs_to_operator(
-        &context.local_db,
-        instance_id,
-        graph_id,
-        &local_operator_pubkey,
-    )
-    .await?
-    {
-        tracing::debug!(
-            "Ignore SolderingProofReady for {instance_id}:{graph_id}: no local pending graph session"
-        );
-
-        return Ok(());
-    }
-
-    let state =
-        load_babe_setup_state(&context.local_db, instance_id, graph_id)?.ok_or_else(|| {
-            retryable_dispatch_error(
-                RetryableDispatchReason::DependencyPending,
-                Some(30),
-                format!("missing BABE setup state for pending graph {graph_id}"),
-            )
-        })?;
-    let operator_state = state.operator.as_ref().ok_or_else(|| {
-        retryable_dispatch_error(
-            RetryableDispatchReason::DependencyPending,
-            Some(30),
-            format!("missing operator BABE setup state for pending graph {graph_id}"),
-        )
-    })?;
-    let frozen = operator_state.candidate_verifier_pubkeys.as_ref().ok_or_else(|| {
-        retryable_dispatch_error(
-            RetryableDispatchReason::DependencyPending,
-            Some(30),
-            "operator verifier membership is not frozen",
-        )
-    })?;
-    let verifier_pubkey = frozen.get(candidate_index).ok_or_else(|| {
-        anyhow!("SolderingProofReady candidate index {candidate_index} out of range")
-    })?;
-    let candidate = operator_state
-        .candidates
-        .iter()
-        .find(|candidate| candidate.verifier_pubkey == *verifier_pubkey)
-        .ok_or_else(|| anyhow!("selected verifier candidate is missing"))?;
-    if candidate.candidate_index != Some(candidate_index) {
-        bail!("selected verifier candidate index does not match SolderingProofReady slot");
-    }
-    if operator_state.selected_verifier_pubkeys.as_ref().is_some_and(|selected| {
-        !selected.iter().any(|selected_pubkey| selected_pubkey == verifier_pubkey)
-    }) {
-        tracing::info!(
-            instance_id = %instance_id,
-            graph_id = %graph_id,
-            candidate_index,
-            verifier_pubkey = %verifier_pubkey,
-            "Ignore late SolderingProofReady from verifier outside the sealed graph selection"
-        );
-        return Ok(());
-    }
-    let verifier_peer_id = context.from_peer_id.to_bytes();
-    if candidate.verifier_peer_id != verifier_peer_id {
-        tracing::warn!(
-            "Ignore SolderingProofReady for {instance_id}:{graph_id}: sender {} does not own verifier candidate {candidate_index}",
-            context.from_peer_id
-        );
-        return Ok(());
-    }
-
-    let store_base_path = get_soldering_proof_payload_store_path()?;
-    let payload_path = soldering_proof_payload_store_path(
-        &store_base_path,
-        instance_id,
-        graph_id,
-        candidate_index,
-        &payload_hash,
-    )?;
-    tracing::info!(
-        from_peer_id = %context.from_peer_id,
-        instance_id = %instance_id,
-        graph_id = %graph_id,
-        candidate_index,
-        total_len,
-        payload_hash = %soldering_payload_hash_hex(&payload_hash),
-        payload_path = %payload_path,
-        "received SolderingProofReady; reading payload from store"
-    );
-    let payload = match read_soldering_proof_store_payload(&payload_path).await {
-        Ok(payload) => payload,
-        Err(err) => {
-            tracing::error!(
-                instance_id = %instance_id,
-                graph_id = %graph_id,
-                candidate_index,
-                payload_path = %payload_path,
-                error = %err,
-                "failed to read soldering proof payload from store"
-            );
-            return Err(retryable_dispatch_error(
-                RetryableDispatchReason::PayloadNotReady,
-                Some(30),
-                format!("read soldering proof payload from store: {err}"),
-            ));
-        }
-    };
-    tracing::info!(
-        instance_id = %instance_id,
-        graph_id = %graph_id,
-        candidate_index,
-        bytes = payload.len(),
-        total_len,
-        payload_hash = %soldering_payload_hash_hex(&payload_hash),
-        payload_path = %payload_path,
-        "read soldering proof payload from store, start processing"
-    );
-    let result =
-        handle_soldering_proof_payload_operator(context, &soldering_proof_ready, &payload).await;
-    context.metrics_state.record_pegin_graph_setup(result.is_ok());
-    result
-}
-
-fn decode_soldering_proof_payload(
-    soldering_proof_ready: &SolderingProofReady,
-    payload: &[u8],
-) -> Result<CompactSolderingProofPayload> {
-    let SolderingProofReady { instance_id, graph_id, candidate_index, payload_hash, total_len } =
-        soldering_proof_ready;
-    if payload.len() != *total_len {
-        tracing::warn!(
-            instance_id = %instance_id,
-            graph_id = %graph_id,
-            candidate_index,
-            actual_len = payload.len(),
-            total_len,
-            payload_hash = %soldering_payload_hash_hex(payload_hash),
-            "SolderingProof payload length mismatch"
-        );
-        bail!(
-            "SolderingProof payload length {} does not match total_len {total_len}",
-            payload.len()
-        );
-    }
-    let actual_hash = soldering_payload_hash(payload);
-    if actual_hash != *payload_hash {
-        tracing::warn!(
-            instance_id = %instance_id,
-            graph_id = %graph_id,
-            candidate_index,
-            expected_hash = %soldering_payload_hash_hex(payload_hash),
-            actual_hash = %soldering_payload_hash_hex(&actual_hash),
-            "SolderingProof payload hash mismatch"
-        );
-        bail!("SolderingProof payload hash mismatch");
-    }
-    bincode::deserialize(payload).context("deserialize compact soldering proof payload")
-}
-
-pub(crate) async fn handle_soldering_proof_payload_operator(
-    context: &HeavyTaskContext,
-    soldering_proof_ready: &SolderingProofReady,
-    payload: &[u8],
-) -> Result<()> {
-    let decode_started_at = Instant::now();
-    tracing::info!(
-        event = "operator_soldering_proof",
-        stage = "payload_decode",
-        outcome = "started",
-        candidate_index = soldering_proof_ready.candidate_index,
-        payload_len = payload.len(),
-        "decoding soldering proof payload"
-    );
-    let payload = decode_soldering_proof_payload(soldering_proof_ready, payload)?;
-    tracing::info!(
-        event = "operator_soldering_proof",
-        stage = "payload_decode",
-        outcome = "completed",
-        candidate_index = soldering_proof_ready.candidate_index,
-        elapsed_ms = decode_started_at.elapsed().as_millis(),
-        "decoded soldering proof payload"
-    );
-    handle_compact_soldering_proof_operator(context, soldering_proof_ready, payload).await
-}
-
-// verify Verifier SolderingProof, build Graph and broadcast CreateGraph.
-#[tracing::instrument(level = "info", skip_all, fields(instance_id = %soldering_proof_ready.instance_id, graph_id = %soldering_proof_ready.graph_id))]
-async fn handle_compact_soldering_proof_operator(
-    context: &HeavyTaskContext,
-    soldering_proof_ready: &SolderingProofReady,
-    payload: CompactSolderingProofPayload,
-) -> Result<()> {
-    let instance_id = soldering_proof_ready.instance_id;
-    let graph_id = soldering_proof_ready.graph_id;
-    let candidate_index = soldering_proof_ready.candidate_index;
-    let operator_master_key = OperatorMasterKey::new(get_bitvm_key()?);
-    let local_operator_pubkey = operator_master_key.master_keypair().public_key().into();
-    if !pending_graph_belongs_to_operator(
-        &context.local_db,
-        instance_id,
-        graph_id,
-        &local_operator_pubkey,
-    )
-    .await?
-    {
-        tracing::debug!(
-            "Ignore SolderingProof for {instance_id}:{graph_id}: no local pending graph session"
-        );
-
-        return Ok(());
-    }
-
-    let mut state =
-        load_babe_setup_state(&context.local_db, instance_id, graph_id)?.ok_or_else(|| {
-            retryable_dispatch_error(
-                RetryableDispatchReason::DependencyPending,
-                Some(30),
-                format!("missing BABE setup state for pending graph {graph_id}"),
-            )
-        })?;
-    let operator_state = state.operator.as_mut().ok_or_else(|| {
-        retryable_dispatch_error(
-            RetryableDispatchReason::DependencyPending,
-            Some(30),
-            format!("missing operator BABE setup state for pending graph {graph_id}"),
-        )
-    })?;
-    let frozen = operator_state.candidate_verifier_pubkeys.as_ref().ok_or_else(|| {
-        retryable_dispatch_error(
-            RetryableDispatchReason::DependencyPending,
-            Some(30),
-            "operator verifier membership is not frozen",
-        )
-    })?;
-    let verifier_pubkey = *frozen
-        .get(candidate_index)
-        .ok_or_else(|| anyhow!("SolderingProof candidate index {candidate_index} out of range"))?;
-
-    let candidate = operator_state
-        .candidates
-        .iter()
-        .find(|candidate| candidate.verifier_pubkey == verifier_pubkey)
-        .ok_or_else(|| anyhow!("selected verifier candidate is missing"))?;
-    if candidate.candidate_index != Some(candidate_index) {
-        bail!("selected verifier candidate index does not match SolderingProof slot");
-    }
-    let setup_package = candidate.setup_package.clone();
-    let claimed_finalized_indices = candidate.selected_circuit_indexes.clone();
-    let expand_started_at = Instant::now();
-    tracing::info!(
-        event = "operator_soldering_proof",
-        stage = "payload_expand",
-        outcome = "started",
-        candidate_index,
-        "expanding compact soldering proof"
-    );
-    let (opened, finalized, soldering) = expand_compact_soldering_proof_payload(payload)
-        .context("expand compact soldering proof payload")?;
-    tracing::info!(
-        event = "operator_soldering_proof",
-        stage = "payload_expand",
-        outcome = "completed",
-        candidate_index,
-        opened_instances = opened.len(),
-        finalized_instances = finalized.len(),
-        elapsed_ms = expand_started_at.elapsed().as_millis(),
-        "expanded compact soldering proof"
-    );
-
-    let vk = crate::vk::get_vk().await.context("load Groth16 verifying key for BABE validation")?;
-    let static_input = derive_operator_static_input()?;
-    let package_for_validation = setup_package.clone();
-    let opened_for_validation = opened.clone();
-    let finalized_for_validation = finalized.clone();
-    let soldering_for_validation = soldering.clone();
-    let soldering_builder = Arc::clone(
-        context
-            .soldering_builder
-            .as_ref()
-            .context("BABE soldering builder is not initialized for Operator")?,
-    );
-
-    let verification_started_at = Instant::now();
-    tracing::info!(
-        event = "operator_soldering_proof",
-        stage = "setup_verify",
-        outcome = "started",
-        candidate_index,
-        opened_instances = opened.len(),
-        finalized_instances = finalized.len(),
-        "verifying verifier soldering proof"
-    );
-    tokio::task::spawn_blocking(move || {
-        verify_real_setup(
-            &soldering_builder,
-            &package_for_validation,
-            &opened_for_validation,
-            &finalized_for_validation,
-            &soldering_for_validation,
-            &vk,
-            &claimed_finalized_indices,
-            static_input,
-        )
-    })
-    .await
-    .context("real BABE setup verification task failed")??;
-    tracing::info!(
-        event = "operator_soldering_proof",
-        stage = "setup_verify",
-        outcome = "completed",
-        candidate_index,
-        elapsed_ms = verification_started_at.elapsed().as_millis(),
-        "verified verifier soldering proof"
-    );
-
-    tracing::info!(
-        event = "operator_graph_creation",
-        outcome = "soldering_verified",
-        candidate_index,
-        verifier_pubkey = %verifier_pubkey,
-        finalized_instances = finalized.len(),
-        payload_hash = %hex::encode(soldering_proof_ready.payload_hash),
-        "verified verifier soldering proof"
-    );
-
-    if finalized.len() != BABE_M_CC {
-        bail!("each verifier must contribute exactly {BABE_M_CC} finalized BABE instances");
-    }
-    let epk = &setup_package.commits[finalized[0].index].epk;
-    let gc_data_started_at = Instant::now();
-    tracing::info!(
-        event = "operator_soldering_proof",
-        stage = "gc_data_extract",
-        outcome = "started",
-        candidate_index,
-        "building BABE prover state and extracting GC data"
-    );
-    let prover_state = build_babe_prover_state(&setup_package, finalized, soldering)?;
-    let gc_data = extract_gc_circuit_data(verifier_pubkey, epk, &prover_state.h_msgs)?;
-    tracing::info!(
-        event = "operator_soldering_proof",
-        stage = "gc_data_extract",
-        outcome = "completed",
-        candidate_index,
-        elapsed_ms = gc_data_started_at.elapsed().as_millis(),
-        "extracted GC data from soldering proof"
-    );
-    record_candidate_gc_data(
-        operator_state,
-        verifier_pubkey,
-        candidate_index,
-        &setup_package,
-        gc_data,
-        &prover_state,
-        soldering_proof_ready.clone(),
-    )?;
-    let completed_slots =
-        operator_state.candidates.iter().filter(|candidate| candidate.gc_data.is_some()).count();
-    let required_slots = min_required_verifier();
-    let proof_window_started_at =
-        operator_state.proof_collection_started_at.get_or_insert_with(current_time_secs);
-    let elapsed = current_time_secs() - *proof_window_started_at;
-    let collection_window = get_verifier_candidate_collection_window_secs();
-    if completed_slots < required_slots || elapsed < collection_window {
-        if let Err(error) = save_babe_setup_state(&context.local_db, instance_id, graph_id, &state)
-        {
-            tracing::error!(
-                event = "operator_graph_creation",
-                outcome = "failed",
-                stage = "babe_state_persist",
-                candidate_index,
-                error = %error,
-                "failed to persist incomplete operator BABE setup state"
-            );
-            return Err(error).context("persist incomplete operator BABE setup state");
-        }
-        tracing::info!(
-            event = "operator_graph_creation",
-            outcome = "waiting_for_soldering",
-            candidate_index,
-            completed_slots,
-            required_slots,
-            retry_after_secs = (collection_window - elapsed).max(1),
-            "persisted verified soldering proof; waiting for the proof selection window"
-        );
-        return Err(retryable_dispatch_error(
-            RetryableDispatchReason::DependencyPending,
-            Some((collection_window - elapsed).max(1)),
-            format!("collecting verified soldering proofs: {completed_slots}/{required_slots}"),
-        ));
-    }
-
-    let selected_verifier_pubkeys =
-        if let Some(selected) = &operator_state.selected_verifier_pubkeys {
-            selected.clone()
-        } else {
-            let mut selected = operator_state
-                .candidates
-                .iter()
-                .filter(|candidate| candidate.gc_data.is_some())
-                .map(|candidate| candidate.verifier_pubkey)
-                .collect::<Vec<_>>();
-            selected.sort_by_key(|candidate| candidate.to_bytes());
-            selected.truncate(required_slots);
-            selected
-        };
-    seal_selected_verifiers(operator_state, selected_verifier_pubkeys)?;
-    let bitvm_gc_circuit_datas = selected_gc_data(operator_state)?;
-    let selected_verifier_count = operator_state
-        .selected_verifier_pubkeys
-        .as_ref()
-        .context("selected verifier set is missing after proof collection")?
-        .len();
-    let selected_verifier_peer_ids = (0..selected_verifier_count)
-        .map(|verifier_index| {
-            let candidate = selected_candidate_for_graph_index(operator_state, verifier_index)?;
-            PeerId::from_bytes(&candidate.verifier_peer_id)
-                .context("decode selected verifier peer id for CreateGraph ACK")
-                .map(|peer_id| peer_id.to_string())
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let mut obsolete_setup_outbox_ids = vec![format!("init-graph:{graph_id}")];
-    obsolete_setup_outbox_ids.extend(operator_state.candidates.iter().map(|candidate| {
-        format!("cut-circuits:{instance_id}:{graph_id}:{}", candidate.verifier_pubkey)
-    }));
-    if let Err(error) = save_babe_setup_state(&context.local_db, instance_id, graph_id, &state) {
-        tracing::error!(
-            event = "operator_graph_creation",
-            outcome = "failed",
-            stage = "babe_state_persist",
-            candidate_index,
-            error = %error,
-            "failed to persist complete operator BABE setup state"
-        );
-        return Err(error).context("persist complete operator BABE setup state");
-    }
-    tracing::info!(
-        event = "operator_graph_creation",
-        outcome = "all_soldering_collected",
-        verifier_slots = bitvm_gc_circuit_datas.len(),
-        "all verifier soldering proofs are ready to build the graph"
-    );
-
-    // Reuse an existing graph for this ID and resume CreateGraph delivery.
-    let (graph_nonce, graph, definition_hash, already_finalized) = match get_graph(
-        &context.local_db,
-        instance_id,
-        graph_id,
-    )
-    .await?
-    {
-        Some(stored) => {
-            let graph_nonce = stored.parameters.graph_nonce;
-            let definition_hash = hex::encode(stored.parameters_hash()?);
-            let already_finalized = BitvmGcGraph::from_simplified(&stored)?.committee_pre_signed();
-            tracing::info!(
-                event = "operator_graph_creation",
-                outcome = "resumed",
-                stage = "definition_store",
-                graph_nonce,
-                definition_hash = %definition_hash,
-                already_finalized,
-                "graph was stored by an earlier run; resuming at the CreateGraph outbox"
-            );
-            (graph_nonce, stored, definition_hash, already_finalized)
-        }
-        None => {
-            let instance_params = get_instance_parameters(&context.local_db, instance_id)
-                .await?
-                .ok_or_else(|| anyhow!("Instance parameters not found for {instance_id}"))?;
-
-            let (graph_nonce, cur_prekickoff_txn) =
-                match get_current_prekickoff_tx(&context.local_db, &local_operator_pubkey).await? {
-                    Some((graph_nonce, prekickoff_tx)) => (graph_nonce, prekickoff_tx),
-                    None => (
-                        0,
-                        build_genesis_prekickoff_tx(&context.btc_client, &context.goat_client)
-                            .await?,
-                    ),
-                };
-            let prekickoff_params =
-                build_prekickoff_params(&context.btc_client, graph_nonce, cur_prekickoff_txn)
-                    .await?;
-
-            let graph_build_started_at = Instant::now();
-            tracing::info!(
-                event = "operator_soldering_proof",
-                stage = "graph_build",
-                outcome = "started",
-                verifier_slots = bitvm_gc_circuit_datas.len(),
-                graph_nonce,
-                "building graph parameters from verified soldering proofs"
-            );
-            let mut graph_params = build_graph_params(
-                &context.local_db,
-                &context.goat_client,
-                instance_params,
-                prekickoff_params,
-                bitvm_gc_circuit_datas,
-                graph_nonce,
-                graph_id,
-            )
-            .await?;
-
-            let challenge_init_txid = generate_bitvm_graph(graph_params.clone())?
-                .watchtower_challenge_init
-                .tx()
-                .compute_txid()
-                .to_byte_array();
-            graph_params.pubin_disprove_constant = get_guest_constant_value(
-                graph_id,
-                challenge_init_txid,
-                &graph_params.watchtower_pubkeys,
-            )?;
-            let mut graph = generate_bitvm_graph(graph_params)?;
-            anyhow::ensure!(
-                graph.watchtower_challenge_init.tx().compute_txid().to_byte_array()
-                    == challenge_init_txid,
-                "Operator constant unexpectedly changes the watchtower challenge init transaction"
-            );
-            operator_pre_sign(operator_master_key.master_keypair(), &mut graph)?;
-
-            let graph = graph.to_simplified()?;
-            tracing::info!(
-                event = "operator_soldering_proof",
-                stage = "graph_build",
-                outcome = "completed",
-                graph_nonce,
-                elapsed_ms = graph_build_started_at.elapsed().as_millis(),
-                "built operator-pre-signed graph"
-            );
-            let definition_hash = hex::encode(graph.parameters_hash()?);
-            tracing::info!(
-                event = "operator_graph_creation",
-                outcome = "started",
-                stage = "definition_store",
-                graph_nonce,
-                definition_hash = %definition_hash,
-                "storing operator-pre-signed graph definition"
-            );
-            if let Err(error) = store_operator_presigned_graph(&context.local_db, &graph).await {
-                tracing::error!(
-                    event = "operator_graph_creation",
-                    outcome = "failed",
-                    stage = "definition_store",
-                    graph_nonce,
-                    definition_hash = %definition_hash,
-                    error = %error,
-                    "failed to store operator-pre-signed graph definition"
-                );
-                return Err(error).context("store operator-pre-signed graph definition");
-            }
-            tracing::info!(
-                event = "operator_graph_creation",
-                outcome = "committed",
-                stage = "definition_store",
-                graph_nonce,
-                definition_hash = %definition_hash,
-                "stored operator-pre-signed graph definition"
-            );
-            (graph_nonce, graph, definition_hash, false)
-        }
-    };
-
-    let message = GOATMessage::new(
-        Actor::All,
-        GOATMessageContent::CreateGraph(CreateGraph { instance_id, graph_id, graph_nonce, graph }),
-    );
-    let mut outbox_ids = Vec::new();
-    if !already_finalized {
-        for ack_peer_id in &selected_verifier_peer_ids {
-            outbox_ids.push(
-                enqueue_graph_setup_outbox_message(
-                    &context.local_db,
-                    message.clone(),
-                    Some(ack_peer_id),
-                )
-                .await?,
-            );
-        }
-    }
-    let mut storage = context.local_db.acquire().await?;
-    // The per-verifier outbox rows retry until each selected verifier ACKs.
-    // A finalized graph was already announced; only the setup cleanup is left.
-    let mut cancelled_setup_messages = 0;
-    for setup_outbox_id in obsolete_setup_outbox_ids {
-        cancelled_setup_messages +=
-            storage.cancel_p2p_outbox_message(&setup_outbox_id).await? as u64;
-    }
-    drop(storage);
-    tracing::info!(
-        event = "operator_graph_creation",
-        outcome = "enqueued",
-        stage = "create_graph_outbox",
-        graph_nonce,
-        definition_hash = %definition_hash,
-        outbox_ids = ?outbox_ids,
-        cancelled_setup_messages,
-        "enqueued CreateGraph for selected verifier delivery"
-    );
-
-    // The outbox is durable before this cleanup. A process crash before
-    // insertion leaves the session for inbox recovery; a crash after insertion
-    // leaves the outbox for swarm publication.
-    let mut storage = context.local_db.acquire().await?;
-    let deleted_pending_sessions = storage
-        .delete_pending_graph_init(&instance_id, &local_operator_pubkey.to_string())
-        .await
-        .context("delete pending graph session after CreateGraph outbox enqueue")?;
-    tracing::info!(
-        event = "operator_graph_creation",
-        outcome = "completed",
-        stage = "pending_session_delete",
-        graph_nonce,
-        definition_hash = %definition_hash,
-        deleted_pending_sessions,
-        "deleted pending graph session after CreateGraph outbox enqueue"
-    );
-
     Ok(())
 }
 
@@ -2908,1428 +979,106 @@ async fn handle_confirm_instance_default(
     Ok(())
 }
 
-#[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
-async fn handle_create_graph_verifier(
-    context: &HeavyTaskContext,
-    instance_id: Uuid,
-    graph_id: Uuid,
-    graph_nonce: u64,
-    graph: &SimplifiedBitvmGcGraph,
-) -> Result<()> {
-    if !message_identity_matches(
-        "CreateGraph",
-        instance_id,
-        graph_id,
-        Some(graph_nonce),
-        graph.parameters.instance_parameters.instance_id,
-        graph.parameters.graph_id,
-        graph.parameters.graph_nonce,
-    ) {
-        return Ok(());
-    }
-
-    let verifier_master_key = VerifierMasterKey::new(get_bitvm_key()?);
-    let local_verifier_pubkey: PublicKey = verifier_master_key.master_keypair().public_key().into();
-    let Some(verifier_index) =
-        find_verifier_index_by_pubkey(&graph.parameters.gc_data, &local_verifier_pubkey)?
-    else {
-        return Ok(());
-    };
-
-    let full_graph = BitvmGcGraph::from_simplified(graph)?;
-    validate_verifier_slot(&full_graph, verifier_index)?;
-    verify_graph_operator_pre_signatures(&full_graph)
-        .context("verify operator pre-signatures before endorsing graph parameters")?;
-    let Some(verifier_state) = load_babe_setup_state(&context.local_db, instance_id, graph_id)?
-        .and_then(|state| state.verifier)
-    else {
-        tracing::warn!(
-            "Ignore CreateGraph for {instance_id}:{graph_id}: missing local BABE verifier state"
-        );
-        return Ok(());
-    };
-    if verifier_state.verifier_pubkey != local_verifier_pubkey {
-        tracing::warn!(
-            "Ignore CreateGraph for {instance_id}:{graph_id}: local BABE verifier pubkey mismatch"
-        );
-        return Ok(());
-    }
-    let Some(soldering_proof_ready) = verifier_state.soldering_proof_ready.clone() else {
-        tracing::warn!(
-            "Ignore CreateGraph for {instance_id}:{graph_id}: local verifier has no soldering proof"
-        );
-        return Ok(());
-    };
-    let store_base_path = get_soldering_proof_payload_store_path()?;
-    let payload_path = soldering_proof_payload_store_path(
-        &store_base_path,
-        instance_id,
-        graph_id,
-        soldering_proof_ready.candidate_index,
-        &soldering_proof_ready.payload_hash,
-    )?;
-    let payload = read_soldering_proof_store_payload(&payload_path)
-        .await
-        .context("read local soldering proof payload for graph params endorsement")?;
-    let payload = decode_soldering_proof_payload(&soldering_proof_ready, &payload)?;
-    let (_opened, finalized, soldering) = expand_compact_soldering_proof_payload(payload)
-        .context("expand local soldering proof payload for graph params endorsement")?;
-    if finalized.len() != BABE_M_CC {
-        bail!("local verifier finalized BABE instance count mismatch");
-    }
-    let epk = &verifier_state.setup_package.commits[finalized[0].index].epk;
-    let prover_state =
-        build_babe_prover_state(&verifier_state.setup_package, finalized, soldering)?;
-    let expected_gc_data =
-        extract_gc_circuit_data(local_verifier_pubkey, epk, &prover_state.h_msgs)?;
-    if graph.parameters.gc_data[verifier_index] != expected_gc_data {
-        tracing::warn!(
-            "Ignore CreateGraph for {instance_id}:{graph_id}: graph GC data for local verifier does not match local soldering proof"
-        );
-        return Ok(());
-    }
-
-    let canonical_graph_params_hash = graph.canonical_graph_params_hash()?;
-    let signature = sign_verifier_graph_params(verifier_master_key.master_keypair(), graph)?;
-    let message = GOATMessage::new(
-        Actor::Committee,
-        GOATMessageContent::VerifierGraphParamsEndorsement(VerifierGraphParamsEndorsement {
-            instance_id,
-            graph_id,
-            verifier_pubkey: local_verifier_pubkey,
-            verifier_index,
-            canonical_graph_params_hash,
-            signature,
-        }),
-    );
-    let serialized = message.serialize_message().await?;
-    let endorsement_outbox_id =
-        format!("verifier-graph-params-endorsement:{graph_id}:{verifier_index}");
-    let mut storage = context.local_db.acquire().await?;
-    storage
-        .enqueue_p2p_outbox_message(
-            &endorsement_outbox_id,
-            message.content.event_type(),
-            &serialized,
-        )
-        .await?;
-    let cancelled_gen_circuits = storage
-        .cancel_p2p_outbox_message(&format!(
-            "gen-circuits:{instance_id}:{graph_id}:{local_verifier_pubkey}"
-        ))
-        .await?;
-    let cancelled_soldering_proof = storage
-        .cancel_p2p_outbox_message(&format!(
-            "soldering-proof-ready:{graph_id}:{}:{}",
-            soldering_proof_ready.candidate_index,
-            hex::encode(soldering_proof_ready.payload_hash),
-        ))
-        .await?;
-
-    tracing::info!(
-        event = "verifier_graph_validation",
-        outcome = "endorsement_enqueued",
-        instance_id = %instance_id,
-        graph_id = %graph_id,
-        verifier_index,
-        endorsement_outbox_id,
-        cancelled_gen_circuits,
-        cancelled_soldering_proof,
-        "validated CreateGraph and enqueued verifier graph params endorsement"
-    );
-    Ok(())
-}
-
-async fn try_start_graph_committee_setup(
+/// Start, or resume after a restart, the committee's PeginConfirm round once
+/// the instance holds enough finalized graphs: the deterministic nonce is
+/// stored, then published, and the round proceeds from the stored values.
+/// Run by the Instance aggregate's `start_pegin_confirm` job on entering
+/// Presigned (docs/node-protocol.md §10.7.1).
+pub(crate) async fn start_pegin_confirm_round(
     ctx: &mut HandlerContext<'_>,
     instance_id: Uuid,
-    graph_id: Uuid,
-    graph: &SimplifiedBitvmGcGraph,
 ) -> Result<()> {
-    let verifier_endorsements =
-        get_verifier_graph_params_endorsements_for_graph(ctx.local_db, instance_id, graph_id)
-            .await?;
-    if verifier_endorsements.len() < graph.parameters.gc_data.len() {
-        tracing::info!(
-            "Defer CreateGraph for {instance_id}:{graph_id}: waiting for verifier graph params endorsements ({}/{})",
-            verifier_endorsements.len(),
-            graph.parameters.gc_data.len()
-        );
-        return Ok(());
-    }
-    let validation = validate_init_graph(
-        ctx.local_db,
-        ctx.btc_client,
-        ctx.goat_client,
-        graph,
-        &verifier_endorsements,
-    )
-    .await;
-    ctx.metrics_state.record_graph_validation(validation.is_ok());
-    if let Err(e) = validation {
-        if should_ignore_invalid_graph(&e, instance_id, graph_id, "CreateGraph", None) {
-            return Ok(());
-        }
-        bail!(e)
-    };
-
-    // generate Musig2 nonces & broadcast NonceGeneration
-    let committee_master_key = CommitteeMasterKey::new(get_bitvm_key()?);
-    let instance_keypair = load_committee_instance_keypair(&committee_master_key, instance_id)?;
-    let full_graph = BitvmGcGraph::from_simplified(graph)?;
-    let (pub_nonces, _, nonce_sigs) =
-        committee_master_key.nonces_for_graph_job_with_keypair(&full_graph, instance_keypair)?;
-    let local_committee_pubkey = instance_keypair.public_key().into();
-    if get_committee_partial_sigs_for_graph_member(
-        ctx.local_db,
-        instance_id,
-        graph_id,
-        &local_committee_pubkey,
-    )
-    .await?
-    .is_some()
+    if let CommitteeMembership::NotMember(reason) =
+        local_committee_membership(ctx.goat_client, instance_id).await?
     {
-        tracing::warn!(
-            "Ignore CreateGraph for {instance_id}:{graph_id}: local committee partial signatures already exist"
+        tracing::info!(
+            event = "pegin_confirm_round",
+            instance_id = %instance_id,
+            outcome = "not_member",
+            reason,
+            "this node is not in the instance's committee"
         );
         return Ok(());
     }
-    let message_content = GOATMessageContent::NonceGeneration(NonceGeneration {
-        instance_id,
-        graph_id,
-        committee_pubkey: local_committee_pubkey,
-        pub_nonces: pub_nonces.clone(),
-        nonce_sigs,
-    });
-    send_protocol_message(
-        ctx.swarm,
-        ctx.local_db,
-        GOATMessage::new(Actor::All, message_content),
-        StoredValue::Fresh,
-    )
-    .await?;
-    store_committee_pub_nonces_for_graph(
-        ctx.local_db,
-        instance_id,
-        graph_id,
-        local_committee_pubkey,
-        pub_nonces,
-    )
-    .await?;
-    maybe_vote_and_presign_graph(ctx, instance_id, graph_id, graph).await
-}
-
-async fn graph_nonce_consensus_context(
-    ctx: &HandlerContext<'_>,
-    instance_id: Uuid,
-    graph_id: Uuid,
-    graph: &SimplifiedBitvmGcGraph,
-) -> Result<Option<(BitvmGcGraph, Vec<PublicKey>, CommitteeAggNonces, [u8; 32])>> {
-    let committee_pubkeys = ctx.goat_client.gateway_get_committee_pubkeys(&instance_id).await?;
-    let pub_nonces_unchecked =
-        get_committee_pub_nonces_for_graph(ctx.local_db, instance_id, graph_id).await?;
-    if pub_nonces_unchecked.len() < committee_pubkeys.len() {
-        return Ok(None);
-    }
-
-    let full_graph = BitvmGcGraph::from_simplified(graph)?;
-    let verifier_num = full_graph.parameters.gc_data.len();
-    let watchtower_num = full_graph.parameters.watchtower_pubkeys.len();
-    let mut checked_pub_nonces = Vec::with_capacity(pub_nonces_unchecked.len());
-    for (pubkey, pub_nonces) in pub_nonces_unchecked {
-        pub_nonces.validate_length(watchtower_num, verifier_num).map_err(|error| {
-            anyhow!("committee public nonces from {pubkey} have invalid length: {error}")
-        })?;
-        checked_pub_nonces.push((pubkey, pub_nonces));
-    }
-    let ordered_pub_nonces = order_committee_values(
-        &committee_pubkeys,
-        checked_pub_nonces,
-        "graph committee pub nonces",
-    )?;
-    let agg_nonces = nonces_aggregation(&ordered_pub_nonces)?;
-    let consensus_hash =
-        committee_nonce_consensus_hash(&full_graph, &committee_pubkeys, &ordered_pub_nonces)?;
-    Ok(Some((full_graph, committee_pubkeys, agg_nonces, consensus_hash)))
-}
-
-async fn maybe_vote_and_presign_graph(
-    ctx: &mut HandlerContext<'_>,
-    instance_id: Uuid,
-    graph_id: Uuid,
-    graph: &SimplifiedBitvmGcGraph,
-) -> Result<()> {
-    let Some((mut full_graph, committee_pubkeys, agg_nonces, consensus_hash)) =
-        graph_nonce_consensus_context(ctx, instance_id, graph_id, graph).await?
-    else {
+    if !has_required_presigned_graphs(ctx.local_db, instance_id).await? {
+        tracing::info!(
+            event = "pegin_confirm_round",
+            instance_id = %instance_id,
+            outcome = "not_ready",
+            "not enough finalized graphs for the PeginConfirm round"
+        );
         return Ok(());
-    };
-
+    }
+    let instance_parameters = get_instance_parameters(ctx.local_db, instance_id)
+        .await?
+        .ok_or_else(|| anyhow!("Instance parameters not found for {instance_id}"))?;
     let committee_master_key = CommitteeMasterKey::new(get_bitvm_key()?);
     let instance_keypair = load_committee_instance_keypair(&committee_master_key, instance_id)?;
     let local_committee_pubkey = instance_keypair.public_key().into();
-    if let Some(stored_partial_sigs) = get_committee_partial_sigs_for_graph_member(
-        ctx.local_db,
-        instance_id,
-        graph_id,
-        &local_committee_pubkey,
-    )
-    .await?
-    {
-        // Publish stored partial signatures without signing again.
-        publish_stored(
-            ctx,
-            &format!("committee-presign:{graph_id}"),
-            Actor::All,
-            GOATMessageContent::CommitteePresign(CommitteePresign {
-                instance_id,
-                graph_id,
-                committee_pubkey: local_committee_pubkey,
-                committee_partial_sigs: stored_partial_sigs,
-                agg_nonces,
-            }),
-            StoredValue::Found,
-        )
-        .await?;
-        return endorse_graph_if_presigned(ctx, instance_id, graph_id, &full_graph).await;
-    }
-
-    let consensus_votes =
-        get_committee_agg_nonce_consensus_for_graph(ctx.local_db, instance_id, graph_id).await?;
-    if let Some((_, stored_hash, _)) = consensus_votes
-        .iter()
-        .find(|(committee_pubkey, _, _)| *committee_pubkey == local_committee_pubkey)
-        && *stored_hash != consensus_hash
-    {
-        bail!(SpecialError::InvalidGraph(format!(
-            "local committee agg nonce consensus differs for graph {graph_id}"
-        )));
-    }
-    // Recover delivery of the stored vote.
-    let local_vote = consensus_votes
-        .iter()
-        .find(|(committee_pubkey, _, _)| *committee_pubkey == local_committee_pubkey)
-        .map(|(_, _, signature)| *signature);
-    if local_vote.is_none()
-        && signing_closed(ctx, instance_id, "graph nonce consensus vote").await?
-    {
-        return Ok(());
-    }
-    let (signature, origin) = match local_vote {
-        Some(signature) => (signature, StoredValue::Found),
-        None => {
-            let signature = SECP256K1
-                .sign_schnorr(&SecpMessage::from_digest(consensus_hash), &instance_keypair);
-            store_committee_agg_nonce_consensus_for_graph(
-                ctx.local_db,
-                instance_id,
-                graph_id,
-                local_committee_pubkey,
-                consensus_hash,
-                signature,
-            )
+    let stored_pub_nonce =
+        get_committee_pub_nonce_for_instance(ctx.local_db, instance_id, &local_committee_pubkey)
             .await?;
-            (signature, StoredValue::Fresh)
-        }
-    };
-    publish_stored(
-        ctx,
-        &format!("agg-nonce-consensus:{graph_id}"),
-        Actor::Committee,
-        GOATMessageContent::AggNonceConsensus(AggNonceConsensus {
-            instance_id,
-            graph_id,
-            committee_pubkey: local_committee_pubkey,
-            consensus_hash,
-            signature,
-        }),
-        origin,
-    )
-    .await?;
-
-    let consensus_votes =
-        get_committee_agg_nonce_consensus_for_graph(ctx.local_db, instance_id, graph_id).await?;
-    if consensus_votes.len() < committee_pubkeys.len() {
-        tracing::info!(
-            "Defer committee pre-sign for {instance_id}:{graph_id}: waiting for agg nonce consensus ({}/{})",
-            consensus_votes.len(),
-            committee_pubkeys.len(),
-        );
-        return Ok(());
-    }
-    let ordered_votes = order_committee_values(
-        &committee_pubkeys,
-        consensus_votes
-            .into_iter()
-            .map(|(committee_pubkey, consensus_hash, signature)| {
-                (committee_pubkey, (consensus_hash, signature))
-            })
-            .collect(),
-        "graph committee agg nonce consensus",
-    )?;
-    for (committee_pubkey, (received_hash, signature)) in
-        committee_pubkeys.iter().zip(ordered_votes)
-    {
-        if received_hash != consensus_hash {
-            bail!(SpecialError::InvalidGraph(format!(
-                "committee agg nonce consensus differs for graph {graph_id} and committee {committee_pubkey}"
-            )));
-        }
-        SECP256K1
-            .verify_schnorr(
-                &signature,
-                &SecpMessage::from_digest(consensus_hash),
-                &XOnlyPublicKey::from(*committee_pubkey),
-            )
-            .map_err(|error| {
-                SpecialError::InvalidGraph(format!(
-                    "invalid agg nonce consensus signature for graph {graph_id} and committee {committee_pubkey}: {error}"
-                ))
-            })?;
-    }
-
-    // Recheck the persisted bindings at the actual signing boundary, including recovery.
-    let verifier_endorsements =
-        get_verifier_graph_params_endorsements_for_graph(ctx.local_db, instance_id, graph_id)
-            .await?;
-    validate_verifier_graph_params_endorsements(ctx.goat_client, graph, &verifier_endorsements)
-        .await?;
-    if signing_closed(ctx, instance_id, "committee presign").await? {
-        return Ok(());
-    }
-    let (_, sec_nonces, _) =
-        committee_master_key.nonces_for_graph_job_with_keypair(&full_graph, instance_keypair)?;
-    let committee_partial_sigs =
-        committee_pre_sign(instance_keypair, sec_nonces, agg_nonces.clone(), &mut full_graph)?;
-    store_committee_partial_sigs_for_graph(
-        ctx.local_db,
-        instance_id,
-        graph_id,
-        local_committee_pubkey,
-        committee_partial_sigs.clone(),
-    )
-    .await?;
-    publish_stored(
-        ctx,
-        &format!("committee-presign:{graph_id}"),
-        Actor::All,
-        GOATMessageContent::CommitteePresign(CommitteePresign {
-            instance_id,
-            graph_id,
-            committee_pubkey: local_committee_pubkey,
-            committee_partial_sigs,
-            agg_nonces,
-        }),
-        StoredValue::Fresh,
-    )
-    .await?;
-    endorse_graph_if_presigned(ctx, instance_id, graph_id, &full_graph).await
-}
-
-async fn endorse_graph_if_presigned(
-    ctx: &mut HandlerContext<'_>,
-    instance_id: Uuid,
-    graph_id: Uuid,
-    graph: &BitvmGcGraph,
-) -> Result<()> {
-    let committee_pubkeys = ctx.goat_client.gateway_get_committee_pubkeys(&instance_id).await?;
-    let committee_partial_sigs =
-        get_committee_partial_sigs_for_graph(ctx.local_db, instance_id, graph_id).await?;
-    if committee_partial_sigs.len() != committee_pubkeys.len() {
-        return Ok(());
-    }
-    // Check the recovery gate before signing the endorsement.
-    let gate_key = format!("endorse-graph:{graph_id}");
-    if crate::p2p_admission::protocol_republish_gate()
-        .is_cooling(&gate_key, std::time::Instant::now())
-    {
-        return Ok(());
-    }
-
-    if signing_closed(ctx, instance_id, "graph endorsement").await? {
-        return Ok(());
-    }
-    let committee_sig_for_graph = endorse_graph(ctx.goat_client, graph).await?;
-    let committee_sig_for_params = endorse_graph_params(graph).await?;
-    let committee_master_key = CommitteeMasterKey::new(get_bitvm_key()?);
-    let instance_keypair = load_committee_instance_keypair(&committee_master_key, instance_id)?;
-    let local_committee_pubkey = instance_keypair.public_key().into();
-    let committee_evm_address = get_node_goat_address()
-        .ok_or_else(|| anyhow!("failed to get node goat address".to_string()))?;
-    let message_content = GOATMessageContent::EndorseGraph(EndorseGraph {
-        instance_id,
-        graph_id,
-        committee_pubkey: local_committee_pubkey,
-        committee_sig_for_graph: committee_sig_for_graph.as_bytes().to_vec(),
-        committee_sig_for_params: committee_sig_for_params.as_bytes().to_vec(),
-        committee_evm_address,
-    });
-    // `Found`: whether this is the first endorsement or a repeat is exactly what
-    // the outbox row records, and a repeat must not be published past it.
-    publish_stored(ctx, &gate_key, Actor::All, message_content, StoredValue::Found).await
-}
-
-#[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
-async fn handle_create_graph_committee(
-    ctx: &mut HandlerContext<'_>,
-    instance_id: Uuid,
-    graph_id: Uuid,
-    graph_nonce: u64,
-    graph: &SimplifiedBitvmGcGraph,
-    content: &GOATMessageContent,
-) -> Result<()> {
-    if !message_identity_matches(
-        "CreateGraph",
-        instance_id,
-        graph_id,
-        Some(graph_nonce),
-        graph.parameters.instance_parameters.instance_id,
-        graph.parameters.graph_id,
-        graph.parameters.graph_nonce,
-    ) {
-        return Ok(());
-    }
-
-    // received from Operator
-    if graph.parameters.graph_nonce > 0 {
-        let previous_nonce = graph.parameters.graph_nonce - 1;
-        match get_graph_id_by_nonce(ctx.local_db, previous_nonce, &graph.parameters.operator_pubkey)
-            .await?
-        {
-            Some((previous_instance_id, previous_graph_id)) => {
-                let Some(previous_graph) =
-                    get_graph(ctx.local_db, previous_instance_id, previous_graph_id).await?
-                else {
-                    if let Err(e) = try_send_sync_graph_request(
-                        ctx.swarm,
-                        ctx.goat_client,
-                        previous_instance_id,
-                        previous_graph_id,
-                    )
-                    .await
-                    {
-                        tracing::warn!(
-                            "Failed to send SyncGraphRequest for previous graph {previous_instance_id}:{previous_graph_id}: {e}"
-                        );
-                    }
-                    let message = make_message(ctx, content);
-                    defer_or_enqueue_message(
-                        ctx.local_db,
-                        &message,
-                        60,
-                        MessageDeferReason::PreviousGraphPending,
-                        "previous graph definition is not available locally",
-                    )
-                    .await?;
-                    tracing::info!(
-                        "Defer CreateGraph for {instance_id}:{graph_id}: waiting for previous graph raw data {previous_instance_id}:{previous_graph_id}"
-                    );
-                    return Ok(());
-                };
-                if !previous_graph.committee_pre_signed() {
-                    let message = make_message(ctx, content);
-                    defer_or_enqueue_message(
-                        ctx.local_db,
-                        &message,
-                        60,
-                        MessageDeferReason::PreviousGraphPending,
-                        "previous graph is waiting for committee pre-signatures",
-                    )
-                    .await?;
-                    tracing::info!(
-                        "Defer CreateGraph for {instance_id}:{graph_id}: waiting for previous graph {previous_instance_id}:{previous_graph_id} to be committee pre-signed"
-                    );
-                    return Ok(());
-                }
-            }
-            None => {
-                let message = make_message(ctx, content);
-                defer_or_enqueue_message(
-                    ctx.local_db,
-                    &message,
-                    60,
-                    MessageDeferReason::PreviousGraphPending,
-                    "previous graph nonce is not available locally",
-                )
-                .await?;
-                tracing::info!(
-                    "Defer CreateGraph for {instance_id}:{graph_id}: previous graph with nonce {previous_nonce} is not available locally"
-                );
-                return Ok(());
-            }
-        }
-    }
-
-    // 1. check graph data & operator stake without verifier params endorsements; those may arrive later.
-    let validation =
-        validate_init_graph_base(ctx.local_db, ctx.btc_client, ctx.goat_client, graph).await;
-    ctx.metrics_state.record_graph_validation(validation.is_ok());
-    if let Err(e) = validation {
-        if should_ignore_invalid_graph(&e, instance_id, graph_id, "CreateGraph", None) {
-            return Ok(());
-        }
-        bail!(e)
-    };
-    // 2. save the graph data to local db
-    store_operator_presigned_graph(ctx.local_db, graph).await?;
-    // 3. start committee setup once verifier params endorsements are complete
-    try_start_graph_committee_setup(ctx, instance_id, graph_id, graph).await
-}
-
-#[allow(clippy::too_many_arguments)]
-#[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
-async fn handle_verifier_graph_params_endorsement_committee(
-    ctx: &mut HandlerContext<'_>,
-    instance_id: Uuid,
-    graph_id: Uuid,
-    verifier_pubkey: &PublicKey,
-    verifier_index: usize,
-    canonical_graph_params_hash: [u8; 32],
-    signature: &secp256k1::schnorr::Signature,
-    content: &GOATMessageContent,
-) -> Result<()> {
-    if !ctx.goat_client.committee_mana_is_verifier(&ctx.from_peer_id.to_bytes()).await? {
-        tracing::warn!(
-            "Ignore VerifierGraphParamsEndorsement for {instance_id}:{graph_id}: sender {} is not a registered verifier",
-            ctx.from_peer_id
-        );
-        return Ok(());
-    }
-
-    let message = make_message(ctx, content);
-    let graph = match get_graph_or_defer(
-        ctx.swarm,
-        ctx.local_db,
-        ctx.goat_client,
-        instance_id,
-        graph_id,
-        &message,
-    )
-    .await?
-    {
-        Some(graph) => graph,
-        None => return Ok(()),
-    };
-    let expected_hash = graph.canonical_graph_params_hash()?;
-    if canonical_graph_params_hash != expected_hash {
-        tracing::warn!(
-            "Ignore VerifierGraphParamsEndorsement for {instance_id}:{graph_id} from {verifier_pubkey}: canonical graph params hash mismatch"
-        );
-        return Ok(());
-    }
-    if verifier_index >= graph.parameters.gc_data.len() {
-        tracing::warn!(
-            "Ignore VerifierGraphParamsEndorsement for {instance_id}:{graph_id} from {verifier_pubkey}: verifier index {verifier_index} out of range"
-        );
-        return Ok(());
-    }
-    if graph.parameters.gc_data[verifier_index].verifier_pubkey != *verifier_pubkey {
-        tracing::warn!(
-            "Ignore VerifierGraphParamsEndorsement for {instance_id}:{graph_id}: verifier pubkey does not own slot {verifier_index}"
-        );
-        return Ok(());
-    }
-    if !verify_verifier_graph_params_endorsement(verifier_pubkey, &graph, signature)? {
-        tracing::warn!(
-            "Ignore VerifierGraphParamsEndorsement for {instance_id}:{graph_id} from {verifier_pubkey}: invalid signature"
-        );
-        return Ok(());
-    }
-
-    store_verifier_graph_params_endorsement(
-        ctx.local_db,
-        instance_id,
-        graph_id,
-        *verifier_pubkey,
-        verifier_index,
-        &ctx.from_peer_id.to_string(),
-        *signature,
-    )
-    .await?;
-    try_start_graph_committee_setup(ctx, instance_id, graph_id, &graph).await
-}
-
-#[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
-async fn handle_nonce_generation_committee(
-    ctx: &mut HandlerContext<'_>,
-    instance_id: Uuid,
-    graph_id: Uuid,
-    received_committee_pubkey: &PublicKey,
-    pub_nonces: &CommitteePubNonces,
-    nonce_sigs: &CommitteeNonceSignatures,
-    content: &GOATMessageContent,
-) -> Result<()> {
-    if graph_signing_round_is_over(ctx.local_db, instance_id, graph_id).await? {
-        tracing::debug!(
-            "Ignore NonceGeneration for {instance_id}:{graph_id}: signing round is over"
-        );
-        return Ok(());
-    }
-    // received from Committee members
-    if !ensure_self_or_valid_committee(
-        ctx,
-        instance_id,
-        Some(graph_id),
-        received_committee_pubkey,
-        "NonceGeneration",
-    )
-    .await?
-    {
-        return Ok(());
-    }
-    // 1. check pub_nonces & nonce signatures
-    let message = make_message(ctx, content);
-    let graph = match get_graph_or_defer(
-        ctx.swarm,
-        ctx.local_db,
-        ctx.goat_client,
-        instance_id,
-        graph_id,
-        &message,
-    )
-    .await?
-    {
-        Some(g) => g,
-        None => return Ok(()),
-    };
-    let watchtower_num = graph.parameters.watchtower_pubkeys.len();
-    let verifier_num = graph.parameters.gc_data.len();
-    let committee_xonly_pubkey = XOnlyPublicKey::from(*received_committee_pubkey);
-    if !verify_nonce_signatures(
-        &committee_xonly_pubkey,
-        pub_nonces,
-        nonce_sigs,
-        watchtower_num,
-        verifier_num,
-    )? {
-        tracing::warn!(
-            "Ignore NonceGeneration for {instance_id}:{graph_id} from {}: invalid pub_nonces or nonce_sigs",
-            received_committee_pubkey.to_string()
-        );
-        return Ok(());
-    }
-    // 2. Save immutable pub_nonces for this committee member and graph.
-    store_committee_pub_nonces_for_graph(
-        ctx.local_db,
-        instance_id,
-        graph_id,
-        *received_committee_pubkey,
-        pub_nonces.clone(),
-    )
-    .await?;
-    maybe_vote_and_presign_graph(ctx, instance_id, graph_id, &graph).await
-}
-
-#[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
-async fn handle_agg_nonce_consensus_committee(
-    ctx: &mut HandlerContext<'_>,
-    instance_id: Uuid,
-    graph_id: Uuid,
-    received_committee_pubkey: &PublicKey,
-    received_consensus_hash: [u8; 32],
-    signature: &secp256k1::schnorr::Signature,
-    content: &GOATMessageContent,
-) -> Result<()> {
-    if graph_signing_round_is_over(ctx.local_db, instance_id, graph_id).await? {
-        tracing::debug!(
-            "Ignore AggNonceConsensus for {instance_id}:{graph_id}: signing round is over"
-        );
-        return Ok(());
-    }
-    if !ensure_self_or_valid_committee(
-        ctx,
-        instance_id,
-        Some(graph_id),
-        received_committee_pubkey,
-        "AggNonceConsensus",
-    )
-    .await?
-    {
-        return Ok(());
-    }
-
-    let message = make_message(ctx, content);
-    let graph = match get_graph_or_defer(
-        ctx.swarm,
-        ctx.local_db,
-        ctx.goat_client,
-        instance_id,
-        graph_id,
-        &message,
-    )
-    .await?
-    {
-        Some(graph) => graph,
-        None => return Ok(()),
-    };
-    let Some((_, _, _, expected_consensus_hash)) =
-        graph_nonce_consensus_context(ctx, instance_id, graph_id, &graph).await?
-    else {
-        defer_or_enqueue_message(
-            ctx.local_db,
-            &message,
-            30,
-            MessageDeferReason::CommitteeNoncesPending,
-            "waiting for committee public nonces before validating agg nonce consensus",
-        )
-        .await?;
-        tracing::info!(
-            "Defer AggNonceConsensus for {instance_id}:{graph_id}: waiting for committee pub nonces"
-        );
-        return Ok(());
-    };
-    if received_consensus_hash != expected_consensus_hash {
-        tracing::warn!(
-            "Ignore AggNonceConsensus for {instance_id}:{graph_id} from {}: consensus hash mismatch",
-            received_committee_pubkey,
-        );
-        return Ok(());
-    }
-    if SECP256K1
-        .verify_schnorr(
-            signature,
-            &SecpMessage::from_digest(expected_consensus_hash),
-            &XOnlyPublicKey::from(*received_committee_pubkey),
-        )
-        .is_err()
-    {
-        tracing::warn!(
-            "Ignore AggNonceConsensus for {instance_id}:{graph_id} from {}: invalid signature",
-            received_committee_pubkey,
-        );
-        return Ok(());
-    }
-    store_committee_agg_nonce_consensus_for_graph(
-        ctx.local_db,
-        instance_id,
-        graph_id,
-        *received_committee_pubkey,
-        received_consensus_hash,
-        *signature,
-    )
-    .await?;
-    maybe_vote_and_presign_graph(ctx, instance_id, graph_id, &graph).await
-}
-
-#[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
-async fn handle_nonce_generation_operator(
-    ctx: &mut HandlerContext<'_>,
-    instance_id: Uuid,
-    graph_id: Uuid,
-    received_committee_pubkey: &PublicKey,
-    pub_nonces: &CommitteePubNonces,
-    nonce_sigs: &CommitteeNonceSignatures,
-) -> Result<()> {
-    // received from Committee members
-    if !ensure_self_or_valid_committee(
-        ctx,
-        instance_id,
-        Some(graph_id),
-        received_committee_pubkey,
-        "NonceGeneration",
-    )
-    .await?
-    {
-        return Ok(());
-    }
-    let graph = match get_graph(ctx.local_db, instance_id, graph_id).await? {
-        Some(g) => g,
-        None => {
-            tracing::warn!(
-                "Ignore NonceGeneration for {instance_id}:{graph_id} from {}: graph not found, maybe belongs to another Operator",
-                received_committee_pubkey.to_string()
-            );
-            return Ok(());
-        }
-    };
-    let verifier_num = graph.parameters.gc_data.len();
-    let watchtower_num = graph.parameters.watchtower_pubkeys.len();
-    // 1. check pub_nonces & nonce signatures
-    let committee_xonly_pubkey = XOnlyPublicKey::from(*received_committee_pubkey);
-    if !verify_nonce_signatures(
-        &committee_xonly_pubkey,
-        pub_nonces,
-        nonce_sigs,
-        watchtower_num,
-        verifier_num,
-    )? {
-        tracing::warn!(
-            "Ignore NonceGeneration for {instance_id}:{graph_id} from {}: invalid pub_nonces or nonce_sigs",
-            received_committee_pubkey.to_string()
-        );
-        return Ok(());
-    }
-    if let Err(e) = pub_nonces.validate_length(watchtower_num, verifier_num) {
-        tracing::warn!(
-            "Ignore NonceGeneration for {instance_id}:{graph_id} from {}: invalid pub_nonces length: {e}",
-            received_committee_pubkey.to_string()
-        );
-        return Ok(());
-    }
-    // 2. Save immutable pub_nonces for this committee member and graph.
-    store_committee_pub_nonces_for_graph(
-        ctx.local_db,
-        instance_id,
-        graph_id,
-        *received_committee_pubkey,
-        pub_nonces.clone(),
-    )
-    .await?;
-    // 3. if received enough endorsement signatures, mark the graph as endorsed, send the graph to local db, broadcast GraphFinalize
-    // Operator may receive EndorseGraph, CommitteePresign or NonceGeneration messages in any order
-    // So we need to check if we have collected enough endorsements, pub_nonces and partial_sigs every time we receive them
-    if let Some((finalized_graph, _)) = try_finalize_graph(
-        ctx.swarm,
-        ctx.local_db,
-        ctx.goat_client,
-        instance_id,
-        graph_id,
-        Some(&graph),
-        true,
-    )
-    .await?
-    {
-        refresh_newly_finalized_graph(ctx, instance_id, graph_id, &finalized_graph).await?;
-    }
-    Ok(())
-}
-
-async fn validate_committee_presign_for_graph(
-    ctx: &mut HandlerContext<'_>,
-    instance_id: Uuid,
-    graph_id: Uuid,
-    received_committee_pubkey: &PublicKey,
-    committee_partial_sigs: &CommitteePartialSignatures,
-    received_agg_nonces: &CommitteeAggNonces,
-    content: &GOATMessageContent,
-) -> Result<Option<BitvmGcGraph>> {
-    let message = make_message(ctx, content);
-    let graph = match get_graph_or_defer(
-        ctx.swarm,
-        ctx.local_db,
-        ctx.goat_client,
-        instance_id,
-        graph_id,
-        &message,
-    )
-    .await?
-    {
-        Some(g) => g,
-        None => return Ok(None),
-    };
-    let graph = BitvmGcGraph::from_simplified(&graph)?;
-    let committee_pubkeys = ctx.goat_client.gateway_get_committee_pubkeys(&instance_id).await?;
-    let pub_nonces_unchecked =
-        get_committee_pub_nonces_for_graph(ctx.local_db, instance_id, graph_id).await?;
-    if pub_nonces_unchecked.len() != committee_pubkeys.len() {
-        defer_or_enqueue_message(
-            ctx.local_db,
-            &message,
-            30,
-            MessageDeferReason::CommitteeNoncesPending,
-            "waiting for committee public nonces",
-        )
-        .await?;
-        tracing::info!(
-            "Defer CommitteePresign for {instance_id}:{graph_id}: waiting for committee pub nonces"
-        );
-        return Ok(None);
-    }
-    let received_pub_nonces = match pub_nonces_unchecked
-        .iter()
-        .find(|(pubkey, _)| pubkey == received_committee_pubkey)
-        .map(|(_, pub_nonces)| pub_nonces.clone())
-    {
-        Some(pub_nonces) => pub_nonces,
-        None => {
-            tracing::warn!(
-                "Ignore CommitteePresign for {instance_id}:{graph_id} from {}: missing signer pub nonces",
-                received_committee_pubkey
-            );
-            return Ok(None);
-        }
-    };
-    let pub_nonces = match order_committee_values(
-        &committee_pubkeys,
-        pub_nonces_unchecked,
-        "graph committee pub nonces",
-    ) {
-        Ok(pub_nonces) => pub_nonces,
-        Err(e) => {
-            tracing::warn!(
-                "Ignore CommitteePresign for {instance_id}:{graph_id} from {}: invalid pub nonce set: {e}",
-                received_committee_pubkey
-            );
-            return Ok(None);
-        }
-    };
-    let agg_nonces = nonces_aggregation(&pub_nonces)?;
-    if &agg_nonces != received_agg_nonces {
-        tracing::warn!(
-            "Ignore CommitteePresign for {instance_id}:{graph_id} from {}: agg_nonces mismatch",
-            received_committee_pubkey
-        );
-        return Ok(None);
-    }
-    if let Err(e) = verify_graph_committee_partial_sigs(
-        &graph,
-        &committee_pubkeys,
-        received_committee_pubkey,
-        &received_pub_nonces,
-        &agg_nonces,
-        committee_partial_sigs,
-    ) {
-        tracing::warn!(
-            "Ignore CommitteePresign for {instance_id}:{graph_id} from {}: invalid partial signatures: {e}",
-            received_committee_pubkey
-        );
-        return Ok(None);
-    }
-    Ok(Some(graph))
-}
-
-#[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
-async fn handle_committee_presign_committee(
-    ctx: &mut HandlerContext<'_>,
-    instance_id: Uuid,
-    graph_id: Uuid,
-    received_committee_pubkey: &PublicKey,
-    committee_partial_sigs: &CommitteePartialSignatures,
-    _agg_nonces: &CommitteeAggNonces,
-    content: &GOATMessageContent,
-) -> Result<()> {
-    if graph_signing_round_is_over(ctx.local_db, instance_id, graph_id).await? {
-        tracing::debug!(
-            "Ignore CommitteePresign for {instance_id}:{graph_id}: signing round is over"
-        );
-        return Ok(());
-    }
-    // received from Committee members
-    if !ensure_self_or_valid_committee(
-        ctx,
-        instance_id,
-        Some(graph_id),
-        received_committee_pubkey,
-        "CommitteePresign",
-    )
-    .await?
-    {
-        return Ok(());
-    }
-    let graph = match validate_committee_presign_for_graph(
-        ctx,
-        instance_id,
-        graph_id,
-        received_committee_pubkey,
-        committee_partial_sigs,
-        _agg_nonces,
-        content,
-    )
-    .await?
-    {
-        Some(graph) => graph,
-        None => return Ok(()),
-    };
-    // 1. save the validated committee partial sigs to local db
-    store_committee_partial_sigs_for_graph(
-        ctx.local_db,
-        instance_id,
-        graph_id,
-        *received_committee_pubkey,
-        committee_partial_sigs.clone(),
-    )
-    .await?;
-    // 2. This also covers the case where the local partial signature was the last one and is
-    // not delivered back by gossip.
-    endorse_graph_if_presigned(ctx, instance_id, graph_id, &graph).await
-}
-
-#[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
-async fn handle_committee_presign_operator(
-    ctx: &mut HandlerContext<'_>,
-    instance_id: Uuid,
-    graph_id: Uuid,
-    received_committee_pubkey: &PublicKey,
-    committee_partial_sigs: &CommitteePartialSignatures,
-    _agg_nonces: &CommitteeAggNonces,
-    content: &GOATMessageContent,
-) -> Result<()> {
-    // received from Committee members
-    if !ensure_self_or_valid_committee(
-        ctx,
-        instance_id,
-        Some(graph_id),
-        received_committee_pubkey,
-        "CommitteePresign",
-    )
-    .await?
-    {
-        return Ok(());
-    }
-    if validate_committee_presign_for_graph(
-        ctx,
-        instance_id,
-        graph_id,
-        received_committee_pubkey,
-        committee_partial_sigs,
-        _agg_nonces,
-        content,
-    )
-    .await?
-    .is_none()
-    {
-        return Ok(());
-    }
-    // 1. save the validated committee partial sigs to local db
-    store_committee_partial_sigs_for_graph(
-        ctx.local_db,
-        instance_id,
-        graph_id,
-        *received_committee_pubkey,
-        committee_partial_sigs.clone(),
-    )
-    .await?;
-    // 3. if received enough endorsement signatures, mark the graph as endorsed, send the graph to local database, broadcast GraphFinalize
-    // Operator may receive EndorseGraph, CommitteePresign or NonceGeneration messages in any order
-    // So we need to check if we have collected enough endorsements, pub_nonces and partial_sigs every time we receive them
-    if let Some((finalized_graph, _)) = try_finalize_graph(
-        ctx.swarm,
-        ctx.local_db,
-        ctx.goat_client,
-        instance_id,
-        graph_id,
-        None,
-        true,
-    )
-    .await?
-    {
-        refresh_newly_finalized_graph(ctx, instance_id, graph_id, &finalized_graph).await?;
-    }
-    Ok(())
-}
-
-#[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
-async fn handle_endorse_graph_operator(
-    ctx: &mut HandlerContext<'_>,
-    instance_id: Uuid,
-    graph_id: Uuid,
-    received_committee_pubkey: &PublicKey,
-    committee_sig_for_graph: &[u8],
-    committee_sig_for_params: &[u8],
-    committee_evm_address: &alloy::primitives::Address,
-) -> Result<()> {
-    // received from Committee members
-    if !ensure_self_or_valid_committee_with_evm(
-        ctx,
-        instance_id,
-        Some(graph_id),
-        received_committee_pubkey,
-        committee_evm_address,
-        "EndorseGraph",
-    )
-    .await?
-    {
-        return Ok(());
-    }
-    // 1. check endorsement signature
-    let graph = match get_graph(ctx.local_db, instance_id, graph_id).await? {
-        Some(g) => g,
-        None => {
-            tracing::warn!(
-                "Ignore EndorseGraph for {instance_id}:{graph_id} from {}: graph not found, maybe belongs to another Operator",
-                received_committee_pubkey.to_string()
-            );
-            return Ok(());
-        }
-    };
-    let full_graph = BitvmGcGraph::from_simplified(&graph)?;
-    if let Err(e) = verify_graph_endorsement(
-        ctx.goat_client,
-        committee_evm_address,
-        &full_graph,
-        committee_sig_for_graph,
-    )
-    .await
-    {
-        tracing::warn!(
-            "Ignore EndorseGraph for {instance_id}:{graph_id} from {}: invalid endorsement signature: {e}",
-            received_committee_pubkey.to_string()
-        );
-        return Ok(());
-    }
-    match verify_graph_params_endorsement(
-        committee_evm_address,
-        &full_graph,
-        committee_sig_for_params,
-    ) {
-        Ok(true) => {}
-        Ok(false) => {
-            tracing::warn!(
-                "Ignore EndorseGraph for {instance_id}:{graph_id} from {}: invalid params endorsement signature",
-                received_committee_pubkey.to_string()
-            );
-            return Ok(());
-        }
-        Err(e) => {
-            tracing::warn!(
-                "Ignore EndorseGraph for {instance_id}:{graph_id} from {}: invalid params endorsement signature: {e}",
-                received_committee_pubkey.to_string()
-            );
-            return Ok(());
-        }
-    }
-    // 2. save the endorsement signature to local db
-    store_committee_endorsement_for_graph(
-        ctx.local_db,
-        instance_id,
-        graph_id,
-        *received_committee_pubkey,
-        *committee_evm_address,
-        committee_sig_for_graph.to_owned(),
-        committee_sig_for_params.to_owned(),
-    )
-    .await?;
-    // 3. if received enough endorsement signatures, mark the graph as endorsed, send the graph to local database, broadcast GraphFinalize
-    // Operator may receive EndorseGraph, CommitteePresign or NonceGeneration messages in any order
-    // So we need to check if we have collected enough endorsements, pub_nonces and partial_sigs every time we receive them
-    if let Some((finalized_graph, _)) = try_finalize_graph(
-        ctx.swarm,
-        ctx.local_db,
-        ctx.goat_client,
-        instance_id,
-        graph_id,
-        Some(&graph),
-        true,
-    )
-    .await?
-    {
-        refresh_newly_finalized_graph(ctx, instance_id, graph_id, &finalized_graph).await?;
-    }
-    Ok(())
-}
-
-#[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
-async fn handle_graph_finalize_committee(
-    ctx: &mut HandlerContext<'_>,
-    instance_id: Uuid,
-    graph_id: Uuid,
-    graph_nonce: u64,
-    graph: &SimplifiedBitvmGcGraph,
-    endorse_sigs: &[(PublicKey, alloy::primitives::Address, Vec<u8>)],
-    params_endorse_sigs: &[(PublicKey, alloy::primitives::Address, Vec<u8>)],
-) -> Result<()> {
-    if !message_identity_matches(
-        "GraphFinalize",
-        instance_id,
-        graph_id,
-        Some(graph_nonce),
-        graph.parameters.instance_parameters.instance_id,
-        graph.parameters.graph_id,
-        graph.parameters.graph_nonce,
-    ) {
-        return Ok(());
-    }
-
-    // received from Operator
-    // 1. check graph data
-    let validation = validate_finalized_graph(
-        ctx.btc_client,
-        ctx.goat_client,
-        graph,
-        endorse_sigs,
-        params_endorse_sigs,
-    )
-    .await;
-    ctx.metrics_state.record_graph_validation(validation.is_ok());
-    if let Err(e) = validation {
-        if should_ignore_invalid_graph(
-            &e,
-            instance_id,
-            graph_id,
-            "GraphFinalize",
-            Some(&ctx.from_peer_id),
-        ) {
-            return Ok(());
-        }
-        bail!(e)
-    }
-    // 2. Store a finalized graph only when it upgrades the local graph.
-    let _ = store_finalized_graph_if_needed(ctx.local_db, graph).await?;
-    store_committee_endorsements_for_graph(
-        ctx.local_db,
-        instance_id,
-        graph_id,
-        endorse_sigs.to_owned(),
-        params_endorse_sigs.to_owned(),
-    )
-    .await?;
-    // After storing, mark the graph as finalized for the instance threshold.
-    mark_graph_as_endorsed(ctx.local_db, instance_id, graph_id).await?;
-    notify_graph_endorsed(ctx.local_db, instance_id, graph_id).await?;
-    let finalized_graph = BitvmGcGraph::from_simplified(graph)?;
-    refresh_newly_finalized_graph(ctx, instance_id, graph_id, &finalized_graph).await?;
-    // 3. if endorsed graph count >= threshold, generate & broadcast PeginConfirmNonce
-    if has_required_presigned_graphs(ctx.local_db, instance_id).await? {
-        let committee_master_key = CommitteeMasterKey::new(get_bitvm_key()?);
-        let instance_keypair = load_committee_instance_keypair(&committee_master_key, instance_id)?;
-        let local_committee_pubkey = instance_keypair.public_key().into();
-        let stored_pub_nonce = get_committee_pub_nonce_for_instance(
+    if stored_pub_nonce.is_none() {
+        if signing_closed(ctx, instance_id, "PeginConfirm nonce").await? {
+            // Nothing new after T0; stored values are still re-sent below.
+        } else if get_committee_partial_sig_for_instance(
             ctx.local_db,
             instance_id,
             &local_committee_pubkey,
         )
-        .await?;
-        if stored_pub_nonce.is_none() {
-            if signing_closed(ctx, instance_id, "PeginConfirm nonce").await? {
-                // Nothing new after T0; stored values are still re-sent below.
-            } else if get_committee_partial_sig_for_instance(
+        .await?
+        .is_some()
+        {
+            tracing::warn!(
+                "Skip PeginConfirm nonce for {instance_id}: local committee partial signature already exists"
+            );
+        } else {
+            let (_, pub_nonce, nonce_sig) = committee_master_key
+                .nonce_for_instance_job_with_keypair(&instance_parameters, instance_keypair)?;
+            let message_content = GOATMessageContent::PeginConfirmNonce(PeginConfirmNonce {
+                instance_id,
+                committee_pubkey: local_committee_pubkey,
+                pub_nonce: pub_nonce.clone(),
+                nonce_sig,
+            });
+            store_committee_pub_nonce_for_instance(
                 ctx.local_db,
                 instance_id,
-                &local_committee_pubkey,
+                local_committee_pubkey,
+                pub_nonce,
             )
-            .await?
-            .is_some()
-            {
-                tracing::warn!(
-                    "Skip PeginConfirm nonce for {instance_id}: local committee partial signature already exists"
-                );
-            } else {
-                let (_, pub_nonce, nonce_sig) = committee_master_key
-                    .nonce_for_instance_job_with_keypair(
-                        &graph.parameters.instance_parameters,
-                        instance_keypair,
-                    )?;
-                let message_content = GOATMessageContent::PeginConfirmNonce(PeginConfirmNonce {
-                    instance_id,
-                    committee_pubkey: local_committee_pubkey,
-                    pub_nonce: pub_nonce.clone(),
-                    nonce_sig,
-                });
-                store_committee_pub_nonce_for_instance(
-                    ctx.local_db,
-                    instance_id,
-                    local_committee_pubkey,
-                    pub_nonce,
-                )
-                .await?;
-                send_protocol_message(
-                    ctx.swarm,
-                    ctx.local_db,
-                    GOATMessage::new(Actor::Committee, message_content),
-                    StoredValue::Fresh,
-                )
-                .await?;
-            }
-        }
-        if let Some(pub_nonce) = stored_pub_nonce {
-            // Recover the stored nonce proof after Presigned without recomputing MuSig signatures.
-            let (_, expected_nonce, nonce_sig) = committee_master_key
-                .nonce_for_instance_job_with_keypair(
-                    &graph.parameters.instance_parameters,
-                    instance_keypair,
-                )?;
-            if expected_nonce != pub_nonce {
-                bail!("stored pegin public nonce differs from deterministic nonce");
-            }
-            publish_stored(
-                ctx,
-                &format!("pegin-nonce:{instance_id}"),
-                Actor::Committee,
-                GOATMessageContent::PeginConfirmNonce(PeginConfirmNonce {
-                    instance_id,
-                    committee_pubkey: local_committee_pubkey,
-                    pub_nonce,
-                    nonce_sig,
-                }),
-                StoredValue::Found,
+            .await?;
+            send_protocol_message(
+                ctx.swarm,
+                ctx.local_db,
+                GOATMessage::new(Actor::Committee, message_content),
+                StoredValue::Fresh,
             )
             .await?;
         }
-        maybe_vote_and_sign_pegin_confirm(ctx, instance_id).await?;
     }
-    // 4. (Relayer) try to call Gateway.postGraphData
-    // GraphFinalize may come after PostReady, so we need to check it here
-    if is_relayer() {
-        let pegin_data = ctx.goat_client.gateway_get_pegin_data(&instance_id).await?;
-        if pegin_data.status != PeginStatus::Withdrawable {
-            // pegin not posted yet
-            return Ok(());
+    if let Some(pub_nonce) = stored_pub_nonce {
+        // Recover the stored nonce proof without recomputing MuSig signatures.
+        let (_, expected_nonce, nonce_sig) = committee_master_key
+            .nonce_for_instance_job_with_keypair(&instance_parameters, instance_keypair)?;
+        if expected_nonce != pub_nonce {
+            bail!("stored pegin public nonce differs from deterministic nonce");
         }
-        let graph_data = ctx.goat_client.gateway_get_graph_data(&graph_id).await?;
-        if graph_data.operator_pubkey != [0u8; 32] {
-            // already posted
-            return Ok(());
-        }
-        let graph = BitvmGcGraph::from_simplified(graph)?;
-        let graph_data = build_graph_data(&graph)?;
-        let endorse_sigs = endorse_sigs.iter().map(|(_, _, sig)| sig.clone()).collect::<Vec<_>>();
-        ctx.goat_client
-            .gateway_post_graph_data(&instance_id, &graph_id, &graph_data, &endorse_sigs)
-            .await?;
+        publish_stored(
+            ctx,
+            &format!("pegin-nonce:{instance_id}"),
+            Actor::Committee,
+            GOATMessageContent::PeginConfirmNonce(PeginConfirmNonce {
+                instance_id,
+                committee_pubkey: local_committee_pubkey,
+                pub_nonce,
+                nonce_sig,
+            }),
+            StoredValue::Found,
+        )
+        .await?;
     }
-    Ok(())
-}
-
-#[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
-async fn handle_graph_finalize_default(
-    ctx: &mut HandlerContext<'_>,
-    instance_id: Uuid,
-    graph_id: Uuid,
-    graph_nonce: u64,
-    graph: &SimplifiedBitvmGcGraph,
-    endorse_sigs: &[(PublicKey, alloy::primitives::Address, Vec<u8>)],
-    params_endorse_sigs: &[(PublicKey, alloy::primitives::Address, Vec<u8>)],
-) -> Result<()> {
-    if !message_identity_matches(
-        "GraphFinalize",
-        instance_id,
-        graph_id,
-        Some(graph_nonce),
-        graph.parameters.instance_parameters.instance_id,
-        graph.parameters.graph_id,
-        graph.parameters.graph_nonce,
-    ) {
-        return Ok(());
-    }
-
-    // received from Operator
-    // 1. check graph data
-    let validation = validate_finalized_graph(
-        ctx.btc_client,
-        ctx.goat_client,
-        graph,
-        endorse_sigs,
-        params_endorse_sigs,
-    )
-    .await;
-    ctx.metrics_state.record_graph_validation(validation.is_ok());
-    if let Err(e) = validation {
-        if should_ignore_invalid_graph(
-            &e,
-            instance_id,
-            graph_id,
-            "GraphFinalize",
-            Some(&ctx.from_peer_id),
-        ) {
-            return Ok(());
-        }
-        bail!(e)
-    }
-    // 2. Store a finalized graph only when it upgrades the local graph.
-    let _ = store_finalized_graph_if_needed(ctx.local_db, graph).await?;
-    store_committee_endorsements_for_graph(
-        ctx.local_db,
-        instance_id,
-        graph_id,
-        endorse_sigs.to_owned(),
-        params_endorse_sigs.to_owned(),
-    )
-    .await?;
-    mark_graph_as_endorsed(ctx.local_db, instance_id, graph_id).await?;
-    notify_graph_endorsed(ctx.local_db, instance_id, graph_id).await?;
-    let finalized_graph = BitvmGcGraph::from_simplified(graph)?;
-    refresh_newly_finalized_graph(ctx, instance_id, graph_id, &finalized_graph).await?;
-    Ok(())
+    maybe_vote_and_sign_pegin_confirm(ctx, instance_id).await
 }
 
 async fn pegin_confirm_nonce_consensus_context(
@@ -4453,6 +1202,35 @@ async fn broadcast_pegin_confirm_if_presigned(
     let result = broadcast_tx(ctx.btc_client, pegin_confirm.tx()).await;
     ctx.metrics_state.record_pegin_confirm(result.is_ok());
     result?;
+    Ok(())
+}
+
+/// Bind the PeginConfirm signing nonce to the nonce transcript it signs for;
+/// a second transcript under the same nonce is refused (§10.4).
+async fn authorize_pegin_confirm_signing(
+    local_db: &LocalDB,
+    instance_id: Uuid,
+    pub_nonce: &musig2::PubNonce,
+    consensus_hash: [u8; 32],
+) -> Result<()> {
+    let nonce_id = signing_nonce_id("pegin-confirm", &pub_nonce.serialize());
+    let transcript = hex::encode(consensus_hash);
+    let authorization = local_db
+        .acquire()
+        .await?
+        .authorize_signing(
+            "instance",
+            &instance_id.to_string(),
+            &nonce_id,
+            &transcript,
+            current_time_secs(),
+        )
+        .await?;
+    if let store::SigningAuthorization::Conflict { existing_digest } = authorization {
+        bail!(SpecialError::InvalidPeginData(format!(
+            "PeginConfirm nonce for {instance_id} is already authorized for transcript {existing_digest}; refusing {transcript}"
+        )));
+    }
     Ok(())
 }
 
@@ -4586,8 +1364,11 @@ async fn maybe_vote_and_sign_pegin_confirm(
     if signing_closed(ctx, instance_id, "PeginConfirm partial signature").await? {
         return Ok(());
     }
-    let (sec_nonce, _, _) = committee_master_key
+    let (sec_nonce, pub_nonce, _) = committee_master_key
         .nonce_for_instance_job_with_keypair(&instance_parameters, instance_keypair)?;
+    // Authorization before the signature (docs/node-protocol.md §10.4): the
+    // deterministic nonce signs exactly one transcript, the agreed nonce set.
+    authorize_pegin_confirm_signing(ctx.local_db, instance_id, &pub_nonce, consensus_hash).await?;
     let mut pegin_confirm = instance_parameters.build_pegin_tx()?.1;
     let committee_context = instance_parameters.get_committee_context(instance_keypair)?;
     let partial_sig = pegin_confirm
@@ -5001,16 +1782,7 @@ async fn handle_kickoff_ready_operator(
 ) -> Result<()> {
     // triggered by InitWithdraw event from GoatChain
     let message = make_message(ctx, content);
-    let graph = match get_graph_or_defer(
-        ctx.swarm,
-        ctx.local_db,
-        ctx.goat_client,
-        instance_id,
-        graph_id,
-        &message,
-    )
-    .await?
-    {
+    let graph = match get_graph_or_defer(ctx.local_db, instance_id, graph_id, &message).await? {
         Some(g) => g,
         None => return Ok(()),
     };
@@ -5052,19 +1824,13 @@ async fn handle_kickoff_ready_operator(
                 return Ok(());
             }
         };
-        let current_graph = match get_graph_or_defer(
-            ctx.swarm,
-            ctx.local_db,
-            ctx.goat_client,
-            current_instance_id,
-            current_graph_id,
-            &message,
-        )
-        .await?
-        {
-            Some(g) => g,
-            None => return Ok(()),
-        };
+        let current_graph =
+            match get_graph_or_defer(ctx.local_db, current_instance_id, current_graph_id, &message)
+                .await?
+            {
+                Some(g) => g,
+                None => return Ok(()),
+            };
         let mut current_graph = BitvmGcGraph::from_simplified(&current_graph)?;
         let current_graph_refresh = refresh_graph(
             ctx.local_db,
@@ -5397,19 +2163,11 @@ async fn handle_previous_graph_after_prekickoff(
         get_graph_id_by_nonce(ctx.local_db, graph_nonce - 1, &graph.parameters.operator_pubkey)
             .await?
             .ok_or_else(|| anyhow!("Prev graph not found for {instance_id}:{graph_id}"))?;
-    let prev_graph = match get_graph_or_defer(
-        ctx.swarm,
-        ctx.local_db,
-        ctx.goat_client,
-        prev_instance_id,
-        prev_graph_id,
-        message,
-    )
-    .await?
-    {
-        Some(g) => g,
-        None => return Ok(()),
-    };
+    let prev_graph =
+        match get_graph_or_defer(ctx.local_db, prev_instance_id, prev_graph_id, message).await? {
+            Some(g) => g,
+            None => return Ok(()),
+        };
     let prev_graph = BitvmGcGraph::from_simplified(&prev_graph)?;
     let (prev_graph_status, _prev_graph_sub_status, status_transition_accepted) =
         refresh_and_compensate(
@@ -7326,157 +4084,6 @@ async fn handle_take2_sent_default(
     Ok(())
 }
 
-#[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
-async fn handle_sync_graph_request(
-    ctx: &mut HandlerContext<'_>,
-    instance_id: Uuid,
-    graph_id: Uuid,
-) -> Result<()> {
-    // sent by other nodes when they find a graph is missing locally
-    // 1. (Relayer) send SyncGraph response if have the graph
-    if !is_relayer() {
-        tracing::debug!("Ignore SyncGraphRequest for {instance_id}:{graph_id}: not a relayer node");
-        return Ok(());
-    }
-    // Check graph ownership before charging the response budget or recording cooldown.
-    let now = std::time::Instant::now();
-    let graph_key = graph_id.to_string();
-    if crate::p2p_admission::sync_graph_response_gate().is_cooling(&graph_key, now) {
-        return Ok(());
-    }
-    // Require the graph to belong to the requested instance.
-    if !ctx.local_db.acquire().await?.has_graph_of_instance(&instance_id, &graph_id).await? {
-        tracing::debug!("Graph not found for SyncGraphRequest {instance_id}:{graph_id}");
-        return Ok(());
-    }
-    let requester_registered =
-        crate::p2p_admission::peer_registry().sender_class(&ctx.from_peer_id, now).is_registered();
-    if !crate::p2p_admission::sync_graph_response_budget(requester_registered).allow(now) {
-        tracing::debug!(
-            "Defer SyncGraphRequest for {instance_id}:{graph_id}: sync-graph response budget spent"
-        );
-        return Ok(());
-    }
-    let Some(graph) = get_graph(ctx.local_db, instance_id, graph_id).await? else {
-        // TODO: if no relayer has the graph, how to recover?
-        tracing::warn!("Graph not loadable for SyncGraphRequest {instance_id}:{graph_id}");
-        return Ok(());
-    };
-    // The cooldown is taken only for a response that is actually going out.
-    if !crate::p2p_admission::sync_graph_response_gate().allow(&graph_key, now) {
-        return Ok(());
-    }
-    let message_content = GOATMessageContent::SyncGraph(SyncGraph { instance_id, graph_id, graph });
-    send_protocol_message(
-        ctx.swarm,
-        ctx.local_db,
-        GOATMessage::new(Actor::All, message_content),
-        StoredValue::Fresh,
-    )
-    .await?;
-    Ok(())
-}
-
-#[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
-async fn handle_sync_graph(
-    ctx: &mut HandlerContext<'_>,
-    instance_id: Uuid,
-    graph_id: Uuid,
-    graph: &SimplifiedBitvmGcGraph,
-) -> Result<()> {
-    // Accept only responses to a recorded local request.
-    if !crate::p2p_admission::requested_graphs()
-        .contains(&graph_id.to_string(), std::time::Instant::now())
-    {
-        tracing::debug!(
-            "Ignore SyncGraph for {instance_id}:{graph_id}: no matching local sync request"
-        );
-        return Ok(());
-    }
-    // Require a cached committee identity for the relayer.
-    if !crate::p2p_admission::peer_registry()
-        .is_committee(&ctx.from_peer_id, std::time::Instant::now())
-    {
-        tracing::debug!(
-            "Ignore SyncGraph for {instance_id}:{graph_id}: sender {} is not a committee peer",
-            ctx.from_peer_id
-        );
-        return Ok(());
-    }
-    // Apply rejection cooldown per graph and sender; RPC failures leave the gate open.
-    let gate_key = format!("{graph_id}:{}", ctx.from_peer_id);
-    if crate::p2p_admission::sync_graph_validation_gate()
-        .is_cooling(&gate_key, std::time::Instant::now())
-    {
-        tracing::debug!(
-            "Ignore SyncGraph for {instance_id}:{graph_id}: this sender's graph was rejected recently"
-        );
-        return Ok(());
-    }
-    let reject = |why: String| {
-        crate::p2p_admission::sync_graph_validation_gate()
-            .allow(&gate_key, std::time::Instant::now());
-        tracing::warn!("Ignore SyncGraph for {instance_id}:{graph_id}: {why}");
-    };
-
-    if !message_identity_matches(
-        "SyncGraph",
-        instance_id,
-        graph_id,
-        None,
-        graph.parameters.instance_parameters.instance_id,
-        graph.parameters.graph_id,
-        graph.parameters.graph_nonce,
-    ) {
-        reject("envelope and graph parameters name different graphs".to_string());
-        return Ok(());
-    }
-
-    validate_graph_id_on_goat(ctx.goat_client, instance_id, graph_id).await.with_context(|| {
-        format!("Failed to validate graph_id on GoatChain for SyncGraph {instance_id}:{graph_id}")
-    })?;
-    let validation = validate_graph_instance_parameters(
-        ctx.btc_client,
-        ctx.goat_client,
-        &graph.parameters.instance_parameters,
-    )
-    .await;
-    ctx.metrics_state.record_graph_validation(validation.is_ok());
-    if let Err(e) = validation {
-        // This check talks to both chains. "Could not ask" is not a verdict on
-        // the graph: let the inbox retry instead of rejecting a good answer.
-        if crate::action::is_retryable_external_rpc_error(&e) {
-            return Err(e).context("validate SyncGraph instance parameters");
-        }
-        reject(format!("invalid instance parameters: {e}"));
-        return Ok(());
-    }
-    let graph = BitvmGcGraph::from_simplified(graph)?;
-    let graph_data = build_graph_data(&graph)?;
-    let graph_data_on_goat = ctx.goat_client.gateway_get_graph_data(&graph_id).await?;
-    if graph_data != graph_data_on_goat {
-        reject("reconstructed graph data does not match GoatChain".to_string());
-        return Ok(());
-    }
-
-    if let Err(e) = verify_graph_operator_pre_signatures(&graph) {
-        reject(format!("invalid operator pre-signatures: {e}"));
-        return Ok(());
-    }
-    if let Err(e) = verify_graph_committee_pre_signatures(&graph) {
-        reject(format!("invalid committee pre-signatures: {e}"));
-        return Ok(());
-    }
-    let simplified_graph = graph.to_simplified()?;
-    let _ = store_finalized_graph_if_needed(ctx.local_db, &simplified_graph).await?;
-    refresh_and_compensate(ctx, instance_id, graph_id, &graph, GraphStatus::OperatorPresigned)
-        .await?;
-    // Close only after compensation succeeds. Otherwise a transient refresh
-    // failure would make this inbox row's retry look unsolicited and drop it.
-    crate::p2p_admission::requested_graphs().remove(&graph_id.to_string());
-    Ok(())
-}
-
 /// A `NodeInfo` payload is entirely self-declared, so only accept it as the
 /// sender's own record: the registry is keyed by `peer_id`, and without this
 /// check any peer could overwrite any other node's row.
@@ -7632,10 +4239,6 @@ async fn handle_response_node_info(
 #[cfg(test)]
 mod tests {
     use bitcoin::hashes::Hash;
-    use bitvm_lib::babe_adapter::{
-        BABE_M_CC, BabeProverState, build_setup_package, open_and_solder,
-    };
-    use std::str::FromStr;
 
     use super::*;
 
@@ -7656,258 +4259,6 @@ mod tests {
             .await
             .unwrap();
         assert!(queued.is_none());
-    }
-
-    fn verifier_pubkey() -> PublicKey {
-        PublicKey::from_str("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
-            .unwrap()
-    }
-
-    fn gc_submission() -> (CACSetupPackage, BitvmGcCircuitData, BabeProverState) {
-        let package = build_setup_package(BABE_M_CC + 1).unwrap();
-        let selected = (0..BABE_M_CC).collect::<Vec<_>>();
-        let (_, finalized, soldering) = open_and_solder(&package, &selected).unwrap();
-        let epk = &package.commits[finalized[0].index].epk;
-        let h_msgs: Vec<[u8; 20]> =
-            finalized.iter().map(|f| package.commits[f.index].h_msg).collect();
-        let gc_data = extract_gc_circuit_data(verifier_pubkey(), epk, &h_msgs).unwrap();
-        let prover_state = BabeProverState {
-            package: package.clone(),
-            finalized,
-            soldering,
-            h_msgs: gc_data.final_msg_hashlocks.clone(),
-        };
-        (package, gc_data, prover_state)
-    }
-
-    fn soldering_proof_ready(hash_byte: u8) -> SolderingProofReady {
-        SolderingProofReady {
-            instance_id: Uuid::nil(),
-            graph_id: Uuid::nil(),
-            candidate_index: 0,
-            payload_hash: [hash_byte; 32],
-            total_len: 1,
-        }
-    }
-
-    fn operator_state(package: CACSetupPackage) -> OperatorBabeSetupState {
-        OperatorBabeSetupState {
-            candidate_verifier_pubkeys: Some(vec![verifier_pubkey()]),
-            candidates: vec![OperatorVerifierCandidate {
-                verifier_peer_id: vec![1],
-                verifier_pubkey: verifier_pubkey(),
-                setup_package: package,
-                candidate_index: Some(0),
-                selected_circuit_indexes: (0..BABE_M_CC).collect(),
-                gc_data: None,
-                soldering_proof_ready: None,
-            }],
-            candidate_collection_started_at: None,
-            proof_collection_started_at: None,
-            selected_verifier_pubkeys: None,
-            asserted_operator_proof: None,
-        }
-    }
-
-    /// Verify retries fill missing CutCircuits entries without changing existing entries.
-    #[tokio::test]
-    async fn retry_after_a_cut_off_freeze_completes_the_cut_circuits() {
-        use bitcoin::secp256k1::{Secp256k1, SecretKey};
-
-        let sender_peer_id = generate_local_key().public().to_peer_id().to_string();
-
-        let local_db = store::create_local_db("sqlite::memory:").await;
-        let (instance_id, graph_id) = (Uuid::new_v4(), Uuid::new_v4());
-        let package = build_setup_package(BABE_M_CC + 1).unwrap();
-        let secp = Secp256k1::new();
-        let mut state = OperatorBabeSetupState {
-            candidate_verifier_pubkeys: None,
-            candidates: (1..=3u8)
-                .map(|index| OperatorVerifierCandidate {
-                    verifier_peer_id: PeerId::random().to_bytes(),
-                    verifier_pubkey: PublicKey::new(
-                        SecretKey::from_slice(&[index; 32]).unwrap().public_key(&secp),
-                    ),
-                    setup_package: package.clone(),
-                    candidate_index: None,
-                    selected_circuit_indexes: vec![],
-                    gc_data: None,
-                    soldering_proof_ready: None,
-                })
-                .collect(),
-            candidate_collection_started_at: None,
-            proof_collection_started_at: None,
-            selected_verifier_pubkeys: None,
-            asserted_operator_proof: None,
-        };
-        let now = current_time_secs();
-        assert!(cut_circuits_owed(&state, now).is_empty(), "nothing is owed before the freeze");
-        freeze_operator_candidates(&mut state).unwrap();
-        let outbox_id = |candidate: &OperatorVerifierCandidate| {
-            format!("cut-circuits:{instance_id}:{graph_id}:{}", candidate.verifier_pubkey)
-        };
-        let outbox_state = async |message_id: String| -> Option<(String, i64)> {
-            local_db.acquire().await.unwrap().p2p_outbox_entry_state(&message_id).await.unwrap()
-        };
-
-        // First run: the set is frozen and saved, one CutCircuits is written, and
-        // then the handler is cut off.
-        let owed = cut_circuits_owed(&state, now);
-        assert_eq!(owed.len(), 3);
-        ensure_cut_circuits_outbox(&local_db, instance_id, graph_id, &owed[..1], &sender_peer_id)
-            .await
-            .unwrap();
-        // That verifier acknowledges it before the retry comes round.
-        let first_peer = PeerId::from_bytes(&owed[0].verifier_peer_id).unwrap().to_string();
-        let first_delivery_id = local_db
-            .acquire()
-            .await
-            .unwrap()
-            .p2p_outbox_delivery_id(&outbox_id(&owed[0]))
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(
-            local_db
-                .acquire()
-                .await
-                .unwrap()
-                .acknowledge_p2p_outbox_message(&first_delivery_id, &first_peer)
-                .await
-                .unwrap()
-        );
-        assert!(outbox_state(outbox_id(&owed[1])).await.is_none(), "never written");
-
-        // The retry: the set is frozen already, and everything is still owed.
-        let owed = cut_circuits_owed(&state, now);
-        assert_eq!(owed.len(), 3);
-        ensure_cut_circuits_outbox(&local_db, instance_id, graph_id, &owed, &sender_peer_id)
-            .await
-            .unwrap();
-        assert_eq!(
-            outbox_state(outbox_id(&owed[0])).await,
-            Some(("Processed".to_string(), 0)),
-            "the acknowledged entry is left as it is, not re-opened"
-        );
-        for candidate in &owed[1..] {
-            let (entry_state, len) = outbox_state(outbox_id(candidate)).await.unwrap();
-            assert_eq!(entry_state, "Pending");
-            assert!(len > 0, "the missing CutCircuits is now queued for delivery");
-        }
-        // And again: nothing changes.
-        ensure_cut_circuits_outbox(&local_db, instance_id, graph_id, &owed, &sender_peer_id)
-            .await
-            .unwrap();
-        assert_eq!(outbox_state(outbox_id(&owed[0])).await, Some(("Processed".to_string(), 0)));
-
-        // A candidate that has delivered its proof is owed nothing more ...
-        state.candidates[0].soldering_proof_ready = Some(soldering_proof_ready(1));
-        assert_eq!(cut_circuits_owed(&state, now).len(), 2);
-        // ... nobody is once the proof window has closed with enough proofs in
-        // hand, so a late retry does not set verifiers garbling for nothing ...
-        let (_, gc_data, _) = gc_submission();
-        state.candidates[0].gc_data = Some(gc_data);
-        state.proof_collection_started_at = Some(now);
-        assert_eq!(cut_circuits_owed(&state, now).len(), 2, "the window is still open");
-        let after_window = now + get_verifier_candidate_collection_window_secs();
-        assert!(cut_circuits_owed(&state, after_window).is_empty());
-        // ... and nobody is once the selection is sealed.
-        state.proof_collection_started_at = None;
-        state.selected_verifier_pubkeys = Some(vec![state.candidates[0].verifier_pubkey]);
-        assert!(cut_circuits_owed(&state, now).is_empty());
-    }
-
-    #[test]
-    fn freeze_operator_candidate_selects_protocol_finalized_count() {
-        let package = build_setup_package(BABE_M_CC + 1).unwrap();
-        let mut state = OperatorBabeSetupState {
-            candidate_verifier_pubkeys: None,
-            candidates: vec![OperatorVerifierCandidate {
-                verifier_peer_id: vec![1],
-                verifier_pubkey: verifier_pubkey(),
-                setup_package: package,
-                candidate_index: None,
-                selected_circuit_indexes: vec![],
-                gc_data: None,
-                soldering_proof_ready: None,
-            }],
-            candidate_collection_started_at: None,
-            proof_collection_started_at: None,
-            selected_verifier_pubkeys: None,
-            asserted_operator_proof: None,
-        };
-
-        freeze_operator_candidates(&mut state).unwrap();
-
-        assert_eq!(state.candidates[0].selected_circuit_indexes.len(), BABE_M_CC);
-    }
-
-    #[test]
-    fn candidate_records_one_slot_and_payload_reference_idempotently() {
-        let (package, gc_data, prover_state) = gc_submission();
-        let mut state = operator_state(package.clone());
-        let soldering_proof_ready = soldering_proof_ready(1);
-
-        record_candidate_gc_data(
-            &mut state,
-            verifier_pubkey(),
-            0,
-            &package,
-            gc_data.clone(),
-            &prover_state,
-            soldering_proof_ready.clone(),
-        )
-        .unwrap();
-
-        assert_eq!(
-            state.candidates[0].gc_data.as_ref().unwrap().final_msg_hashlocks.len(),
-            BABE_M_CC
-        );
-        assert_eq!(
-            state.candidates[0].soldering_proof_ready.as_ref(),
-            Some(&soldering_proof_ready)
-        );
-
-        record_candidate_gc_data(
-            &mut state,
-            verifier_pubkey(),
-            0,
-            &package,
-            gc_data.clone(),
-            &prover_state,
-            soldering_proof_ready.clone(),
-        )
-        .unwrap();
-
-        let mut conflict = prover_state;
-        conflict.h_msgs[0][0] ^= 1;
-        assert!(
-            record_candidate_gc_data(
-                &mut state,
-                verifier_pubkey(),
-                0,
-                &package,
-                gc_data,
-                &conflict,
-                soldering_proof_ready,
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn rebuilds_prover_state_from_persisted_payload_data() {
-        let package = build_setup_package(BABE_M_CC + 1).unwrap();
-        let selected = (0..BABE_M_CC).collect::<Vec<_>>();
-        let (_, finalized, soldering) = open_and_solder(&package, &selected).unwrap();
-
-        let restored =
-            build_babe_prover_state(&package, finalized.clone(), soldering.clone()).unwrap();
-
-        assert_eq!(restored.package, package);
-        assert_eq!(restored.finalized, finalized);
-        assert_eq!(restored.soldering, soldering);
-        assert_eq!(restored.h_msgs.len(), BABE_M_CC);
     }
 
     // ── collect_ack_txins ─────────────────────────────────────────────────────
@@ -8100,67 +4451,5 @@ mod tests {
             "pubin-disprove transaction is {} non-witness bytes",
             tx.base_size()
         );
-    }
-    #[tokio::test]
-    async fn late_round_messages_are_dropped_only_once_the_round_is_provably_over() {
-        let local_db = store::create_local_db("sqlite::memory:").await;
-        let (instance_id, graph_id) = (Uuid::new_v4(), Uuid::new_v4());
-        // No row yet: the full path must run, it is what asks for the graph.
-        assert!(!graph_signing_round_is_over(&local_db, instance_id, graph_id).await.unwrap());
-
-        let mut storage = local_db.acquire().await.unwrap();
-        storage
-            .upsert_graph_definition(&store::Graph {
-                graph_id,
-                instance_id,
-                status: GraphStatus::OperatorPresigned.to_string(),
-                definition_hash: "definition".to_owned(),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        drop(storage);
-        assert!(!graph_signing_round_is_over(&local_db, instance_id, graph_id).await.unwrap());
-
-        // Obsoleted straight from OperatorPresigned: the round never finished.
-        let obsoleted = Uuid::new_v4();
-        let mut storage = local_db.acquire().await.unwrap();
-        storage
-            .upsert_graph_definition(&store::Graph {
-                graph_id: obsoleted,
-                instance_id,
-                status: GraphStatus::OperatorPresigned.to_string(),
-                definition_hash: "definition".to_owned(),
-                // One definition per (operator, nonce): the second row takes the next slot.
-                kickoff_index: 1,
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        storage
-            .transition_graph_status(
-                instance_id,
-                obsoleted,
-                GraphStatus::Obsoleted,
-                store::GraphStatusSource::ChainReconcile,
-                None,
-            )
-            .await
-            .unwrap();
-        storage
-            .transition_graph_status(
-                instance_id,
-                graph_id,
-                GraphStatus::CommitteePresigned,
-                store::GraphStatusSource::Definition,
-                None,
-            )
-            .await
-            .unwrap();
-        drop(storage);
-        assert!(!graph_signing_round_is_over(&local_db, instance_id, obsoleted).await.unwrap());
-        assert!(graph_signing_round_is_over(&local_db, instance_id, graph_id).await.unwrap());
-        // The row answers for its own instance only.
-        assert!(!graph_signing_round_is_over(&local_db, Uuid::new_v4(), graph_id).await.unwrap());
     }
 }
