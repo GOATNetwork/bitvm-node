@@ -217,8 +217,8 @@ pub(crate) enum OnDemandOutcome {
     /// The task was no longer `New` (its request timed out), or proving stopped for
     /// shutdown. Nothing was recorded.
     Cancelled,
-    /// The task stays `New` for the next round: a failure below the attempt limit, or a
-    /// transient prover failure outside Fleet.
+    /// The task stays `New` for the next round: a fatal failure below the attempt limit,
+    /// a transient failure (which does not count), or an unavailable prover outside Fleet.
     Deferred,
     Failed,
 }
@@ -314,8 +314,12 @@ where
     metrics_state.record_attempt(proof_type, failure_outcome(&error), elapsed);
     let error = match error {
         ProveError::Prove(error, Failure::Fatal) => error,
-        ProveError::Prove(error, Failure::Retryable) if !runtime.is_fleet() => {
-            warn!(task_index, "{proof_type} prover failed transiently; retrying: {error:#}");
+        ProveError::Prove(error, Failure::Transient) => {
+            warn!(task_index, "{proof_type} prover call failed transiently; retrying: {error:#}");
+            return Ok(OnDemandOutcome::Deferred);
+        }
+        ProveError::Prove(error, Failure::ProverUnavailable) if !runtime.is_fleet() => {
+            warn!(task_index, "{proof_type} prover is unavailable; retrying: {error:#}");
             return Ok(OnDemandOutcome::Deferred);
         }
         error => {
@@ -350,7 +354,8 @@ where
 /// The proof attempt metric outcome of a failure.
 pub(crate) fn failure_outcome(error: &ProveError) -> &'static str {
     match error {
-        ProveError::Prove(_, Failure::Retryable) => "retryable",
+        ProveError::Prove(_, Failure::Transient) => "transient",
+        ProveError::Prove(_, Failure::ProverUnavailable) => "unavailable",
         ProveError::Prove(_, Failure::Fatal) | ProveError::Save(_) => "failed",
     }
 }
@@ -374,7 +379,9 @@ pub(crate) fn settle_chain_failure(
     chain: &str,
 ) -> anyhow::Result<()> {
     match error {
-        ProveError::Prove(error, failure) if failure == Failure::Fatal || !runtime.is_fleet() => {
+        ProveError::Prove(error, failure)
+            if failure != Failure::ProverUnavailable || !runtime.is_fleet() =>
+        {
             error!("{chain} proof failed; retrying the batch: {error:#}");
             Ok(())
         }

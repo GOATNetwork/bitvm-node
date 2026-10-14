@@ -95,10 +95,15 @@ Proving behaviour in Fleet mode:
   and database commit) pass through a FIFO gate.
 - An operator or watchtower task stays `New` while it queues and proves. Its result is written
   only while it is still `New`, so a timeout request that arrives in the meantime wins.
-- A proof failure marks the task `Failed` only after `--max-proof-attempts` consecutive
-  failures (default 2).
 - If the GPU server stops reporting ready, or a proof cannot be published, the task stays
   pending and the worker exits. Fleet then restarts the GPU server and the worker.
+- Otherwise a failed prover call is replayed by executing its guest on the CPU. GPU RPC
+  errors do not distinguish transport failures from rejected inputs. If the guest executes,
+  the prover or its transport failed; the proof is retried in place and the failure does not
+  count as an attempt.
+- A proof that fails because the guest rejects its input, or because the result does not
+  verify, marks the task `Failed` after `--max-proof-attempts` consecutive failures
+  (default 2).
 - On SIGTERM the worker starts no new proof. It waits up to `--drain-timeout-secs` for the proof
   in progress to be published and committed, then stops. Keep that value below the service's
   `worker_stop_timeout_s`.
