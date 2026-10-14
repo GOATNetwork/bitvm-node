@@ -104,9 +104,11 @@ Proving behaviour in Fleet mode:
 - A proof that fails because the guest rejects its input, or because the result does not
   verify, marks the task `Failed` after `--max-proof-attempts` consecutive failures
   (default 2).
-- On SIGTERM the worker starts no new proof. It waits up to `--drain-timeout-secs` for the proof
-  in progress to be published and committed, then stops. Keep that value below the service's
-  `worker_stop_timeout_s`.
+- On SIGTERM or a task failure the worker starts no new proof. It waits up to
+  `--drain-timeout-secs` for the proof in progress to be published and committed, then exits.
+  A proof still running at the timeout does not delay the exit; it is retried after restart.
+  Keep that value below the service's `worker_stop_timeout_s`. Exit codes: 0 after a clean stop,
+  1 after a task failure or an abandoned proof, 101 after a panic.
 - Proofs and their sidecars are published through synced temporary files and atomic renames.
   A `<proof>.manifest.json` written last marks a complete set. State-chain `.args`/`.ctx`
   snapshots are written atomically as well.

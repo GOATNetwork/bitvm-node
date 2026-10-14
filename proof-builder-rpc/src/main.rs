@@ -213,29 +213,73 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Start no further proofs, let the one in progress publish and commit, then stop.
-    runtime.begin_shutdown();
     task_token.cancel();
-    if runtime.in_flight() > 0 {
-        info!(timeout_secs = opt.drain_timeout_secs, "waiting for the proof in progress to commit");
-    }
-    if !runtime.drain(Duration::from_secs(opt.drain_timeout_secs)).await {
-        warn!("drain timed out; the unfinished proof is retried after restart");
-    }
-    api_token.cancel();
-    // Give the API a moment to finish in-flight requests, then abort what remains.
-    tokio::time::sleep(Duration::from_secs(2)).await;
     // A finished select hands back the other tasks; an interrupted one still holds them.
     remaining.extend(tasks.into_inner());
-    remaining.into_iter().for_each(|handle| handle.abort());
-    tracing::info!("All tasks stopped");
+    let drain_timeout = Duration::from_secs(opt.drain_timeout_secs);
+    let drained = shut_down(&runtime, &api_token, remaining, drain_timeout, API_GRACE).await;
+    if let Some(payload) = &panic {
+        tracing::error!("a task panicked: {}", panic_message(payload.as_ref()));
+    }
+    if let Some(reason) = failure {
+        tracing::error!("proof builder stopped after a task {reason}");
+    }
+    // Exit explicitly. Returning would drop the runtime, which waits without limit for a
+    // proof still running on a blocking thread: a stuck GPU call would keep the worker
+    // alive, and Fleet only restarts a worker whose process has exited.
+    std::process::exit(exit_code(failure.is_some(), drained, panic.is_some()))
+}
 
-    if let Some(panic) = panic {
-        std::panic::resume_unwind(panic);
+/// How long the API may finish in-flight requests after proving has stopped.
+const API_GRACE: Duration = Duration::from_secs(2);
+
+/// Stops new proofs and waits up to `drain_timeout` for the one in progress to commit, then
+/// stops the API and aborts the remaining tasks. Returns whether the proof drained; a proof
+/// still running afterwards is abandoned and retried after restart.
+async fn shut_down(
+    runtime: &ProverRuntime,
+    api_token: &CancellationToken,
+    tasks: Vec<JoinHandle<anyhow::Result<String, String>>>,
+    drain_timeout: Duration,
+    api_grace: Duration,
+) -> bool {
+    runtime.begin_shutdown();
+    if runtime.in_flight() > 0 {
+        info!(
+            timeout_secs = drain_timeout.as_secs(),
+            "waiting for the proof in progress to commit"
+        );
     }
-    match failure {
-        Some(reason) => anyhow::bail!("proof builder stopped after a task {reason}"),
-        None => Ok(()),
+    let drained = runtime.drain(drain_timeout).await;
+    if !drained {
+        warn!(
+            "drain timed out; exiting without the unfinished proof, which is retried after restart"
+        );
     }
+    api_token.cancel();
+    tokio::time::sleep(api_grace).await;
+    tasks.into_iter().for_each(|handle| handle.abort());
+    tracing::info!("All tasks stopped");
+    drained
+}
+
+/// 0 after a clean stop, 1 after a task failure or an abandoned proof, 101 after a panic.
+fn exit_code(failed: bool, drained: bool, panicked: bool) -> i32 {
+    if panicked {
+        101
+    } else if failed || !drained {
+        1
+    } else {
+        0
+    }
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or("unknown panic")
 }
 
 /// Validates the Fleet worker environment and connects to the replica's GPU server.
@@ -468,6 +512,43 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_returns_when_a_proof_is_stuck() {
+        let runtime = ProverRuntime::sdk(2);
+        let (release, stuck) = std::sync::mpsc::channel::<()>();
+        let unit = {
+            let runtime = runtime.clone();
+            tokio::spawn(async move {
+                runtime
+                    .run(prover::blocking(move || {
+                        let _ = stuck.recv();
+                    }))
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let started = std::time::Instant::now();
+        let api_token = CancellationToken::new();
+        let drained =
+            shut_down(&runtime, &api_token, Vec::new(), Duration::from_millis(100), Duration::ZERO)
+                .await;
+        assert!(!drained);
+        assert!(api_token.is_cancelled());
+        assert!(started.elapsed() < Duration::from_secs(5), "shutdown must not wait for the proof");
+        assert_eq!(exit_code(false, drained, false), 1);
+        // Let the blocking thread finish so the test runtime can stop.
+        release.send(()).unwrap();
+        unit.await.unwrap().unwrap().unwrap();
+    }
+
+    #[test]
+    fn exit_code_reports_failures_abandoned_proofs_and_panics() {
+        assert_eq!(exit_code(false, true, false), 0);
+        assert_eq!(exit_code(true, true, false), 1);
+        assert_eq!(exit_code(false, false, false), 1);
+        assert_eq!(exit_code(true, false, true), 101);
+    }
 
     #[test]
     fn parses_single_and_multiple_gateway_addresses() {
