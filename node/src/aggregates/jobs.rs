@@ -3,8 +3,8 @@
 
 use super::common::InboundMessage;
 use super::instance::{SigningGate, signing_gate};
-use crate::action::GOATMessage;
 use crate::env::get_bitvm_key;
+use crate::messages::GOATMessage;
 use crate::metrics_service::MetricsState;
 use crate::middleware::publisher::NetworkPublisher;
 use crate::utils::{CommitteeMembership, local_committee_membership, validate_committee};

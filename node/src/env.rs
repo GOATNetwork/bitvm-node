@@ -1,4 +1,4 @@
-use crate::action::NodeInfo;
+use crate::messages::NodeInfo;
 use alloy::primitives::Address as EvmAddress;
 use alloy::primitives::Address;
 use alloy::providers::{Provider, ProviderBuilder};
@@ -364,7 +364,7 @@ pub fn get_local_node_info() -> NodeInfo {
         .unwrap_or_default();
     let binding_sig = match get_bitvm_key() {
         Ok(keypair) => {
-            crate::action::sign_node_info_binding(&peer_key, &pubkey_str, issued_at, &keypair)
+            crate::messages::sign_node_info_binding(&peer_key, &pubkey_str, issued_at, &keypair)
         }
         Err(error) => {
             tracing::error!("failed to sign node info binding: {error}");

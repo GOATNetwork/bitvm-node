@@ -1,7 +1,7 @@
 //! The BABE setup state and soldering payloads kept on disk during graph setup.
 
-use crate::action::SolderingProofReady;
 use crate::env::*;
+use crate::messages::SolderingProofReady;
 use crate::soldering_payload_store::{
     delete_soldering_proof_store_payload, is_soldering_proof_s3_path,
     soldering_proof_payload_store_path, write_soldering_proof_store_payload,

@@ -1,8 +1,9 @@
 //! NodeInfo validation and the node table rows it keeps current.
 
-use crate::action::{GOATMessage, GOATMessageContent, NodeInfo, publish_to_role};
 use crate::env::*;
+use crate::messages::{GOATMessage, GOATMessageContent, NodeInfo};
 use crate::middleware::AllBehaviours;
+use crate::middleware::publisher::publish_to_role;
 use alloy::primitives::Address as EvmAddress;
 use anyhow::Result;
 use bitcoin::PublicKey;

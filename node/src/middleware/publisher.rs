@@ -1,5 +1,7 @@
 //! Bounded, acknowledged access to the swarm from tasks that do not own it:
 //! gossip publishes and direct `GetGraph` requests.
+use crate::messages::GOATMessage;
+use anyhow::Result;
 use futures::future::BoxFuture;
 use libp2p::request_response::{OutboundRequestId, ResponseChannel};
 use libp2p::{
@@ -157,6 +159,82 @@ impl MessagePublisher for NetworkPublisher {
                 .await
                 .map_err(|_| anyhow::anyhow!("network task did not take the publish in time"))?
         })
+    }
+}
+
+/// Receivers drop what exceeds their envelope limit without telling anyone,
+/// so an outgrown message is reported loudly on the sending side.
+pub(crate) fn note_oversized_payload(payload: &[u8], target: &str, message_type: &str) {
+    let limits = crate::p2p_admission::inbound_limits();
+    let receiver_limit = if GOATMessage::is_binary_envelope(payload) {
+        limits.max_binary_bytes
+    } else {
+        limits.max_json_bytes
+    };
+    if payload.len() > receiver_limit {
+        if let Some(metrics_state) = crate::metrics_service::node_metrics_state() {
+            metrics_state.record_p2p_oversized_message();
+        }
+        tracing::error!(
+            event = "p2p_message_publish",
+            outcome = "oversized",
+            target,
+            message_type,
+            content_size = payload.len(),
+            receiver_limit,
+            "outbound protocol message exceeds the inbound size limit peers enforce"
+        );
+    }
+}
+
+/// Publish one message on its role topic; every sender goes through here.
+pub async fn publish_to_role(
+    swarm: &mut dyn MessagePublisher,
+    message: GOATMessage,
+) -> Result<MessageId> {
+    let target_actor = message.actor.to_string();
+    let message_type = message.content.event_type();
+    let topic = crate::middleware::get_topic_name(&target_actor);
+    let gossipsub_topic = IdentTopic::new(topic);
+    let serialized = match message.serialize_message().await {
+        Ok(serialized) => serialized,
+        Err(error) => {
+            if let Some(metrics_state) = crate::metrics_service::node_metrics_state() {
+                metrics_state.record_p2p_publish(false);
+            }
+            return Err(error);
+        }
+    };
+    note_oversized_payload(&serialized, &target_actor, message_type);
+    match swarm.publish_message(gossipsub_topic, serialized).await {
+        Ok(message_id) => {
+            if let Some(metrics_state) = crate::metrics_service::node_metrics_state() {
+                metrics_state.record_p2p_publish(true);
+            }
+            tracing::info!(
+                event = "p2p_message_publish",
+                outcome = "published",
+                target_actor,
+                message_type,
+                message_id = ?message_id,
+                "published protocol message"
+            );
+            Ok(message_id)
+        }
+        Err(err) => {
+            if let Some(metrics_state) = crate::metrics_service::node_metrics_state() {
+                metrics_state.record_p2p_publish(false);
+            }
+            tracing::warn!(
+                event = "p2p_message_publish",
+                outcome = "failed",
+                target_actor,
+                message_type,
+                error = %err,
+                "failed to publish protocol message"
+            );
+            Err(anyhow::anyhow!("publish {message_type} to {target_actor}: {err}"))
+        }
     }
 }
 

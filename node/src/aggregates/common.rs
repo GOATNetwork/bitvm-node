@@ -2,7 +2,7 @@
 //! network, the applies and the jobs, the membership probe and scan marks.
 
 use super::{graph, instance};
-use crate::action::{BusinessRef, GOATMessage, GOATMessageContent, HasBusinessRef};
+use crate::messages::{BusinessRef, GOATMessage, GOATMessageContent, HasBusinessRef};
 use crate::utils::committee_instance_keys_envelope_path;
 use bitvm_lib::actors::Actor;
 use engine::{ApplyContext, EventSource, NewEvent};

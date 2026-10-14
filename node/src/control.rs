@@ -1,10 +1,11 @@
 //! Control message handling: ACKs settle the engine outbox, NodeInfo messages
 //! update peer information and registration. Every other message kind is
-//! recorded for the engine by `action::handle_inbound_p2p_message`.
+//! recorded for the engine by `p2p_msg_handler::handle_inbound_p2p_message`.
 
-use crate::action::*;
 use crate::clock::current_time_secs;
+use crate::messages::*;
 use crate::middleware::publisher::MessagePublisher;
+use crate::middleware::publisher::publish_to_role;
 use crate::utils::*;
 use anyhow::Result;
 use bitvm_lib::actors::Actor;
@@ -84,13 +85,13 @@ fn check_node_info(
     }
     // A present-but-invalid binding is a forgery attempt (claiming another key's
     // authorisation), not a benign omission, so reject the whole payload.
-    if crate::action::verify_node_info_binding(node_info).is_none() {
+    if crate::messages::verify_node_info_binding(node_info).is_none() {
         return Err("node info binding signature is invalid".to_string());
     }
     // `binding_issued_at` orders re-bindings, newest winning. One dated far ahead
     // would win against every honest re-binding until that date.
     if node_info.binding_issued_at
-        > current_time_secs() + crate::action::NODE_INFO_BINDING_MAX_FUTURE_SECS
+        > current_time_secs() + crate::messages::NODE_INFO_BINDING_MAX_FUTURE_SECS
     {
         return Err("node info binding is dated in the future".to_string());
     }
@@ -106,7 +107,7 @@ async fn learn_node_info_binding(
     if node_info.actor != Actor::Operator.to_string() {
         return;
     }
-    let Some(operator_key) = crate::action::verify_node_info_binding(node_info) else {
+    let Some(operator_key) = crate::messages::verify_node_info_binding(node_info) else {
         return;
     };
     let operator_key = crate::p2p_admission::operator_key(&operator_key);
@@ -139,8 +140,8 @@ async fn record_node_info(ctx: &ControlContext<'_>, node_info: &NodeInfo) -> Res
             .await?
             .node_row_admissible(
                 &node_info.peer_id,
-                crate::action::NODE_TABLE_MAX_UNREGISTERED_ROWS,
-                current_time_secs() - crate::action::NODE_TABLE_EVICTABLE_AFTER_SECS,
+                crate::p2p_admission::NODE_TABLE_MAX_UNREGISTERED_ROWS,
+                current_time_secs() - crate::p2p_admission::NODE_TABLE_EVICTABLE_AFTER_SECS,
                 &crate::env::get_peer_id(),
             )
             .await?;

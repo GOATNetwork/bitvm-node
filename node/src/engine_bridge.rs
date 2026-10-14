@@ -3,7 +3,6 @@
 //! configuration from the environment, aggregate registration, and the
 //! process-wide handle producers use to record events.
 
-use crate::action::{GOATMessage, GOATMessageContent, GraphSetupAck, publish_to_role};
 use crate::aggregates::graph::{GRAPH_KIND, GraphAggregate};
 use crate::aggregates::graph_jobs::register_graph_jobs;
 use crate::aggregates::instance::{INSTANCE_KIND, InstanceAggregate};
@@ -11,8 +10,9 @@ use crate::aggregates::instance_jobs::register_instance_jobs;
 use crate::aggregates::jobs::JobDeps;
 use crate::clock::current_time_secs;
 use crate::env;
+use crate::messages::{GOATMessage, GOATMessageContent, GraphSetupAck};
 use crate::metrics_service::{MetricsState, node_metrics_state};
-use crate::middleware::publisher::{MessagePublisher, NetworkPublisher};
+use crate::middleware::publisher::{MessagePublisher, NetworkPublisher, publish_to_role};
 use async_trait::async_trait;
 use bitvm_lib::actors::Actor;
 use bitvm_lib::babe_adapter::BabeBundleBuilder;
@@ -44,7 +44,7 @@ impl GossipTransport {
 #[async_trait]
 impl Transport for GossipTransport {
     async fn publish(&self, topic: &str, payload: &[u8]) -> anyhow::Result<()> {
-        crate::action::note_oversized_payload(payload, topic, "outbox");
+        crate::middleware::publisher::note_oversized_payload(payload, topic, "outbox");
         let mut publisher = self.publisher.clone();
         let result = publisher.publish_message(IdentTopic::new(topic), payload.to_vec()).await;
         if let Some(metrics) = node_metrics_state() {

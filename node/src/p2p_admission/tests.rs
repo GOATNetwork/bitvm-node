@@ -9,7 +9,7 @@ use super::registry_refresh::{REGISTERED_KIND_COMMITTEE, REGISTERED_KIND_OPERATO
 use super::replay::{REPLAY_LOCKOUT_SUSPECT_REJECTIONS, REPLAY_MAX_FUTURE, REPLAY_WINDOW};
 use super::strikes::{STRIKE_BAN, STRIKE_LIMIT, STRIKE_WINDOW};
 use super::*;
-use crate::action::{AggNonceConsensus, InitGraph, sign_init_graph};
+use crate::messages::{AggNonceConsensus, InitGraph, sign_init_graph};
 use bitvm_lib::actors::Actor;
 use std::collections::HashSet;
 use uuid::Uuid;
@@ -146,7 +146,7 @@ fn envelope_limits_depend_on_the_encoding_and_the_sender() {
 /// Verify GenCircuits fits the binary transport ceiling.
 #[tokio::test]
 async fn gen_circuits_fits_the_binary_envelope() {
-    use crate::action::GenCircuits;
+    use crate::messages::GenCircuits;
     use bitvm_lib::babe_adapter::{BABE_N_CC, build_setup_package};
 
     let secp = bitcoin::secp256k1::Secp256k1::new();
@@ -827,7 +827,7 @@ async fn binary_envelope_is_reserved_for_gen_circuits_from_verifiers() {
 
 /// A verifier's endorsement of the graph parameters.
 fn verifier_endorsement() -> GOATMessage {
-    use crate::action::VerifierGraphParamsEndorsement;
+    use crate::messages::VerifierGraphParamsEndorsement;
     let keypair = test_keypair(9);
     let digest = bitcoin::secp256k1::Message::from_digest([5; 32]);
     GOATMessage::new(
@@ -866,7 +866,7 @@ async fn parameter_endorsements_come_from_the_verifier_set_once_it_is_loaded() {
 
 #[tokio::test]
 async fn immediate_messages_are_rate_limited_per_sender() {
-    use crate::action::NodeInfo;
+    use crate::messages::NodeInfo;
 
     let local_db = store::create_local_db("sqlite::memory:").await;
     let gates = TestGates::new(PeerRateLimiter::new(1.0, 0.0, 16));
@@ -902,7 +902,7 @@ async fn immediate_messages_are_rate_limited_per_sender() {
 /// Verify equivalent key encodings share one operator identity.
 #[test]
 fn operator_identity_ignores_how_the_key_is_spelled() {
-    use crate::action::{NodeInfo, sign_node_info_binding, verify_node_info_binding};
+    use crate::messages::{NodeInfo, sign_node_info_binding, verify_node_info_binding};
     use bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey};
 
     let secp = Secp256k1::new();
@@ -1167,7 +1167,7 @@ async fn messages_for_another_role_are_forwarded_without_being_stored() {
 /// for the roles that handle it, and relayed for the others.
 #[test]
 fn handled_kinds_follow_the_role_table() {
-    use crate::action::MessageKind;
+    use crate::messages::MessageKind;
 
     let roles = [Actor::Committee, Actor::Operator, Actor::Verifier, Actor::Watchtower];
     // Immediate kinds reach every role's dispatch.

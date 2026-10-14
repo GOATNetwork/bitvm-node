@@ -18,15 +18,15 @@ use super::jobs::{
     JobDeps, Plan, aggregate_uuid, committee_pubkeys, decode_inbound, ensure_committee_sender,
     gate_closed, instance_status, local_member, local_operator, plan_outcome, signing_nonce_id,
 };
-use crate::action::{
-    GOATMessage, GOATMessageContent, PeginConfirmNonce, PeginConfirmNonceConsensus,
-    PeginConfirmPartialSig,
-};
 use crate::clock::current_time_secs;
 use crate::env::{
     get_bitvm_key, get_operator_graph_start_cutoff_blocks, is_enable_committee_instance_key_delete,
 };
 use crate::error::{FailureClass, SpecialError, classify_failure};
+use crate::messages::{
+    GOATMessage, GOATMessageContent, PeginConfirmNonce, PeginConfirmNonceConsensus,
+    PeginConfirmPartialSig,
+};
 use crate::utils::{
     avg_block_time_secs, broadcast_tx, committee_instance_keys_envelope_path, endorse_pegin,
     get_committee_agg_nonce_consensus_for_instance, get_committee_endorse_sigs_for_pegin,

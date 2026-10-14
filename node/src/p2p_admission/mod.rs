@@ -5,6 +5,7 @@
 mod gates;
 mod get_graph_budget;
 mod limits;
+mod maintenance;
 mod rate;
 mod registry;
 mod registry_refresh;
@@ -13,7 +14,7 @@ mod strikes;
 #[cfg(test)]
 mod tests;
 
-use crate::action::{GOATMessage, GOATMessageContent, P2PMessageDelivery};
+use crate::messages::{GOATMessage, GOATMessageContent, P2PMessageDelivery};
 use anyhow::Result;
 use libp2p::PeerId;
 use std::collections::HashMap;
@@ -30,6 +31,10 @@ pub use get_graph_budget::{
     get_graph_response_gate, get_graph_serve_slots,
 };
 pub use limits::{InboundLimits, Quota, inbound_limits};
+pub use maintenance::{
+    NODE_TABLE_EVICTABLE_AFTER_SECS, NODE_TABLE_MAX_UNREGISTERED_ROWS,
+    load_persisted_peer_bindings, run_p2p_admission_maintenance,
+};
 pub use rate::{
     GlobalRate, InboundRateLimiter, PeerRateLimiter, RateLimits, TierRate, immediate_limiter,
     inbound_rate_limiter,
@@ -332,7 +337,7 @@ pub struct AdmissionGates<'a> {
 impl AdmissionGates<'_> {
     /// Whether this node stores an admitted durable message of `kind`, or only
     /// relays it.
-    pub fn keeps(&self, kind: crate::action::MessageKind) -> bool {
+    pub fn keeps(&self, kind: crate::messages::MessageKind) -> bool {
         kind.handled_by(self.local_actor)
     }
 }

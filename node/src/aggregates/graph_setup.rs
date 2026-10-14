@@ -1,10 +1,10 @@
 //! Graph setup helpers for candidate selection, verifier indices, message
 //! identity checks and signed `InitGraph` messages.
 
-use crate::action::{InitGraph, SolderingProofReady, sign_init_graph};
 use crate::env::{
     get_peer_id, get_verifier_candidate_backup_count, get_verifier_candidate_collection_window_secs,
 };
+use crate::messages::{InitGraph, SolderingProofReady, sign_init_graph};
 use crate::utils::{
     OperatorBabeSetupState, OperatorVerifierCandidate, min_required_verifier,
     soldering_payload_hash, soldering_payload_hash_hex,

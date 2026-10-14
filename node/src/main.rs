@@ -26,9 +26,9 @@ use bitvm_noded::{
 };
 
 use anyhow::Result;
-use bitvm_noded::action::load_persisted_peer_bindings;
 use bitvm_noded::metrics_service::{MetricsState, set_node_metrics_state};
 use bitvm_noded::middleware::swarm::{BitvmNetworkManager, BitvmSwarmConfig};
+use bitvm_noded::p2p_admission::load_persisted_peer_bindings;
 use bitvm_noded::p2p_msg_handler::BitvmNodeProcessor;
 use client::http_client::async_client::HttpAsyncClient;
 use futures::future;
