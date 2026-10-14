@@ -742,7 +742,8 @@ async fn handle_bridge_in_events<'a>(
             warn!("failed to parse instance id of BridgeIn event: {event:?}");
             continue;
         };
-        if storage_processor.find_instance(&instance_id).await?.is_none()
+        let mut row_exists = storage_processor.find_instance(&instance_id).await?.is_some();
+        if !row_exists
             && let Some(tx_record) = storage_processor
                 .find_graph_goat_tx_record(
                     &instance_id,
@@ -751,22 +752,38 @@ async fn handle_bridge_in_events<'a>(
                 )
                 .await?
         {
-            // it will happened when handle history events
+            // A request seen in history whose instance was never built: build
+            // it in its final state.
             warn!("Instance {instance_id} is finished but not find in db. we will create it");
             if let Some(extra) = tx_record.extra.as_ref()
                 && let Ok(bridge_event) = serde_json::from_str::<BridgeInRequestEvent>(extra)
-                && let Ok(mut instance) = generate_instance_from_bridge_in_request_event(
+            {
+                match generate_instance_from_bridge_in_request_event(
                     btc_client.as_ref(),
                     goat_client.as_ref(),
                     &bridge_event,
                 )
                 .await
-            {
-                info!("Instance {instance_id} is created and set status to RelayerL2Minted");
-                instance.status = InstanceBridgeInStatus::RelayerL2Minted.to_string();
-                instance.post_pegin_txhash = Some(post_pegin_txhash.clone());
-                if !storage_processor.insert_instance_if_absent(&instance).await? {
-                    info!("Instance {instance_id} was created concurrently; applying mint event");
+                {
+                    Ok(mut instance) => {
+                        info!(
+                            "Instance {instance_id} is created and set status to RelayerL2Minted"
+                        );
+                        instance.status = InstanceBridgeInStatus::RelayerL2Minted.to_string();
+                        instance.post_pegin_txhash = Some(post_pegin_txhash.clone());
+                        if !storage_processor.insert_instance_if_absent(&instance).await? {
+                            info!(
+                                "Instance {instance_id} was created concurrently; applying mint event"
+                            );
+                        }
+                        row_exists = true;
+                    }
+                    Err(error) => warn!(
+                        event = "event_watch",
+                        instance_id = %instance_id,
+                        error = %error,
+                        "could not build the instance of a BridgeIn; mint event skipped"
+                    ),
                 }
             }
 
@@ -783,6 +800,16 @@ async fn handle_bridge_in_events<'a>(
                     )
                     .await?;
             }
+        }
+        if !row_exists {
+            // Without a row the event would park forever; nothing local to update.
+            warn!(
+                event = "event_watch",
+                instance_id = %instance_id,
+                tx_hash = %post_pegin_txhash,
+                "BridgeIn for an instance this node never saw the request of; mint event skipped"
+            );
+            continue;
         }
         // The Instance aggregate applies the mint, or alerts when it holds the instance in a
         // failure state.

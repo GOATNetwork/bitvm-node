@@ -15,7 +15,7 @@ use client::btc_chain::BTCClient;
 use client::goat_chain::GOATClient;
 use engine::EngineHandle;
 use indexmap::IndexMap;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::{LazyLock, Mutex};
 use store::localdb::{InstanceQuery, LocalDB};
@@ -174,6 +174,24 @@ fn forget_scanned(instance_id: Uuid) {
     marks.remove(&instance_id);
 }
 
+/// Timeout instances whose Peg-In-Confirm confirmed anyway. The apply reports
+/// them once; the row stays `Timeout` for manual handling and there is nothing
+/// left to watch, so they leave the scan (until a restart, which reports again).
+static SETTLED_TIMEOUTS: LazyLock<Mutex<HashSet<Uuid>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+fn settled_timeout(instance_id: Uuid) -> bool {
+    SETTLED_TIMEOUTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).contains(&instance_id)
+}
+
+fn mark_settled_timeout(instance_id: Uuid) {
+    let mut settled = SETTLED_TIMEOUTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if settled.len() >= SCAN_MARKS_LIMIT {
+        settled.clear();
+    }
+    settled.insert(instance_id);
+}
+
 /// Statuses the Bitcoin scan follows. The key-deletion statuses are only
 /// followed on committee nodes with deletion enabled.
 fn scanned_statuses(actor: &Actor) -> (Vec<String>, bool) {
@@ -222,10 +240,18 @@ pub async fn scan_instances_on_bitcoin(
         if already_scanned(instance_id, height, status) {
             continue;
         }
+        if status == InstanceBridgeInStatus::Timeout && settled_timeout(instance_id) {
+            continue;
+        }
         match gather_snapshot(btc_client, &instance, status, height).await {
             Ok(Some(snapshot)) => {
+                let confirm_confirmed =
+                    snapshot.confirm.as_ref().is_some_and(|fact| fact.confirmed);
                 engine.submit(snapshot.event(instance_id)?).await?;
                 mark_scanned(instance_id, height, status);
+                if status == InstanceBridgeInStatus::Timeout && confirm_confirmed {
+                    mark_settled_timeout(instance_id);
+                }
             }
             Ok(None) => forget_scanned(instance_id),
             Err(error) => warn!(

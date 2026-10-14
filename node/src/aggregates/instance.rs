@@ -1015,6 +1015,18 @@ impl InstanceAggregate {
             debug!(event = "instance_apply", instance_id = %instance_id, kind, "not in this instance's committee; message ignored");
             return ApplyOutcome::Applied;
         }
+        // The round's parameters derive from the committee answers; a message
+        // that arrives before the window closed here (a node catching up)
+        // waits for them instead of running a job that cannot aggregate.
+        if matches!(
+            status,
+            InstanceBridgeInStatus::UserIniting | InstanceBridgeInStatus::UserInited
+        ) {
+            return ApplyOutcome::Waiting(WaitingFor::on(
+                &ctx.aggregate,
+                "committee answers not recorded yet",
+            ));
+        }
         let round_over = status.is_failed()
             || status == InstanceBridgeInStatus::RelayerL2Minted
             || (status == InstanceBridgeInStatus::RelayerL1Broadcasted

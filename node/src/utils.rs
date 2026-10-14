@@ -5610,6 +5610,12 @@ pub fn gen_instance_parameters_local(
             })
         })
         .collect::<anyhow::Result<_>>()?;
+    if committee_pubkeys.is_empty() {
+        bail!(
+            "instance {} has no committee answers to derive parameters from",
+            instance.instance_id
+        );
+    }
 
     let committee_agg_pubkey = generate_n_of_n_public_key(&committee_pubkeys).0;
     let utxos: Vec<client::Utxo> = serde_json::from_str(&instance.input_utxos)?;

@@ -6,6 +6,7 @@
 
 use crate::aggregates::instance::{PeginRequested, pegin_request_event};
 use crate::engine_bridge::record_event_in;
+use crate::error::{FailureClass, classify_failure};
 use crate::rpc_service::current_time_secs;
 use crate::scheduled_tasks::event_watch_task::generate_instance_from_bridge_in_request_event;
 use client::btc_chain::BTCClient;
@@ -54,13 +55,38 @@ pub async fn pegin_request_monitor(
                     .await
                 {
                     Ok(instance) => Some(instance),
-                    Err(error) => {
+                    Err(error)
+                        if classify_failure(&error) == FailureClass::Transient
+                            && !is_outside_response_window =>
+                    {
                         warn!(
                             event = "pegin_request",
                             instance_id = %instance_id,
                             error = %error,
                             "could not build the instance of a BridgeInRequest; retried next tick"
                         );
+                        continue;
+                    }
+                    Err(error) => {
+                        // A malformed request, a Goat refusal or a request past its
+                        // window: nothing a retry can change.
+                        warn!(
+                            event = "pegin_request",
+                            instance_id = %instance_id,
+                            outside_window = is_outside_response_window,
+                            error = %error,
+                            "could not build the instance of a BridgeInRequest; request skipped"
+                        );
+                        local_db
+                            .acquire()
+                            .await?
+                            .update_goat_tx_record_processing_status(
+                                &tx_record.graph_id,
+                                &instance_id,
+                                &tx_record.tx_type,
+                                &GoatTxProcessingStatus::Skipped.to_string(),
+                            )
+                            .await?;
                         continue;
                     }
                 }
