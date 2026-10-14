@@ -7,6 +7,7 @@ mod state_chain_proof;
 mod watchtower_proof;
 use crate::api::metrics_service::ApiMetricsState;
 use crate::config::ProofBuilderConfig;
+use crate::prover::{Cancelled, Failure, ProveError, ProverRuntime};
 use crate::task::{
     commit_chain_proof::spawn_commit_chain_proof_task,
     header_chain_proof::spawn_header_chain_proof_task, operator_proof::spawn_operator_proof_task,
@@ -17,17 +18,21 @@ use ::header_chain_proof::HeaderChainProofBuilder;
 use ::state_chain_proof::StateChainProofBuilder;
 use bitcoin::{BlockHash, Network, PublicKey, Txid};
 use client::btc_chain::BTCClient;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
-use std::time::UNIX_EPOCH;
+use std::sync::Arc;
+use std::time::{Instant, UNIX_EPOCH};
 use uuid::Uuid;
 
 use futures::future::Either;
-use proof_builder::{OnDemandTask, ProofBuilder};
+use proof_builder::{OnDemandTask, ProofBuilder, ProofRequest};
 use store::localdb::LocalDB;
-use store::{LongRunningTaskProof, OperatorProof, ProofState, WatchtowerProof};
+use store::{
+    LongRunningTaskProof, OnDemandProofCompletion, OnDemandProofTable, OperatorProof, ProofState,
+    WatchtowerProof,
+};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 pub(crate) fn is_start_generate_proof_tasks(cfg: &ProofBuilderConfig) -> bool {
     cfg.header_chain.enable
@@ -37,15 +42,26 @@ pub(crate) fn is_start_generate_proof_tasks(cfg: &ProofBuilderConfig) -> bool {
         || cfg.operator.enable
 }
 
+/// Settings shared by the proof tasks.
+#[derive(Clone)]
+pub(crate) struct TaskOptions {
+    pub runtime: ProverRuntime,
+    /// Unproved state-chain batches prepared ahead of the prover (0 = unlimited).
+    pub state_chain_max_pending_batches: i64,
+}
+
 pub(crate) async fn run_generate_proof_tasks(
     cfg: ProofBuilderConfig,
     local_db: LocalDB,
     metrics_state: ApiMetricsState,
+    options: TaskOptions,
     interval: u64,
     cancellation_token: CancellationToken,
 ) -> anyhow::Result<String> {
+    let runtime = options.runtime.clone();
     let header_chain_proof_future = if cfg.header_chain.enable {
         Either::Left(spawn_header_chain_proof_task(
+            runtime.clone(),
             cfg.header_chain.clone(),
             local_db.clone(),
             metrics_state.clone(),
@@ -59,6 +75,7 @@ pub(crate) async fn run_generate_proof_tasks(
 
     let commit_chain_proof_future = if cfg.commit_chain.enable {
         Either::Left(spawn_commit_chain_proof_task(
+            runtime.clone(),
             cfg.commit_chain.clone(),
             local_db.clone(),
             metrics_state.clone(),
@@ -72,6 +89,7 @@ pub(crate) async fn run_generate_proof_tasks(
 
     let state_chain_proof_future = if cfg.state_chain.enable {
         Either::Left(spawn_state_chain_proof_task(
+            options.clone(),
             cfg.state_chain.clone(),
             local_db.clone(),
             metrics_state.clone(),
@@ -85,6 +103,7 @@ pub(crate) async fn run_generate_proof_tasks(
 
     let operator_proof_future = if cfg.operator.enable {
         Either::Left(spawn_operator_proof_task(
+            runtime.clone(),
             cfg.operator.clone(),
             local_db.clone(),
             metrics_state.clone(),
@@ -98,6 +117,7 @@ pub(crate) async fn run_generate_proof_tasks(
 
     let watchtower_proof_future = if cfg.watchtower.enable {
         Either::Left(spawn_watchtower_proof_task(
+            runtime.clone(),
             cfg.watchtower.clone(),
             local_db.clone(),
             metrics_state,
@@ -188,6 +208,178 @@ pub(crate) async fn run_generate_proof_tasks(
     }
 
     Ok("tasks_completed".to_string())
+}
+
+/// What happened to one on-demand proof attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OnDemandOutcome {
+    Proven,
+    /// The task was no longer `New` (its request timed out), or proving stopped for
+    /// shutdown. Nothing was recorded.
+    Cancelled,
+    /// The task stays `New` for the next round: a failure below the attempt limit, or a
+    /// transient prover failure outside Fleet.
+    Deferred,
+    Failed,
+}
+
+/// One operator or watchtower proof to produce.
+pub(crate) struct OnDemandJob<B> {
+    pub table: OnDemandProofTable,
+    pub task_index: i64,
+    pub output: String,
+    pub builder: Arc<B>,
+    pub ctx: ProofRequest,
+}
+
+enum OnDemandUnit {
+    NotNew,
+    Proven,
+    Failed(ProveError),
+}
+
+/// Proves one on-demand task under the GPU gate.
+///
+/// The result is recorded only while the task is still `New`, so a timeout that arrives
+/// while the proof queues or runs wins. A failed proof marks the task failed after the
+/// runtime's attempt limit. A prover failure leaves the task `New`; in Fleet mode it
+/// returns an error so the worker exits and Fleet restarts the GPU server.
+pub(crate) async fn prove_on_demand<B>(
+    runtime: &ProverRuntime,
+    local_db: &LocalDB,
+    job: OnDemandJob<B>,
+    attempts: &mut HashMap<i64, u32>,
+    metrics_state: &ApiMetricsState,
+    proof_type: &str,
+) -> anyhow::Result<OnDemandOutcome>
+where
+    B: ProofBuilder + Send + Sync + 'static,
+{
+    let picked_at = Instant::now();
+    let OnDemandJob { table, task_index, output, builder, ctx } = job;
+    let unit = {
+        let (runtime, local_db, output) = (runtime.clone(), local_db.clone(), output.clone());
+        async move {
+            // Recheck after waiting for the gate: the request may have timed out meanwhile.
+            let state =
+                local_db.acquire().await?.get_on_demand_proof_state(table, task_index).await?;
+            if state != Some(ProofState::New.to_i64()) {
+                return Ok(OnDemandUnit::NotNew);
+            }
+            let proved = match runtime.prove_and_save(builder, ctx).await {
+                Ok(proved) => proved,
+                Err(error) => return Ok(OnDemandUnit::Failed(error)),
+            };
+            let completion = OnDemandProofCompletion {
+                path_to_proof: output,
+                public_value_hex: proved.public_value_hex,
+                proof_size: proved.proof_size as i64,
+                cycles: proved.cycles as i64,
+                proof_state: ProofState::Proven.to_i64(),
+                total_time_to_proof: picked_at.elapsed().as_millis() as i64,
+                proving_time: proved.proving_time as i64,
+                zkm_version: proved.zkm_version,
+            };
+            let affected = local_db
+                .acquire()
+                .await?
+                .complete_on_demand_proof_if_new(table, task_index, &completion)
+                .await?;
+            Ok::<_, anyhow::Error>(if affected > 0 {
+                OnDemandUnit::Proven
+            } else {
+                OnDemandUnit::NotNew
+            })
+        }
+    };
+    let unit = match runtime.run(unit).await {
+        Ok(result) => result?,
+        Err(Cancelled) => return Ok(OnDemandOutcome::Cancelled),
+    };
+    let elapsed = picked_at.elapsed();
+    let error = match unit {
+        OnDemandUnit::Proven => {
+            attempts.remove(&task_index);
+            metrics_state.record_attempt(proof_type, "success", elapsed);
+            return Ok(OnDemandOutcome::Proven);
+        }
+        OnDemandUnit::NotNew => {
+            attempts.remove(&task_index);
+            info!(task_index, "{proof_type} task is no longer pending; its proof is not recorded");
+            metrics_state.record_attempt(proof_type, "cancelled", elapsed);
+            return Ok(OnDemandOutcome::Cancelled);
+        }
+        OnDemandUnit::Failed(error) => error,
+    };
+    metrics_state.record_attempt(proof_type, failure_outcome(&error), elapsed);
+    let error = match error {
+        ProveError::Prove(error, Failure::Fatal) => error,
+        ProveError::Prove(error, Failure::Retryable) if !runtime.is_fleet() => {
+            warn!(task_index, "{proof_type} prover failed transiently; retrying: {error:#}");
+            return Ok(OnDemandOutcome::Deferred);
+        }
+        error => {
+            return Err(stop_for_failure(
+                runtime,
+                error,
+                &format!("{proof_type} task {task_index}"),
+            ));
+        }
+    };
+    let attempt = attempts.entry(task_index).or_default();
+    *attempt += 1;
+    error!(task_index, attempt = *attempt, "{proof_type} proof failed: {error:#}");
+    if *attempt < runtime.max_attempts() {
+        return Ok(OnDemandOutcome::Deferred);
+    }
+    attempts.remove(&task_index);
+    let completion = OnDemandProofCompletion {
+        path_to_proof: output,
+        proof_state: ProofState::Failed.to_i64(),
+        total_time_to_proof: elapsed.as_millis() as i64,
+        ..Default::default()
+    };
+    let affected = local_db
+        .acquire()
+        .await?
+        .complete_on_demand_proof_if_new(table, task_index, &completion)
+        .await?;
+    Ok(if affected > 0 { OnDemandOutcome::Failed } else { OnDemandOutcome::Cancelled })
+}
+
+/// The proof attempt metric outcome of a failure.
+pub(crate) fn failure_outcome(error: &ProveError) -> &'static str {
+    match error {
+        ProveError::Prove(_, Failure::Retryable) => "retryable",
+        ProveError::Prove(_, Failure::Fatal) | ProveError::Save(_) => "failed",
+    }
+}
+
+/// Stops proving after a failure that must not be retried in place: a proof that could
+/// not be published, or (in Fleet mode) a prover failure that needs a fresh GPU server.
+fn stop_for_failure(runtime: &ProverRuntime, error: ProveError, what: &str) -> anyhow::Error {
+    runtime.begin_shutdown();
+    match error {
+        ProveError::Save(error) => error.context(format!("failed to publish the proof of {what}")),
+        ProveError::Prove(error, _) => error
+            .context(format!("prover failed on {what}; exiting so Fleet restarts the GPU server")),
+    }
+}
+
+/// Handles a failed chain proof. The batch is retried next round unless the failure
+/// must stop the worker (see [`stop_for_failure`]).
+pub(crate) fn settle_chain_failure(
+    runtime: &ProverRuntime,
+    error: ProveError,
+    chain: &str,
+) -> anyhow::Result<()> {
+    match error {
+        ProveError::Prove(error, failure) if failure == Failure::Fatal || !runtime.is_fleet() => {
+            error!("{chain} proof failed; retrying the batch: {error:#}");
+            Ok(())
+        }
+        error => Err(stop_for_failure(runtime, error, &format!("a {chain} batch"))),
+    }
 }
 
 pub(crate) async fn fetch_next_commit_task_index(local_db: &LocalDB) -> anyhow::Result<usize> {
@@ -723,34 +915,6 @@ pub(crate) async fn update_watchtower_task_state(
         .await
 }
 
-pub(crate) async fn update_watchtower_task(
-    local_db: &LocalDB,
-    index: i64,
-    path_to_proof: String,
-    public_value_hex: String,
-    proof_size: i64,
-    cycles: u64,
-    proof_state: ProofState,
-    total_time_to_proof: i64,
-    proving_time: i64,
-    zkm_version: String,
-) -> anyhow::Result<u64> {
-    let mut storage_processor = local_db.acquire().await?;
-    storage_processor
-        .update_watchtower_proof(
-            index,
-            path_to_proof,
-            public_value_hex,
-            proof_size,
-            cycles as i64,
-            proof_state.to_i64(),
-            total_time_to_proof,
-            proving_time,
-            &zkm_version,
-        )
-        .await
-}
-
 /// table schema: (index, instance_id, graph_id, execution_layer_block_number, path_to_proof, cycles, state, update_time)
 /// * state: 0-new, 1-doing, 2-done, 3-failed
 /// * execution_layer_block_number: proceedWithdraw's block number
@@ -944,34 +1108,6 @@ pub(crate) async fn update_operator_task_state(
             &graph_id,
             old_proof_state.to_i64(),
             new_proof_state.to_i64(),
-        )
-        .await
-}
-
-pub(crate) async fn update_operator_task(
-    local_db: &LocalDB,
-    index: i64,
-    path_to_proof: String,
-    public_value_hex: String,
-    proof_size: i64,
-    cycles: u64,
-    proof_state: ProofState,
-    total_time_to_proof: i64,
-    proving_time: i64,
-    zkm_version: String,
-) -> anyhow::Result<u64> {
-    let mut storage_processor = local_db.acquire().await?;
-    storage_processor
-        .update_operator_proof(
-            index,
-            path_to_proof,
-            public_value_hex,
-            proof_size,
-            cycles as i64,
-            proof_state.to_i64(),
-            total_time_to_proof,
-            proving_time,
-            &zkm_version,
         )
         .await
 }

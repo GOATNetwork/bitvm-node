@@ -5,8 +5,7 @@ use borsh::BorshDeserialize;
 use commit_chain::{CommitChainCircuitInput, CommitChainPrevProofType};
 use header_chain::{CircuitBlockHeader, HeaderChainCircuitInput, HeaderChainPrevProofType};
 use zkm_sdk::{
-    HashableKey, Prover, ProverClient, ZKMProofKind, ZKMProofWithPublicValues, ZKMStdin,
-    include_elf,
+    HashableKey, ProverClient, ZKMProofKind, ZKMProofWithPublicValues, ZKMStdin, include_elf,
 };
 
 use bitcoin::{Block, Network, Transaction, Txid, hashes::Hash};
@@ -14,7 +13,7 @@ use bitcoin_light_client_circuit::build_spv;
 use sha2::{Digest, Sha256};
 use state_chain::{StateChainCircuitInput, StateChainPrevProofType};
 use std::str::FromStr;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 static ELF_ID: OnceLock<String> = OnceLock::new();
 
 use proof_builder::{LongRunning, ProofBuilder, ProofRequest};
@@ -140,7 +139,7 @@ pub async fn fetch_target_block(
 /// A program that aggregates the proofs of the simple program.
 pub const WATCHTOWER: &[u8] = include_elf!("guest");
 pub struct WatchtowerProofBuilder {
-    client: ProverClient,
+    client: Arc<ProverClient>,
     proving_key: zkm_sdk::ZKMProvingKey,
     verifying_key: zkm_sdk::ZKMVerifyingKey,
 }
@@ -148,7 +147,11 @@ pub struct WatchtowerProofBuilder {
 impl WatchtowerProofBuilder {
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
-        let client = ProverClient::new();
+        Self::with_client(Arc::new(ProverClient::new()))
+    }
+
+    /// Sets the program up on a prover client that other builders may share.
+    pub fn with_client(client: Arc<ProverClient>) -> Self {
         let (proving_key, verifying_key) = client.setup(WATCHTOWER);
         Self { client, proving_key, verifying_key }
     }
@@ -326,17 +329,19 @@ impl ProofBuilder for WatchtowerProofBuilder {
                 };
                 tracing::info!("elf id: {:?}", elf_id);
 
-                let proving_start = tokio::time::Instant::now();
-                let (proof, cycles) = self.client.prove_with_cycles(
+                proof_builder::prove_timed(
+                    &self.client,
                     &self.proving_key,
                     &stdin,
                     ZKMProofKind::Groth16,
                     elf_id,
-                )?;
-                let proving_duration = proving_start.elapsed().as_secs_f32() * 1000.0;
-                Ok((proof, cycles, proving_duration))
+                )
             },
         )?;
+
+        self.client
+            .verify(&proof, &self.verifying_key)
+            .context("Failed to verify generated watchtower proof")?;
 
         Ok((vec![], proof, cycles, proving_time))
     }
@@ -352,13 +357,20 @@ impl ProofBuilder for WatchtowerProofBuilder {
             anyhow::bail!("invalid context");
         };
         let proof_bytes = proof.bytes()?;
-        std::fs::write(output, &proof_bytes)?;
-        let public_value_hex = hex::encode(proof.public_values.to_vec());
         let proof_size = proof_bytes.len();
-        let zkm_version = proof.zkm_version.clone();
-        std::fs::write(format!("{}.public_inputs.bin", output), proof.public_values.to_vec())?;
-        std::fs::write(format!("{}.vk_hash.bin", output), self.verifying_key.bytes32())?;
-        std::fs::write(format!("{}.zkm_version.bin", output), zkm_version)?;
+        let public_values = proof.public_values.to_vec();
+        let public_value_hex = hex::encode(&public_values);
+        let vk_hash = self.verifying_key.bytes32();
+        proof_builder::artifacts::publish_artifacts(
+            output,
+            &proof_bytes,
+            &[
+                (".public_inputs.bin", public_values.as_slice()),
+                (".vk_hash.bin", vk_hash.as_bytes()),
+                (".zkm_version.bin", proof.zkm_version.as_bytes()),
+            ],
+            &format!("{} {}", Self::name(), output),
+        )?;
         Ok((public_value_hex, proof_size))
     }
 }

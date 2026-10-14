@@ -27,5 +27,8 @@ commit-chain.workspace = true
 state-chain.workspace = true
 bitcoin = { workspace = true }
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [lints]
 workspace = true

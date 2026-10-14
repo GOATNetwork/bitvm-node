@@ -4,17 +4,17 @@ use commit_chain::*;
 use proof_builder::{LongRunning, ProofBuilder, ProofRequest};
 use std::str::FromStr;
 use zkm_sdk::{
-    HashableKey, Prover, ProverClient, ZKM_CIRCUIT_VERSION, ZKMProofKind, ZKMProofWithPublicValues,
+    HashableKey, ProverClient, ZKM_CIRCUIT_VERSION, ZKMProofKind, ZKMProofWithPublicValues,
     ZKMStdin, include_elf,
 };
 
 use sha2::{Digest, Sha256};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 static ELF_ID: OnceLock<String> = OnceLock::new();
 use anyhow::Context;
 
 /// A program that aggregates the proofs of the simple program.
-const COMMIT_CHAIN: &[u8] = include_elf!("guest");
+pub const COMMIT_CHAIN: &[u8] = include_elf!("guest");
 
 use std::fs;
 
@@ -162,7 +162,7 @@ pub async fn fetch_commit_chain(
 
 /// A program that aggregates the proofs of the simple program.
 pub struct CommitChainProofBuilder {
-    client: ProverClient,
+    client: Arc<ProverClient>,
     proving_key: zkm_sdk::ZKMProvingKey,
     verifying_key: zkm_sdk::ZKMVerifyingKey,
 }
@@ -170,7 +170,11 @@ pub struct CommitChainProofBuilder {
 impl CommitChainProofBuilder {
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
-        let client = ProverClient::new();
+        Self::with_client(Arc::new(ProverClient::new()))
+    }
+
+    /// Sets the program up on a prover client that other builders may share.
+    pub fn with_client(client: Arc<ProverClient>) -> Self {
         let (proving_key, verifying_key) = client.setup(COMMIT_CHAIN);
         Self { client, proving_key, verifying_key }
     }
@@ -271,15 +275,13 @@ impl ProofBuilder for CommitChainProofBuilder {
                     Some(ELF_ID.get().unwrap().clone())
                 };
                 tracing::info!("elf id: {:?}", elf_id);
-                let proving_start = tokio::time::Instant::now();
-                let (proof, cycles) = self.client.prove_with_cycles(
+                proof_builder::prove_timed(
+                    &self.client,
                     &self.proving_key,
                     &stdin,
                     ZKMProofKind::Groth16,
                     elf_id,
-                )?;
-                let proving_duration = proving_start.elapsed().as_secs_f32() * 1000.0;
-                Ok((proof, cycles, proving_duration))
+                )
             },
         )?;
 
@@ -311,20 +313,24 @@ impl ProofBuilder for CommitChainProofBuilder {
         //tracing::info!("Generate proof successfully, proof: {:?}", proof);
         //Ok((public_value_hex, proof_size))
 
-        let public_values = proof.public_values.to_vec();
-
         let proof_bytes = proof.bytes()?;
-        std::fs::write(output_proof, &proof_bytes)?;
-        let public_value_hex = hex::encode(&public_values);
         let proof_size = proof_bytes.len();
-        let zkm_version = proof.zkm_version.clone();
-        std::fs::write(format!("{}.public_inputs.bin", output_proof), public_values)?;
-        std::fs::write(format!("{}.vk_hash.bin", output_proof), self.verifying_key.bytes32())?;
-        std::fs::write(format!("{}.zkm_version.bin", output_proof), zkm_version)?;
         let latest_commit = commits.last().context("commit proof input must be non-empty")?;
-        let commits_path = format!("{output_proof}.commits");
-        std::fs::write(&commits_path, serde_json::to_vec(std::slice::from_ref(latest_commit))?)
-            .with_context(|| format!("write {commits_path} error"))?;
+        let latest_commits = serde_json::to_vec(std::slice::from_ref(latest_commit))?;
+        let public_values = proof.public_values.to_vec();
+        let public_value_hex = hex::encode(&public_values);
+        let vk_hash = self.verifying_key.bytes32();
+        proof_builder::artifacts::publish_artifacts(
+            output_proof,
+            &proof_bytes,
+            &[
+                (".public_inputs.bin", public_values.as_slice()),
+                (".vk_hash.bin", vk_hash.as_bytes()),
+                (".zkm_version.bin", proof.zkm_version.as_bytes()),
+                (".commits", latest_commits.as_slice()),
+            ],
+            &format!("{} {}", Self::name(), output_proof),
+        )?;
         Ok((public_value_hex, proof_size))
     }
 }

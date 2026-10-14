@@ -8,9 +8,10 @@ use std::fs;
 use strum::{Display, EnumString};
 use thiserror::Error;
 use zkm_sdk::{HashableKey, ProverClient, ZKM_CIRCUIT_VERSION, ZKMProofWithPublicValues};
-use zkm_sdk::{ZKMProvingKey, ZKMVerifyingKey};
+use zkm_sdk::{Prover, ZKMProofKind, ZKMProvingKey, ZKMStdin, ZKMVerifyingKey};
 
 pub mod api_auth;
+pub mod artifacts;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ProofRequest {
@@ -111,6 +112,26 @@ pub trait ProofBuilder {
 
 pub trait LongRunning {
     fn rotate(&self) -> Self;
+}
+
+/// Proves `stdin` and returns the proof, its cycles, and its execution time in
+/// milliseconds: the prover's own measurement when it reports one (the GPU server's
+/// `prove_ms`), otherwise the wall time of the prove call. Transfers and the CPU
+/// Groth16 wrap are excluded from the GPU measurement.
+pub fn prove_timed(
+    client: &ProverClient,
+    pk: &ZKMProvingKey,
+    stdin: &ZKMStdin,
+    kind: ZKMProofKind,
+    elf_id: Option<String>,
+) -> Result<(ZKMProofWithPublicValues, u64, f32)> {
+    // Discard a measurement left by an earlier call on this client.
+    let _ = client.take_prove_ms();
+    let started = std::time::Instant::now();
+    let (proof, cycles) = client.prove_with_cycles(pk, stdin, kind, elf_id)?;
+    let wall_ms = started.elapsed().as_secs_f32() * 1000.0;
+    let prove_ms = client.take_prove_ms().map_or(wall_ms, |ms| ms as f32);
+    Ok((proof, cycles, prove_ms))
 }
 
 #[derive(Debug, Default)]

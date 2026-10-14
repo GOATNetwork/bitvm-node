@@ -93,6 +93,7 @@ zkm-build = { git = "https://github.com/ProjectZKM/Ziren" }
 zkm-core-executor = { git = "https://github.com/ProjectZKM/Ziren" }
 zkm-prover = { git = "https://github.com/ProjectZKM/Ziren" }
 zkm-sdk = { git = "https://github.com/ProjectZKM/Ziren" }
+zkm-cuda = { git = "https://github.com/ProjectZKM/Ziren" }
 zkm-verifier = { git = "https://github.com/ProjectZKM/Ziren" }
 zkm-primitives = { git = "https://github.com/ProjectZKM/Ziren" }
 zkm-zkvm = { git = "https://github.com/ProjectZKM/Ziren", features = ["verify"] }

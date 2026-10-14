@@ -1,22 +1,37 @@
 mod api;
 mod config;
+mod fleet;
+mod prover;
+mod storage;
 mod task;
 
-use crate::task::{is_start_generate_proof_tasks, run_generate_proof_tasks};
+use crate::fleet::{FleetEnv, ProgramRecord, ProgramsFile, StorageLock};
+use crate::prover::ProverRuntime;
+use crate::storage::Level;
+use crate::task::{TaskOptions, is_start_generate_proof_tasks, run_generate_proof_tasks};
 use alloy_primitives::Address;
 use anyhow::Context;
 use api::metrics_service::ApiMetricsState;
 use api::{AuthorizationChain, AuthorizationChains};
 use clap::Parser;
 use client::goat_chain::{GOATClient, GoatInitConfig, GoatNetwork};
+use commit_chain_proof::CommitChainProofBuilder;
 use futures::future;
-use std::collections::HashSet;
+use header_chain_proof::HeaderChainProofBuilder;
+use operator_proof::OperatorProofBuilder;
+use proof_builder::ProofBuilder;
+use state_chain_proof::StateChainProofBuilder;
+use std::collections::{BTreeSet, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::signal;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
+use watchtower_proof::WatchtowerProofBuilder;
+use zkm_sdk::{HashableKey, ProverClient, ZKM_CIRCUIT_VERSION};
 
 use crate::config::ProofBuilderConfig;
 
@@ -39,31 +54,76 @@ struct Opts {
 
     #[arg(long, default_value = "proof-builder.toml")]
     pub config: String,
+
+    /// Print the guest program bundle (ELF digests, program IDs, verifying keys and the
+    /// Fleet app id) as JSON, then exit.
+    #[arg(long)]
+    pub print_programs: bool,
+
+    /// Check that the database, config and pending state-chain snapshots keep every proof
+    /// path inside this storage root, then exit.
+    #[arg(long, value_name = "STORAGE_ROOT")]
+    pub check_storage: Option<PathBuf>,
+
+    /// How long shutdown waits for the proof in progress to be published and committed.
+    #[arg(long, default_value_t = 600)]
+    pub drain_timeout_secs: u64,
+
+    /// Consecutive non-retryable failures before an operator or watchtower task is failed.
+    #[arg(long, default_value_t = 2)]
+    pub max_proof_attempts: u32,
+
+    /// Unproved state-chain batches prepared ahead of the prover (0 = unlimited).
+    #[arg(long, default_value_t = 2)]
+    pub state_chain_max_pending_batches: i64,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Only the process environment selects Fleet mode; a `.env` file cannot.
+    let fleet_env = FleetEnv::from_lookup(|key| std::env::var(key).ok())?;
+    if fleet_env.as_ref().is_some_and(|env| env.exit_with_parent) {
+        fleet::exit_with_parent()?;
+    }
     dotenv::dotenv().ok();
     let opt = Opts::parse();
+    let _ = tracing_subscriber::fmt().with_env_filter(EnvFilter::from_default_env()).try_init();
+
+    if opt.print_programs {
+        return print_programs().await;
+    }
 
     let cfg = ProofBuilderConfig::new(&opt.config)?;
     println!("proof builder config: {:?}", cfg);
 
-    let _ = tracing_subscriber::fmt().with_env_filter(EnvFilter::from_default_env()).try_init();
+    if let Some(root) = &opt.check_storage {
+        return check_storage(root, &cfg, &opt.database_url).await;
+    }
+
+    let (runtime, _storage_lock) = match &fleet_env {
+        Some(env) => {
+            let (runtime, lock) = start_fleet_worker(env, &opt).await?;
+            (runtime, Some(lock))
+        }
+        None => (ProverRuntime::sdk(opt.max_proof_attempts), None),
+    };
+    remove_stale_tmp_files(&cfg);
+
     let metrics_listener = match opt.metrics_addr.as_deref() {
         Some(metrics_addr) => Some(api::bind_metrics_listener(metrics_addr).await?),
         None => None,
     };
     let authorization_chains = goat_clients_from_env().await?;
-    // Create cancellation token for graceful shutdown
-    let cancellation_token = CancellationToken::new();
+    // Proof tasks stop first; the API keeps serving while the proof in progress drains.
+    let task_token = CancellationToken::new();
+    let api_token = CancellationToken::new();
     info!("load db {}", opt.database_url);
     let local_db = store::create_local_db(&opt.database_url).await;
     let metrics_state = ApiMetricsState::new();
     let api_state =
         api::ApiState::new(local_db.clone(), metrics_state.clone(), authorization_chains);
     let mut task_handles: Vec<JoinHandle<anyhow::Result<String, String>>> = vec![];
-    let cancel_token_clone = cancellation_token.clone();
+    let cancel_token_clone = api_token.clone();
     let opt_rpc_addr = opt.rpc_addr.clone();
     let rpc_api_state = api_state.clone();
     info!(
@@ -81,7 +141,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }));
     if let Some(listener) = metrics_listener {
-        let cancel_token_clone = cancellation_token.clone();
+        let cancel_token_clone = api_token.clone();
         task_handles.push(tokio::spawn(async move {
             match api::serve_metrics(listener, api_state, cancel_token_clone).await {
                 Ok(tag) => Ok(tag),
@@ -94,10 +154,21 @@ async fn main() -> anyhow::Result<()> {
     }
     if is_start_generate_proof_tasks(&cfg) {
         info!("start generate proof tasks");
-        let cancel_token_clone = cancellation_token.clone();
+        let cancel_token_clone = task_token.clone();
+        let options = TaskOptions {
+            runtime: runtime.clone(),
+            state_chain_max_pending_batches: opt.state_chain_max_pending_batches,
+        };
         task_handles.push(tokio::spawn(async move {
-            match run_generate_proof_tasks(cfg, local_db, metrics_state, 1, cancel_token_clone)
-                .await
+            match run_generate_proof_tasks(
+                cfg,
+                local_db,
+                metrics_state,
+                options,
+                1,
+                cancel_token_clone,
+            )
+            .await
             {
                 Ok(tag) => Ok(tag),
                 Err(e) => {
@@ -110,8 +181,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Wait for shutdown signal or any task completion
     let task_count = task_handles.len();
-    tokio::select! {
-        (result, index, remaining_handles) = future::select_all(task_handles) => {
+    let mut tasks = future::select_all(task_handles);
+    let (failure, panic, mut remaining) = tokio::select! {
+        (result, index, remaining) = &mut tasks => {
             // Log the specific failure
             let failure_reason = match &result {
                 Ok(Ok(tag)) => {
@@ -127,36 +199,178 @@ async fn main() -> anyhow::Result<()> {
                     "join error"
                 }
             };
-
             tracing::info!("Triggering shutdown due to {} in task {}/{}", failure_reason, index + 1, task_count);
-
-            // Initiate graceful shutdown
-            cancellation_token.cancel();
-
-            // Wait a moment for graceful shutdown, then force abort remaining tasks
-            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-
-            // Force abort any tasks that didn't respond to cancellation
-            remaining_handles.into_iter().for_each(|handle| handle.abort());
-
-            tracing::info!("All tasks stopped");
-
-            // Handle panic propagation
-            if let Err(join_error) = result && join_error.is_panic() {
-                    std::panic::resume_unwind(join_error.into_panic());
-
-            }
+            let panic = match result {
+                Err(join_error) if join_error.is_panic() => Some(join_error.into_panic()),
+                _ => None,
+            };
+            (Some(failure_reason), panic, remaining)
         }
         _ = shutdown_signal() => {
             tracing::info!("Received shutdown signal, initiating graceful shutdown...");
-            cancellation_token.cancel();
+            (None, None, Vec::new())
+        }
+    };
 
-            // Give tasks some time to shutdown gracefully
-            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-            tracing::info!("Graceful shutdown completed");
+    // Start no further proofs, let the one in progress publish and commit, then stop.
+    runtime.begin_shutdown();
+    task_token.cancel();
+    if runtime.in_flight() > 0 {
+        info!(timeout_secs = opt.drain_timeout_secs, "waiting for the proof in progress to commit");
+    }
+    if !runtime.drain(Duration::from_secs(opt.drain_timeout_secs)).await {
+        warn!("drain timed out; the unfinished proof is retried after restart");
+    }
+    api_token.cancel();
+    // Give the API a moment to finish in-flight requests, then abort what remains.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    // A finished select hands back the other tasks; an interrupted one still holds them.
+    remaining.extend(tasks.into_inner());
+    remaining.into_iter().for_each(|handle| handle.abort());
+    tracing::info!("All tasks stopped");
+
+    if let Some(panic) = panic {
+        std::panic::resume_unwind(panic);
+    }
+    match failure {
+        Some(reason) => anyhow::bail!("proof builder stopped after a task {reason}"),
+        None => Ok(()),
+    }
+}
+
+/// Validates the Fleet worker environment and connects to the replica's GPU server.
+async fn start_fleet_worker(
+    env: &FleetEnv,
+    opt: &Opts,
+) -> anyhow::Result<(ProverRuntime, StorageLock)> {
+    let lock = fleet::lock_storage_root(&env.storage_root)?;
+    fleet::check_storage_paths(&env.storage_root, &std::env::current_dir()?, &opt.database_url)?;
+    let programs = ProgramsFile::load(&env.programs_file)?;
+    let embedded: Vec<_> = fleet::bundle_programs()
+        .iter()
+        .map(|(name, elf)| (*name, fleet::sha256_hex(elf)))
+        .collect();
+    programs.check_embedded(&env.app_id, &embedded, zkm_primitives::io::zkm_imm_wrap_vk_mode())?;
+    if std::env::var("ZKM_PROVER").is_ok() {
+        warn!("ZKM_PROVER is ignored: Fleet supplies this worker's GPU server");
+    }
+    info!(
+        app = %format!("{}/{}", env.tenant, env.app_id),
+        namespace = %env.namespace,
+        storage_root = %env.storage_root.display(),
+        gpu_endpoint = %env.gpu_endpoint,
+        "starting proof builder as a Fleet app worker"
+    );
+    let runtime =
+        ProverRuntime::fleet(env.gpu_endpoint.clone(), programs, opt.max_proof_attempts).await?;
+    Ok((runtime, lock))
+}
+
+/// Prints the program bundle by setting every program up on the CPU prover.
+async fn print_programs() -> anyhow::Result<()> {
+    let file = tokio::task::spawn_blocking(|| -> anyhow::Result<ProgramsFile> {
+        fn record<B: ProofBuilder>(name: &str, builder: &B) -> anyhow::Result<ProgramRecord> {
+            Ok(ProgramRecord {
+                name: name.to_string(),
+                elf_sha256: fleet::sha256_hex(&builder.pk().elf),
+                program_id: hex::encode(builder.program_id()?),
+                vk_hash: builder.vk().bytes32(),
+            })
+        }
+        let client = Arc::new(ProverClient::cpu());
+        let mut programs = Vec::new();
+        for (name, elf) in fleet::bundle_programs() {
+            let program = match name {
+                "commit-chain" => {
+                    record(name, &CommitChainProofBuilder::with_client(client.clone()))?
+                }
+                "header-chain" => {
+                    record(name, &HeaderChainProofBuilder::with_client(client.clone()))?
+                }
+                "operator" => record(name, &OperatorProofBuilder::with_client(client.clone()))?,
+                "state-chain" => {
+                    record(name, &StateChainProofBuilder::with_client(client.clone()))?
+                }
+                "watchtower" => record(name, &WatchtowerProofBuilder::with_client(client.clone()))?,
+                other => anyhow::bail!("unknown program {other}"),
+            };
+            anyhow::ensure!(
+                program.elf_sha256 == fleet::sha256_hex(elf),
+                "{name} proving key does not embed its ELF"
+            );
+            programs.push(program);
+        }
+        let digests: Vec<_> =
+            programs.iter().map(|p| (p.name.as_str(), p.elf_sha256.clone())).collect();
+        Ok(ProgramsFile {
+            bundle_id: fleet::bundle_id(&fleet::bundle_manifest(&digests)),
+            zkm_circuit_version: ZKM_CIRCUIT_VERSION.to_string(),
+            imm_wrap_vk: zkm_primitives::io::zkm_imm_wrap_vk_mode(),
+            programs,
+        })
+    })
+    .await??;
+    println!("{}", serde_json::to_string_pretty(&file)?);
+    Ok(())
+}
+
+/// Reports the storage check and fails when any proof path needs attention.
+async fn check_storage(
+    root: &Path,
+    cfg: &ProofBuilderConfig,
+    database_url: &str,
+) -> anyhow::Result<()> {
+    let database = fleet::sqlite_file(database_url)?;
+    anyhow::ensure!(database.exists(), "database {} does not exist", database.display());
+    // Open without migrating: the check never changes the database it inspects.
+    let local_db = store::localdb::LocalDB::new(database_url, true).await;
+    let findings = storage::check_storage(root, cfg, &local_db).await?;
+    for finding in &findings {
+        let level = match finding.level {
+            Level::Ok => "ok",
+            Level::Legacy => "legacy",
+            Level::Warning => "warning",
+            Level::Error => "error",
+        };
+        println!("[{level}] {}", finding.message);
+    }
+    let count = |level| findings.iter().filter(|f| f.level == level).count();
+    let errors = count(Level::Error);
+    println!(
+        "storage check: {} ok, {} legacy, {} warnings, {errors} errors",
+        count(Level::Ok),
+        count(Level::Legacy),
+        count(Level::Warning)
+    );
+    anyhow::ensure!(errors == 0, "storage check found {errors} errors");
+    Ok(())
+}
+
+/// Removes temporary files that interrupted proof writes left in the proof directories.
+fn remove_stale_tmp_files(cfg: &ProofBuilderConfig) {
+    let outputs = [
+        &cfg.header_chain.output_proof,
+        &cfg.commit_chain.output_proof,
+        &cfg.state_chain.output_proof,
+        &cfg.state_chain.input_proof,
+        &cfg.watchtower.output,
+        &cfg.operator.output,
+    ];
+    let dirs: BTreeSet<_> = outputs
+        .iter()
+        .filter_map(|path| Path::new(path.as_str()).parent())
+        .map(|dir| if dir.as_os_str().is_empty() { Path::new(".") } else { dir })
+        .filter(|dir| dir.is_dir())
+        .collect();
+    for dir in dirs {
+        match proof_builder::artifacts::remove_stale_tmp_files(dir) {
+            Ok(0) => {}
+            Ok(removed) => info!(dir = %dir.display(), removed, "removed interrupted proof writes"),
+            Err(error) => {
+                warn!(dir = %dir.display(), %error, "failed to clean interrupted proof writes")
+            }
         }
     }
-    Ok(())
 }
 
 /// Builds one read-only GOAT client per configured Gateway for live authorization.

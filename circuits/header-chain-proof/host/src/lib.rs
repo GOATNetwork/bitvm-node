@@ -14,13 +14,12 @@ use std::{
 use util::get_btc_block_confirms;
 use zkm_sdk::ZKMProofKind;
 use zkm_sdk::{
-    HashableKey, Prover, ProverClient, ZKM_CIRCUIT_VERSION, ZKMProofWithPublicValues, ZKMStdin,
-    include_elf,
+    HashableKey, ProverClient, ZKM_CIRCUIT_VERSION, ZKMProofWithPublicValues, ZKMStdin, include_elf,
 };
 static ELF_ID: OnceLock<String> = OnceLock::new();
 use anyhow::Context;
 use clap::Parser;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 /// The arguments for the cli.
 #[derive(Debug, Clone, Parser, serde::Deserialize, serde::Serialize)]
@@ -155,7 +154,7 @@ pub async fn fetch_header_chain(
 /// A program that aggregates the proofs of the simple program.
 pub const HEADER_CHAIN: &[u8] = include_elf!("guest");
 pub struct HeaderChainProofBuilder {
-    client: ProverClient,
+    client: Arc<ProverClient>,
     proving_key: zkm_sdk::ZKMProvingKey,
     verifying_key: zkm_sdk::ZKMVerifyingKey,
     // database handle
@@ -164,7 +163,11 @@ pub struct HeaderChainProofBuilder {
 impl HeaderChainProofBuilder {
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
-        let client = ProverClient::new();
+        Self::with_client(Arc::new(ProverClient::new()))
+    }
+
+    /// Sets the program up on a prover client that other builders may share.
+    pub fn with_client(client: Arc<ProverClient>) -> Self {
         let (proving_key, verifying_key) = client.setup(HEADER_CHAIN);
         Self { client, proving_key, verifying_key }
     }
@@ -278,15 +281,13 @@ impl ProofBuilder for HeaderChainProofBuilder {
                     Some(ELF_ID.get().unwrap().clone())
                 };
 
-                let proving_start = tokio::time::Instant::now();
-                let (proof, cycles) = self.client.prove_with_cycles(
+                proof_builder::prove_timed(
+                    &self.client,
                     &self.proving_key,
                     &stdin,
                     ZKMProofKind::Groth16,
                     elf_id,
-                )?;
-                let proving_duration = proving_start.elapsed().as_secs_f32() * 1000.0;
-                Ok((proof, cycles, proving_duration))
+                )
             },
         )?;
 
@@ -317,16 +318,20 @@ impl ProofBuilder for HeaderChainProofBuilder {
         //fs::write(&format!("{}.in", output_proof), input)?;
 
         let proof_bytes = proof.bytes()?;
-        std::fs::write(output_proof, &proof_bytes)?;
-        let public_value_hex = hex::encode(proof.public_values.to_vec());
         let proof_size = proof_bytes.len();
-        let zkm_version = proof.zkm_version.clone();
-        std::fs::write(
-            format!("{}.public_inputs.bin", output_proof),
-            proof.public_values.to_vec(),
+        let public_values = proof.public_values.to_vec();
+        let public_value_hex = hex::encode(&public_values);
+        let vk_hash = self.verifying_key.bytes32();
+        proof_builder::artifacts::publish_artifacts(
+            output_proof,
+            &proof_bytes,
+            &[
+                (".public_inputs.bin", public_values.as_slice()),
+                (".vk_hash.bin", vk_hash.as_bytes()),
+                (".zkm_version.bin", proof.zkm_version.as_bytes()),
+            ],
+            &format!("{} {}", Self::name(), output_proof),
         )?;
-        std::fs::write(format!("{}.vk_hash.bin", output_proof), self.verifying_key.bytes32())?;
-        std::fs::write(format!("{}.zkm_version.bin", output_proof), zkm_version)?;
 
         tracing::info!("Generate proof successfully, proof: {:?}", proof);
         Ok((public_value_hex, proof_size))

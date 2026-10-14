@@ -52,6 +52,73 @@ To enable multiple Gateways without interrupting proof polling, first upgrade Pr
 single Gateway, then upgrade all Nodes to send `gateway_address`, and finally configure the
 comma-separated Gateway list.
 
+## Fleet app worker mode
+
+Proof Builder can run as a zkm-fleet integrated app worker. Fleet starts a dedicated Ziren GPU
+server for the app and launches `proof-builder-rpc` beside it. The
+worker proves directly against that loopback server instead of submitting through the SDK
+network prover and the Fleet gateway. The HTTP API and node configuration are unchanged.
+
+Fleet mode starts when Fleet supplies its worker environment. Any partial Fleet environment is a
+startup error. Without these variables the SDK network prover (`ZKM_PROVER=network`) is used as
+before, which is how operators fall back explicitly.
+
+| Variable | Source | Meaning |
+|---|---|---|
+| `FLEET_GPU_ENDPOINT` | Fleet | Loopback URL of the replica's GPU server |
+| `FLEET_APP_STORAGE_ROOT` | Fleet | Durable app storage (`proof_storage_root`) |
+| `FLEET_APP_ELF_ID` | Fleet | App id: the SHA-256 of the program bundle manifest |
+| `FLEET_APP_NAMESPACE`, `FLEET_APP_TENANT` | Fleet | App identity |
+| `FLEET_EXIT_WITH_PARENT` | Fleet | Exit with the Fleet actor (Linux `PR_SET_PDEATHSIG`) |
+| `PROOF_BUILDER_PROGRAMS_FILE` | worker env file | `programs.json` from the package |
+
+The app id covers all five guests. Each line is `<name> <ELF SHA-256>`, sorted by name
+(commit-chain, header-chain, operator, state-chain, watchtower), and the id is the SHA-256 of
+those lines. `proof-builder-rpc --print-programs` sets every program up on the CPU prover and
+prints the ELF digests, program IDs, verifying-key hashes, wrap mode and app id as JSON; package
+that output as `programs.json`. At startup the worker checks that the embedded programs, the
+programs file and `ZKM_IMM_WRAP_VK` match the Fleet app id. After each GPU setup it also checks
+the verifying key.
+
+Startup also requires the following:
+
+- The working directory (`worker_workdir`) and the sqlite database must be inside the storage
+  root, and the worker takes an exclusive lock on `<root>/proof-builder.lock`.
+- Use `<root>/run` as the working directory so that relative `../circuits/data/...` paths
+  resolve to `<root>/circuits/data/...`.
+- Groth16 wrapping runs on the worker's CPU. Pre-install the Groth16 circuit artifacts for the
+  Fleet execution user before enabling the app.
+
+Proving behaviour in Fleet mode:
+
+- The GPU server runs one proof at a time. Builder setup and every proving unit (prove, publish
+  and database commit) pass through a FIFO gate.
+- An operator or watchtower task stays `New` while it queues and proves. Its result is written
+  only while it is still `New`, so a timeout request that arrives in the meantime wins.
+- A proof failure marks the task `Failed` only after `--max-proof-attempts` consecutive
+  failures (default 2).
+- If the GPU server stops reporting ready, or a proof cannot be published, the task stays
+  pending and the worker exits. Fleet then restarts the GPU server and the worker.
+- On SIGTERM the worker starts no new proof. It waits up to `--drain-timeout-secs` for the proof
+  in progress to be published and committed, then stops. Keep that value below the service's
+  `worker_stop_timeout_s`.
+- Proofs and their sidecars are published through synced temporary files and atomic renames.
+  A `<proof>.manifest.json` written last marks a complete set. State-chain `.args`/`.ctx`
+  snapshots are written atomically as well.
+- The state-chain context builder prepares at most `--state-chain-max-pending-batches`
+  unproved batches (default 2; 0 means unlimited).
+
+Before migrating data into a storage root, and before every Fleet enable, run the read-only
+storage check from the working directory with the worker's config and `DATABASE_URL`:
+
+```bash
+proof-builder-rpc --config proof-builder.toml --check-storage /srv/zkm-fleet/apps/goat
+```
+
+It reports every recorded proof, config path and pending state-chain snapshot that is missing,
+outside the root, or inconsistent with its manifest. It exits non-zero on any error. Proofs
+written before atomic publication are reported as `legacy`.
+
 ## Metrics
 
 Prometheus metrics use a dedicated listener and are disabled unless `--metrics-addr` is set. The
