@@ -229,7 +229,7 @@ async fn run_step(
         JOB_POST_GRAPH_DATA => post_graph_data(deps, graph_id, params).await,
         JOB_FETCH_GRAPH => fetch_graph(deps, graph_id, params, attempts).await,
         pegout if PEGOUT_JOBS.contains(&pegout) => {
-            run_pegout_step(deps, pegout, graph_id, params).await
+            run_pegout_step(deps, pegout, graph_id, params, attempts).await
         }
         other => bail!("unknown graph job {other}"),
     }

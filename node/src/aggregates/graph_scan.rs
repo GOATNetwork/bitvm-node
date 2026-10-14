@@ -1,8 +1,9 @@
 //! Collect graph chain facts outside the apply transaction.
 //!
-//! Maintenance scans active graphs, including Obsoleted ones, once per Bitcoin
-//! height and stored status. Each result becomes a `chain_scan` event. Operator
-//! nodes also report setups unfinished at their instance's abandon height.
+//! Maintenance scans active graphs once per Bitcoin height and stored status;
+//! Obsoleted graphs only get a cheap probe until their Pre-Kickoff confirms.
+//! Each result becomes a `chain_scan` event. Operator nodes also report setups
+//! unfinished at their instance's abandon height.
 
 use super::graph::{SetupAbandoned, setup_abandoned_event};
 use super::graph_pegout::{ChainScan, PegoutSignal, Unusable};
@@ -40,6 +41,12 @@ use uuid::Uuid;
 /// after the slot the previous tick stopped at and wrap around, so no graph
 /// starves at a height when there are more graphs than one tick covers.
 const SCAN_BATCH: usize = 64;
+/// Obsoleted graphs probed per tick, in their own rotation so they never hold
+/// the active graphs back.
+const OBSOLETED_SCAN_BATCH: usize = 16;
+/// Every this many heights an Obsoleted graph gets a full scan anyway, so a
+/// dead Pre-Kickoff input is still noticed and recorded for the later slots.
+const OBSOLETED_FULL_SCAN_EVERY: i64 = 16;
 const SCAN_MARKS_LIMIT: usize = 50_000;
 
 const MONITOR_KICKOFF: &str = "kickoff";
@@ -88,8 +95,11 @@ impl ChallengeSubStatus {
 static SCAN_MARKS: LazyLock<Mutex<HashMap<Uuid, (i64, GraphStatus)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// The slot `(operator_pubkey, kickoff_index)` the last tick stopped at.
+/// The slot `(operator_pubkey, kickoff_index)` the last tick stopped at, for
+/// the active graphs and for the Obsoleted ones.
 static SCAN_CURSOR: LazyLock<Mutex<Option<(String, i64)>>> = LazyLock::new(|| Mutex::new(None));
+static OBSOLETED_SCAN_CURSOR: LazyLock<Mutex<Option<(String, i64)>>> =
+    LazyLock::new(|| Mutex::new(None));
 
 /// Where a scan over `slots` (sorted by operator and nonce) resumes: the
 /// first slot after `cursor`, or the start when the cursor is unset or past
@@ -168,46 +178,107 @@ pub async fn scan_graphs_on_chain(
         return Ok(());
     }
     let height = i64::from(btc_client.get_height().await?);
-    let slots: Vec<(String, i64)> =
-        graphs.iter().map(|row| (row.operator_pubkey.clone(), row.kickoff_index)).collect();
-    let start = {
-        let cursor = SCAN_CURSOR.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        resume_index(&slots, cursor.as_ref())
-    };
-    let mut scanned = 0;
-    let mut stopped_at = None;
-    for offset in 0..graphs.len() {
-        if scanned >= SCAN_BATCH {
-            break;
+    let (obsoleted, active): (Vec<Graph>, Vec<Graph>) =
+        graphs.into_iter().partition(|row| row.status == GraphStatus::Obsoleted.to_string());
+    let scan = ScanPass { local_db, btc_client, goat_client, engine, height };
+    scan.rows(&active, SCAN_BATCH, &SCAN_CURSOR, false).await?;
+    scan.rows(&obsoleted, OBSOLETED_SCAN_BATCH, &OBSOLETED_SCAN_CURSOR, true).await
+}
+
+struct ScanPass<'a> {
+    local_db: &'a LocalDB,
+    btc_client: &'a BTCClient,
+    goat_client: &'a GOATClient,
+    engine: &'a EngineHandle,
+    height: i64,
+}
+
+impl ScanPass<'_> {
+    /// Scan up to `batch` of `graphs`, resuming after the slot `cursor` points
+    /// at. The cursor moves per graph, so a tick cut short by the maintenance
+    /// timeout resumes where it stopped instead of restarting at the same slot.
+    async fn rows(
+        &self,
+        graphs: &[Graph],
+        batch: usize,
+        cursor: &Mutex<Option<(String, i64)>>,
+        obsoleted: bool,
+    ) -> anyhow::Result<()> {
+        if graphs.is_empty() {
+            return Ok(());
         }
-        let index = (start + offset) % graphs.len();
-        let row = &graphs[index];
-        stopped_at = Some(slots[index].clone());
-        let Ok(status) = GraphStatus::from_str(&row.status) else {
-            continue;
+        let slots: Vec<(String, i64)> =
+            graphs.iter().map(|row| (row.operator_pubkey.clone(), row.kickoff_index)).collect();
+        let start = {
+            let cursor = cursor.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            resume_index(&slots, cursor.as_ref())
         };
-        if already_scanned(row.graph_id, height, status) {
-            continue;
-        }
-        scanned += 1;
-        match gather_chain_scan(local_db, btc_client, goat_client, row, status, height).await {
-            Ok(Some(scan)) => {
-                engine.submit(scan.event(row.graph_id)?).await?;
-                mark_scanned(row.graph_id, height, status);
+        let mut scanned = 0;
+        for offset in 0..graphs.len() {
+            if scanned >= batch {
+                break;
             }
-            Ok(None) => mark_scanned(row.graph_id, height, status),
-            Err(error) => warn!(
-                event = "graph_scan",
-                graph_id = %row.graph_id,
-                status = %status,
-                height,
-                error = %error,
-                "chain scan failed; retried on the next tick"
-            ),
+            let index = (start + offset) % graphs.len();
+            let row = &graphs[index];
+            *cursor.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                Some(slots[index].clone());
+            let Ok(status) = GraphStatus::from_str(&row.status) else {
+                continue;
+            };
+            if already_scanned(row.graph_id, self.height, status) {
+                continue;
+            }
+            scanned += 1;
+            if obsoleted && self.height % OBSOLETED_FULL_SCAN_EVERY != 0 {
+                match prekickoff_confirmed(self.btc_client, row).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        mark_scanned(row.graph_id, self.height, status);
+                        continue;
+                    }
+                    Err(error) => {
+                        warn!(event = "graph_scan", graph_id = %row.graph_id, status = %status, height = self.height, error = %error, "pre-kickoff probe failed; retried on the next tick");
+                        continue;
+                    }
+                }
+            }
+            match gather_chain_scan(
+                self.local_db,
+                self.btc_client,
+                self.goat_client,
+                row,
+                status,
+                self.height,
+            )
+            .await
+            {
+                Ok(Some(scan)) => {
+                    self.engine.submit(scan.event(row.graph_id)?).await?;
+                    mark_scanned(row.graph_id, self.height, status);
+                }
+                Ok(None) => mark_scanned(row.graph_id, self.height, status),
+                Err(error) => warn!(
+                    event = "graph_scan",
+                    graph_id = %row.graph_id,
+                    status = %status,
+                    height = self.height,
+                    error = %error,
+                    "chain scan failed; retried on the next tick"
+                ),
+            }
         }
+        Ok(())
     }
-    *SCAN_CURSOR.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = stopped_at;
-    Ok(())
+}
+
+/// Nothing happens on chain for an Obsoleted graph until its Pre-Kickoff
+/// confirms (a Skip-Kickoff needs it, and a confirmed Pre-Kickoff makes the
+/// graph live again), so that is all the regular probe asks.
+async fn prekickoff_confirmed(btc_client: &BTCClient, row: &Graph) -> anyhow::Result<bool> {
+    let Some(txid) = row.cur_prekickoff_txid.clone() else {
+        return Ok(false);
+    };
+    Ok(btc_client.get_tx_status(&Txid::from(txid)).await?.confirmed)
 }
 
 /// Report operator setups unfinished at the abandon height, including pending
@@ -577,7 +648,7 @@ async fn watchtower_flow(
 
     let mut all_resolved = true;
     let mut timeout_ready = false;
-    let mut nack_ready = false;
+    let mut nack_ready = Vec::new();
     for index in 0..watchtower_num {
         let watchtower_vout =
             output_topology::watchtower_challenge_init::watchtower_connector(index) as u64;
@@ -612,7 +683,7 @@ async fn watchtower_flow(
                             height,
                         )
                     {
-                        nack_ready = true;
+                        nack_ready.push(index);
                     }
                 }
             }
@@ -634,8 +705,8 @@ async fn watchtower_flow(
     if timeout_ready {
         signals.push(PegoutSignal::WatchtowerChallengeTimeout);
     }
-    if nack_ready {
-        signals.push(PegoutSignal::NackReady);
+    for watchtower_index in nack_ready {
+        signals.push(PegoutSignal::NackReady { watchtower_index });
     }
     if all_resolved && connector_e_spent.is_none() && connector_f_spent.is_none() {
         signals.push(PegoutSignal::OperatorCommitPubinReady);

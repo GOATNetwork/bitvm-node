@@ -128,7 +128,11 @@ pub enum PegoutSignal {
         watchtower_index: usize,
     },
     WatchtowerChallengeTimeout,
-    NackReady,
+    /// A watchtower's challenge confirmed, the operator neither ACKed nor
+    /// NACKed it and `T5` passed: one NACK per branch.
+    NackReady {
+        watchtower_index: usize,
+    },
     OperatorCommitPubinReady,
     OperatorCommitPubinTimeout,
     AssertReady,
@@ -274,7 +278,7 @@ pub fn route_signal(
         (AssertSent { .. }, Watchtower) => JOB_WATCHTOWER_PROOF_TIMEOUT,
         (WatchtowerChallengeSent { .. }, Operator) if own => JOB_CHALLENGE_ACK,
         (WatchtowerChallengeTimeout, Operator) if own => JOB_WATCHTOWER_TIMEOUT,
-        (NackReady, Verifier) => JOB_CHALLENGE_NACK,
+        (NackReady { .. }, Verifier) => JOB_CHALLENGE_NACK,
         (OperatorCommitPubinReady, Operator) if own => JOB_COMMIT_PUBIN,
         (OperatorCommitPubinTimeout, Verifier) => JOB_COMMIT_TIMEOUT,
         (AssertReady, Operator) if own => JOB_PROVER_ASSERT,

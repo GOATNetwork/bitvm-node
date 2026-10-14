@@ -57,6 +57,7 @@ pub(super) async fn run_pegout_step(
     action: &str,
     graph_id: Uuid,
     params: &[u8],
+    attempts: i64,
 ) -> Result<Step> {
     match action {
         JOB_KICKOFF => kickoff(deps, graph_id, params).await,
@@ -66,7 +67,7 @@ pub(super) async fn run_pegout_step(
             let Some((row, graph)) = load_graph(&deps.local_db, graph_id).await? else {
                 return Step::ignore("graph not stored locally");
             };
-            settlement_step(deps, action, &row, graph, signal).await
+            settlement_step(deps, action, &row, graph, signal, attempts).await
         }
     }
 }
@@ -77,6 +78,7 @@ async fn settlement_step(
     row: &Graph,
     graph: BitvmGcGraph,
     signal: PegoutSignal,
+    attempts: i64,
 ) -> Result<Step> {
     use PegoutSignal::*;
     // A closed graph's branches are over; it may still owe the relayer's Goat
@@ -94,7 +96,7 @@ async fn settlement_step(
     }
     match (action, signal) {
         (JOB_CHECK_PREVIOUS_GRAPH, _) => check_previous_graph(deps, &graph).await,
-        (JOB_PROCEED_WITHDRAW, _) => proceed_withdraw(deps, &graph).await,
+        (JOB_PROCEED_WITHDRAW, _) => proceed_withdraw(deps, row, &graph, attempts).await,
         (JOB_CHALLENGE_KICKOFF, _) => challenge_kickoff(deps, &graph).await,
         (JOB_WATCHTOWER_CHALLENGE_INIT, ChallengeSent { challenge_txid }) => {
             watchtower_challenge_init(deps, row, graph, challenge_txid).await
@@ -105,7 +107,9 @@ async fn settlement_step(
             challenge_ack(deps, row, &graph, watchtower_index).await
         }
         (JOB_WATCHTOWER_TIMEOUT, _) => watchtower_timeout(deps, row, graph).await,
-        (JOB_CHALLENGE_NACK, _) => challenge_nack(deps, row, &graph).await,
+        (JOB_CHALLENGE_NACK, NackReady { watchtower_index }) => {
+            challenge_nack(deps, row, &graph, watchtower_index).await
+        }
         (JOB_COMMIT_PUBIN, _) => commit_pubin(deps, &graph).await,
         (JOB_COMMIT_TIMEOUT, _) => commit_timeout(deps, row, &graph).await,
         (JOB_PROVER_ASSERT, _) => prover_assert(deps, graph).await,
@@ -121,11 +125,14 @@ async fn settlement_step(
         (
             JOB_FINISH_DISPROVED,
             DisproveSent { disprove_type, index, challenge_finish_txid, .. },
-        ) => finish_disproved(deps, &graph, disprove_type, index, challenge_finish_txid).await,
+        ) => {
+            finish_disproved(deps, &graph, disprove_type, index, challenge_finish_txid, attempts)
+                .await
+        }
         (JOB_TAKE1, _) => take1(deps, row, graph).await,
-        (JOB_FINISH_HAPPY, _) => finish_happy(deps, &graph).await,
+        (JOB_FINISH_HAPPY, _) => finish_happy(deps, &graph, attempts).await,
         (JOB_TAKE2, _) => take2(deps, row, graph).await,
-        (JOB_FINISH_UNHAPPY, _) => finish_unhappy(deps, &graph).await,
+        (JOB_FINISH_UNHAPPY, _) => finish_unhappy(deps, &graph, attempts).await,
         (action, signal) => bail!("{action} does not act on {signal:?}"),
     }
 }
@@ -492,10 +499,9 @@ async fn check_previous_graph(deps: &GraphJobDeps, graph: &BitvmGcGraph) -> Resu
         return Step::ignore("first slot of the operator");
     }
     let btc = &deps.btc_client;
+    // The scan saw the Pre-Kickoff confirmed; a read that disagrees (a lagging
+    // backend, a reorg) is looked at again rather than ending the job.
     let prekickoff_txid = graph.cur_prekickoff.tx().compute_txid();
-    if !tx_on_chain(btc, &prekickoff_txid).await? {
-        return Step::ignore("pre-kickoff is not on chain");
-    }
     if !tx_confirmed(btc, &prekickoff_txid).await? {
         return after_blocks(deps, "pre-kickoff is not confirmed yet", 1);
     }
@@ -635,9 +641,17 @@ fn local_verifier_pubkey() -> Result<PublicKey> {
 }
 
 /// An ACK-Connector unspent past `T5` after a watchtower challenge: NACK.
-async fn challenge_nack(deps: &GraphJobDeps, row: &Graph, graph: &BitvmGcGraph) -> Result<Step> {
+async fn challenge_nack(
+    deps: &GraphJobDeps,
+    row: &Graph,
+    graph: &BitvmGcGraph,
+    watchtower_index: usize,
+) -> Result<Step> {
     let btc = &deps.btc_client;
     let watchtower_num = validate_watchtower_branches(graph)?;
+    if watchtower_index >= watchtower_num {
+        bail!("watchtower index {watchtower_index} out of range for {watchtower_num} slots");
+    }
     let wci_txid = graph.watchtower_challenge_init.tx().compute_txid();
     let connector_f =
         output_topology::watchtower_challenge_init::connector_f(watchtower_num) as u64;
@@ -646,43 +660,42 @@ async fn challenge_nack(deps: &GraphJobDeps, row: &Graph, graph: &BitvmGcGraph) 
     {
         return step;
     }
-    let mut pending = None;
-    for index in 0..watchtower_num {
-        let watchtower_vout =
-            output_topology::watchtower_challenge_init::watchtower_connector(index) as u64;
-        let Some(watchtower_spent) = outpoint_spent_txid(btc, &wci_txid, watchtower_vout).await?
-        else {
-            continue;
-        };
-        if watchtower_spent == graph.watchtower_challenge_timeouts[index].tx().compute_txid() {
-            continue;
-        }
-        let ack_vout = output_topology::watchtower_challenge_init::ack_connector(index) as u64;
-        // ACK or NACK (ours included) spend the ACK-Connector: confirmed, the
-        // branch is settled; pending, it is looked at again.
-        match spend_of(btc, &wci_txid, ack_vout).await? {
-            Spend::Confirmed(_) => continue,
-            Spend::Pending(by) => {
-                pending = Some(format!("ack connector {index} spent by unconfirmed {by}"));
-                continue;
-            }
-            Spend::Unspent => {}
-        }
-        let nack = graph
-            .operator_challenge_nacks
-            .get(index)
-            .ok_or_else(|| anyhow!("invalid watchtower index {index}"))?;
-        let nack_tx = nack.tx().clone();
-        let nack_txid = nack_tx.compute_txid();
-        let input_amount = nack.prev_outs().iter().map(|o| o.value).sum::<Amount>();
-        broadcast_tx_with_cpfp(btc, nack_tx, input_amount).await?;
-        info!(event = "graph_challenge", graph_id = %row.graph_id, watchtower_index = index, txid = %nack_txid, "Operator-Challenge-NACK broadcast");
-        return broadcast_pending(deps, &format!("Operator-Challenge-NACK {nack_txid}"));
+    // The scan saw this watchtower's challenge confirmed; a read that disagrees
+    // is looked at again.
+    let watchtower_vout =
+        output_topology::watchtower_challenge_init::watchtower_connector(watchtower_index) as u64;
+    let Some(watchtower_spent) = outpoint_spent_txid(btc, &wci_txid, watchtower_vout).await? else {
+        return after_blocks(
+            deps,
+            format!("watchtower connector {watchtower_index} is not spent"),
+            1,
+        );
+    };
+    if watchtower_spent == graph.watchtower_challenge_timeouts[watchtower_index].tx().compute_txid()
+    {
+        return Step::ignore(format!("watchtower {watchtower_index} timed out"));
     }
-    match pending {
-        Some(reason) => after_blocks(deps, reason, 1),
-        None => Step::ignore("no watchtower branch is ready for NACK"),
+    // ACK or NACK (ours included) spend the ACK-Connector: confirmed, the
+    // branch is settled; pending, it is looked at again.
+    let ack_vout =
+        output_topology::watchtower_challenge_init::ack_connector(watchtower_index) as u64;
+    if let Some(step) = settled_by(
+        deps,
+        &spend_of(btc, &wci_txid, ack_vout).await?,
+        &format!("ack connector {watchtower_index}"),
+    ) {
+        return step;
     }
+    let nack = graph
+        .operator_challenge_nacks
+        .get(watchtower_index)
+        .ok_or_else(|| anyhow!("invalid watchtower index {watchtower_index}"))?;
+    let nack_tx = nack.tx().clone();
+    let nack_txid = nack_tx.compute_txid();
+    let input_amount = nack.prev_outs().iter().map(|o| o.value).sum::<Amount>();
+    broadcast_tx_with_cpfp(btc, nack_tx, input_amount).await?;
+    info!(event = "graph_challenge", graph_id = %row.graph_id, watchtower_index, txid = %nack_txid, "Operator-Challenge-NACK broadcast");
+    broadcast_pending(deps, &format!("Operator-Challenge-NACK {nack_txid}"))
 }
 
 /// Commit-pubin missing past `T6`: Operator-Commit-Timeout.
@@ -842,7 +855,7 @@ async fn verifier_assert(
     if pubin_consistent && assert_witness.verify_groth16_proof(&vk, &[static_input]) {
         return Step::ignore("operator assert proof is valid");
     }
-    broadcast_verifier_challenge_assert_tx(
+    let broadcast = broadcast_verifier_challenge_assert_tx(
         &deps.local_db,
         btc,
         graph,
@@ -852,6 +865,13 @@ async fn verifier_assert(
         false,
     )
     .await?;
+    if broadcast.is_none() {
+        // Without the BABE verifier state the assert cannot be challenged by
+        // this node; repeating the proof work every block would not change that.
+        warn!(event = "graph_challenge", graph_id = %graph_id, "ChallengeAssert cannot be built: BABE verifier state or soldering proof reference missing");
+        alert("verifier_assert_unavailable");
+        return Step::ignore("ChallengeAssert not built: missing BABE verifier state");
+    }
     broadcast_pending(deps, "ChallengeAssert")
 }
 
@@ -1047,9 +1067,15 @@ async fn challenge_ack(
     let wci_txid = graph.watchtower_challenge_init.tx().compute_txid();
     let watchtower_vout =
         output_topology::watchtower_challenge_init::watchtower_connector(watchtower_index) as u64;
+    // The scan saw this watchtower's challenge confirmed; a read that disagrees
+    // is looked at again rather than ending the only ACK job of the branch.
     let Some((spent_txid, vin, _)) = outpoint_spent_txin(btc, &wci_txid, watchtower_vout).await?
     else {
-        return Step::ignore(format!("watchtower connector {watchtower_index} is not spent"));
+        return after_blocks(
+            deps,
+            format!("watchtower connector {watchtower_index} is not spent"),
+            1,
+        );
     };
     if vin != 0 {
         return Step::ignore(format!(
@@ -1225,11 +1251,9 @@ async fn prover_assert(deps: &GraphJobDeps, mut graph: BitvmGcGraph) -> Result<S
     let (proof, wait_secs) =
         get_operator_proof(&deps.local_db, &deps.http_client, &graph, btc, instance_id, graph_id)
             .await?;
-    if wait_secs > 0 {
-        return Step::retry("operator proof is not ready", wait_secs as i64);
-    }
     let Some(proof) = proof else {
-        return Step::ignore("no operator proof for the graph");
+        // Not ready yet, never "never": the assert must follow once the proof exists.
+        return Step::retry("operator proof is not ready", (wait_secs as i64).max(1));
     };
     let (master, _) = local_operator()?;
     let assert_secret = master.assert_wots_keypair_for_graph(graph_id).0;
@@ -1546,7 +1570,10 @@ async fn watchtower_challenge(
     {
         (Some(proof), _) => proof,
         (None, wait_secs) => {
-            return Step::retry("watchtower proof commitment is not ready", wait_secs as i64);
+            return Step::retry(
+                "watchtower proof commitment is not ready",
+                (wait_secs as i64).max(1),
+            );
         }
     };
     match send_watchtower_challenge_tx(btc, graph, index, proof).await {
@@ -1570,15 +1597,83 @@ async fn watchtower_proof_timeout(row: &Graph, graph: &BitvmGcGraph) -> Result<S
 // ------------------------------------------------------------------ relayer
 
 /// Kickoff confirmed and covered by the SPV client: `proceedWithdraw`.
-async fn proceed_withdraw(deps: &GraphJobDeps, graph: &BitvmGcGraph) -> Result<Step> {
+/// Blocks a relayer job waits for a lagging Goat node to show the withdraw
+/// before it gives up on it.
+const WITHDRAW_LAG_RETRIES: i64 = 30;
+/// Runs (six blocks apart) a finish job waits for `proceedWithdraw` to land.
+const WITHDRAW_PROCEED_RETRIES: i64 = 60;
+
+/// Goat does not show the withdraw: a lagging node (the `InitWithdraw` came
+/// from a finalized block) is waited out; a kickoff without a withdraw is
+/// given up on with an alert. These jobs run once per graph, so an early
+/// `ignore` would leave the Goat side behind for good.
+fn withdraw_missing(
+    deps: &GraphJobDeps,
+    graph_id: Uuid,
+    call: &str,
+    attempts: i64,
+) -> Result<Step> {
+    if attempts < WITHDRAW_LAG_RETRIES {
+        return after_blocks(deps, format!("withdraw is not visible on Goat yet; {call} waits"), 1);
+    }
+    warn!(event = "graph_withdraw", graph_id = %graph_id, call, attempts, "withdraw never appeared on Goat; giving up");
+    alert("pegout_withdraw_missing");
+    Step::ignore(format!("withdraw not on Goat after {attempts} attempts; {call} skipped"))
+}
+
+/// `proceedWithdraw` has not landed: wait for it, but not forever.
+fn withdraw_not_proceeded(
+    deps: &GraphJobDeps,
+    graph_id: Uuid,
+    call: &str,
+    attempts: i64,
+) -> Result<Step> {
+    if attempts < WITHDRAW_PROCEED_RETRIES {
+        return after_blocks(deps, "withdraw is initialized but the kickoff is not posted", 6);
+    }
+    warn!(event = "graph_withdraw", graph_id = %graph_id, call, attempts, "proceedWithdraw never landed; giving up");
+    alert("pegout_withdraw_stuck");
+    Step::ignore(format!("withdraw still Initialized after {attempts} attempts; {call} skipped"))
+}
+
+/// Goat shows a status the chain contradicts: report it, nothing to send.
+fn withdraw_inconsistent(
+    graph_id: Uuid,
+    call: &str,
+    status: WithdrawStatus,
+    settled_by: &str,
+) -> Result<Step> {
+    warn!(event = "graph_withdraw", graph_id = %graph_id, call, status = ?status, "withdraw status on Goat contradicts the {settled_by} on Bitcoin");
+    alert("pegout_withdraw_inconsistent");
+    Step::ignore(format!("withdraw is {status:?} although {settled_by} confirmed; {call} skipped"))
+}
+
+async fn proceed_withdraw(
+    deps: &GraphJobDeps,
+    row: &Graph,
+    graph: &BitvmGcGraph,
+    attempts: i64,
+) -> Result<Step> {
     if !is_relayer() {
         return Step::ignore("not a relayer");
     }
     let btc = &deps.btc_client;
     let graph_id = graph.parameters.graph_id;
     let withdraw_status = deps.goat_client.gateway_get_withdraw_data(&graph_id).await?.status;
-    if withdraw_status != WithdrawStatus::Initialized {
-        return Step::ignore(format!("withdraw is {withdraw_status:?}"));
+    match withdraw_status {
+        WithdrawStatus::Initialized => {}
+        WithdrawStatus::None if closed(row) => {
+            return Step::ignore("graph closed without a withdraw on Goat");
+        }
+        WithdrawStatus::None => {
+            return withdraw_missing(deps, graph_id, "proceedWithdraw", attempts);
+        }
+        WithdrawStatus::Canceled => {
+            // Cancelling needs the committee; a cancelled withdraw is handled by hand.
+            info!(event = "graph_withdraw", graph_id = %graph_id, "withdraw cancelled on Goat; nothing to proceed");
+            return Step::ignore("withdraw is Canceled");
+        }
+        other => return Step::ignore(format!("withdraw is already {other:?}")),
     }
     let kickoff_txid = graph.kickoff.tx().compute_txid();
     let Some(kickoff_tx) = btc.get_tx(&kickoff_txid).await? else {
@@ -1620,7 +1715,7 @@ async fn spv_covered(deps: &GraphJobDeps, txid: &Txid, what: &str) -> Result<Opt
 }
 
 /// Take-1 confirmed: `finishWithdrawHappyPath`.
-async fn finish_happy(deps: &GraphJobDeps, graph: &BitvmGcGraph) -> Result<Step> {
+async fn finish_happy(deps: &GraphJobDeps, graph: &BitvmGcGraph, attempts: i64) -> Result<Step> {
     if !is_relayer() {
         return Step::ignore("not a relayer");
     }
@@ -1630,11 +1725,18 @@ async fn finish_happy(deps: &GraphJobDeps, graph: &BitvmGcGraph) -> Result<Step>
         return after_blocks(deps, "take-1 tx is not available", 1);
     };
     let withdraw_status = deps.goat_client.gateway_get_withdraw_data(&graph_id).await?.status;
-    if withdraw_status == WithdrawStatus::Initialized {
-        return after_blocks(deps, "withdraw is initialized but the kickoff is not posted", 6);
-    }
-    if withdraw_status != WithdrawStatus::Processing {
-        return Step::ignore(format!("withdraw is {withdraw_status:?}"));
+    match withdraw_status {
+        WithdrawStatus::Processing => {}
+        WithdrawStatus::Initialized => {
+            return withdraw_not_proceeded(deps, graph_id, "finishWithdrawHappyPath", attempts);
+        }
+        WithdrawStatus::None => {
+            return withdraw_missing(deps, graph_id, "finishWithdrawHappyPath", attempts);
+        }
+        WithdrawStatus::Complete => return Step::ignore("withdraw already complete on Goat"),
+        other => {
+            return withdraw_inconsistent(graph_id, "finishWithdrawHappyPath", other, "Take-1");
+        }
     }
     if let Some(retry) = spv_covered(deps, &take1_txid, "take-1").await? {
         return Ok(retry);
@@ -1647,7 +1749,7 @@ async fn finish_happy(deps: &GraphJobDeps, graph: &BitvmGcGraph) -> Result<Step>
 }
 
 /// Take-2 confirmed: `finishWithdrawUnhappyPath`.
-async fn finish_unhappy(deps: &GraphJobDeps, graph: &BitvmGcGraph) -> Result<Step> {
+async fn finish_unhappy(deps: &GraphJobDeps, graph: &BitvmGcGraph, attempts: i64) -> Result<Step> {
     if !is_relayer() {
         return Step::ignore("not a relayer");
     }
@@ -1657,11 +1759,18 @@ async fn finish_unhappy(deps: &GraphJobDeps, graph: &BitvmGcGraph) -> Result<Ste
         return after_blocks(deps, "take-2 tx is not available", 1);
     };
     let withdraw_status = deps.goat_client.gateway_get_withdraw_data(&graph_id).await?.status;
-    if withdraw_status == WithdrawStatus::Initialized {
-        return after_blocks(deps, "withdraw is initialized but the kickoff is not posted", 6);
-    }
-    if withdraw_status != WithdrawStatus::Processing {
-        return Step::ignore(format!("withdraw is {withdraw_status:?}"));
+    match withdraw_status {
+        WithdrawStatus::Processing => {}
+        WithdrawStatus::Initialized => {
+            return withdraw_not_proceeded(deps, graph_id, "finishWithdrawUnhappyPath", attempts);
+        }
+        WithdrawStatus::None => {
+            return withdraw_missing(deps, graph_id, "finishWithdrawUnhappyPath", attempts);
+        }
+        WithdrawStatus::Complete => return Step::ignore("withdraw already complete on Goat"),
+        other => {
+            return withdraw_inconsistent(graph_id, "finishWithdrawUnhappyPath", other, "Take-2");
+        }
     }
     if let Some(retry) = spv_covered(deps, &take2_txid, "take-2").await? {
         return Ok(retry);
@@ -1680,6 +1789,7 @@ async fn finish_disproved(
     disprove_type: DisproveTxType,
     index: usize,
     challenge_finish_txid: Txid,
+    attempts: i64,
 ) -> Result<Step> {
     if !is_relayer() {
         return Step::ignore("not a relayer");
@@ -1687,8 +1797,12 @@ async fn finish_disproved(
     let btc = &deps.btc_client;
     let graph_id = graph.parameters.graph_id;
     let withdraw_status = deps.goat_client.gateway_get_withdraw_data(&graph_id).await?.status;
-    if withdraw_status == WithdrawStatus::Disproved {
-        return Step::ignore("already disproved on Goat");
+    match withdraw_status {
+        WithdrawStatus::Disproved => return Step::ignore("already disproved on Goat"),
+        WithdrawStatus::None => {
+            return withdraw_missing(deps, graph_id, "finishWithdrawDisproved", attempts);
+        }
+        _ => {}
     }
     let kickoff_txid = graph.kickoff.tx().compute_txid();
     let take1_txid = graph.take1.tx().compute_txid();
