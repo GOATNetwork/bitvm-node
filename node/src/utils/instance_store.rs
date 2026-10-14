@@ -11,6 +11,8 @@ use bitcoin::{Address, Amount, Network, OutPoint, PublicKey, Txid, XOnlyPublicKe
 use bitvm_lib::types::{BitvmGcInstanceParameters, UserInfo};
 use client::Utxo as ClientUtxo;
 use client::btc_chain::BTCClient;
+use client::goat_chain::GOATClient;
+use client::graphs::graph_query::BridgeInRequestEvent;
 use goat::contexts::base::generate_n_of_n_public_key;
 use goat::transactions::base::Input;
 use indexmap::IndexMap;
@@ -26,6 +28,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 use super::rounds::InstanceProcessDataMap;
+use super::strip_hex_prefix_owned;
 
 pub struct GenerateInstanceParams {
     pub instance_id: Uuid,
@@ -245,4 +248,51 @@ fn gen_user_info(
         user_change_address: user_change_address.require_network(network)?,
         user_refund_address: user_refund_addr.require_network(network)?,
     })
+}
+
+/// Build an instance from BridgeInRequest and Goat pegin data. Input-spend checks
+/// are deferred until the Prepare transaction can be identified.
+pub(crate) async fn generate_instance_from_bridge_in_request_event(
+    btc_client: &BTCClient,
+    goat_client: &GOATClient,
+    event: &BridgeInRequestEvent,
+) -> anyhow::Result<Instance> {
+    let instance_id = Uuid::from_str(&strip_hex_prefix_owned(&event.instance_id))?;
+    let pegin_data = goat_client.gateway_get_pegin_data(&instance_id).await?;
+    let inputs: Vec<Input> = pegin_data
+        .user_inputs
+        .iter()
+        .map(|u| Input {
+            outpoint: OutPoint { txid: Txid::from_byte_array(u.txid), vout: u.vout },
+            amount: Amount::from_sat(u.amount_sats),
+        })
+        .collect();
+
+    let user_change_address: Address<NetworkUnchecked> =
+        Address::from_str(&event.user_change_address)?;
+    let user_refund_addr: Address<NetworkUnchecked> =
+        Address::from_str(&event.user_refund_address)?;
+    let network = get_network();
+    let user_info = UserInfo {
+        depositor_evm_address: EvmAddress::from_str(&event.depositor_address)?.into_array(),
+        txn_fees: event.txn_fees.clone().map(|s| s.parse::<u64>().unwrap_or(0)),
+        inputs,
+        user_xonly_pubkey: XOnlyPublicKey::from_str(&strip_hex_prefix_owned(
+            &event.user_xonly_pubkey,
+        ))?,
+        user_change_address: user_change_address.require_network(network)?,
+        user_refund_address: user_refund_addr.require_network(network)?,
+    };
+    generate_instance(
+        btc_client,
+        GenerateInstanceParams {
+            instance_id,
+            user_info,
+            pegin_amount: Amount::from_sat(event.pegin_amount_sats.parse::<u64>().unwrap_or(0)),
+            pegin_request_tx_hash: event.transaction_hash.clone(),
+            pegin_request_height: event.block_number.parse::<i64>().unwrap_or(0),
+            pegin_timestamp: event.block_timestamp.parse::<i64>().unwrap_or(current_time_secs()),
+        },
+    )
+    .await
 }

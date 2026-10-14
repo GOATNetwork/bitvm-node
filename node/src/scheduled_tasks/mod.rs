@@ -1,12 +1,14 @@
 mod babe_setup_state_cleanup_task;
 mod event_watch_task;
-pub mod instance_maintenance_tasks;
 mod node_maintenance_tasks;
 mod sequencer_set_hash_monitor_task;
 mod spv_maintenance_tasks;
+mod swap_maintenance_tasks;
 
 use crate::aggregates::graph_scan::{abandon_unfinished_setups, scan_graphs_on_chain};
-use crate::aggregates::instance_scan::{scan_answer_windows, scan_instances_on_bitcoin};
+use crate::aggregates::instance_scan::{
+    pegin_request_monitor, scan_answer_windows, scan_instances_on_bitcoin,
+};
 use crate::env::{
     actor_runs_babe_setup_state_cleanup, get_maintenance_run_timeout_secs, get_network,
     get_node_goat_address, get_node_pubkey, is_enable_babe_setup_state_cleanup,
@@ -14,11 +16,9 @@ use crate::env::{
 };
 use crate::metrics_service::MetricsState;
 use crate::scheduled_tasks::babe_setup_state_cleanup_task::babe_setup_state_cleanup_monitor;
-use crate::scheduled_tasks::instance_maintenance_tasks::{
-    pegin_request_monitor, swap_escrow_timeout_monitor,
-};
 use crate::scheduled_tasks::node_maintenance_tasks::node_available_pbtc_update_monitor;
 use crate::scheduled_tasks::spv_maintenance_tasks::spv_header_hash_update;
+use crate::scheduled_tasks::swap_maintenance_tasks::swap_escrow_timeout_monitor;
 use crate::utils::node_p2wsh_address;
 use bitvm_lib::actors::Actor;
 use client::btc_chain::BTCClient;

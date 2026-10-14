@@ -17,16 +17,13 @@ use crate::metrics_service::{EventWatchState, MetricsState};
 use crate::scheduled_tasks::get_timestamp_from_contract_data;
 use crate::utils::evm_swap_utils::{extract_claim_data_from_tx, extract_escrow_data_from_tx};
 use crate::utils::{
-    GenerateInstanceParams, generate_instance, get_bridge_out_global_stats,
+    generate_instance_from_bridge_in_request_event, get_bridge_out_global_stats,
     obsolete_instance_graphs_except, reflect_goat_address, strip_hex_prefix_owned,
 };
 use alloy::primitives::{Address as EvmAddress, U256};
 use alloy::sol_types::SolValue;
-use bitcoin::address::NetworkUnchecked;
-use bitcoin::hashes::Hash;
-use bitcoin::{Address, Amount, OutPoint, Txid};
+use bitcoin::Address;
 use bitvm_lib::actors::Actor;
-use bitvm_lib::types::UserInfo;
 use client::btc_chain::BTCClient;
 use client::goat_chain::{GOATClient, GoatInitConfig};
 use client::graphs::GraphQueryClient;
@@ -38,8 +35,6 @@ use client::graphs::graph_query::{
     WithdrawDisprovedEvent, WithdrawHappyEvent, WithdrawPathsEvent, WithdrawUnhappyEvent,
     get_bridge_out_events_query, get_gateway_events_query,
 };
-use goat::transactions::base::Input;
-use secp256k1::XOnlyPublicKey;
 use std::collections::HashMap;
 use std::ops::AddAssign;
 use std::str::FromStr;
@@ -48,7 +43,7 @@ use std::time::{Duration, Instant};
 use store::localdb::{GraphRuntimeUpdate, LocalDB, NodeQuery, StorageProcessor, SwapEscrowUpdate};
 use store::{
     GoatTxProcessingStatus, GoatTxRecord, GoatTxType, GraphStatus, GraphStatusSource,
-    GraphStatusTransitionOutcome, Instance, InstanceBridgeInStatus, SwapEscrow, SwapEscrowStatus,
+    GraphStatusTransitionOutcome, InstanceBridgeInStatus, SwapEscrow, SwapEscrowStatus,
     WatchContract, WatchContractStatus, normalize_escrow_hash,
 };
 use tokio::time::sleep;
@@ -1019,52 +1014,6 @@ async fn handle_swap_refund_events<'a>(
     Ok(())
 }
 
-/// Build an instance from BridgeInRequest and Goat pegin data. Input-spend checks
-/// are deferred until the Prepare transaction can be identified.
-pub(super) async fn generate_instance_from_bridge_in_request_event(
-    btc_client: &BTCClient,
-    goat_client: &GOATClient,
-    event: &BridgeInRequestEvent,
-) -> anyhow::Result<Instance> {
-    let instance_id = Uuid::from_str(&strip_hex_prefix_owned(&event.instance_id))?;
-    let pegin_data = goat_client.gateway_get_pegin_data(&instance_id).await?;
-    let inputs: Vec<Input> = pegin_data
-        .user_inputs
-        .iter()
-        .map(|u| Input {
-            outpoint: OutPoint { txid: Txid::from_byte_array(u.txid), vout: u.vout },
-            amount: Amount::from_sat(u.amount_sats),
-        })
-        .collect();
-
-    let user_change_address: Address<NetworkUnchecked> =
-        Address::from_str(&event.user_change_address)?;
-    let user_refund_addr: Address<NetworkUnchecked> =
-        Address::from_str(&event.user_refund_address)?;
-    let network = get_network();
-    let user_info = UserInfo {
-        depositor_evm_address: EvmAddress::from_str(&event.depositor_address)?.into_array(),
-        txn_fees: event.txn_fees.clone().map(|s| s.parse::<u64>().unwrap_or(0)),
-        inputs,
-        user_xonly_pubkey: XOnlyPublicKey::from_str(&strip_hex_prefix_owned(
-            &event.user_xonly_pubkey,
-        ))?,
-        user_change_address: user_change_address.require_network(network)?,
-        user_refund_address: user_refund_addr.require_network(network)?,
-    };
-    generate_instance(
-        btc_client,
-        GenerateInstanceParams {
-            instance_id,
-            user_info,
-            pegin_amount: Amount::from_sat(event.pegin_amount_sats.parse::<u64>().unwrap_or(0)),
-            pegin_request_tx_hash: event.transaction_hash.clone(),
-            pegin_request_height: event.block_number.parse::<i64>().unwrap_or(0),
-            pegin_timestamp: event.block_timestamp.parse::<i64>().unwrap_or(current_time_secs()),
-        },
-    )
-    .await
-}
 async fn handle_post_graph_data_events<'a>(
     actor: &Actor,
     storage_processor: &mut StorageProcessor<'a>,

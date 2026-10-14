@@ -5,23 +5,28 @@
 //! for deadline decisions.
 
 use super::common::ScanMarks;
-use super::instance::{AnswerWindow, BtcSnapshot, TxFact};
+use super::instance::{AnswerWindow, BtcSnapshot, PeginRequested, TxFact, pegin_request_event};
 use crate::clock::current_time_secs;
+use crate::engine_bridge::record_event_in;
 use crate::env::{get_instance_maintenance_batch_size, is_enable_committee_instance_key_delete};
-use crate::utils::check_bridge_in_uxto_available_or_self_spent;
+use crate::error::{FailureClass, classify_failure};
+use crate::utils::{
+    check_bridge_in_uxto_available_or_self_spent, generate_instance_from_bridge_in_request_event,
+};
 use bitcoin::Txid;
 use bitvm_lib::actors::Actor;
 use client::Utxo;
 use client::btc_chain::BTCClient;
 use client::goat_chain::GOATClient;
+use client::graphs::graph_query::BridgeInRequestEvent;
 use engine::EngineHandle;
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::{LazyLock, Mutex};
 use store::localdb::{InstanceQuery, LocalDB};
-use store::{Instance, InstanceBridgeInStatus};
-use tracing::{debug, warn};
+use store::{GoatTxProcessingStatus, GoatTxType, Instance, InstanceBridgeInStatus};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 const TASK_KEY_ANSWER_WINDOW: &str = "instance_answer_window_scan";
@@ -359,4 +364,127 @@ pub async fn gather_snapshot(
         "bitcoin snapshot"
     );
     Ok(Some(snapshot))
+}
+
+/// Store pending Goat bridge-in requests. Submit pegin_request events only while
+/// the response window is open; late requests are handled by the answer-window scan.
+pub async fn pegin_request_monitor(
+    local_db: &LocalDB,
+    btc_client: &BTCClient,
+    goat_client: &GOATClient,
+    engine: &EngineHandle,
+) -> anyhow::Result<()> {
+    let tx_records = {
+        let mut storage_processor = local_db.acquire().await?;
+        storage_processor
+            .get_goat_tx_record_by_processing_status(
+                &GoatTxType::BridgeInRequest.to_string(),
+                &GoatTxProcessingStatus::Pending.to_string(),
+            )
+            .await?
+    };
+    if tx_records.is_empty() {
+        return Ok(());
+    }
+    let current_height = goat_client.get_finalized_block_number().await?;
+    let response_window_blocks = goat_client.gateway_get_response_window_blocks().await? as i64;
+    for tx_record in tx_records {
+        let instance_id = tx_record.instance_id;
+        let event = tx_record
+            .extra
+            .as_deref()
+            .map(serde_json::from_str::<BridgeInRequestEvent>)
+            .transpose()?;
+        let is_outside_response_window = tx_record.height + response_window_blocks < current_height;
+        // The row is built from the indexed event and Goat's pegin data; the
+        // request's inputs are checked by the committee's answer job.
+        let instance = match event.as_ref() {
+            Some(event) => {
+                match generate_instance_from_bridge_in_request_event(btc_client, goat_client, event)
+                    .await
+                {
+                    Ok(instance) => Some(instance),
+                    Err(error)
+                        if classify_failure(&error) == FailureClass::Transient
+                            && !is_outside_response_window =>
+                    {
+                        warn!(
+                            event = "pegin_request",
+                            instance_id = %instance_id,
+                            error = %error,
+                            "could not build the instance of a BridgeInRequest; retried next tick"
+                        );
+                        continue;
+                    }
+                    Err(error) => {
+                        // A malformed request, a Goat refusal or a request past its
+                        // window: nothing a retry can change.
+                        warn!(
+                            event = "pegin_request",
+                            instance_id = %instance_id,
+                            outside_window = is_outside_response_window,
+                            error = %error,
+                            "could not build the instance of a BridgeInRequest; request skipped"
+                        );
+                        local_db
+                            .acquire()
+                            .await?
+                            .update_goat_tx_record_processing_status(
+                                &tx_record.graph_id,
+                                &instance_id,
+                                &tx_record.tx_type,
+                                &GoatTxProcessingStatus::Skipped.to_string(),
+                            )
+                            .await?;
+                        continue;
+                    }
+                }
+            }
+            None => None,
+        };
+
+        let mut tx = local_db.start_transaction().await?;
+        if let Some(instance) = instance {
+            if is_outside_response_window {
+                if tx.insert_instance_if_absent(&instance).await? {
+                    info!(
+                        event = "pegin_request",
+                        instance_id = %instance_id,
+                        outcome = "late",
+                        "BridgeInRequest seen after its response window; the answer-window scan decides"
+                    );
+                }
+            } else {
+                // A re-indexed request refreshes its row; a row that moved on is
+                // left alone.
+                tx.upsert_pegin_request_instance(&instance).await?;
+                record_event_in(
+                    &mut tx,
+                    pegin_request_event(
+                        instance_id,
+                        &PeginRequested { tx_hash: tx_record.tx_hash.clone() },
+                    )?,
+                )
+                .await?;
+            }
+        } else {
+            warn!(
+                event = "pegin_request",
+                instance_id = %instance_id,
+                "BridgeInRequest record carries no event; skipped"
+            );
+        }
+        tx.update_goat_tx_record_processing_status(
+            &tx_record.graph_id,
+            &instance_id,
+            &tx_record.tx_type,
+            &GoatTxProcessingStatus::Processed.to_string(),
+        )
+        .await?;
+        tx.commit().await?;
+        if !is_outside_response_window {
+            engine.wake_for(&crate::aggregates::instance::instance_ref(instance_id));
+        }
+    }
+    Ok(())
 }
