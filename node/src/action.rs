@@ -5,7 +5,7 @@
 
 use crate::aggregates::common::inbound_event;
 use crate::clock::current_time_secs;
-use crate::handle::{ControlContext, dispatch_control};
+use crate::control::{ControlContext, dispatch_control};
 use crate::metrics_service::MetricsState;
 use crate::middleware::AllBehaviours;
 use crate::middleware::publisher::MessagePublisher;

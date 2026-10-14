@@ -168,7 +168,7 @@ impl BitvmNodeProcessor {
                 _ = async {
                     crate::action::run_p2p_admission_maintenance(&self.local_db, &self.goat_client)
                         .await;
-                    crate::handle::flush_deferred_node_info_response(&mut publisher).await;
+                    crate::control::flush_deferred_node_info_response(&mut publisher).await;
                 } => {}
             }
         }
