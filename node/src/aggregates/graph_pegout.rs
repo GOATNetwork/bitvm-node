@@ -565,7 +565,7 @@ impl GraphAggregate {
         let Some(row) = row else {
             return Ok(ApplyOutcome::Applied);
         };
-        let failed = super::graph::instance_failed(ctx, row.instance_id).await?;
+        let failed = super::common::instance_failed(ctx, row.instance_id).await?;
         if let Some(target) = decide_status(&scan, failed) {
             let outcome = ctx
                 .storage

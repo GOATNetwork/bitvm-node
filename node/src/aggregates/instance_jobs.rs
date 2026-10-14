@@ -4,15 +4,19 @@
 //! [`InstancePlan`] for outgoing messages and follow-up work. Goat posting and
 //! committee key deletion use their own result handlers.
 
-use super::graph::{InboundMessage, PlannedMessage, graph_ref};
-use super::graph_jobs::signing_nonce_id;
+use super::common::PlannedMessage;
+use super::graph::graph_ref;
 use super::instance::{
     INSTANCE_JOBS, INSTANCE_KIND, InstancePlan, JOB_ANSWER_PEGIN_REQUEST,
     JOB_BROADCAST_PEGIN_CONFIRM, JOB_CONFIRM_INSTANCE, JOB_DELETE_INSTANCE_KEY,
     JOB_INGEST_PEGIN_CONFIRM_NONCE, JOB_INGEST_PEGIN_CONFIRM_PARTIAL_SIG,
     JOB_INGEST_PEGIN_CONFIRM_VOTE, JOB_PEGIN_CONFIRM_SIGN, JOB_PEGIN_CONFIRM_VOTE,
-    JOB_POST_PEGIN_DATA, JOB_START_PEGIN_CONFIRM, KeyDeleteResult, PHASE_CONFIRM, SigningGate,
-    StartGraph, confirm_round_over, signing_gate,
+    JOB_POST_PEGIN_DATA, JOB_START_PEGIN_CONFIRM, KeyDeleteResult, PHASE_CONFIRM, StartGraph,
+    confirm_round_over,
+};
+use super::jobs::{
+    JobDeps, Plan, aggregate_uuid, committee_pubkeys, decode_inbound, ensure_committee_sender,
+    gate_closed, instance_status, local_member, local_operator, plan_outcome, signing_nonce_id,
 };
 use crate::action::{
     GOATMessage, GOATMessageContent, PeginConfirmNonce, PeginConfirmNonceConsensus,
@@ -22,20 +26,18 @@ use crate::env::{
     get_bitvm_key, get_operator_graph_start_cutoff_blocks, is_enable_committee_instance_key_delete,
 };
 use crate::error::{FailureClass, SpecialError, classify_failure};
-use crate::metrics_service::MetricsState;
 use crate::rpc_service::current_time_secs;
 use crate::utils::{
-    CommitteeMembership, avg_block_time_secs, broadcast_tx, committee_instance_keys_envelope_path,
-    endorse_pegin, get_committee_agg_nonce_consensus_for_instance,
-    get_committee_endorse_sigs_for_pegin, get_committee_partial_sig_for_instance,
-    get_committee_partial_sigs_for_instance, get_committee_pub_nonce_for_instance,
-    get_committee_pub_nonces_for_instance, get_graph_by_instance_id_and_operator_pubkey,
-    get_instance_parameters, has_required_presigned_graphs, is_io_not_found_error,
-    local_committee_membership, order_committee_values, read_instance_info_from_goat,
-    read_pegin_request, store_committee_agg_nonce_consensus_for_instance,
-    store_committee_endorse_sig_for_pegin, store_committee_partial_sig_for_instance,
-    store_committee_pub_nonce_for_instance, store_instance_parameters, tx_visible,
-    validate_committee, verify_pegin_endorsement,
+    avg_block_time_secs, broadcast_tx, committee_instance_keys_envelope_path, endorse_pegin,
+    get_committee_agg_nonce_consensus_for_instance, get_committee_endorse_sigs_for_pegin,
+    get_committee_partial_sig_for_instance, get_committee_partial_sigs_for_instance,
+    get_committee_pub_nonce_for_instance, get_committee_pub_nonces_for_instance,
+    get_graph_by_instance_id_and_operator_pubkey, get_instance_parameters,
+    has_required_presigned_graphs, is_io_not_found_error, order_committee_values,
+    read_instance_info_from_goat, read_pegin_request,
+    store_committee_agg_nonce_consensus_for_instance, store_committee_endorse_sig_for_pegin,
+    store_committee_partial_sig_for_instance, store_committee_pub_nonce_for_instance,
+    store_instance_parameters, tx_visible, verify_pegin_endorsement,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
@@ -45,32 +47,21 @@ use bitvm_lib::actors::Actor;
 use bitvm_lib::committee::{
     nonce_aggregation, pegin_confirm_nonce_consensus_hash, verify_pegin_confirm_partial_sig,
 };
-use bitvm_lib::keys::{CommitteeMasterKey, OperatorMasterKey};
+use bitvm_lib::keys::CommitteeMasterKey;
 use bitvm_lib::types::BitvmGcInstanceParameters;
-use client::btc_chain::BTCClient;
-use client::goat_chain::{GOATClient, PeginStatus};
+use client::goat_chain::PeginStatus;
 use engine::{EngineBuilder, JobContext, JobOutcome, JobRunner};
 use goat::transactions::pre_signed::PreSignedTransaction;
 use goat::transactions::pre_signed_musig2::verify_public_nonce;
-use libp2p::PeerId;
 use secp256k1::{Message as SecpMessage, SECP256K1};
 use std::str::FromStr;
 use std::sync::Arc;
 use store::localdb::LocalDB;
 use store::{InstanceBridgeInStatus, SigningAuthorization};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 use uuid::Uuid;
 
-pub struct InstanceJobDeps {
-    pub actor: Actor,
-    pub relayer: bool,
-    pub local_db: LocalDB,
-    pub btc_client: Arc<BTCClient>,
-    pub goat_client: Arc<GOATClient>,
-    pub metrics_state: MetricsState,
-}
-
-pub fn register_instance_jobs(builder: EngineBuilder, deps: Arc<InstanceJobDeps>) -> EngineBuilder {
+pub fn register_instance_jobs(builder: EngineBuilder, deps: Arc<JobDeps>) -> EngineBuilder {
     let runner: Arc<dyn JobRunner> = Arc::new(InstanceJobRunner { deps: deps.clone() });
     let mut builder = builder;
     for action in INSTANCE_JOBS {
@@ -85,34 +76,7 @@ pub fn register_instance_jobs(builder: EngineBuilder, deps: Arc<InstanceJobDeps>
         .job_runner(INSTANCE_KIND, JOB_DELETE_INSTANCE_KEY, Arc::new(DeleteInstanceKeyRunner))
 }
 
-fn job_instance_id(ctx: &JobContext) -> Result<Uuid, JobOutcome> {
-    Uuid::parse_str(&ctx.job.aggregate_id).map_err(|error| {
-        JobOutcome::Failed(format!(
-            "job aggregate id {} is not an instance id: {error}",
-            ctx.job.aggregate_id
-        ))
-    })
-}
-
-/// What one step decided.
-pub enum Step {
-    Plan(Box<InstancePlan>),
-    Retry { reason: String, after_secs: Option<i64> },
-}
-
-impl Step {
-    fn done(plan: InstancePlan) -> Result<Step> {
-        Ok(Step::Plan(Box::new(plan)))
-    }
-
-    fn ignore(note: impl Into<String>) -> Result<Step> {
-        Ok(Step::Plan(Box::new(InstancePlan::noted(note))))
-    }
-
-    fn retry(reason: impl Into<String>, after_secs: i64) -> Result<Step> {
-        Ok(Step::Retry { reason: reason.into(), after_secs: Some(after_secs) })
-    }
-}
+type Step = super::jobs::Step<InstancePlan>;
 
 /// Rejections that need a human: the node's own signing steps, the
 /// relayer's broadcast and the reading of a confirmed peg-in on any, the
@@ -131,13 +95,13 @@ fn fails_on_rejection(action: &str, error: &anyhow::Error) -> bool {
 }
 
 struct InstanceJobRunner {
-    deps: Arc<InstanceJobDeps>,
+    deps: Arc<JobDeps>,
 }
 
 #[async_trait]
 impl JobRunner for InstanceJobRunner {
     async fn run(&self, ctx: JobContext) -> JobOutcome {
-        let instance_id = match job_instance_id(&ctx) {
+        let instance_id = match aggregate_uuid(&ctx, "an instance") {
             Ok(instance_id) => instance_id,
             Err(outcome) => return outcome,
         };
@@ -145,23 +109,14 @@ impl JobRunner for InstanceJobRunner {
         let action = ctx.job.action.clone();
         let attempts = ctx.job.attempts;
         match run_step(&self.deps, &action, instance_id, &params).await {
-            Ok(Step::Plan(plan)) => match plan.encode() {
-                Ok(bytes) => JobOutcome::Done(bytes),
-                Err(error) => JobOutcome::Failed(format!("encode plan: {error}")),
-            },
-            Ok(Step::Retry { reason, after_secs }) => {
-                JobOutcome::Transient { error: reason, retry_after_secs: after_secs }
-            }
+            Ok(step) => step.into_outcome(),
             Err(error) => match classify_failure(&error) {
                 FailureClass::Permanent(reason) if fails_on_rejection(&action, &error) => {
                     JobOutcome::Failed(reason)
                 }
                 FailureClass::Permanent(reason) => {
                     warn!(event = "instance_job", instance_id = %instance_id, action = %action, reason = %reason, "rejected");
-                    match InstancePlan::noted(format!("rejected: {reason}")).encode() {
-                        Ok(bytes) => JobOutcome::Done(bytes),
-                        Err(error) => JobOutcome::Failed(format!("encode plan: {error}")),
-                    }
+                    plan_outcome(&InstancePlan::noted(format!("rejected: {reason}")))
                 }
                 FailureClass::Transient => {
                     JobOutcome::Transient { error: format!("{error:#}"), retry_after_secs: None }
@@ -184,12 +139,7 @@ impl JobRunner for InstanceJobRunner {
 
 const UNKNOWN_FAILURE_ALERT_EVERY: i64 = 20;
 
-async fn run_step(
-    deps: &InstanceJobDeps,
-    action: &str,
-    instance_id: Uuid,
-    params: &[u8],
-) -> Result<Step> {
+async fn run_step(deps: &JobDeps, action: &str, instance_id: Uuid, params: &[u8]) -> Result<Step> {
     match action {
         JOB_ANSWER_PEGIN_REQUEST => answer_pegin_request(deps, instance_id).await,
         JOB_CONFIRM_INSTANCE => confirm_instance(deps, instance_id).await,
@@ -210,64 +160,8 @@ async fn run_step(
 
 // ------------------------------------------------------------------ helpers
 
-async fn instance_status(
-    deps: &InstanceJobDeps,
-    instance_id: Uuid,
-) -> Result<Option<InstanceBridgeInStatus>> {
-    Ok(deps
-        .local_db
-        .acquire()
-        .await?
-        .find_instance(&instance_id)
-        .await?
-        .and_then(|instance| InstanceBridgeInStatus::from_str(&instance.status).ok()))
-}
-
-/// The instance keypair when this node is in the instance's committee on
-/// Goat; `None` means the instance is not this node's to sign for. Only the
-/// node's own steps ask: a value from a member is stored by whoever the
-/// apply let it through to (the members, and a relayer for every round).
-async fn local_member(deps: &InstanceJobDeps, instance_id: Uuid) -> Result<Option<Keypair>> {
-    match local_committee_membership(&deps.goat_client, instance_id).await? {
-        CommitteeMembership::Member(keypair) => Ok(Some(keypair)),
-        CommitteeMembership::NotMember(reason) => {
-            debug!(event = "instance_job", instance_id = %instance_id, reason, "not in this instance's committee");
-            Ok(None)
-        }
-    }
-}
-
-async fn committee_pubkeys(deps: &InstanceJobDeps, instance_id: Uuid) -> Result<Vec<PublicKey>> {
-    deps.goat_client.gateway_get_committee_pubkeys(&instance_id).await
-}
-
-/// The T0 gate for the committee's signing steps: `None` when open.
-async fn gate_closed(deps: &InstanceJobDeps, instance_id: Uuid) -> Result<Option<String>> {
-    Ok(match signing_gate(&deps.local_db, &deps.btc_client, instance_id).await? {
-        SigningGate::Open => None,
-        SigningGate::Closed(reason) => Some(reason),
-    })
-}
-
 fn invalid<T>(message: impl Into<String>) -> Result<T> {
     Err(SpecialError::InvalidPeginData(message.into()).into())
-}
-
-async fn decode_inbound(params: &[u8]) -> Result<(InboundMessage, GOATMessage)> {
-    let inbound = InboundMessage::decode(params).context("decode inbound message")?;
-    let message = GOATMessage::deserialize_message(&inbound.message).await?;
-    Ok((inbound, message))
-}
-
-/// The committee value really comes from the member it names (pubkey and
-/// peer id bound on Goat).
-async fn ensure_committee_sender(
-    deps: &InstanceJobDeps,
-    inbound: &InboundMessage,
-    committee_pubkey: &PublicKey,
-) -> Result<()> {
-    let peer = PeerId::from_str(&inbound.author).context("decode author peer id")?;
-    validate_committee(&deps.goat_client, &peer, inbound.instance_id, committee_pubkey).await
 }
 
 /// A PeginConfirm round message for the committee topic: one outbox row per
@@ -283,10 +177,6 @@ async fn round_message(instance_id: Uuid, content: GOATMessageContent) -> Result
         payload,
         ack_set: None,
     })
-}
-
-fn local_operator_pubkey() -> Result<PublicKey> {
-    Ok(OperatorMasterKey::new(get_bitvm_key()?).master_keypair().public_key().into())
 }
 
 /// Load the committee instance key, creating the envelope on first use. A deleted key is never
@@ -352,7 +242,7 @@ async fn load_or_create_committee_instance_keypair(
 
 /// Answer a pending request with this committee node's instance key.
 /// Skip requests already answered, no longer pending, or with spent inputs.
-async fn answer_pegin_request(deps: &InstanceJobDeps, instance_id: Uuid) -> Result<Step> {
+async fn answer_pegin_request(deps: &JobDeps, instance_id: Uuid) -> Result<Step> {
     if deps.actor != Actor::Committee {
         return Step::ignore("only committee nodes answer");
     }
@@ -385,7 +275,7 @@ async fn answer_pegin_request(deps: &InstanceJobDeps, instance_id: Uuid) -> Resu
 
 /// Local operator policy: no new graph for an instance past `Prepare height +
 /// OPERATOR_GRAPH_START_CUTOFF_BLOCKS`.
-async fn graph_start_blocked(deps: &InstanceJobDeps, instance_id: Uuid) -> Result<Option<String>> {
+async fn graph_start_blocked(deps: &JobDeps, instance_id: Uuid) -> Result<Option<String>> {
     let instance = deps.local_db.acquire().await?.find_instance(&instance_id).await?;
     let Some(instance) = instance else {
         return Ok(None);
@@ -407,7 +297,7 @@ async fn graph_start_blocked(deps: &InstanceJobDeps, instance_id: Uuid) -> Resul
 
 /// Read and store instance parameters after Prepare confirmation.
 /// Operators also prepare a setup session and return its start event.
-async fn confirm_instance(deps: &InstanceJobDeps, instance_id: Uuid) -> Result<Step> {
+async fn confirm_instance(deps: &JobDeps, instance_id: Uuid) -> Result<Step> {
     match instance_status(deps, instance_id).await? {
         Some(status) if status.is_failed() => {
             return Step::ignore(format!("instance is {status}"));
@@ -428,7 +318,7 @@ async fn confirm_instance(deps: &InstanceJobDeps, instance_id: Uuid) -> Result<S
     if deps.actor != Actor::Operator {
         return Step::ignore("instance parameters stored");
     }
-    let operator_pubkey = local_operator_pubkey()?;
+    let (_, operator_pubkey) = local_operator()?;
     let mut plan = InstancePlan::default();
     if let Some(graph) =
         get_graph_by_instance_id_and_operator_pubkey(&deps.local_db, instance_id, &operator_pubkey)
@@ -473,10 +363,7 @@ struct NonceConsensus {
     consensus_hash: [u8; 32],
 }
 
-async fn nonce_consensus(
-    deps: &InstanceJobDeps,
-    instance_id: Uuid,
-) -> Result<Option<NonceConsensus>> {
+async fn nonce_consensus(deps: &JobDeps, instance_id: Uuid) -> Result<Option<NonceConsensus>> {
     let parameters = get_instance_parameters(&deps.local_db, instance_id)
         .await?
         .ok_or_else(|| anyhow!("Instance parameters not found for {instance_id}"))?;
@@ -493,7 +380,7 @@ async fn nonce_consensus(
 
 /// Every member signed the same ordered nonce set (the consensus barrier).
 async fn votes_complete(
-    deps: &InstanceJobDeps,
+    deps: &JobDeps,
     instance_id: Uuid,
     consensus: &NonceConsensus,
 ) -> Result<bool> {
@@ -527,20 +414,20 @@ async fn votes_complete(
     Ok(true)
 }
 
-async fn nonces_complete(deps: &InstanceJobDeps, instance_id: Uuid) -> Result<bool> {
+async fn nonces_complete(deps: &JobDeps, instance_id: Uuid) -> Result<bool> {
     let committee = committee_pubkeys(deps, instance_id).await?.len();
     let nonces = get_committee_pub_nonces_for_instance(&deps.local_db, instance_id).await?.len();
     Ok(committee > 0 && nonces >= committee)
 }
 
-async fn partial_sigs_complete(deps: &InstanceJobDeps, instance_id: Uuid) -> Result<bool> {
+async fn partial_sigs_complete(deps: &JobDeps, instance_id: Uuid) -> Result<bool> {
     let committee = committee_pubkeys(deps, instance_id).await?.len();
     let sigs = get_committee_partial_sigs_for_instance(&deps.local_db, instance_id).await?.len();
     Ok(committee > 0 && sigs >= committee)
 }
 
 /// The relayer aggregates and broadcasts once the last partial signature is in.
-fn then_broadcast(deps: &InstanceJobDeps, plan: &mut InstancePlan) {
+fn then_broadcast(deps: &JobDeps, plan: &mut InstancePlan) {
     if deps.relayer {
         plan.then(JOB_BROADCAST_PEGIN_CONFIRM, Vec::new(), None);
     }
@@ -548,7 +435,7 @@ fn then_broadcast(deps: &InstanceJobDeps, plan: &mut InstancePlan) {
 
 /// Start or resume PeginConfirm after enough graphs are endorsed.
 /// Persist the deterministic nonce before scheduling its delivery.
-async fn start_pegin_confirm(deps: &InstanceJobDeps, instance_id: Uuid) -> Result<Step> {
+async fn start_pegin_confirm(deps: &JobDeps, instance_id: Uuid) -> Result<Step> {
     if deps.actor != Actor::Committee {
         return Step::ignore("not a committee node");
     }
@@ -617,7 +504,7 @@ async fn start_pegin_confirm(deps: &InstanceJobDeps, instance_id: Uuid) -> Resul
 }
 
 async fn ingest_pegin_confirm_nonce(
-    deps: &InstanceJobDeps,
+    deps: &JobDeps,
     instance_id: Uuid,
     params: &[u8],
 ) -> Result<Step> {
@@ -653,7 +540,7 @@ async fn ingest_pegin_confirm_nonce(
 }
 
 /// Sign the agreed nonce transcript once every nonce is in.
-async fn pegin_confirm_vote(deps: &InstanceJobDeps, instance_id: Uuid) -> Result<Step> {
+async fn pegin_confirm_vote(deps: &JobDeps, instance_id: Uuid) -> Result<Step> {
     if let Some(status) = instance_status(deps, instance_id).await?
         && confirm_round_over(status)
     {
@@ -714,7 +601,7 @@ async fn pegin_confirm_vote(deps: &InstanceJobDeps, instance_id: Uuid) -> Result
 }
 
 async fn ingest_pegin_confirm_vote(
-    deps: &InstanceJobDeps,
+    deps: &JobDeps,
     instance_id: Uuid,
     params: &[u8],
 ) -> Result<Step> {
@@ -769,7 +656,7 @@ async fn ingest_pegin_confirm_vote(
 /// The committee's partial signature over the Peg-In-Confirm, with the EVM
 /// endorsement the relayer's `postPeginData` needs. Authorization is written
 /// before signing: the deterministic nonce signs exactly one transcript.
-async fn pegin_confirm_sign(deps: &InstanceJobDeps, instance_id: Uuid) -> Result<Step> {
+async fn pegin_confirm_sign(deps: &JobDeps, instance_id: Uuid) -> Result<Step> {
     if let Some(status) = instance_status(deps, instance_id).await?
         && confirm_round_over(status)
     {
@@ -894,7 +781,7 @@ async fn pegin_confirm_sign(deps: &InstanceJobDeps, instance_id: Uuid) -> Result
 }
 
 async fn ingest_pegin_confirm_partial_sig(
-    deps: &InstanceJobDeps,
+    deps: &JobDeps,
     instance_id: Uuid,
     params: &[u8],
 ) -> Result<Step> {
@@ -986,7 +873,7 @@ async fn ingest_pegin_confirm_partial_sig(
 /// The relayer broadcasts Peg-In-Confirm only before T0 and while no Peg-In-Cancel is
 /// confirmed.
 async fn pegin_confirm_broadcast_blocked(
-    deps: &InstanceJobDeps,
+    deps: &JobDeps,
     instance_id: Uuid,
 ) -> Result<Option<String>> {
     let instance = deps.local_db.acquire().await?.find_instance(&instance_id).await?;
@@ -1010,11 +897,7 @@ async fn pegin_confirm_broadcast_blocked(
 /// (the apply schedules it from the Bitcoin snapshot, with the snapshot's
 /// height as params), so a failed attempt retries only until the next
 /// block's job takes over.
-async fn broadcast_pegin_confirm(
-    deps: &InstanceJobDeps,
-    instance_id: Uuid,
-    params: &[u8],
-) -> Result<Step> {
+async fn broadcast_pegin_confirm(deps: &JobDeps, instance_id: Uuid, params: &[u8]) -> Result<Step> {
     if !deps.relayer {
         return Step::ignore("not a relayer");
     }
@@ -1098,10 +981,7 @@ fn is_permanent_post_rejection(error: &anyhow::Error) -> bool {
 
 /// Submit pegin data after Confirm is confirmed, all committee endorsements are
 /// present and Goat SPV covers it. Graph publishing uses separate Graph jobs.
-pub async fn post_pegin_data(
-    deps: &InstanceJobDeps,
-    instance_id: Uuid,
-) -> anyhow::Result<PostOutcome> {
+pub async fn post_pegin_data(deps: &JobDeps, instance_id: Uuid) -> anyhow::Result<PostOutcome> {
     if !deps.relayer {
         warn!(event = "instance_post", instance_id = %instance_id, outcome = "not_relayer", "post job on a node that is not a relayer");
         return Ok(PostOutcome::Done);
@@ -1169,13 +1049,13 @@ pub async fn post_pegin_data(
 }
 
 struct PostPeginDataRunner {
-    deps: Arc<InstanceJobDeps>,
+    deps: Arc<JobDeps>,
 }
 
 #[async_trait]
 impl JobRunner for PostPeginDataRunner {
     async fn run(&self, ctx: JobContext) -> JobOutcome {
-        let instance_id = match job_instance_id(&ctx) {
+        let instance_id = match aggregate_uuid(&ctx, "an instance") {
             Ok(instance_id) => instance_id,
             Err(outcome) => return outcome,
         };
@@ -1205,7 +1085,7 @@ fn key_delete_done(deleted: bool, detail: impl Into<String>) -> JobOutcome {
 #[async_trait]
 impl JobRunner for DeleteInstanceKeyRunner {
     async fn run(&self, ctx: JobContext) -> JobOutcome {
-        let instance_id = match job_instance_id(&ctx) {
+        let instance_id = match aggregate_uuid(&ctx, "an instance") {
             Ok(instance_id) => instance_id,
             Err(outcome) => return outcome,
         };

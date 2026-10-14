@@ -5,6 +5,7 @@
 //! Each result becomes a `chain_scan` event. Operator nodes also report setups
 //! unfinished at their instance's abandon height.
 
+use super::common::ScanMarks;
 use super::graph::{SetupAbandoned, setup_abandoned_event};
 use super::graph_pegout::{ChainScan, PegoutSignal, Unusable};
 use super::instance::PeginDeadlines;
@@ -47,7 +48,6 @@ const OBSOLETED_SCAN_BATCH: usize = 16;
 /// Every this many heights an Obsoleted graph gets a full scan anyway, so a
 /// dead Pre-Kickoff input is still noticed and recorded for the later slots.
 const OBSOLETED_FULL_SCAN_EVERY: i64 = 16;
-const SCAN_MARKS_LIMIT: usize = 50_000;
 
 const MONITOR_KICKOFF: &str = "kickoff";
 const MONITOR_WATCHTOWER_INIT: &str = "watchtower_init";
@@ -75,10 +75,7 @@ pub struct ChallengeSubStatus {
 
 // ------------------------------------------------------------------- marks
 
-/// `(height, status)` of the last scan recorded per graph: a scan at the same
-/// tip for the same status would repeat the same facts.
-static SCAN_MARKS: LazyLock<Mutex<HashMap<Uuid, (i64, GraphStatus)>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+static SCAN_MARKS: LazyLock<ScanMarks<GraphStatus>> = LazyLock::new(ScanMarks::new);
 
 /// The slot `(operator_pubkey, kickoff_index)` the last tick stopped at, for
 /// the active graphs and for the Obsoleted ones.
@@ -92,19 +89,6 @@ static OBSOLETED_SCAN_CURSOR: LazyLock<Mutex<Option<(String, i64)>>> =
 fn resume_index(slots: &[(String, i64)], cursor: Option<&(String, i64)>) -> usize {
     let Some(cursor) = cursor else { return 0 };
     slots.iter().position(|slot| slot > cursor).unwrap_or(0)
-}
-
-fn already_scanned(graph_id: Uuid, height: i64, status: GraphStatus) -> bool {
-    let marks = SCAN_MARKS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    marks.get(&graph_id).is_some_and(|mark| *mark == (height, status))
-}
-
-fn mark_scanned(graph_id: Uuid, height: i64, status: GraphStatus) {
-    let mut marks = SCAN_MARKS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    if marks.len() >= SCAN_MARKS_LIMIT {
-        marks.clear();
-    }
-    marks.insert(graph_id, (height, status));
 }
 
 /// Lowest slot per operator whose Pre-Kickoff can never confirm. The later
@@ -210,7 +194,7 @@ impl ScanPass<'_> {
             let Ok(status) = GraphStatus::from_str(&row.status) else {
                 continue;
             };
-            if already_scanned(row.graph_id, self.height, status) {
+            if SCAN_MARKS.seen(row.graph_id, self.height, status) {
                 continue;
             }
             scanned += 1;
@@ -218,7 +202,7 @@ impl ScanPass<'_> {
                 match prekickoff_confirmed(self.btc_client, row).await {
                     Ok(true) => {}
                     Ok(false) => {
-                        mark_scanned(row.graph_id, self.height, status);
+                        SCAN_MARKS.mark(row.graph_id, self.height, status);
                         continue;
                     }
                     Err(error) => {
@@ -239,9 +223,9 @@ impl ScanPass<'_> {
             {
                 Ok(Some(scan)) => {
                     self.engine.submit(scan.event(row.graph_id)?).await?;
-                    mark_scanned(row.graph_id, self.height, status);
+                    SCAN_MARKS.mark(row.graph_id, self.height, status);
                 }
-                Ok(None) => mark_scanned(row.graph_id, self.height, status),
+                Ok(None) => SCAN_MARKS.mark(row.graph_id, self.height, status),
                 Err(error) => warn!(
                     event = "graph_scan",
                     graph_id = %row.graph_id,

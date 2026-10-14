@@ -6,7 +6,7 @@
 
 use super::graph::{GraphPlan, graph_pulled_event, slot_ref};
 use super::graph_fetch::fetch_and_store_graph;
-use super::graph_jobs::{GraphJobDeps, Step};
+use super::graph_jobs::Step;
 use super::graph_pegout::{
     JOB_CHALLENGE_ACK, JOB_CHALLENGE_KICKOFF, JOB_CHALLENGE_NACK, JOB_COMMIT_PUBIN,
     JOB_COMMIT_TIMEOUT, JOB_DISPROVE, JOB_ENFORCE_PREVIOUS_SLOT, JOB_FINISH_DISPROVED,
@@ -22,6 +22,7 @@ use super::graph_setup::{
     selected_candidate_for_graph_index, validate_verifier_slot,
 };
 use super::instance::{PeginDeadlines, TxFact};
+use super::jobs::{JobDeps, Plan, local_operator};
 use crate::engine_bridge::submit_event;
 use crate::env::{get_bitvm_key, get_soldering_proof_payload_store_path};
 use crate::metrics_service::node_metrics_state;
@@ -38,7 +39,7 @@ use bitvm_lib::babe_adapter::{
     expand_compact_soldering_proof_payload, recover_operator_proof_from_assert_witness,
     recover_real_wrongly_challenged_witness,
 };
-use bitvm_lib::keys::{OperatorMasterKey, VerifierMasterKey, WatchtowerMasterKey};
+use bitvm_lib::keys::{VerifierMasterKey, WatchtowerMasterKey};
 use bitvm_lib::operator::*;
 use bitvm_lib::types::BitvmGcGraph;
 use bitvm_lib::verifier::*;
@@ -53,7 +54,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 pub(super) async fn run_pegout_step(
-    deps: &GraphJobDeps,
+    deps: &JobDeps,
     action: &str,
     graph_id: Uuid,
     params: &[u8],
@@ -73,7 +74,7 @@ pub(super) async fn run_pegout_step(
 }
 
 async fn settlement_step(
-    deps: &GraphJobDeps,
+    deps: &JobDeps,
     action: &str,
     row: &Graph,
     graph: BitvmGcGraph,
@@ -162,12 +163,12 @@ fn closed(row: &Graph) -> bool {
     status_of(row).is_some_and(|status| status.is_closed())
 }
 
-fn block_secs(deps: &GraphJobDeps) -> i64 {
+fn block_secs(deps: &JobDeps) -> i64 {
     avg_block_time_secs(deps.btc_client.network()) as i64
 }
 
 /// Retry after `blocks` blocks (at least one).
-fn after_blocks(deps: &GraphJobDeps, reason: impl Into<String>, blocks: u64) -> Result<Step> {
+fn after_blocks(deps: &JobDeps, reason: impl Into<String>, blocks: u64) -> Result<Step> {
     Step::retry(reason, block_secs(deps) * blocks.max(1) as i64)
 }
 
@@ -189,7 +190,7 @@ async fn spend_of(btc: &client::btc_chain::BTCClient, txid: &Txid, vout: u64) ->
 
 /// The step a connector's spend settles, `None` while it is unspent: a
 /// confirmed spend ends the job, a pending one is looked at again.
-fn settled_by(deps: &GraphJobDeps, spend: &Spend, what: &str) -> Option<Result<Step>> {
+fn settled_by(deps: &JobDeps, spend: &Spend, what: &str) -> Option<Result<Step>> {
     match spend {
         Spend::Unspent => None,
         Spend::Confirmed(by) => Some(Step::ignore(format!("{what} already spent by {by}"))),
@@ -216,7 +217,7 @@ async fn presence_of(btc: &client::btc_chain::BTCClient, txid: &Txid) -> Result<
 }
 
 /// The step an own transaction's presence settles, `None` while it is absent.
-fn present(deps: &GraphJobDeps, presence: &Presence, what: &str) -> Option<Result<Step>> {
+fn present(deps: &JobDeps, presence: &Presence, what: &str) -> Option<Result<Step>> {
     match presence {
         Presence::Absent => None,
         Presence::Confirmed => Some(Step::ignore(format!("{what} is confirmed"))),
@@ -226,7 +227,7 @@ fn present(deps: &GraphJobDeps, presence: &Presence, what: &str) -> Option<Resul
 
 /// After a broadcast: look again next block, so a transaction that fell out
 /// of the mempool is sent again and a confirmed one ends the job.
-fn broadcast_pending(deps: &GraphJobDeps, what: &str) -> Result<Step> {
+fn broadcast_pending(deps: &JobDeps, what: &str) -> Result<Step> {
     after_blocks(deps, format!("{what} broadcast; waiting for its confirmation"), 1)
 }
 
@@ -236,17 +237,11 @@ fn alert(reason: &str) {
     }
 }
 
-fn local_operator() -> Result<(OperatorMasterKey, PublicKey)> {
-    let master = OperatorMasterKey::new(get_bitvm_key()?);
-    let pubkey = master.master_keypair().public_key().into();
-    Ok((master, pubkey))
-}
-
 /// The step that ends an operator's kickoff job unless its withdraw is live
 /// on Goat. `None` is a lagging Goat node (the `InitWithdraw` came from a
 /// finalized block), so it is looked at again; any other status is over.
 async fn step_unless_withdraw_live(
-    deps: &GraphJobDeps,
+    deps: &JobDeps,
     graph_id: Uuid,
     tx_hash: &str,
 ) -> Result<Option<Step>> {
@@ -263,7 +258,7 @@ async fn step_unless_withdraw_live(
 
 /// Pre-Kickoff + Kickoff of the operator's graph; the apply queued it once
 /// the previous slot settled.
-async fn kickoff(deps: &GraphJobDeps, graph_id: Uuid, params: &[u8]) -> Result<Step> {
+async fn kickoff(deps: &JobDeps, graph_id: Uuid, params: &[u8]) -> Result<Step> {
     let params: KickoffParams = serde_json::from_slice(params).context("decode kickoff params")?;
     let Some((_, mut graph)) = load_graph(&deps.local_db, graph_id).await? else {
         return Step::ignore("graph not stored locally");
@@ -309,7 +304,7 @@ async fn kickoff(deps: &GraphJobDeps, graph_id: Uuid, params: &[u8]) -> Result<S
 
 /// Settle earlier operator slots in order: skip eligible slots, fetch missing
 /// definitions and wait for unresolved slots. Completion unblocks kickoff.
-async fn settle_predecessors(deps: &GraphJobDeps, graph_id: Uuid, params: &[u8]) -> Result<Step> {
+async fn settle_predecessors(deps: &JobDeps, graph_id: Uuid, params: &[u8]) -> Result<Step> {
     let params: KickoffParams = serde_json::from_slice(params).context("decode kickoff params")?;
     let Some(row) = deps.local_db.acquire().await?.find_graph(&graph_id).await? else {
         return Step::ignore("graph not stored locally");
@@ -424,7 +419,7 @@ struct ChainClock {
 }
 
 async fn slot_facts(
-    deps: &GraphJobDeps,
+    deps: &JobDeps,
     operator_pubkey: &str,
     slot: u64,
     chain: &ChainClock,
@@ -508,7 +503,7 @@ async fn slot_facts(
 /// settled, or skipped. Force-Skip it if Kickoff-(N−1) never appeared,
 /// Quick-Challenge it if it is still unsettled. The previous definition comes
 /// from the store or, if missing, from the relayer / committee.
-async fn enforce_previous_slot(deps: &GraphJobDeps, graph: &BitvmGcGraph) -> Result<Step> {
+async fn enforce_previous_slot(deps: &JobDeps, graph: &BitvmGcGraph) -> Result<Step> {
     let graph_nonce = graph.parameters.graph_nonce;
     if graph_nonce == 0 {
         return Step::ignore("first slot of the operator");
@@ -597,7 +592,7 @@ async fn enforce_previous_slot(deps: &GraphJobDeps, graph: &BitvmGcGraph) -> Res
 }
 
 /// Kickoff confirmed: challenge it when Goat shows no live withdraw.
-async fn challenge_kickoff(deps: &GraphJobDeps, graph: &BitvmGcGraph) -> Result<Step> {
+async fn challenge_kickoff(deps: &JobDeps, graph: &BitvmGcGraph) -> Result<Step> {
     let btc = &deps.btc_client;
     let graph_id = graph.parameters.graph_id;
     let kickoff_txid = graph.kickoff.tx().compute_txid();
@@ -657,7 +652,7 @@ fn local_verifier_pubkey() -> Result<PublicKey> {
 
 /// An ACK-Connector unspent past `T5` after a watchtower challenge: NACK.
 async fn challenge_nack(
-    deps: &GraphJobDeps,
+    deps: &JobDeps,
     row: &Graph,
     graph: &BitvmGcGraph,
     watchtower_index: usize,
@@ -714,7 +709,7 @@ async fn challenge_nack(
 }
 
 /// Commit-pubin missing past `T6`: Operator-Commit-Timeout.
-async fn commit_timeout(deps: &GraphJobDeps, row: &Graph, graph: &BitvmGcGraph) -> Result<Step> {
+async fn commit_timeout(deps: &JobDeps, row: &Graph, graph: &BitvmGcGraph) -> Result<Step> {
     let btc = &deps.btc_client;
     let wci_txid = graph.watchtower_challenge_init.tx().compute_txid();
     let watchtower_num = graph.parameters.watchtower_pubkeys.len();
@@ -738,11 +733,7 @@ async fn commit_timeout(deps: &GraphJobDeps, row: &Graph, graph: &BitvmGcGraph) 
 
 /// Prover-Assert confirmed: Pubin-Disprove if the committed pubin and the
 /// asserted one disagree, otherwise Verifier-Assert unless the proof is valid.
-async fn verifier_assert(
-    deps: &GraphJobDeps,
-    graph: &BitvmGcGraph,
-    assert_txid: Txid,
-) -> Result<Step> {
+async fn verifier_assert(deps: &JobDeps, graph: &BitvmGcGraph, assert_txid: Txid) -> Result<Step> {
     let btc = &deps.btc_client;
     let instance_id = graph.parameters.instance_parameters.instance_id;
     let graph_id = graph.parameters.graph_id;
@@ -985,7 +976,7 @@ pub async fn broadcast_verifier_challenge_assert_tx(
 
 /// A Verifier-Assert unanswered past `T2`: Disprove-X by its own verifier.
 async fn disprove(
-    deps: &GraphJobDeps,
+    deps: &JobDeps,
     graph: &BitvmGcGraph,
     challenge_assert_txid: Txid,
     verifier_index: usize,
@@ -1028,7 +1019,7 @@ async fn disprove(
 
 /// Challenge on Connector-A: Watchtower-Challenge-Init.
 async fn watchtower_challenge_init(
-    deps: &GraphJobDeps,
+    deps: &JobDeps,
     row: &Graph,
     mut graph: BitvmGcGraph,
     challenge_txid: Txid,
@@ -1065,7 +1056,7 @@ async fn watchtower_challenge_init(
 
 /// A watchtower challenged: reveal the ACK preimage.
 async fn challenge_ack(
-    deps: &GraphJobDeps,
+    deps: &JobDeps,
     row: &Graph,
     graph: &BitvmGcGraph,
     watchtower_index: usize,
@@ -1126,11 +1117,7 @@ async fn challenge_ack(
 }
 
 /// Watchtowers silent past `T4`: their timeouts.
-async fn watchtower_timeout(
-    deps: &GraphJobDeps,
-    row: &Graph,
-    mut graph: BitvmGcGraph,
-) -> Result<Step> {
+async fn watchtower_timeout(deps: &JobDeps, row: &Graph, mut graph: BitvmGcGraph) -> Result<Step> {
     let btc = &deps.btc_client;
     let watchtower_num = validate_watchtower_branches(&graph)?;
     let wci_txid = graph.watchtower_challenge_init.tx().compute_txid();
@@ -1180,7 +1167,7 @@ async fn watchtower_timeout(
 }
 
 /// Every watchtower branch resolved: Operator-Commit-Pubin.
-async fn commit_pubin(deps: &GraphJobDeps, graph: &BitvmGcGraph) -> Result<Step> {
+async fn commit_pubin(deps: &JobDeps, graph: &BitvmGcGraph) -> Result<Step> {
     let btc = &deps.btc_client;
     let graph_id = graph.parameters.graph_id;
     let wci = graph.watchtower_challenge_init.tx().compute_txid();
@@ -1240,7 +1227,7 @@ async fn commit_pubin(deps: &GraphJobDeps, graph: &BitvmGcGraph) -> Result<Step>
 }
 
 /// Watchtower flow over and pubin committed: prove and assert.
-async fn prover_assert(deps: &GraphJobDeps, mut graph: BitvmGcGraph) -> Result<Step> {
+async fn prover_assert(deps: &JobDeps, mut graph: BitvmGcGraph) -> Result<Step> {
     let btc = &deps.btc_client;
     let instance_id = graph.parameters.instance_parameters.instance_id;
     let graph_id = graph.parameters.graph_id;
@@ -1331,7 +1318,7 @@ fn recover_challenge_assert_witness(
 
 /// A verifier asserted against the operator's proof: Wrongly-Challenged.
 async fn wrongly_challenged(
-    deps: &GraphJobDeps,
+    deps: &JobDeps,
     graph: &BitvmGcGraph,
     challenge_assert_txid: Txid,
     verifier_index: usize,
@@ -1471,7 +1458,7 @@ async fn wrongly_challenged(
 const WRONGLY_CHALLENGED_OP_RETURN_DATA: &[u8] = b"wrongly-challenged";
 
 /// No challenge for `T1` after the kickoff: Take-1.
-async fn take1(deps: &GraphJobDeps, row: &Graph, mut graph: BitvmGcGraph) -> Result<Step> {
+async fn take1(deps: &JobDeps, row: &Graph, mut graph: BitvmGcGraph) -> Result<Step> {
     let btc = &deps.btc_client;
     let kickoff_txid = graph.kickoff.tx().compute_txid();
     let connector_a = output_topology::kickoff::connector_a() as u64;
@@ -1501,7 +1488,7 @@ async fn take1(deps: &GraphJobDeps, row: &Graph, mut graph: BitvmGcGraph) -> Res
 }
 
 /// Challenge answered and `T3` / `T7` elapsed: Take-2.
-async fn take2(deps: &GraphJobDeps, row: &Graph, mut graph: BitvmGcGraph) -> Result<Step> {
+async fn take2(deps: &JobDeps, row: &Graph, mut graph: BitvmGcGraph) -> Result<Step> {
     let btc = &deps.btc_client;
     // Take-2 spends Connector-0, Connector-D, Connector-F and the Guardian
     // Connector: recheck every input before signing.
@@ -1549,11 +1536,7 @@ fn watchtower_index(graph: &BitvmGcGraph) -> Result<Option<usize>> {
 }
 
 /// Watchtower-Challenge-Init confirmed: challenge with the watchtower proof.
-async fn watchtower_challenge(
-    deps: &GraphJobDeps,
-    row: &Graph,
-    graph: &BitvmGcGraph,
-) -> Result<Step> {
+async fn watchtower_challenge(deps: &JobDeps, row: &Graph, graph: &BitvmGcGraph) -> Result<Step> {
     let btc = &deps.btc_client;
     let Some(index) = watchtower_index(graph)? else {
         return Step::ignore("not a watchtower of this graph");
@@ -1617,12 +1600,7 @@ const WITHDRAW_PROCEED_RETRIES: i64 = 60;
 /// from a finalized block) is waited out; a kickoff without a withdraw is
 /// given up on with an alert. These jobs run once per graph, so an early
 /// `ignore` would leave the Goat side behind for good.
-fn withdraw_missing(
-    deps: &GraphJobDeps,
-    graph_id: Uuid,
-    call: &str,
-    attempts: i64,
-) -> Result<Step> {
+fn withdraw_missing(deps: &JobDeps, graph_id: Uuid, call: &str, attempts: i64) -> Result<Step> {
     if attempts < WITHDRAW_LAG_RETRIES {
         return after_blocks(deps, format!("withdraw is not visible on Goat yet; {call} waits"), 1);
     }
@@ -1633,7 +1611,7 @@ fn withdraw_missing(
 
 /// `proceedWithdraw` has not landed: wait for it, but not forever.
 fn withdraw_not_proceeded(
-    deps: &GraphJobDeps,
+    deps: &JobDeps,
     graph_id: Uuid,
     call: &str,
     attempts: i64,
@@ -1659,7 +1637,7 @@ fn withdraw_inconsistent(
 }
 
 async fn proceed_withdraw(
-    deps: &GraphJobDeps,
+    deps: &JobDeps,
     row: &Graph,
     graph: &BitvmGcGraph,
     attempts: i64,
@@ -1707,7 +1685,7 @@ async fn proceed_withdraw(
 }
 
 /// The SPV height covering `txid`, or a retry while it does not.
-async fn spv_covered(deps: &GraphJobDeps, txid: &Txid, what: &str) -> Result<Option<Step>> {
+async fn spv_covered(deps: &JobDeps, txid: &Txid, what: &str) -> Result<Option<Step>> {
     let Some(height) = deps.btc_client.get_tx_status(txid).await?.block_height else {
         return after_blocks(deps, format!("{what} is not confirmed yet"), 1).map(Some);
     };
@@ -1725,7 +1703,7 @@ async fn spv_covered(deps: &GraphJobDeps, txid: &Txid, what: &str) -> Result<Opt
 }
 
 /// Take-1 confirmed: `finishWithdrawHappyPath`.
-async fn finish_happy(deps: &GraphJobDeps, graph: &BitvmGcGraph, attempts: i64) -> Result<Step> {
+async fn finish_happy(deps: &JobDeps, graph: &BitvmGcGraph, attempts: i64) -> Result<Step> {
     if !deps.relayer {
         return Step::ignore("not a relayer");
     }
@@ -1759,7 +1737,7 @@ async fn finish_happy(deps: &GraphJobDeps, graph: &BitvmGcGraph, attempts: i64) 
 }
 
 /// Take-2 confirmed: `finishWithdrawUnhappyPath`.
-async fn finish_unhappy(deps: &GraphJobDeps, graph: &BitvmGcGraph, attempts: i64) -> Result<Step> {
+async fn finish_unhappy(deps: &JobDeps, graph: &BitvmGcGraph, attempts: i64) -> Result<Step> {
     if !deps.relayer {
         return Step::ignore("not a relayer");
     }
@@ -1794,7 +1772,7 @@ async fn finish_unhappy(deps: &GraphJobDeps, graph: &BitvmGcGraph, attempts: i64
 
 /// A challenge succeeded on Bitcoin: `finishWithdrawDisproved`.
 async fn finish_disproved(
-    deps: &GraphJobDeps,
+    deps: &JobDeps,
     graph: &BitvmGcGraph,
     disprove_type: DisproveTxType,
     index: usize,

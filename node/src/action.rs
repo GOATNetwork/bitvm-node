@@ -3,7 +3,7 @@
 //! message into the engine inbox or the control queue, and the single
 //! publish function every sender goes through.
 
-use crate::aggregates::graph::inbound_event;
+use crate::aggregates::common::inbound_event;
 use crate::handle::{ControlContext, dispatch_control};
 use crate::metrics_service::MetricsState;
 use crate::middleware::AllBehaviours;
@@ -537,14 +537,7 @@ pub async fn handle_inbound_p2p_message(
         InboundVerdict::Enqueue { message: decoded, class } => {
             let author = from_peer_id.to_string();
             let event =
-                match inbound_event(&actor, &author, &crate::env::get_peer_id(), &decoded, message)
-                {
-                    Ok(Some(event)) => Ok(Some(event)),
-                    Ok(None) => crate::aggregates::instance::inbound_event(
-                        &actor, &author, &decoded, message,
-                    ),
-                    Err(error) => Err(error),
-                };
+                inbound_event(&actor, &author, &crate::env::get_peer_id(), &decoded, message);
             let recorded = match event {
                 Ok(Some(event)) => {
                     record_engine_message(

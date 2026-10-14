@@ -4,16 +4,17 @@
 //! They return a [`GraphPlan`] for outgoing messages and follow-up work;
 //! temporary failures are retried.
 
+use super::common::{PlannedMessage, delivery_id};
 use super::graph::{
-    ALL_JOBS, GRAPH_KIND, GraphPlan, GraphStateUpdate, InboundMessage, JOB_BUILD_GRAPH,
-    JOB_COMMITTEE_ENDORSE, JOB_COMMITTEE_INGEST_GRAPH, JOB_COMMITTEE_NONCES, JOB_COMMITTEE_PRESIGN,
-    JOB_COMMITTEE_VOTE, JOB_FETCH_GRAPH, JOB_FINALIZE_GRAPH, JOB_FREEZE_CANDIDATES,
-    JOB_INGEST_ENDORSEMENT, JOB_INGEST_FINALIZED, JOB_INGEST_GEN_CIRCUITS, JOB_INGEST_NONCES,
-    JOB_INGEST_PRESIGN, JOB_INGEST_SOLDERING_PROOF, JOB_INGEST_VERIFIER_ENDORSEMENT,
-    JOB_INGEST_VOTE, JOB_OPERATOR_INIT, JOB_POST_GRAPH_DATA, JOB_SEAL_PROOFS, JOB_VERIFIER_SETUP,
+    ALL_JOBS, GRAPH_KIND, GraphPlan, GraphStateUpdate, JOB_BUILD_GRAPH, JOB_COMMITTEE_ENDORSE,
+    JOB_COMMITTEE_INGEST_GRAPH, JOB_COMMITTEE_NONCES, JOB_COMMITTEE_PRESIGN, JOB_COMMITTEE_VOTE,
+    JOB_FETCH_GRAPH, JOB_FINALIZE_GRAPH, JOB_FREEZE_CANDIDATES, JOB_INGEST_ENDORSEMENT,
+    JOB_INGEST_FINALIZED, JOB_INGEST_GEN_CIRCUITS, JOB_INGEST_NONCES, JOB_INGEST_PRESIGN,
+    JOB_INGEST_SOLDERING_PROOF, JOB_INGEST_VERIFIER_ENDORSEMENT, JOB_INGEST_VOTE,
+    JOB_OPERATOR_INIT, JOB_POST_GRAPH_DATA, JOB_SEAL_PROOFS, JOB_VERIFIER_SETUP,
     JOB_VERIFIER_SOLDER, JOB_VERIFIER_VALIDATE_GRAPH, OperatorStart, PHASE_COLLECT, PHASE_DELIVER,
-    PHASE_ENDORSE, PHASE_SETUP, PHASE_SIGNING, PlannedMessage, delivery_id, graph_pulled_event,
-    graph_ref, outbox_id, retired, slot_ref,
+    PHASE_ENDORSE, PHASE_SETUP, PHASE_SIGNING, graph_pulled_event, graph_ref, outbox_id, retired,
+    slot_ref,
 };
 use super::graph_fetch::{GraphLookup, fetch_and_store_graph};
 use super::graph_pegout::PEGOUT_JOBS;
@@ -25,7 +26,11 @@ use super::graph_setup::{
     record_candidate_gc_data, seal_selected_verifiers, selected_candidate_for_graph_index,
     selected_gc_data, validate_verifier_slot,
 };
-use super::instance::{SigningGate, signing_gate};
+use super::jobs::{
+    JobDeps, Plan, aggregate_uuid, author_peer, committee_pubkeys, decode_inbound,
+    ensure_committee_sender, gate_closed, instance_status, local_member, local_operator,
+    plan_outcome, signing_nonce_id,
+};
 use crate::action::{
     AggNonceConsensus, CommitteePresign, CreateGraph, CutCircuits, EndorseGraph, GOATMessage,
     GOATMessageContent, GenCircuits, GraphFinalize, NonceGeneration,
@@ -37,14 +42,12 @@ use crate::env::{
     get_soldering_proof_payload_store_path, get_verifier_candidate_collection_window_secs,
 };
 use crate::error::{FailureClass, SpecialError, classify_failure};
-use crate::metrics_service::MetricsState;
-use crate::middleware::publisher::NetworkPublisher;
 use crate::rpc_service::current_time_secs;
 use crate::soldering_payload_store::{
     read_soldering_proof_store_payload, soldering_proof_payload_store_path,
 };
 use crate::utils::{
-    CommitteeMembership, OperatorBabeSetupState, OperatorStakeStatus, VerifierBabeSetupState,
+    OperatorBabeSetupState, OperatorStakeStatus, VerifierBabeSetupState,
     build_genesis_prekickoff_tx, build_graph_params, build_prekickoff_params,
     derive_operator_static_input, endorse_graph, endorse_graph_params,
     get_committee_agg_nonce_consensus_for_graph, get_committee_endorsements_for_graph,
@@ -52,69 +55,50 @@ use crate::utils::{
     get_committee_partial_sigs_for_graph_member, get_committee_pub_nonces_for_graph,
     get_current_prekickoff_tx, get_graph, get_guest_constant_value, get_instance_parameters,
     get_verifier_graph_params_endorsements_for_graph, load_babe_setup_state,
-    local_committee_membership, mark_graph_as_endorsed, min_required_verifier,
-    operator_stake_status, order_committee_values, pending_graph_belongs_to_operator,
-    refresh_graph, save_babe_setup_state, save_soldering_proof_payload, sign_verifier_graph_params,
+    mark_graph_as_endorsed, min_required_verifier, operator_stake_status, order_committee_values,
+    pending_graph_belongs_to_operator, refresh_graph, save_babe_setup_state,
+    save_soldering_proof_payload, sign_verifier_graph_params,
     store_committee_agg_nonce_consensus_for_graph, store_committee_endorsement_for_graph,
     store_committee_endorsements_for_graph, store_committee_partial_sigs_for_graph,
     store_committee_pub_nonces_for_graph, store_finalized_graph_if_needed,
     store_operator_presigned_graph, store_verifier_graph_params_endorsement,
-    update_babe_setup_state, validate_committee, validate_committee_with_evm_address,
-    validate_finalized_graph, validate_init_graph, validate_init_graph_base,
-    validate_verifier_graph_params_endorsements, verify_graph_endorsement,
-    verify_graph_params_endorsement, verify_verifier_graph_params_endorsement,
+    update_babe_setup_state, validate_committee_with_evm_address, validate_finalized_graph,
+    validate_init_graph, validate_init_graph_base, validate_verifier_graph_params_endorsements,
+    verify_graph_endorsement, verify_graph_params_endorsement,
+    verify_verifier_graph_params_endorsement,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use bitcoin::hashes::Hash;
-use bitcoin::key::Keypair;
 use bitcoin::{PublicKey, XOnlyPublicKey};
 use bitvm_lib::actors::Actor;
 use bitvm_lib::babe_adapter::{
-    BABE_M_CC, BABE_N_CC, BabeBundleBuilder, build_real_setup_package,
-    expand_compact_soldering_proof_payload, extract_gc_circuit_data, open_real_setup_and_solder,
-    verify_real_setup,
+    BABE_M_CC, BABE_N_CC, build_real_setup_package, expand_compact_soldering_proof_payload,
+    extract_gc_circuit_data, open_real_setup_and_solder, verify_real_setup,
 };
 use bitvm_lib::committee::{
     committee_nonce_consensus_hash, committee_pre_sign, nonces_aggregation,
     push_committee_pre_signatures, signature_aggregation, verify_graph_committee_partial_sigs,
     verify_nonce_signatures,
 };
-use bitvm_lib::keys::{CommitteeMasterKey, OperatorMasterKey, VerifierMasterKey};
+use bitvm_lib::keys::{CommitteeMasterKey, VerifierMasterKey};
 use bitvm_lib::operator::{
     generate_bitvm_graph, operator_pre_sign, verify_graph_operator_pre_signatures,
 };
 use bitvm_lib::types::{BitvmGcGraph, SimplifiedBitvmGcGraph};
-use client::btc_chain::BTCClient;
-use client::goat_chain::{GOATClient, PeginStatus};
-use client::http_client::async_client::HttpAsyncClient;
+use client::goat_chain::PeginStatus;
 use engine::{EngineBuilder, JobContext, JobOutcome, JobRunner};
 use goat::transactions::pre_signed::PreSignedTransaction;
 use libp2p::PeerId;
 use secp256k1::{Message as SecpMessage, SECP256K1};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::str::FromStr;
 use std::sync::Arc;
-use store::localdb::LocalDB;
-use store::{GraphStatus, InstanceBridgeInStatus, SigningAuthorization};
-use tracing::{debug, info, warn};
+use store::{GraphStatus, SigningAuthorization};
+use tracing::{info, warn};
 use uuid::Uuid;
 
-pub struct GraphJobDeps {
-    pub relayer: bool,
-    pub local_db: LocalDB,
-    pub btc_client: Arc<BTCClient>,
-    pub goat_client: Arc<GOATClient>,
-    /// Proof builder requests of the peg-out jobs.
-    pub http_client: Arc<HttpAsyncClient>,
-    pub soldering_builder: Option<Arc<BabeBundleBuilder>>,
-    pub metrics_state: MetricsState,
-    pub publisher: NetworkPublisher,
-    pub actor: Actor,
-}
-
-pub fn register_graph_jobs(builder: EngineBuilder, deps: Arc<GraphJobDeps>) -> EngineBuilder {
+pub fn register_graph_jobs(builder: EngineBuilder, deps: Arc<JobDeps>) -> EngineBuilder {
     let runner: Arc<dyn JobRunner> = Arc::new(GraphJobRunner { deps });
     let mut builder = builder;
     for action in ALL_JOBS.iter().chain(PEGOUT_JOBS) {
@@ -123,71 +107,36 @@ pub fn register_graph_jobs(builder: EngineBuilder, deps: Arc<GraphJobDeps>) -> E
     builder
 }
 
-/// What one step decided.
-pub enum Step {
-    Plan(Box<GraphPlan>),
-    Retry { reason: String, after_secs: Option<i64> },
-}
-
-impl Step {
-    pub(super) fn done(plan: GraphPlan) -> Result<Step> {
-        Ok(Step::Plan(Box::new(plan)))
-    }
-
-    pub(super) fn ignore(note: impl Into<String>) -> Result<Step> {
-        Ok(Step::Plan(Box::new(GraphPlan::noted(note))))
-    }
-
-    pub(super) fn retry(reason: impl Into<String>, after_secs: i64) -> Result<Step> {
-        Ok(Step::Retry { reason: reason.into(), after_secs: Some(after_secs) })
-    }
-}
+pub(super) type Step = super::jobs::Step<GraphPlan>;
 
 struct GraphJobRunner {
-    deps: Arc<GraphJobDeps>,
+    deps: Arc<JobDeps>,
 }
 
 #[async_trait]
 impl JobRunner for GraphJobRunner {
     async fn run(&self, ctx: JobContext) -> JobOutcome {
-        let graph_id = match Uuid::parse_str(&ctx.job.aggregate_id) {
+        let graph_id = match aggregate_uuid(&ctx, "a graph") {
             Ok(graph_id) => graph_id,
-            Err(error) => {
-                return JobOutcome::Failed(format!(
-                    "job aggregate id {} is not a graph id: {error}",
-                    ctx.job.aggregate_id
-                ));
-            }
+            Err(outcome) => return outcome,
         };
         let params = ctx.job.params.clone().unwrap_or_default();
         let action = ctx.job.action.clone();
         let attempts = ctx.job.attempts;
         let pegout = PEGOUT_JOBS.contains(&action.as_str());
         match run_step(&self.deps, &action, graph_id, &params, attempts).await {
-            Ok(Step::Plan(plan)) => match plan.encode() {
-                Ok(bytes) => JobOutcome::Done(bytes),
-                Err(error) => JobOutcome::Failed(format!("encode plan: {error}")),
-            },
-            Ok(Step::Retry { reason, after_secs }) => {
-                JobOutcome::Transient { error: reason, retry_after_secs: after_secs }
-            }
+            Ok(step) => step.into_outcome(),
             Err(error) => match classify_failure(&error) {
                 FailureClass::Permanent(reason) if pegout => {
                     // A Goat revert on a peg-out call: retrying cannot help.
                     warn!(event = "graph_job", graph_id = %graph_id, action = %action, reason = %reason, "peg-out action rejected");
                     self.deps.metrics_state.record_instance_alert("pegout_action_rejected");
-                    match GraphPlan::noted(format!("rejected: {reason}")).encode() {
-                        Ok(bytes) => JobOutcome::Done(bytes),
-                        Err(error) => JobOutcome::Failed(format!("encode plan: {error}")),
-                    }
+                    plan_outcome(&GraphPlan::noted(format!("rejected: {reason}")))
                 }
                 FailureClass::Permanent(reason) => {
                     warn!(event = "graph_job", graph_id = %graph_id, action = %action, reason = %reason, "message rejected");
                     self.deps.metrics_state.record_graph_validation(false);
-                    match GraphPlan::noted(format!("rejected: {reason}")).encode() {
-                        Ok(bytes) => JobOutcome::Done(bytes),
-                        Err(error) => JobOutcome::Failed(format!("encode plan: {error}")),
-                    }
+                    plan_outcome(&GraphPlan::noted(format!("rejected: {reason}")))
                 }
                 FailureClass::Transient => {
                     JobOutcome::Transient { error: format!("{error:#}"), retry_after_secs: None }
@@ -220,7 +169,7 @@ impl JobRunner for GraphJobRunner {
 const UNKNOWN_FAILURE_RETRIES: i64 = 20;
 
 async fn run_step(
-    deps: &GraphJobDeps,
+    deps: &JobDeps,
     action: &str,
     graph_id: Uuid,
     params: &[u8],
@@ -260,16 +209,6 @@ async fn run_step(
 }
 
 // ------------------------------------------------------------------ helpers
-
-async fn decode_inbound(params: &[u8]) -> Result<(InboundMessage, GOATMessage)> {
-    let inbound = InboundMessage::decode(params).context("decode inbound message")?;
-    let message = GOATMessage::deserialize_message(&inbound.message).await?;
-    Ok((inbound, message))
-}
-
-fn author_peer(inbound: &InboundMessage) -> Result<PeerId> {
-    PeerId::from_str(&inbound.author).context("decode author peer id")
-}
 
 /// Serialize an outbound message and plan it, computing the ack set for the
 /// given recipients.
@@ -315,43 +254,6 @@ fn committee_ack_peers() -> Vec<String> {
         .collect()
 }
 
-/// The instance keypair when this node is in the instance's committee on
-/// Goat; `None` means the instance is not this node's to sign for.
-async fn local_member(deps: &GraphJobDeps, instance_id: Uuid) -> Result<Option<Keypair>> {
-    match local_committee_membership(&deps.goat_client, instance_id).await? {
-        CommitteeMembership::Member(keypair) => Ok(Some(keypair)),
-        CommitteeMembership::NotMember(reason) => {
-            debug!(event = "graph_job", instance_id = %instance_id, reason, "not in this instance's committee");
-            Ok(None)
-        }
-    }
-}
-
-async fn committee_pubkeys(deps: &GraphJobDeps, instance_id: Uuid) -> Result<Vec<PublicKey>> {
-    deps.goat_client.gateway_get_committee_pubkeys(&instance_id).await
-}
-
-async fn instance_status(
-    deps: &GraphJobDeps,
-    instance_id: Uuid,
-) -> Result<Option<InstanceBridgeInStatus>> {
-    Ok(deps
-        .local_db
-        .acquire()
-        .await?
-        .find_instance(&instance_id)
-        .await?
-        .and_then(|instance| InstanceBridgeInStatus::from_str(&instance.status).ok()))
-}
-
-/// The T0 gate for committee signing jobs: `None` when open.
-async fn gate_closed(deps: &GraphJobDeps, instance_id: Uuid) -> Result<Option<String>> {
-    Ok(match signing_gate(&deps.local_db, &deps.btc_client, instance_id).await? {
-        SigningGate::Open => None,
-        SigningGate::Closed(reason) => Some(reason),
-    })
-}
-
 /// Counts of committee endorsements, parameter endorsements, nonces and partials.
 struct Collections {
     endorsements: usize,
@@ -360,11 +262,7 @@ struct Collections {
     partial_sigs: usize,
 }
 
-async fn collections(
-    deps: &GraphJobDeps,
-    instance_id: Uuid,
-    graph_id: Uuid,
-) -> Result<Collections> {
+async fn collections(deps: &JobDeps, instance_id: Uuid, graph_id: Uuid) -> Result<Collections> {
     Ok(Collections {
         endorsements: get_committee_endorsements_for_graph(&deps.local_db, instance_id, graph_id)
             .await?
@@ -385,11 +283,7 @@ async fn collections(
     })
 }
 
-async fn four_sets_complete(
-    deps: &GraphJobDeps,
-    instance_id: Uuid,
-    graph_id: Uuid,
-) -> Result<bool> {
+async fn four_sets_complete(deps: &JobDeps, instance_id: Uuid, graph_id: Uuid) -> Result<bool> {
     let committee = committee_pubkeys(deps, instance_id).await?.len();
     let collected = collections(deps, instance_id, graph_id).await?;
     Ok(collected.endorsements == committee
@@ -398,39 +292,15 @@ async fn four_sets_complete(
         && collected.partial_sigs == committee)
 }
 
-fn local_operator_pubkey() -> Result<(OperatorMasterKey, PublicKey)> {
-    let master = OperatorMasterKey::new(get_bitvm_key()?);
-    let pubkey = master.master_keypair().public_key().into();
-    Ok((master, pubkey))
-}
-
 fn invalid<T>(message: impl Into<String>) -> Result<T> {
     Err(SpecialError::InvalidGraph(message.into()).into())
 }
 
-pub(crate) fn signing_nonce_id(label: &str, bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(label.as_bytes());
-    hasher.update(bytes);
-    hex::encode(hasher.finalize())
-}
-
-/// Validate that the committee value really comes from the member it names
-/// (pubkey ↔ peer id on Goat).
-async fn ensure_committee_sender(
-    deps: &GraphJobDeps,
-    inbound: &InboundMessage,
-    committee_pubkey: &PublicKey,
-) -> Result<()> {
-    let peer = author_peer(inbound)?;
-    validate_committee(&deps.goat_client, &peer, inbound.instance_id, committee_pubkey).await
-}
-
 // ----------------------------------------------------------------- operator
 
-async fn operator_init_graph(_deps: &GraphJobDeps, graph_id: Uuid, params: &[u8]) -> Result<Step> {
+async fn operator_init_graph(_deps: &JobDeps, graph_id: Uuid, params: &[u8]) -> Result<Step> {
     let start: OperatorStart = bincode::deserialize(params).context("decode operator_start")?;
-    let (master, operator_pubkey) = local_operator_pubkey()?;
+    let (master, operator_pubkey) = local_operator()?;
     let init = build_signed_init_graph(start.instance_id, graph_id, &master.master_keypair())?;
     let mut plan = GraphPlan::default();
     plan.send(
@@ -452,7 +322,7 @@ async fn operator_init_graph(_deps: &GraphJobDeps, graph_id: Uuid, params: &[u8]
     Step::done(plan)
 }
 
-async fn ingest_gen_circuits(deps: &GraphJobDeps, graph_id: Uuid, params: &[u8]) -> Result<Step> {
+async fn ingest_gen_circuits(deps: &JobDeps, graph_id: Uuid, params: &[u8]) -> Result<Step> {
     let (inbound, message) = decode_inbound(params).await?;
     let GOATMessageContent::GenCircuits(GenCircuits {
         instance_id,
@@ -466,7 +336,7 @@ async fn ingest_gen_circuits(deps: &GraphJobDeps, graph_id: Uuid, params: &[u8])
     if message_graph_id != graph_id || instance_id != inbound.instance_id {
         return invalid("GenCircuits identity mismatch");
     }
-    let (_, local_operator_pubkey) = local_operator_pubkey()?;
+    let (_, local_operator_pubkey) = local_operator()?;
     if !pending_graph_belongs_to_operator(
         &deps.local_db,
         instance_id,
@@ -584,7 +454,7 @@ struct FreezeParams {
     due_at: i64,
 }
 
-async fn freeze_candidates(deps: &GraphJobDeps, graph_id: Uuid, params: &[u8]) -> Result<Step> {
+async fn freeze_candidates(deps: &JobDeps, graph_id: Uuid, params: &[u8]) -> Result<Step> {
     let _: FreezeParams = bincode::deserialize(params).context("decode freeze params")?;
     let Some(instance_id) = pending_session(deps, graph_id).await? else {
         return Step::ignore("no pending graph session");
@@ -620,7 +490,7 @@ async fn freeze_candidates(deps: &GraphJobDeps, graph_id: Uuid, params: &[u8]) -
 
 /// The operator's pending session for a graph: `(instance_id, operator_pubkey)`.
 /// The instance of the graph's pending setup session, if any.
-async fn pending_session(deps: &GraphJobDeps, graph_id: Uuid) -> Result<Option<Uuid>> {
+async fn pending_session(deps: &JobDeps, graph_id: Uuid) -> Result<Option<Uuid>> {
     Ok(deps
         .local_db
         .acquire()
@@ -665,11 +535,7 @@ async fn plan_cut_circuits(
     Ok(())
 }
 
-async fn ingest_soldering_proof(
-    deps: &GraphJobDeps,
-    graph_id: Uuid,
-    params: &[u8],
-) -> Result<Step> {
+async fn ingest_soldering_proof(deps: &JobDeps, graph_id: Uuid, params: &[u8]) -> Result<Step> {
     let (inbound, message) = decode_inbound(params).await?;
     let GOATMessageContent::SolderingProofReady(soldering_proof_ready) = message.content else {
         return invalid("not a SolderingProofReady message");
@@ -682,7 +548,7 @@ async fn ingest_soldering_proof(
     if soldering_proof_ready.total_len == 0 {
         return invalid("SolderingProofReady total_len must be greater than zero");
     }
-    let (_, local_operator_pubkey) = local_operator_pubkey()?;
+    let (_, local_operator_pubkey) = local_operator()?;
     if !pending_graph_belongs_to_operator(
         &deps.local_db,
         instance_id,
@@ -826,7 +692,7 @@ struct SealParams {
 /// Persist the operator state and decide whether the proofs can be sealed now,
 /// later (a delayed `seal_proofs`), or not yet.
 async fn proof_collection_step(
-    deps: &GraphJobDeps,
+    deps: &JobDeps,
     graph_id: Uuid,
     instance_id: Uuid,
     state: &mut crate::utils::BabeSetupState,
@@ -859,7 +725,7 @@ async fn proof_collection_step(
     Step::done(plan)
 }
 
-async fn seal_proofs(deps: &GraphJobDeps, graph_id: Uuid, params: &[u8]) -> Result<Step> {
+async fn seal_proofs(deps: &JobDeps, graph_id: Uuid, params: &[u8]) -> Result<Step> {
     let _: SealParams = bincode::deserialize(params).context("decode seal params")?;
     let Some(instance_id) = pending_session(deps, graph_id).await? else {
         return Step::ignore("no pending graph session");
@@ -872,11 +738,11 @@ async fn seal_proofs(deps: &GraphJobDeps, graph_id: Uuid, params: &[u8]) -> Resu
     proof_collection_step(deps, graph_id, instance_id, &mut state).await
 }
 
-async fn build_graph(deps: &GraphJobDeps, graph_id: Uuid, _params: &[u8]) -> Result<Step> {
+async fn build_graph(deps: &JobDeps, graph_id: Uuid, _params: &[u8]) -> Result<Step> {
     let Some(instance_id) = pending_session(deps, graph_id).await? else {
         return Step::ignore("no pending graph session");
     };
-    let (operator_master_key, local_operator_pubkey) = local_operator_pubkey()?;
+    let (operator_master_key, local_operator_pubkey) = local_operator()?;
     let mut state = load_babe_setup_state(&deps.local_db, instance_id, graph_id)?
         .ok_or_else(|| anyhow!("missing BABE setup state for pending graph {graph_id}"))?;
     let operator_state = state
@@ -1012,7 +878,7 @@ async fn build_graph(deps: &GraphJobDeps, graph_id: Uuid, _params: &[u8]) -> Res
     Step::done(plan)
 }
 
-async fn ingest_nonces(deps: &GraphJobDeps, graph_id: Uuid, params: &[u8]) -> Result<Step> {
+async fn ingest_nonces(deps: &JobDeps, graph_id: Uuid, params: &[u8]) -> Result<Step> {
     let (inbound, message) = decode_inbound(params).await?;
     let GOATMessageContent::NonceGeneration(NonceGeneration {
         instance_id,
@@ -1063,7 +929,7 @@ async fn ingest_nonces(deps: &GraphJobDeps, graph_id: Uuid, params: &[u8]) -> Re
 /// collections are complete; a committee member votes once every nonce is in
 /// and pre-signs once every vote agrees.
 async fn after_committee_value(
-    deps: &GraphJobDeps,
+    deps: &JobDeps,
     instance_id: Uuid,
     graph_id: Uuid,
     graph: &SimplifiedBitvmGcGraph,
@@ -1093,7 +959,7 @@ async fn after_committee_value(
     Step::done(plan)
 }
 
-async fn ingest_presign(deps: &GraphJobDeps, graph_id: Uuid, params: &[u8]) -> Result<Step> {
+async fn ingest_presign(deps: &JobDeps, graph_id: Uuid, params: &[u8]) -> Result<Step> {
     let (inbound, message) = decode_inbound(params).await?;
     let GOATMessageContent::CommitteePresign(CommitteePresign {
         instance_id,
@@ -1164,7 +1030,7 @@ async fn ingest_presign(deps: &GraphJobDeps, graph_id: Uuid, params: &[u8]) -> R
     }
 }
 
-async fn ingest_endorsement(deps: &GraphJobDeps, graph_id: Uuid, params: &[u8]) -> Result<Step> {
+async fn ingest_endorsement(deps: &JobDeps, graph_id: Uuid, params: &[u8]) -> Result<Step> {
     let (inbound, message) = decode_inbound(params).await?;
     let GOATMessageContent::EndorseGraph(EndorseGraph {
         instance_id,
@@ -1233,7 +1099,7 @@ async fn ingest_endorsement(deps: &GraphJobDeps, graph_id: Uuid, params: &[u8]) 
     after_committee_value(deps, instance_id, graph_id, &graph).await
 }
 
-async fn finalize_graph(deps: &GraphJobDeps, graph_id: Uuid, _params: &[u8]) -> Result<Step> {
+async fn finalize_graph(deps: &JobDeps, graph_id: Uuid, _params: &[u8]) -> Result<Step> {
     let Some(row) = deps.local_db.acquire().await?.find_graph(&graph_id).await? else {
         return Step::ignore("graph not stored locally");
     };
@@ -1329,7 +1195,7 @@ async fn finalize_graph(deps: &GraphJobDeps, graph_id: Uuid, _params: &[u8]) -> 
 
 /// Selected verifier peers of an operator's graph, from its BABE setup state.
 async fn selected_verifier_peers(
-    deps: &GraphJobDeps,
+    deps: &JobDeps,
     instance_id: Uuid,
     graph_id: Uuid,
 ) -> Result<Vec<String>> {
@@ -1352,7 +1218,7 @@ async fn selected_verifier_peers(
 }
 
 /// The instance of a stored graph row, if any.
-async fn graph_instance(deps: &GraphJobDeps, graph_id: Uuid) -> Result<Option<Uuid>> {
+async fn graph_instance(deps: &JobDeps, graph_id: Uuid) -> Result<Option<Uuid>> {
     Ok(deps.local_db.acquire().await?.find_graph(&graph_id).await?.map(|row| row.instance_id))
 }
 
@@ -1360,7 +1226,7 @@ async fn graph_instance(deps: &GraphJobDeps, graph_id: Uuid) -> Result<Option<Uu
 /// logged, the finalized definition is already stored. What the chain asks
 /// of this node next comes from the graph's chain scans.
 async fn try_refresh_graph(
-    deps: &GraphJobDeps,
+    deps: &JobDeps,
     instance_id: Uuid,
     graph_id: Uuid,
     graph: &BitvmGcGraph,
@@ -1381,7 +1247,7 @@ async fn try_refresh_graph(
 
 // ----------------------------------------------------------------- verifier
 
-async fn verifier_setup(deps: &GraphJobDeps, graph_id: Uuid, params: &[u8]) -> Result<Step> {
+async fn verifier_setup(deps: &JobDeps, graph_id: Uuid, params: &[u8]) -> Result<Step> {
     let (inbound, message) = decode_inbound(params).await?;
     let GOATMessageContent::InitGraph(init) = message.content else {
         return invalid("not an InitGraph message");
@@ -1469,7 +1335,7 @@ async fn verifier_setup(deps: &GraphJobDeps, graph_id: Uuid, params: &[u8]) -> R
     Step::done(plan)
 }
 
-async fn verifier_solder(deps: &GraphJobDeps, graph_id: Uuid, params: &[u8]) -> Result<Step> {
+async fn verifier_solder(deps: &JobDeps, graph_id: Uuid, params: &[u8]) -> Result<Step> {
     let (inbound, message) = decode_inbound(params).await?;
     let GOATMessageContent::CutCircuits(CutCircuits {
         instance_id,
@@ -1571,11 +1437,7 @@ async fn verifier_solder(deps: &GraphJobDeps, graph_id: Uuid, params: &[u8]) -> 
     Step::done(plan)
 }
 
-async fn verifier_validate_graph(
-    deps: &GraphJobDeps,
-    graph_id: Uuid,
-    params: &[u8],
-) -> Result<Step> {
+async fn verifier_validate_graph(deps: &JobDeps, graph_id: Uuid, params: &[u8]) -> Result<Step> {
     let (inbound, message) = decode_inbound(params).await?;
     let GOATMessageContent::CreateGraph(CreateGraph {
         instance_id,
@@ -1685,11 +1547,7 @@ async fn verifier_validate_graph(
 
 // ---------------------------------------------------------------- committee
 
-async fn committee_ingest_graph(
-    deps: &GraphJobDeps,
-    graph_id: Uuid,
-    params: &[u8],
-) -> Result<Step> {
+async fn committee_ingest_graph(deps: &JobDeps, graph_id: Uuid, params: &[u8]) -> Result<Step> {
     let (inbound, message) = decode_inbound(params).await?;
     let GOATMessageContent::CreateGraph(CreateGraph {
         instance_id,
@@ -1746,7 +1604,7 @@ async fn committee_ingest_graph(
 }
 
 async fn ingest_verifier_endorsement(
-    deps: &GraphJobDeps,
+    deps: &JobDeps,
     graph_id: Uuid,
     params: &[u8],
 ) -> Result<Step> {
@@ -1812,7 +1670,7 @@ async fn ingest_verifier_endorsement(
 
 /// Start the committee's signing round for a validated, fully endorsed graph:
 /// the deterministic nonces, stored before they are sent.
-async fn committee_nonces(deps: &GraphJobDeps, graph_id: Uuid, _params: &[u8]) -> Result<Step> {
+async fn committee_nonces(deps: &JobDeps, graph_id: Uuid, _params: &[u8]) -> Result<Step> {
     let Some(instance_id) = graph_instance(deps, graph_id).await? else {
         return Step::ignore("graph not stored locally");
     };
@@ -1908,7 +1766,7 @@ struct NonceConsensus {
 }
 
 async fn nonce_consensus(
-    deps: &GraphJobDeps,
+    deps: &JobDeps,
     instance_id: Uuid,
     graph_id: Uuid,
     graph: &SimplifiedBitvmGcGraph,
@@ -1941,7 +1799,7 @@ async fn nonce_consensus(
     }))
 }
 
-async fn committee_vote(deps: &GraphJobDeps, graph_id: Uuid, _params: &[u8]) -> Result<Step> {
+async fn committee_vote(deps: &JobDeps, graph_id: Uuid, _params: &[u8]) -> Result<Step> {
     let Some(instance_id) = graph_instance(deps, graph_id).await? else {
         return Step::ignore("graph not stored locally");
     };
@@ -2014,7 +1872,7 @@ async fn committee_vote(deps: &GraphJobDeps, graph_id: Uuid, _params: &[u8]) -> 
 
 /// Every member signed the same ordered nonce set (the AggNonceConsensus barrier).
 async fn votes_complete(
-    deps: &GraphJobDeps,
+    deps: &JobDeps,
     instance_id: Uuid,
     graph_id: Uuid,
     consensus: &NonceConsensus,
@@ -2050,7 +1908,7 @@ async fn votes_complete(
     Ok(true)
 }
 
-async fn ingest_vote(deps: &GraphJobDeps, graph_id: Uuid, params: &[u8]) -> Result<Step> {
+async fn ingest_vote(deps: &JobDeps, graph_id: Uuid, params: &[u8]) -> Result<Step> {
     let (inbound, message) = decode_inbound(params).await?;
     let GOATMessageContent::AggNonceConsensus(AggNonceConsensus {
         instance_id,
@@ -2108,7 +1966,7 @@ async fn ingest_vote(deps: &GraphJobDeps, graph_id: Uuid, params: &[u8]) -> Resu
     Step::done(plan)
 }
 
-async fn committee_presign(deps: &GraphJobDeps, graph_id: Uuid, _params: &[u8]) -> Result<Step> {
+async fn committee_presign(deps: &JobDeps, graph_id: Uuid, _params: &[u8]) -> Result<Step> {
     let Some(instance_id) = graph_instance(deps, graph_id).await? else {
         return Step::ignore("graph not stored locally");
     };
@@ -2221,7 +2079,7 @@ async fn committee_presign(deps: &GraphJobDeps, graph_id: Uuid, _params: &[u8]) 
     Step::done(plan)
 }
 
-async fn committee_endorse(deps: &GraphJobDeps, graph_id: Uuid, _params: &[u8]) -> Result<Step> {
+async fn committee_endorse(deps: &JobDeps, graph_id: Uuid, _params: &[u8]) -> Result<Step> {
     let Some(instance_id) = graph_instance(deps, graph_id).await? else {
         return Step::ignore("graph not stored locally");
     };
@@ -2271,7 +2129,7 @@ async fn committee_endorse(deps: &GraphJobDeps, graph_id: Uuid, _params: &[u8]) 
 
 // ------------------------------------------------------------------ finalize
 
-async fn ingest_finalized(deps: &GraphJobDeps, graph_id: Uuid, params: &[u8]) -> Result<Step> {
+async fn ingest_finalized(deps: &JobDeps, graph_id: Uuid, params: &[u8]) -> Result<Step> {
     let (inbound, message) = decode_inbound(params).await?;
     let GOATMessageContent::GraphFinalize(GraphFinalize {
         instance_id,
@@ -2339,7 +2197,7 @@ async fn ingest_finalized(deps: &GraphJobDeps, graph_id: Uuid, params: &[u8]) ->
 }
 
 /// The relayer's `postGraphData` once the peg-in is withdrawable (Post phase).
-async fn post_graph_data(deps: &GraphJobDeps, graph_id: Uuid, _params: &[u8]) -> Result<Step> {
+async fn post_graph_data(deps: &JobDeps, graph_id: Uuid, _params: &[u8]) -> Result<Step> {
     if !deps.relayer {
         return Step::ignore("not a relayer");
     }
@@ -2396,15 +2254,10 @@ async fn post_graph_data(deps: &GraphJobDeps, graph_id: Uuid, _params: &[u8]) ->
 /// expired (`PARKED_MESSAGE_TTL_SECS`), or earlier when the graph retires.
 const FETCH_GRAPH_FAST_ATTEMPTS: i64 = 5;
 const FETCH_GRAPH_SLOW_RETRY_SECS: i64 = 600;
-const FETCH_GRAPH_MAX_ATTEMPTS: i64 =
-    FETCH_GRAPH_FAST_ATTEMPTS + super::graph::PARKED_MESSAGE_TTL_SECS / FETCH_GRAPH_SLOW_RETRY_SECS;
+const FETCH_GRAPH_MAX_ATTEMPTS: i64 = FETCH_GRAPH_FAST_ATTEMPTS
+    + super::common::PARKED_MESSAGE_TTL_SECS / FETCH_GRAPH_SLOW_RETRY_SECS;
 
-async fn fetch_graph(
-    deps: &GraphJobDeps,
-    graph_id: Uuid,
-    params: &[u8],
-    attempts: i64,
-) -> Result<Step> {
+async fn fetch_graph(deps: &JobDeps, graph_id: Uuid, params: &[u8], attempts: i64) -> Result<Step> {
     let lookup: GraphLookup = bincode::deserialize(params).context("decode graph lookup")?;
     let give_up = |reason: String| {
         if attempts + 1 >= FETCH_GRAPH_MAX_ATTEMPTS {

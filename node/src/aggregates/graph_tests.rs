@@ -3,9 +3,13 @@
 //! Scripted jobs exercise routing, slot rules, missing definitions, job plans
 //! and delivery closing; they do not perform real graph cryptography.
 
+use super::common::{
+    InboundMessage, MembershipProbe, NextJob, PlannedMessage, content_event_id, delivery_id,
+};
 use super::graph::*;
 use super::graph_fetch::GraphLookup;
 use super::graph_pegout::*;
+use super::jobs::Plan;
 use async_trait::async_trait;
 use bitvm_lib::actors::Actor;
 use engine::{
@@ -415,7 +419,7 @@ async fn a_message_becomes_an_ingest_job_and_its_plan_is_committed() {
     let (instance_id, graph_id) = (Uuid::new_v4(), Uuid::new_v4());
     let follow_up = GraphPlan {
         messages: vec![planned(graph_id, "NonceGeneration", PHASE_SIGNING, None)],
-        next: vec![NextStep::Job {
+        next: vec![NextJob {
             action: JOB_COMMITTEE_VOTE.to_string(),
             params: vec![9],
             delay_secs: Some(600),
@@ -645,7 +649,7 @@ async fn the_operator_start_runs_the_setup_and_posting_closes_every_delivery() {
     t.script(
         JOB_INGEST_GEN_CIRCUITS,
         GraphPlan {
-            next: vec![NextStep::Job {
+            next: vec![NextJob {
                 action: JOB_BUILD_GRAPH.to_string(),
                 params: vec![],
                 delay_secs: None,
@@ -704,7 +708,7 @@ async fn an_obsoleted_graph_ignores_messages_and_cancels_its_jobs() {
     t.script(
         JOB_INGEST_NONCES,
         GraphPlan {
-            next: vec![NextStep::Job {
+            next: vec![NextJob {
                 action: JOB_COMMITTEE_VOTE.to_string(),
                 params: vec![],
                 delay_secs: Some(3_600),
@@ -739,7 +743,7 @@ async fn a_plan_finished_after_the_graph_retired_is_dropped() {
         JOB_INGEST_NONCES,
         GraphPlan {
             messages: vec![planned(graph_id, "NonceGeneration", PHASE_SIGNING, None)],
-            next: vec![NextStep::Job {
+            next: vec![NextJob {
                 action: JOB_COMMITTEE_VOTE.to_string(),
                 params: vec![],
                 delay_secs: None,

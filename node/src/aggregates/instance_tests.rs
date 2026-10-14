@@ -1,7 +1,7 @@
 //! Instance lifecycle tests using the engine and SQLite, covering failure
 //! states, signing deadlines, the abandon buffer and cleanup effects.
 
-use super::graph::{InboundMessage, MembershipProbe, PlannedMessage, content_event_id};
+use super::common::{InboundMessage, MembershipProbe, PlannedMessage, content_event_id};
 use super::instance::*;
 use crate::utils::{mark_graph_as_endorsed, store_committee_partial_sig_for_instance};
 use async_trait::async_trait;

@@ -5,11 +5,12 @@
 //! Signing closes at the cancel height. After the abandon buffer, an unconfirmed
 //! Peg-In-Confirm absent from the mempool can cause Timeout.
 
-use crate::action::{BusinessRef, GOATMessage, HasBusinessRef};
-use crate::aggregates::graph::{
-    EnvelopeProbe, InboundMessage, MembershipProbe, NextStep, PARKED_MESSAGE_TTL_SECS,
-    PlannedMessage, content_event_id, operator_start_event,
+use crate::aggregates::common::{
+    EnvelopeProbe, InboundMessage, MembershipProbe, NextJob, PARKED_MESSAGE_TTL_SECS,
+    PlannedMessage,
 };
+use crate::aggregates::graph::operator_start_event;
+use crate::aggregates::jobs::Plan;
 use crate::engine_bridge::record_event_in;
 use crate::env::{
     get_committee_instance_key_delete_timelock_blocks, get_network, get_peer_id,
@@ -146,40 +147,6 @@ pub fn route_action(kind: &str, actor: &Actor) -> Option<&'static str> {
 /// Whether this role takes `kind` through the engine at all.
 pub fn engine_handles(kind: &str, actor: &Actor) -> bool {
     route_action(kind, actor).is_some()
-}
-
-/// The inbox event for an admitted PeginConfirm round message, or `None`
-/// when this role does not take the kind through the engine.
-pub fn inbound_event(
-    actor: &Actor,
-    author: &str,
-    decoded: &GOATMessage,
-    raw: &[u8],
-) -> anyhow::Result<Option<NewEvent>> {
-    let kind = decoded.content.event_type();
-    if !engine_handles(kind, actor) {
-        return Ok(None);
-    }
-    let BusinessRef::Instance { instance_id } = decoded.content.business_ref() else {
-        return Ok(None);
-    };
-    let inbound = InboundMessage {
-        author: author.to_string(),
-        instance_id,
-        graph_nonce: None,
-        operator_pubkey: None,
-        message: raw.to_vec(),
-    };
-    Ok(Some(
-        NewEvent::new(
-            content_event_id(author, kind, &instance_id.to_string(), raw),
-            instance_ref(instance_id),
-            kind,
-            EventSource::Network,
-            inbound.encode()?,
-        )
-        .with_author(author),
-    ))
 }
 
 // ------------------------------------------------------------------ deadlines
@@ -379,17 +346,19 @@ pub struct StartGraph {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstancePlan {
     pub messages: Vec<PlannedMessage>,
-    pub next: Vec<NextStep>,
+    pub next: Vec<NextJob>,
     pub start_graph: Option<StartGraph>,
     pub wake_refs: Vec<String>,
     pub note: Option<String>,
 }
 
-impl InstancePlan {
-    pub fn noted(note: impl Into<String>) -> Self {
+impl Plan for InstancePlan {
+    fn noted(note: impl Into<String>) -> Self {
         Self { note: Some(note.into()), ..Default::default() }
     }
+}
 
+impl InstancePlan {
     pub fn encode(&self) -> anyhow::Result<Vec<u8>> {
         Ok(bincode::serialize(self)?)
     }
@@ -404,7 +373,7 @@ impl InstancePlan {
     }
 
     pub fn then(&mut self, action: &str, params: Vec<u8>, delay_secs: Option<i64>) -> &mut Self {
-        self.next.push(NextStep::Job { action: action.to_string(), params, delay_secs });
+        self.next.push(NextJob { action: action.to_string(), params, delay_secs });
         self
     }
 }
@@ -1053,8 +1022,7 @@ impl InstanceAggregate {
                 ack_set: message.ack_set,
             });
         }
-        for step in plan.next {
-            let NextStep::Job { action, params, delay_secs } = step;
+        for NextJob { action, params, delay_secs } in plan.next {
             let phase = job_phase(&action);
             if round_over && phase == PHASE_CONFIRM {
                 continue;
@@ -1652,7 +1620,7 @@ mod tests {
     #[test]
     fn plans_round_trip_and_the_round_ends_with_the_confirm() {
         let mut plan = InstancePlan::noted("x");
-        plan.send(crate::aggregates::graph::PlannedMessage {
+        plan.send(PlannedMessage {
             outbox_id: "instance:i:PeginConfirmNonce".into(),
             phase_ref: PHASE_CONFIRM.into(),
             kind: "PeginConfirmNonce".into(),

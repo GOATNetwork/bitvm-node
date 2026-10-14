@@ -4,17 +4,20 @@
 //! commits job plans as outgoing messages, follow-up jobs and state updates.
 //! Graph status also receives updates from stored definitions and chain events.
 
-use crate::action::{BusinessRef, GOATMessage, GOATMessageContent, HasBusinessRef};
+use crate::aggregates::common::{
+    EnvelopeProbe, InboundMessage, MembershipProbe, NextJob, PARKED_MESSAGE_TTL_SECS,
+    PlannedMessage, instance_failed,
+};
 use crate::aggregates::graph_fetch::GraphLookup;
 use crate::aggregates::graph_pegout::{
     EVENT_CHAIN_SCAN, EVENT_GOAT_STATUS, EVENT_WITHDRAW_CANCEL, EVENT_WITHDRAW_INIT, PEGOUT_JOBS,
     PHASE_KICKOFF, PHASE_SETTLEMENT, pegout_job_pool,
 };
 use crate::aggregates::instance::graph_endorsed_event;
+use crate::aggregates::jobs::Plan;
 use crate::engine_bridge::record_event_in;
 use crate::metrics_service::node_metrics_state;
 use crate::middleware::get_topic_name;
-use crate::utils::committee_instance_keys_envelope_path;
 use anyhow::anyhow;
 use async_trait::async_trait;
 use bitvm_lib::actors::Actor;
@@ -24,12 +27,10 @@ use engine::{
     JobResultOutcome, JobSpec, NewEvent, OutboxMessage, WaitingFor,
 };
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use store::localdb::GraphQuery;
-use store::{EngineJobState, GraphStatus, GraphStatusSource, InstanceBridgeInStatus};
+use store::{EngineJobState, GraphStatus, GraphStatusSource};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -45,10 +46,6 @@ pub const EVENT_SETUP_ABANDONED: &str = "setup_abandoned";
 /// The operator's setup collected its proofs: build the definition once no
 /// other build of the operator is in flight.
 pub const EVENT_BUILD_READY: &str = "build_ready";
-
-/// How long a message may wait for a definition that never arrives before
-/// it is dropped; the instance deadline normally ends the wait first.
-pub const PARKED_MESSAGE_TTL_SECS: i64 = 2 * 24 * 60 * 60;
 
 pub const PHASE_SETUP: &str = "Setup";
 pub const PHASE_COLLECT: &str = "Collect";
@@ -156,27 +153,6 @@ pub fn outbox_id(graph_id: Uuid, kind: &str, qualifier: Option<&str>) -> String 
 
 // ----------------------------------------------------------------- payloads
 
-/// A network message handed to the aggregate: the raw wire bytes plus the
-/// identity the admission layer already decoded.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct InboundMessage {
-    pub author: String,
-    pub instance_id: Uuid,
-    pub graph_nonce: Option<u64>,
-    pub operator_pubkey: Option<String>,
-    pub message: Vec<u8>,
-}
-
-impl InboundMessage {
-    pub fn decode(bytes: &[u8]) -> anyhow::Result<Self> {
-        Ok(bincode::deserialize(bytes)?)
-    }
-
-    pub fn encode(&self) -> anyhow::Result<Vec<u8>> {
-        Ok(bincode::serialize(self)?)
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OperatorStart {
     pub instance_id: Uuid,
@@ -203,24 +179,6 @@ pub struct SetupAbandoned {
     pub height: i64,
 }
 
-/// A message the apply writes to the outbox.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PlannedMessage {
-    pub outbox_id: String,
-    pub phase_ref: String,
-    pub kind: String,
-    /// Target role topic.
-    pub actor: String,
-    pub payload: Vec<u8>,
-    /// Heavy message: recipient peer id -> delivery id.
-    pub ack_set: Option<BTreeMap<String, String>>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum NextStep {
-    Job { action: String, params: Vec<u8>, delay_secs: Option<i64> },
-}
-
 /// Bookkeeping a job learned about the graph.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GraphStateUpdate {
@@ -235,7 +193,7 @@ pub struct GraphStateUpdate {
 pub struct GraphPlan {
     pub messages: Vec<PlannedMessage>,
     pub close_rows: Vec<String>,
-    pub next: Vec<NextStep>,
+    pub next: Vec<NextJob>,
     pub state: GraphStateUpdate,
     pub delete_pending_session: bool,
     pub notify_instance_endorsed: bool,
@@ -243,11 +201,13 @@ pub struct GraphPlan {
     pub note: Option<String>,
 }
 
-impl GraphPlan {
-    pub fn noted(note: impl Into<String>) -> Self {
+impl Plan for GraphPlan {
+    fn noted(note: impl Into<String>) -> Self {
         Self { note: Some(note.into()), ..Default::default() }
     }
+}
 
+impl GraphPlan {
     pub fn encode(&self) -> anyhow::Result<Vec<u8>> {
         Ok(bincode::serialize(self)?)
     }
@@ -262,7 +222,7 @@ impl GraphPlan {
     }
 
     pub fn then(&mut self, action: &str, params: Vec<u8>, delay_secs: Option<i64>) -> &mut Self {
-        self.next.push(NextStep::Job { action: action.to_string(), params, delay_secs });
+        self.next.push(NextJob { action: action.to_string(), params, delay_secs });
         self
     }
 }
@@ -344,79 +304,6 @@ pub fn ack_required(kind: &str) -> bool {
         kind,
         "GenCircuits" | "CutCircuits" | "SolderingProofReady" | "CreateGraph" | "GraphFinalize"
     )
-}
-
-/// Delivery id of a heavy message: `H("goat/graph-setup-delivery/v2", sender,
-/// recipient, SHA-256(payload))`, the same on both ends.
-pub fn delivery_id(sender_peer: &str, recipient_peer: &str, payload: &[u8]) -> String {
-    let payload_hash: [u8; 32] = Sha256::digest(payload).into();
-    let mut hasher = Sha256::new();
-    hasher.update(b"goat/graph-setup-delivery/v2");
-    for field in [sender_peer.as_bytes(), recipient_peer.as_bytes(), payload_hash.as_slice()] {
-        hasher.update((field.len() as u64).to_be_bytes());
-        hasher.update(field);
-    }
-    format!("graph-setup-v2:{}", hex::encode(hasher.finalize()))
-}
-
-/// Content id of a network message: `H(author ‖ kind ‖ business_ref ‖ H(payload))`.
-pub fn content_event_id(author: &str, kind: &str, business: &str, payload: &[u8]) -> String {
-    let payload_hash: [u8; 32] = Sha256::digest(payload).into();
-    let mut hasher = Sha256::new();
-    for field in [author.as_bytes(), kind.as_bytes(), business.as_bytes(), payload_hash.as_slice()]
-    {
-        hasher.update((field.len() as u64).to_be_bytes());
-        hasher.update(field);
-    }
-    format!("msg:{kind}:{}", hex::encode(hasher.finalize()))
-}
-
-/// The inbox event for an admitted graph-phase message, or `None` when this
-/// role does not take the kind through the engine.
-pub fn inbound_event(
-    actor: &Actor,
-    author: &str,
-    local_peer: &str,
-    decoded: &GOATMessage,
-    raw: &[u8],
-) -> anyhow::Result<Option<NewEvent>> {
-    let kind = decoded.content.event_type();
-    if !engine_handles(kind, actor) {
-        return Ok(None);
-    }
-    let BusinessRef::Graph { instance_id, graph_id } = decoded.content.business_ref() else {
-        return Ok(None);
-    };
-    let (graph_nonce, operator_pubkey) = match &decoded.content {
-        GOATMessageContent::CreateGraph(message) => {
-            (Some(message.graph_nonce), Some(message.graph.parameters.operator_pubkey.to_string()))
-        }
-        GOATMessageContent::GraphFinalize(message) => {
-            (Some(message.graph_nonce), Some(message.graph.parameters.operator_pubkey.to_string()))
-        }
-        GOATMessageContent::InitGraph(message) => (None, Some(message.operator_pubkey.to_string())),
-        _ => (None, None),
-    };
-    let inbound = InboundMessage {
-        author: author.to_string(),
-        instance_id,
-        graph_nonce,
-        operator_pubkey,
-        message: raw.to_vec(),
-    };
-    let business = format!("{instance_id}:{graph_id}");
-    let mut event = NewEvent::new(
-        content_event_id(author, kind, &business, raw),
-        graph_ref(graph_id),
-        kind,
-        EventSource::Network,
-        inbound.encode()?,
-    )
-    .with_author(author);
-    if ack_required(kind) {
-        event = event.with_ack(author, delivery_id(author, local_peer, raw));
-    }
-    Ok(Some(event))
 }
 
 pub fn operator_start_event(
@@ -558,37 +445,6 @@ pub fn retired(status: Option<GraphStatus>) -> bool {
 }
 
 // ------------------------------------------------------------------- handler
-
-/// Whether this committee node holds the key of an instance, which is what
-/// makes the instance's graph messages its business. A cheap local check for
-/// the apply; the jobs verify membership against Goat.
-pub trait MembershipProbe: Send + Sync {
-    fn holds_instance_key(&self, instance_id: Uuid) -> bool;
-
-    /// Whether the author of a message is a peer the registry holds as
-    /// registered on chain. A parked message from anyone else waits for the
-    /// definition to arrive by itself: no GetGraph pull is spent on it.
-    fn is_registered_peer(&self, _peer: &str) -> bool {
-        true
-    }
-}
-
-/// The instance key envelope on disk, and the peer registry.
-pub struct EnvelopeProbe;
-
-impl MembershipProbe for EnvelopeProbe {
-    fn holds_instance_key(&self, instance_id: Uuid) -> bool {
-        committee_instance_keys_envelope_path(instance_id).exists()
-    }
-
-    fn is_registered_peer(&self, peer: &str) -> bool {
-        libp2p::PeerId::from_str(peer).is_ok_and(|peer| {
-            crate::p2p_admission::peer_registry()
-                .sender_class(&peer, std::time::Instant::now())
-                .is_registered()
-        })
-    }
-}
 
 pub struct GraphAggregate {
     actor: Actor,
@@ -894,28 +750,24 @@ impl GraphAggregate {
         for row in plan.close_rows {
             ctx.effects.close_outbox(EngineOutboxCloseTarget::Row(row), "superseded");
         }
-        for step in plan.next {
-            match step {
-                NextStep::Job { action, .. } if action == JOB_BUILD_GRAPH => {
-                    // Builds of one operator run one at a time.
-                    record_event_in(ctx.storage, build_ready_event(graph_id)).await?;
-                }
-                NextStep::Job { action, params, delay_secs } => {
-                    let phase = if action == JOB_POST_GRAPH_DATA {
-                        PHASE_POST
-                    } else if PEGOUT_JOBS.contains(&action.as_str()) {
-                        PHASE_SETTLEMENT
-                    } else {
-                        JOB_PHASE
-                    };
-                    let mut job =
-                        JobSpec::new(&ctx.aggregate, phase, &action, job_pool(&action), params);
-                    if let Some(delay) = delay_secs {
-                        job = job.with_run_after(ctx.now + delay.max(0));
-                    }
-                    ctx.effects.enqueue_job(job);
-                }
+        for NextJob { action, params, delay_secs } in plan.next {
+            if action == JOB_BUILD_GRAPH {
+                // Builds of one operator run one at a time.
+                record_event_in(ctx.storage, build_ready_event(graph_id)).await?;
+                continue;
             }
+            let phase = if action == JOB_POST_GRAPH_DATA {
+                PHASE_POST
+            } else if PEGOUT_JOBS.contains(&action.as_str()) {
+                PHASE_SETTLEMENT
+            } else {
+                JOB_PHASE
+            };
+            let mut job = JobSpec::new(&ctx.aggregate, phase, &action, job_pool(&action), params);
+            if let Some(delay) = delay_secs {
+                job = job.with_run_after(ctx.now + delay.max(0));
+            }
+            ctx.effects.enqueue_job(job);
         }
         if plan.delete_pending_session
             && let (Some(instance_id), Some(operator_pubkey)) =
@@ -1228,19 +1080,6 @@ impl AggregateHandler for GraphAggregate {
     }
 }
 
-/// The instance is in a failure state; an unknown instance is not.
-pub(super) async fn instance_failed(
-    ctx: &mut ApplyContext<'_>,
-    instance_id: Uuid,
-) -> anyhow::Result<bool> {
-    Ok(ctx
-        .storage
-        .find_instance(&instance_id)
-        .await?
-        .and_then(|instance| InstanceBridgeInStatus::from_str(&instance.status).ok())
-        .is_some_and(|status| status.is_failed()))
-}
-
 /// The operator's graph holding the highest slot, if any.
 async fn latest_slot(
     ctx: &mut ApplyContext<'_>,
@@ -1330,6 +1169,7 @@ async fn building_sibling(
 mod tests {
     use super::*;
     use GraphStatus::*;
+    use std::collections::BTreeMap;
 
     #[test]
     fn routes_follow_the_role_table() {
@@ -1356,19 +1196,6 @@ mod tests {
             assert!(ack_required(kind), "{kind}");
         }
         assert!(!ack_required("NonceGeneration") && !ack_required("InitGraph"));
-    }
-
-    #[test]
-    fn delivery_and_content_ids_are_stable_and_bound() {
-        let a = delivery_id("peer-a", "peer-b", b"payload");
-        assert_eq!(a, delivery_id("peer-a", "peer-b", b"payload"));
-        assert_ne!(a, delivery_id("peer-b", "peer-a", b"payload"));
-        assert_ne!(a, delivery_id("peer-a", "peer-b", b"other"));
-        assert!(a.starts_with("graph-setup-v2:"));
-        let c = content_event_id("peer-a", "CreateGraph", "i:g", b"payload");
-        assert_eq!(c, content_event_id("peer-a", "CreateGraph", "i:g", b"payload"));
-        assert_ne!(c, content_event_id("peer-b", "CreateGraph", "i:g", b"payload"));
-        assert_ne!(c, content_event_id("peer-a", "GraphFinalize", "i:g", b"payload"));
     }
 
     #[test]

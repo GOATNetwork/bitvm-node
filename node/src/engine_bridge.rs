@@ -5,9 +5,10 @@
 
 use crate::action::{GOATMessage, GOATMessageContent, GraphSetupAck, publish_to_role};
 use crate::aggregates::graph::{GRAPH_KIND, GraphAggregate};
-use crate::aggregates::graph_jobs::{GraphJobDeps, register_graph_jobs};
+use crate::aggregates::graph_jobs::register_graph_jobs;
 use crate::aggregates::instance::{INSTANCE_KIND, InstanceAggregate};
-use crate::aggregates::instance_jobs::{InstanceJobDeps, register_instance_jobs};
+use crate::aggregates::instance_jobs::register_instance_jobs;
+use crate::aggregates::jobs::JobDeps;
 use crate::env;
 use crate::metrics_service::{MetricsState, node_metrics_state};
 use crate::middleware::publisher::{MessagePublisher, NetworkPublisher};
@@ -114,32 +115,19 @@ pub fn build_engine(
                     .with_local_operator(own_operator_pubkey(&deps.actor)),
             ),
         );
-    let builder = register_instance_jobs(
-        builder,
-        Arc::new(InstanceJobDeps {
-            actor: deps.actor.clone(),
-            relayer: crate::env::is_relayer(),
-            local_db: deps.local_db.clone(),
-            btc_client: deps.btc_client.clone(),
-            goat_client: deps.goat_client.clone(),
-            metrics_state: deps.metrics_state.clone(),
-        }),
-    );
-    let builder = register_graph_jobs(
-        builder,
-        Arc::new(GraphJobDeps {
-            relayer: crate::env::is_relayer(),
-            local_db: deps.local_db,
-            btc_client: deps.btc_client,
-            goat_client: deps.goat_client,
-            http_client: deps.http_client,
-            soldering_builder: deps.soldering_builder,
-            metrics_state: deps.metrics_state,
-            publisher,
-            actor: deps.actor,
-        }),
-    );
-    builder.build()
+    let jobs = Arc::new(JobDeps {
+        actor: deps.actor,
+        relayer: env::is_relayer(),
+        local_db: deps.local_db,
+        btc_client: deps.btc_client,
+        goat_client: deps.goat_client,
+        http_client: deps.http_client,
+        soldering_builder: deps.soldering_builder,
+        metrics_state: deps.metrics_state,
+        publisher,
+    });
+    let builder = register_instance_jobs(builder, jobs.clone());
+    register_graph_jobs(builder, jobs).build()
 }
 
 /// The operator key this node withdraws with, as graphs store it.

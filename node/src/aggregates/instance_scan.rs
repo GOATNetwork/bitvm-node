@@ -4,6 +4,7 @@
 //! events. Snapshots include transaction visibility, input spends and tip height
 //! for deadline decisions.
 
+use super::common::ScanMarks;
 use super::instance::{AnswerWindow, BtcSnapshot, TxFact};
 use crate::env::{get_instance_maintenance_batch_size, is_enable_committee_instance_key_delete};
 use crate::rpc_service::current_time_secs;
@@ -151,28 +152,7 @@ pub async fn scan_answer_windows(
 
 // ------------------------------------------------------------------ bitcoin
 
-/// `(height, status)` of the last snapshot recorded per instance: a scan at
-/// the same tip for the same status would repeat the same facts.
-static SCAN_MARKS: LazyLock<Mutex<HashMap<Uuid, (i64, InstanceBridgeInStatus)>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-fn already_scanned(instance_id: Uuid, height: i64, status: InstanceBridgeInStatus) -> bool {
-    let marks = SCAN_MARKS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    marks.get(&instance_id).is_some_and(|mark| *mark == (height, status))
-}
-
-fn mark_scanned(instance_id: Uuid, height: i64, status: InstanceBridgeInStatus) {
-    let mut marks = SCAN_MARKS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    if marks.len() >= SCAN_MARKS_LIMIT {
-        marks.clear();
-    }
-    marks.insert(instance_id, (height, status));
-}
-
-fn forget_scanned(instance_id: Uuid) {
-    let mut marks = SCAN_MARKS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    marks.remove(&instance_id);
-}
+static SCAN_MARKS: LazyLock<ScanMarks<InstanceBridgeInStatus>> = LazyLock::new(ScanMarks::new);
 
 /// Timeout instances whose Peg-In-Confirm confirmed anyway. The apply reports
 /// them once; the row stays `Timeout` for manual handling and there is nothing
@@ -237,7 +217,7 @@ pub async fn scan_instances_on_bitcoin(
             warn!(event = "instance_scan", instance_id = %instance_id, status = %instance.status, "unknown instance status");
             continue;
         };
-        if already_scanned(instance_id, height, status) {
+        if SCAN_MARKS.seen(instance_id, height, status) {
             continue;
         }
         if status == InstanceBridgeInStatus::Timeout && settled_timeout(instance_id) {
@@ -248,12 +228,12 @@ pub async fn scan_instances_on_bitcoin(
                 let confirm_confirmed =
                     snapshot.confirm.as_ref().is_some_and(|fact| fact.confirmed);
                 engine.submit(snapshot.event(instance_id)?).await?;
-                mark_scanned(instance_id, height, status);
+                SCAN_MARKS.mark(instance_id, height, status);
                 if status == InstanceBridgeInStatus::Timeout && confirm_confirmed {
                     mark_settled_timeout(instance_id);
                 }
             }
-            Ok(None) => forget_scanned(instance_id),
+            Ok(None) => SCAN_MARKS.forget(instance_id),
             Err(error) => warn!(
                 event = "instance_scan",
                 instance_id = %instance_id,
