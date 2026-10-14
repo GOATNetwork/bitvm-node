@@ -18,6 +18,7 @@ use client::goat_chain::GOATClient;
 use libp2p::PeerId;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
+use store::GraphStatus;
 use store::localdb::LocalDB;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -41,8 +42,8 @@ pub enum GraphLookup {
 impl GraphLookup {
     pub fn request(&self) -> GetGraphRequest {
         match self {
-            GraphLookup::Id { instance_id, graph_id, .. } => {
-                GetGraphRequest::by_id(*instance_id, *graph_id)
+            GraphLookup::Id { instance_id, graph_id, finalized } => {
+                GetGraphRequest::by_id(*instance_id, *graph_id, *finalized)
             }
             GraphLookup::Slot { operator_pubkey, graph_nonce } => {
                 GetGraphRequest::by_slot(operator_pubkey.clone(), *graph_nonce)
@@ -70,6 +71,10 @@ pub async fn serve_graph_request(
     if let Some(instance_id) = request.instance_id
         && row.instance_id != instance_id
     {
+        return Ok(GetGraphResponse::not_found());
+    }
+    // Only the operator's copy is stored while the graph is OperatorPresigned.
+    if request.finalized && row.status == GraphStatus::OperatorPresigned.to_string() {
         return Ok(GetGraphResponse::not_found());
     }
     let Some(raw) = storage.find_graph_raw_data(&row.graph_id).await? else {

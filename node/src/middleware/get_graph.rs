@@ -77,22 +77,28 @@ impl request_response::Codec for GetGraphCodec {
     }
 }
 
-/// A definition is addressed by graph id or by operator slot.
+/// A definition is addressed by graph id or by operator slot. `finalized`
+/// asks for the copy with committee pre-signatures; a peer holding only the
+/// operator's copy answers not found instead of sending a copy the requester
+/// would reject after the transfer.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GetGraphRequest {
     pub instance_id: Option<Uuid>,
     pub graph_id: Option<Uuid>,
     pub operator_pubkey: Option<String>,
     pub graph_nonce: Option<u64>,
+    #[serde(default)]
+    pub finalized: bool,
 }
 
 impl GetGraphRequest {
-    pub fn by_id(instance_id: Uuid, graph_id: Uuid) -> Self {
+    pub fn by_id(instance_id: Uuid, graph_id: Uuid, finalized: bool) -> Self {
         Self {
             instance_id: Some(instance_id),
             graph_id: Some(graph_id),
             operator_pubkey: None,
             graph_nonce: None,
+            finalized,
         }
     }
 
@@ -102,6 +108,7 @@ impl GetGraphRequest {
             graph_id: None,
             operator_pubkey: Some(operator_pubkey),
             graph_nonce: Some(graph_nonce),
+            finalized: false,
         }
     }
 }
@@ -130,7 +137,7 @@ const MAX_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
 
 pub fn get_graph_protocol() -> StreamProtocol {
     let protocol = crate::env::get_proto_base();
-    StreamProtocol::try_from_owned(format!("/{protocol}/get-graph/1"))
+    StreamProtocol::try_from_owned(format!("/{protocol}/get-graph/2"))
         .expect("valid get-graph protocol name")
 }
 
