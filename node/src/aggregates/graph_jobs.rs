@@ -1263,6 +1263,12 @@ async fn verifier_setup(deps: &JobDeps, graph_id: Uuid, params: &[u8]) -> Result
     if !verify_init_graph_signature(&init) {
         return invalid("invalid operator signature on InitGraph");
     }
+    // The instance can fail while this message waits (or while a restart
+    // re-claims the job): the operator dropped its session, so the setup
+    // would only cost CPU and be ignored.
+    if instance_status(deps, instance_id).await?.is_some_and(|status| status.is_failed()) {
+        return Step::ignore("instance failed; verifier setup skipped");
+    }
     if !matches!(
         operator_stake_status(&deps.goat_client, &init.operator_pubkey)
             .await
@@ -1349,6 +1355,9 @@ async fn verifier_solder(deps: &JobDeps, graph_id: Uuid, params: &[u8]) -> Resul
     };
     if message_graph_id != graph_id || instance_id != inbound.instance_id {
         return invalid("CutCircuits identity mismatch");
+    }
+    if instance_status(deps, instance_id).await?.is_some_and(|status| status.is_failed()) {
+        return Step::ignore("instance failed; verifier soldering skipped");
     }
     let verifier_master_key = VerifierMasterKey::new(get_bitvm_key()?);
     let local_verifier_pubkey: PublicKey = verifier_master_key.master_keypair().public_key().into();

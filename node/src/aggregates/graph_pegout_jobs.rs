@@ -971,6 +971,7 @@ pub async fn broadcast_verifier_challenge_assert_tx(
     let input_amount =
         graph.verifier_asserts[verifier_index].prev_outs().iter().map(|o| o.value).sum::<Amount>();
     broadcast_tx_with_cpfp(btc_client, challenge_assert_tx, input_amount).await?;
+    info!(event = "graph_challenge", graph_id = %graph_id, verifier_index, txid = %challenge_assert_txid, "Verifier-ChallengeAssert broadcast");
     Ok(Some((challenge_assert_txid, verifier_index)))
 }
 
@@ -1009,9 +1010,11 @@ async fn disprove(
         return step;
     }
     let disprove_tx = build_disprove_tx(graph, verifier_index, None)?;
+    let disprove_txid = disprove_tx.compute_txid();
     let input_amount =
         graph.disproves[verifier_index].prev_outs().iter().map(|o| o.value).sum::<Amount>();
     broadcast_tx_with_cpfp(btc, disprove_tx, input_amount).await?;
+    info!(event = "graph_challenge", graph_id = %graph.parameters.graph_id, verifier_index, txid = %disprove_txid, "Disprove broadcast");
     broadcast_pending(deps, &format!("Disprove of slot {verifier_index}"))
 }
 
