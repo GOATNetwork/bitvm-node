@@ -7,6 +7,8 @@
 
 use crate::config::ProofBuilderConfig;
 use anyhow::Context;
+use commit_chain_proof::CommitChainProofBuilder;
+use header_chain_proof::HeaderChainProofBuilder;
 use proof_builder::ProofBuilder;
 use proof_builder::artifacts::{ManifestStatus, manifest_status};
 use state_chain_proof::StateChainProofBuilder;
@@ -96,10 +98,24 @@ impl Checker {
         Some(located)
     }
 
-    fn check_proof(&mut self, label: &str, path: &str, proven: bool) {
+    /// Checks a recorded proof. A proven proof must exist with its `sidecars` and match
+    /// its manifest when it has one.
+    fn check_proof(&mut self, label: &str, path: &str, proven: bool, sidecars: &[&str]) {
         let need = if proven { Need::File } else { Need::Directory };
         let Some(located) = self.check(label, path, need, Level::Error) else { return };
         if !proven {
+            return;
+        }
+        let missing_before = self.findings.len();
+        for suffix in sidecars {
+            self.check(
+                &format!("{label} {suffix}"),
+                &format!("{path}{suffix}"),
+                Need::File,
+                Level::Error,
+            );
+        }
+        if self.findings.len() > missing_before {
             return;
         }
         match manifest_status(&located) {
@@ -117,6 +133,22 @@ impl Checker {
             }
         }
     }
+}
+
+/// The files next to a proof that its readers need: every proof's public inputs,
+/// verifying-key hash and version, plus the header chain's `.blocks` (operator and
+/// watchtower SPV) and the commit chain's `.commits` (on-demand task inputs).
+fn required_sidecars(source: &str, task: &str) -> Vec<&'static str> {
+    let mut sidecars = vec![".public_inputs.bin", ".vk_hash.bin", ".zkm_version.bin"];
+    if source == "long_running_task_proof" {
+        let chain = task.split(':').next().unwrap_or_default();
+        if chain == HeaderChainProofBuilder::name() {
+            sidecars.push(".blocks");
+        } else if chain == CommitChainProofBuilder::name() {
+            sidecars.push(".commits");
+        }
+    }
+    sidecars
 }
 
 /// Collects the string values of path-like keys from a snapshot.
@@ -162,7 +194,8 @@ pub(crate) async fn check_storage(
     for recorded in storage.list_recorded_proof_paths().await? {
         let label = format!("{} {}", recorded.source, recorded.task);
         let proven = recorded.proof_state == ProofState::Proven.to_i64();
-        checker.check_proof(&label, &recorded.path_to_proof, proven);
+        let sidecars = required_sidecars(&recorded.source, &recorded.task);
+        checker.check_proof(&label, &recorded.path_to_proof, proven, &sidecars);
     }
 
     let runtime_paths = [
@@ -275,14 +308,22 @@ mod tests {
         let data = root.path().join("circuits/data/header-chain");
         std::fs::create_dir_all(&run).unwrap();
         std::fs::create_dir_all(&data).unwrap();
+        let sidecars = required_sidecars("long_running_task_proof", "header-chain:10");
+        assert!(sidecars.contains(&".blocks"));
+        // A legacy proof with every sidecar, but no manifest.
         std::fs::write(data.join("legacy.bin"), b"p").unwrap();
-        proof_builder::artifacts::publish_artifacts(
-            data.join("new.bin"),
-            b"p",
-            &[(".vk_hash.bin", b"v")],
-            "t",
-        )
-        .unwrap();
+        for suffix in &sidecars {
+            std::fs::write(data.join(format!("legacy.bin{suffix}")), b"s").unwrap();
+        }
+        let published: Vec<(&str, &[u8])> =
+            sidecars.iter().map(|s| (*s, b"s".as_slice())).collect();
+        proof_builder::artifacts::publish_artifacts(data.join("new.bin"), b"p", &published, "t")
+            .unwrap();
+        // A legacy header proof whose `.blocks` is gone.
+        std::fs::write(data.join("no-blocks.bin"), b"p").unwrap();
+        for suffix in sidecars.iter().filter(|s| **s != ".blocks") {
+            std::fs::write(data.join(format!("no-blocks.bin{suffix}")), b"s").unwrap();
+        }
         let outside = tempfile::tempdir().unwrap();
         std::fs::write(outside.path().join("x.bin"), b"p").unwrap();
 
@@ -291,25 +332,42 @@ mod tests {
             cwd: run.canonicalize().unwrap(),
             findings: Vec::new(),
         };
-        checker.check_proof("legacy", "../circuits/data/header-chain/legacy.bin", true);
-        checker.check_proof("new", "../circuits/data/header-chain/new.bin", true);
-        checker.check_proof("missing", "../circuits/data/header-chain/gone.bin", true);
-        checker.check_proof("pending", "../circuits/data/header-chain/next.bin", false);
-        checker.check_proof("outside", &outside.path().join("x.bin").display().to_string(), true);
-        checker.check_proof("no-dir", "../circuits/data/none/next.bin", false);
+        let dir = "../circuits/data/header-chain";
+        checker.check_proof("legacy", &format!("{dir}/legacy.bin"), true, &sidecars);
+        checker.check_proof("new", &format!("{dir}/new.bin"), true, &sidecars);
+        checker.check_proof("no-blocks", &format!("{dir}/no-blocks.bin"), true, &sidecars);
+        checker.check_proof("missing", &format!("{dir}/gone.bin"), true, &sidecars);
+        checker.check_proof("pending", &format!("{dir}/next.bin"), false, &sidecars);
+        let outside_proof = outside.path().join("x.bin").display().to_string();
+        checker.check_proof("outside", &outside_proof, true, &sidecars);
+        checker.check_proof("no-dir", "../circuits/data/none/next.bin", false, &sidecars);
         let levels: Vec<_> = checker.findings.iter().map(|f| f.level).collect();
         assert_eq!(
             levels,
-            vec![Level::Legacy, Level::Ok, Level::Error, Level::Error, Level::Error]
+            vec![Level::Legacy, Level::Ok, Level::Error, Level::Error, Level::Error, Level::Error]
         );
-        assert!(checker.findings[2].message.contains("missing"));
-        assert!(checker.findings[3].message.contains("outside"));
-        assert!(checker.findings[4].message.contains("no-dir"));
+        assert!(checker.findings[2].message.contains("no-blocks.bin.blocks does not exist"));
+        assert!(checker.findings[3].message.contains("missing"));
+        assert!(checker.findings[4].message.contains("outside"));
+        assert!(checker.findings[5].message.contains("no-dir"));
 
         // Task inputs replaced from the database at runtime only warn.
         checker.findings.clear();
         checker.check("task input", "/nonexistent/440-10.bin", Need::Directory, Level::Warning);
         assert_eq!(checker.findings.len(), 1);
         assert_eq!(checker.findings[0].level, Level::Warning);
+    }
+
+    #[test]
+    fn required_sidecars_follow_each_reader() {
+        let base = [".public_inputs.bin", ".vk_hash.bin", ".zkm_version.bin"];
+        assert_eq!(required_sidecars("operator_proof", "1"), base);
+        assert_eq!(required_sidecars("long_running_task_proof", "state-chain:5"), base);
+        assert!(
+            required_sidecars("long_running_task_proof", "commit-chain:0").contains(&".commits")
+        );
+        assert!(
+            !required_sidecars("long_running_task_proof", "commit-chain:0").contains(&".blocks")
+        );
     }
 }

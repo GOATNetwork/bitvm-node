@@ -141,14 +141,19 @@ pub async fn fetch_header_chain(
         };
     }
     writer.set_len((block_headers.len() * 80) as u64)?;
-    let backup_file = format!(
-        "{}/{}-{}.bin.blocks",
-        std::path::Path::new(block_header_file).parent().unwrap().to_str().unwrap(),
-        start,
-        batch_size,
-    );
-    std::fs::copy(block_header_file, backup_file).context("copy error")?;
+    // The proof's `.blocks` sidecar is published with the proof (see `save_proof`).
     Ok(block_headers)
+}
+
+/// The `.blocks` sidecar of a header-chain proof: every header up to the proof's last
+/// block, 80 bytes each. Operator and watchtower proofs read it to build SPV proofs.
+pub fn proof_block_headers(headers: &[CircuitBlockHeader]) -> anyhow::Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(headers.len() * 80);
+    for header in headers {
+        header.serialize(&mut bytes)?;
+    }
+    anyhow::ensure!(bytes.len() == headers.len() * 80, "block headers must be 80 bytes each");
+    Ok(bytes)
 }
 
 /// A program that aggregates the proofs of the simple program.
@@ -308,9 +313,20 @@ impl ProofBuilder for HeaderChainProofBuilder {
         _cycles: u64,
         proof: ZKMProofWithPublicValues,
     ) -> anyhow::Result<(String, usize)> {
-        let ProofRequest::HeaderChainProofRequest { output_proof, .. } = ctx else {
+        let ProofRequest::HeaderChainProofRequest {
+            output_proof,
+            start,
+            batch_size,
+            total_block_headers,
+            ..
+        } = ctx
+        else {
             anyhow::bail!("invalid context");
         };
+        let proven_headers = total_block_headers
+            .get(..start + batch_size)
+            .context("block headers do not cover the proven batch")?;
+        let blocks = proof_block_headers(proven_headers)?;
         //fs::write(&output_proof, bincode::serialize(&proof)?)?;
         //let public_value_hex = hex::encode(proof.public_values.as_slice());
         //let proof_size = proof.bytes().len();
@@ -329,11 +345,35 @@ impl ProofBuilder for HeaderChainProofBuilder {
                 (".public_inputs.bin", public_values.as_slice()),
                 (".vk_hash.bin", vk_hash.as_bytes()),
                 (".zkm_version.bin", proof.zkm_version.as_bytes()),
+                (".blocks", blocks.as_slice()),
             ],
             &format!("{} {}", Self::name(), output_proof),
         )?;
 
         tracing::info!("Generate proof successfully, proof: {:?}", proof);
         Ok((public_value_hex, proof_size))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proof_block_headers_matches_the_operator_reader() {
+        let genesis: CircuitBlockHeader =
+            bitcoin::constants::genesis_block(Network::Bitcoin).header.into();
+        let regtest: CircuitBlockHeader =
+            bitcoin::constants::genesis_block(Network::Regtest).header.into();
+        let headers = vec![genesis.clone(), regtest, genesis];
+        let bytes = proof_block_headers(&headers).unwrap();
+        assert_eq!(bytes.len(), 3 * 80);
+        // Operator and watchtower proofs parse the sidecar 80 bytes at a time.
+        let parsed: Vec<_> = bytes
+            .chunks(80)
+            .map(|header| CircuitBlockHeader::try_from_slice(header).unwrap())
+            .collect();
+        assert_eq!(parsed, headers);
+        assert_eq!(proof_block_headers(&[]).unwrap(), Vec::<u8>::new());
     }
 }

@@ -110,8 +110,9 @@ Proving behaviour in Fleet mode:
   Keep that value below the service's `worker_stop_timeout_s`. Exit codes: 0 after a clean stop,
   1 after a task failure or an abandoned proof, 101 after a panic.
 - Proofs and their sidecars are published through synced temporary files and atomic renames.
-  A `<proof>.manifest.json` written last marks a complete set. State-chain `.args`/`.ctx`
-  snapshots are written atomically as well.
+  A `<proof>.manifest.json` written last marks a complete set. Sidecars include the header
+  chain's `.blocks`, which operator and watchtower proofs read for SPV. State-chain
+  `.args`/`.ctx` snapshots are written atomically as well.
 - The state-chain context builder prepares at most `--state-chain-max-pending-batches`
   unproved batches (default 2; 0 means unlimited).
 
@@ -122,9 +123,16 @@ storage check from the working directory with the worker's config and `DATABASE_
 proof-builder-rpc --config proof-builder.toml --check-storage /srv/zkm-fleet/apps/goat
 ```
 
-It reports every recorded proof, config path and pending state-chain snapshot that is missing,
-outside the root, or inconsistent with its manifest. It exits non-zero on any error. Proofs
-written before atomic publication are reported as `legacy`.
+It reports every recorded proof, config path and pending state-chain snapshot that is missing or
+outside the root. A proven proof is also reported when a sidecar its readers need is missing,
+or when it is inconsistent with its manifest. Required sidecars:
+
+- every proof: `.public_inputs.bin`, `.vk_hash.bin` and `.zkm_version.bin`;
+- header chain: `.blocks`;
+- commit chain: `.commits`.
+
+The check exits non-zero on any error. Proofs written before atomic publication are reported
+as `legacy`.
 
 ## Metrics
 
