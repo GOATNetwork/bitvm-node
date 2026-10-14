@@ -532,19 +532,6 @@ pub async fn operator_stake_status(
     Ok(OperatorStakeStatus::Staked)
 }
 
-pub async fn validate_operator_stake(
-    goat_client: &GOATClient,
-    operator_pubkey: &PublicKey,
-) -> Result<()> {
-    match operator_stake_status(goat_client, operator_pubkey).await? {
-        OperatorStakeStatus::Staked => Ok(()),
-        OperatorStakeStatus::NotRegistered => bail!("operator not registered"),
-        OperatorStakeStatus::Insufficient { locked, min } => {
-            bail!("insufficient operator stake: locked={locked}, min={min}")
-        }
-    }
-}
-
 pub async fn validate_verifier_graph_params_endorsements(
     goat_client: &GOATClient,
     graph: &SimplifiedBitvmGcGraph,
@@ -1258,7 +1245,6 @@ pub(crate) async fn refresh_graph(
 pub(crate) struct DetectedDisprove {
     pub(crate) disprove_type: DisproveTxType,
     pub(crate) index: usize,
-    pub(crate) challenge_start_txid: Option<Txid>,
     pub(crate) challenge_finish_txid: Txid,
 }
 
@@ -1269,10 +1255,6 @@ pub(crate) struct GraphChainScan {
     pub(crate) status: GraphStatus,
     pub(crate) sub_status: ChallengeSubStatus,
     pub(crate) challenge_txid: Option<Txid>,
-    #[allow(dead_code)]
-    watchtower_challenge_init_on_chain: bool,
-    #[allow(dead_code)]
-    operator_assert_on_chain: bool,
     pub(crate) disprove: Option<DetectedDisprove>,
 }
 
@@ -1283,8 +1265,6 @@ impl GraphChainScan {
             status,
             sub_status: ChallengeSubStatus::default(),
             challenge_txid: None,
-            watchtower_challenge_init_on_chain: false,
-            operator_assert_on_chain: false,
             disprove: None,
         }
     }
@@ -1313,15 +1293,6 @@ fn connector_d_outpoint(graph: &BitvmGcGraph) -> Result<OutPoint> {
         .map_err(|e| anyhow!("failed to get connector-d input: {e}"))
 }
 
-#[allow(dead_code)]
-fn guardian_connector_outpoint(graph: &BitvmGcGraph) -> Result<OutPoint> {
-    graph
-        .kickoff
-        .guardian_connector_input()
-        .map(|input| input.outpoint)
-        .map_err(|e| anyhow!("failed to get guardian connector input: {e}"))
-}
-
 async fn update_graph_challenge_txid_if_needed(
     local_db: &LocalDB,
     graph_id: Uuid,
@@ -1343,18 +1314,15 @@ async fn update_graph_challenge_txid_if_needed(
     Ok(())
 }
 
-#[allow(dead_code)]
 async fn detect_guardian_disprove(
     btc_client: &BTCClient,
     graph: &BitvmGcGraph,
-    challenge_start_txid: Option<Txid>,
 ) -> Result<Option<DetectedDisprove>> {
     let quick_challenge_txid = graph.quick_challenge.tx().compute_txid();
     if tx_confirmed(btc_client, &quick_challenge_txid).await? {
         return Ok(Some(DetectedDisprove {
             disprove_type: DisproveTxType::QuickChallenge,
             index: 0,
-            challenge_start_txid,
             challenge_finish_txid: quick_challenge_txid,
         }));
     }
@@ -1364,7 +1332,6 @@ async fn detect_guardian_disprove(
         return Ok(Some(DetectedDisprove {
             disprove_type: DisproveTxType::ChallengeIncompleteKickoff,
             index: 0,
-            challenge_start_txid,
             challenge_finish_txid: challenge_incomplete_kickoff_txid,
         }));
     }
@@ -1374,7 +1341,6 @@ async fn detect_guardian_disprove(
 async fn detect_connector_d_disprove(
     btc_client: &BTCClient,
     graph: &BitvmGcGraph,
-    challenge_start_txid: Option<Txid>,
 ) -> Result<Option<DetectedDisprove>> {
     let connector_d = connector_d_outpoint(graph)?;
     let Some(spent_txid) =
@@ -1392,7 +1358,6 @@ async fn detect_connector_d_disprove(
             return Ok(Some(DetectedDisprove {
                 disprove_type: DisproveTxType::Disprove,
                 index,
-                challenge_start_txid,
                 challenge_finish_txid: spent_txid,
             }));
         }
@@ -1401,7 +1366,6 @@ async fn detect_connector_d_disprove(
     Ok(Some(DetectedDisprove {
         disprove_type: DisproveTxType::PubinDisprove,
         index: 0,
-        challenge_start_txid: None,
         challenge_finish_txid: spent_txid,
     }))
 }
@@ -1416,7 +1380,6 @@ async fn detect_watchtower_flow_disprove(
             return Ok(Some(DetectedDisprove {
                 disprove_type: DisproveTxType::OperatorChallengeNack,
                 index,
-                challenge_start_txid: None,
                 challenge_finish_txid: txid,
             }));
         }
@@ -1427,7 +1390,6 @@ async fn detect_watchtower_flow_disprove(
         return Ok(Some(DetectedDisprove {
             disprove_type: DisproveTxType::OperatorCommitTimeout,
             index: 0,
-            challenge_start_txid: None,
             challenge_finish_txid: txid,
         }));
     }
@@ -1472,8 +1434,6 @@ pub(crate) async fn scan_graph_chain_state(
             status: current_status,
             sub_status,
             challenge_txid: None,
-            watchtower_challenge_init_on_chain: false,
-            operator_assert_on_chain: false,
             disprove: None,
         });
     }
@@ -1490,8 +1450,6 @@ pub(crate) async fn scan_graph_chain_state(
                 status: GraphStatus::Skipped,
                 sub_status,
                 challenge_txid: None,
-                watchtower_challenge_init_on_chain: false,
-                operator_assert_on_chain: false,
                 disprove: None,
             });
         }
@@ -1501,8 +1459,6 @@ pub(crate) async fn scan_graph_chain_state(
                 status: GraphStatus::PreKickoff,
                 sub_status,
                 challenge_txid: None,
-                watchtower_challenge_init_on_chain: false,
-                operator_assert_on_chain: false,
                 disprove: None,
             });
         }
@@ -1510,7 +1466,7 @@ pub(crate) async fn scan_graph_chain_state(
 
     let mut challenge_txid = None;
     if current_status == GraphStatus::OperatorKickOff
-        && let Some(disprove) = detect_guardian_disprove(btc_client, graph, challenge_txid).await?
+        && let Some(disprove) = detect_guardian_disprove(btc_client, graph).await?
     {
         sub_status.disprove_type = Some(disprove.disprove_type);
         sub_status.disprove_index = disprove.index as i32;
@@ -1518,8 +1474,6 @@ pub(crate) async fn scan_graph_chain_state(
             status: GraphStatus::Disprove,
             sub_status,
             challenge_txid,
-            watchtower_challenge_init_on_chain: false,
-            operator_assert_on_chain: false,
             disprove: Some(disprove),
         });
     }
@@ -1536,8 +1490,6 @@ pub(crate) async fn scan_graph_chain_state(
                     status: GraphStatus::OperatorTake1,
                     sub_status,
                     challenge_txid: None,
-                    watchtower_challenge_init_on_chain: false,
-                    operator_assert_on_chain: false,
                     disprove: None,
                 });
             }
@@ -1546,35 +1498,19 @@ pub(crate) async fn scan_graph_chain_state(
                 status: GraphStatus::OperatorKickOff,
                 sub_status,
                 challenge_txid: None,
-                watchtower_challenge_init_on_chain: false,
-                operator_assert_on_chain: false,
                 disprove: None,
             });
         }
     }
 
-    if current_status == GraphStatus::Challenge && challenge_txid.is_none() {
-        let connector_a = connector_a_outpoint(graph)?;
-        if let Some(spent_txid) =
-            outpoint_spent_confirmed(btc_client, &connector_a.txid, connector_a.vout as u64).await?
-            && spent_txid != take1_txid
-        {
-            challenge_txid = Some(spent_txid);
-        }
-    }
-
-    let mut watchtower_challenge_init_on_chain = false;
-    let mut operator_assert_on_chain = false;
     if current_status == GraphStatus::Challenge {
-        if let Some(disprove) = detect_guardian_disprove(btc_client, graph, challenge_txid).await? {
+        if let Some(disprove) = detect_guardian_disprove(btc_client, graph).await? {
             sub_status.disprove_type = Some(disprove.disprove_type);
             sub_status.disprove_index = disprove.index as i32;
             return Ok(GraphChainScan {
                 status: GraphStatus::Disprove,
                 sub_status,
                 challenge_txid,
-                watchtower_challenge_init_on_chain,
-                operator_assert_on_chain,
                 disprove: Some(disprove),
             });
         }
@@ -1586,14 +1522,12 @@ pub(crate) async fn scan_graph_chain_state(
                 status: GraphStatus::Disprove,
                 sub_status,
                 challenge_txid,
-                watchtower_challenge_init_on_chain,
-                operator_assert_on_chain,
                 disprove: Some(disprove),
             });
         }
 
         let watchtower_challenge_init_txid = graph.watchtower_challenge_init.tx().compute_txid();
-        watchtower_challenge_init_on_chain =
+        let watchtower_challenge_init_on_chain =
             tx_on_chain(btc_client, &watchtower_challenge_init_txid).await?;
         if watchtower_challenge_init_on_chain {
             for watchtower_index in 0..watchtower_num {
@@ -1620,20 +1554,16 @@ pub(crate) async fn scan_graph_chain_state(
                 status: current_status,
                 sub_status,
                 challenge_txid,
-                watchtower_challenge_init_on_chain,
-                operator_assert_on_chain: false,
                 disprove: None,
             });
         }
         let operator_assert_txid = graph.operator_assert.tx().compute_txid();
-        operator_assert_on_chain = tx_on_chain(btc_client, &operator_assert_txid).await?;
+        let operator_assert_on_chain = tx_on_chain(btc_client, &operator_assert_txid).await?;
         if !operator_assert_on_chain {
             return Ok(GraphChainScan {
                 status: current_status,
                 sub_status,
                 challenge_txid,
-                watchtower_challenge_init_on_chain,
-                operator_assert_on_chain,
                 disprove: None,
             });
         }
@@ -1641,15 +1571,13 @@ pub(crate) async fn scan_graph_chain_state(
     }
 
     if current_status == GraphStatus::Challenge {
-        if let Some(disprove) = detect_guardian_disprove(btc_client, graph, challenge_txid).await? {
+        if let Some(disprove) = detect_guardian_disprove(btc_client, graph).await? {
             sub_status.disprove_type = Some(disprove.disprove_type);
             sub_status.disprove_index = disprove.index as i32;
             return Ok(GraphChainScan {
                 status: GraphStatus::Disprove,
                 sub_status,
                 challenge_txid,
-                watchtower_challenge_init_on_chain,
-                operator_assert_on_chain,
                 disprove: Some(disprove),
             });
         }
@@ -1661,8 +1589,6 @@ pub(crate) async fn scan_graph_chain_state(
                 status: GraphStatus::Disprove,
                 sub_status,
                 challenge_txid,
-                watchtower_challenge_init_on_chain,
-                operator_assert_on_chain,
                 disprove: Some(disprove),
             });
         }
@@ -1684,7 +1610,6 @@ pub(crate) async fn scan_graph_chain_state(
                         detected_disprove = Some(DetectedDisprove {
                             disprove_type: DisproveTxType::Disprove,
                             index: verifier_index,
-                            challenge_start_txid: challenge_txid,
                             challenge_finish_txid: spent_txid,
                         });
                         current_status = GraphStatus::Disprove;
@@ -1703,22 +1628,16 @@ pub(crate) async fn scan_graph_chain_state(
                 status: current_status,
                 sub_status,
                 challenge_txid,
-                watchtower_challenge_init_on_chain,
-                operator_assert_on_chain,
                 disprove: detected_disprove,
             });
         }
-        if let Some(disprove) =
-            detect_connector_d_disprove(btc_client, graph, challenge_txid).await?
-        {
+        if let Some(disprove) = detect_connector_d_disprove(btc_client, graph).await? {
             sub_status.disprove_type = Some(disprove.disprove_type);
             sub_status.disprove_index = disprove.index as i32;
             return Ok(GraphChainScan {
                 status: GraphStatus::Disprove,
                 sub_status,
                 challenge_txid,
-                watchtower_challenge_init_on_chain,
-                operator_assert_on_chain,
                 disprove: Some(disprove),
             });
         }
@@ -1727,21 +1646,12 @@ pub(crate) async fn scan_graph_chain_state(
                 status: GraphStatus::OperatorTake2,
                 sub_status,
                 challenge_txid,
-                watchtower_challenge_init_on_chain,
-                operator_assert_on_chain,
                 disprove: None,
             });
         }
     }
 
-    Ok(GraphChainScan {
-        status: current_status,
-        sub_status,
-        challenge_txid,
-        watchtower_challenge_init_on_chain,
-        operator_assert_on_chain,
-        disprove: None,
-    })
+    Ok(GraphChainScan { status: current_status, sub_status, challenge_txid, disprove: None })
 }
 
 pub fn build_graph_data(graph: &BitvmGcGraph) -> Result<GraphData> {
@@ -1866,23 +1776,6 @@ pub async fn validate_committee_with_evm_address(
     ))
 }
 
-pub async fn validate_graph_id_on_goat(
-    goat_client: &GOATClient,
-    instance_id: Uuid,
-    graph_id: Uuid,
-) -> Result<()> {
-    let graph_data_on_goat = goat_client.gateway_get_graph_data(&graph_id).await?;
-    if graph_data_on_goat.operator_pubkey == [0u8; 32] {
-        bail!("Graph {graph_id} not found on GoatChain")
-    }
-    let all_instance_graph_ids =
-        goat_client.gateway_get_graph_ids_by_instance_id(&instance_id).await?;
-    if !all_instance_graph_ids.contains(&graph_id) {
-        bail!("graph_id: {graph_id} and instance_id {instance_id} mismatch")
-    }
-    Ok(())
-}
-
 pub async fn read_pegin_request(
     btc_client: &BTCClient,
     goat_client: &GOATClient,
@@ -1979,20 +1872,10 @@ pub async fn read_instance_info_from_goat(
     };
     let committee_pubkeys = match goat_client.gateway_get_committee_pubkeys(&instance_id).await {
         Ok(pks) => pks,
-        Err(e) => {
-            if let Some(msg) = e.downcast_ref::<SpecialError>() {
-                match msg {
-                    SpecialError::EvmReverted(err_msg) => {
-                        bail!(SpecialError::InvalidPeginData(format!(
-                            "fail to get committee pubkeys: {err_msg}"
-                        )))
-                    }
-                    _ => bail!(e),
-                }
-            } else {
-                bail!(e)
-            }
+        Err(e) if crate::error::is_contract_revert(&e) => {
+            bail!(SpecialError::InvalidPeginData(format!("fail to get committee pubkeys: {e:#}")))
         }
+        Err(e) => bail!(e),
     };
     let committee_agg_pubkey = generate_n_of_n_public_key(&committee_pubkeys).0;
     Ok(BitvmGcInstanceParameters {
@@ -2913,114 +2796,6 @@ pub async fn get_proper_utxo_set(
     Ok(None)
 }
 
-/// Returns:
-/// - `Ok((Empty, None))` if given address does not have enough btc,
-/// - `Ok((Empty, Some((SplitTx, Vec<TxinAmount>))))` if UTXO cannot be properly grouped, and a split transaction is needed, needing user to sign and broadcast
-/// - `Ok(Vec<Vec<Inputs>>, None))`
-pub async fn get_proper_utxo_sets(
-    client: &BTCClient,
-    address: Address,
-    target_amounts: Vec<Amount>,
-    fee_rate: f64,
-) -> Result<(Vec<Vec<Input>>, Option<(Transaction, Vec<Amount>)>)> {
-    let mut utxos = client.get_address_utxo(address.clone()).await?;
-
-    let total_available_sat: u64 = utxos.iter().map(|u| u.value.to_sat()).sum();
-
-    let total_target_sat: u64 = target_amounts.iter().map(|a| a.to_sat()).sum();
-
-    if total_available_sat <= total_target_sat {
-        return Ok((Vec::new(), None));
-    }
-
-    let mut targets_with_idx: Vec<(usize, Amount)> =
-        target_amounts.clone().into_iter().enumerate().collect();
-    targets_with_idx.sort_by(|a, b| b.1.to_sat().cmp(&a.1.to_sat()));
-
-    utxos.sort_by(|a, b| b.value.to_sat().cmp(&a.value.to_sat()));
-
-    let mut available_indices: Vec<usize> = (0..utxos.len()).collect();
-
-    use std::collections::HashMap;
-    let mut temp_groups: HashMap<usize, Vec<Input>> = HashMap::new();
-
-    for (original_idx, target) in targets_with_idx {
-        let mut group: Vec<Input> = Vec::new();
-        let mut sum_sat: u64 = 0;
-
-        let i = 0;
-        while i < available_indices.len() && sum_sat < target.to_sat() {
-            let utxo_idx = available_indices[i];
-            let utxo = utxos[utxo_idx].clone();
-            sum_sat += utxo.value.to_sat();
-            group.push(Input {
-                outpoint: OutPoint { txid: utxo.txid, vout: utxo.vout },
-                amount: utxo.value,
-            });
-            available_indices.remove(i);
-        }
-
-        if sum_sat < target.to_sat() {
-            // if all UTXOs are used but target not met, need to build a split transaction (already checked that total_available > total_target)
-            let script_pubkey = address.script_pubkey();
-            let base_outputs: Vec<TxOut> = target_amounts
-                .iter()
-                .map(|amt| TxOut { value: *amt, script_pubkey: script_pubkey.clone() })
-                .collect();
-            let tx_ins: Vec<TxIn> = utxos
-                .iter()
-                .map(|u| TxIn {
-                    previous_output: OutPoint { txid: u.txid, vout: u.vout },
-                    script_sig: ScriptBuf::new(),
-                    sequence: Sequence::MAX,
-                    witness: bitcoin::Witness::new(),
-                })
-                .collect();
-            let txin_amounts: Vec<Amount> = utxos.iter().map(|u| u.value).collect();
-
-            let n_inputs = tx_ins.len() as u64;
-            let n_outputs = base_outputs.len() as u64 + 1;
-            let est_vbytes = 100u64
-                + n_inputs * CHECKSIG_P2WSH_INPUT_VBYTES_ESTIMATE
-                + n_outputs * P2WSH_OUTPUT_VBYTES;
-            let est_fee_sat = (est_vbytes as f64 * fee_rate).ceil() as u64;
-
-            if total_available_sat < total_target_sat + est_fee_sat {
-                return Ok((Vec::new(), None));
-            }
-
-            let change_sat = total_available_sat
-                .checked_sub(total_target_sat + est_fee_sat)
-                .ok_or_else(|| anyhow!("overflow when calculating change"))?;
-
-            let mut tx_outs = base_outputs;
-
-            if change_sat >= DUST_AMOUNT {
-                tx_outs.push(TxOut {
-                    value: Amount::from_sat(change_sat),
-                    script_pubkey: script_pubkey.clone(),
-                });
-            }
-
-            let split_tx = Transaction {
-                version: bitcoin::transaction::Version(2),
-                lock_time: bitcoin::absolute::LockTime::ZERO,
-                input: tx_ins,
-                output: tx_outs,
-            };
-            return Ok((Vec::new(), Some((split_tx, txin_amounts))));
-        }
-
-        temp_groups.insert(original_idx, group);
-    }
-
-    let mut ordered: Vec<(usize, Vec<Input>)> = temp_groups.into_iter().collect();
-    ordered.sort_by_key(|(idx, _)| *idx);
-    let grouped: Vec<Vec<Input>> = ordered.into_iter().map(|(_, g)| g).collect();
-
-    Ok((grouped, None))
-}
-
 pub fn node_p2wsh_script(pubkey: &PublicKey) -> ScriptBuf {
     script! {
         { *pubkey }
@@ -3636,15 +3411,6 @@ pub async fn notify_watchtower_proof_timeout(instance_id: Uuid, graph_id: Uuid) 
     Ok(response.data.is_some())
 }
 
-/// store new graph, graph_raw_data, and update instance_id
-pub async fn get_bitvm_graph_from_db(
-    _local_db: &LocalDB,
-    _instance_id: Uuid,
-    graph_id: Uuid,
-) -> Result<BitvmGcGraph> {
-    Err(anyhow!("graph:{graph_id} not found"))
-}
-
 pub async fn get_graph_status(
     local_db: &LocalDB,
     instance_id: Uuid,
@@ -3702,70 +3468,6 @@ pub async fn wait_tx_confirmation(
             }
         }
         thread::sleep(Duration::from_secs(interval));
-    }
-}
-
-#[allow(dead_code)]
-pub async fn wait_tx_appear(
-    btc_client: &BTCClient,
-    txid: &Txid,
-    interval: u64,
-    max_wait_secs: u64,
-) -> Result<bool> {
-    use std::{
-        thread,
-        time::{Duration, Instant},
-    };
-    let start_time = Instant::now();
-    loop {
-        if start_time.elapsed().as_secs() > max_wait_secs {
-            // println!("Timeout: Transaction not appear after {} seconds", max_wait_secs);
-            return Ok(false);
-        };
-        match btc_client.get_tx(txid).await {
-            Ok(tx) => {
-                if tx.is_some() {
-                    return Ok(true);
-                }
-            }
-            Err(e) => {
-                bail!("Failed to fetch transaction status: {e}");
-            }
-        }
-        thread::sleep(Duration::from_secs(interval));
-    }
-}
-
-pub mod defer {
-    pub struct Defer<F: FnOnce()> {
-        cleanup: Option<F>,
-    }
-    impl<F: FnOnce()> Defer<F> {
-        pub fn new(f: F) -> Self {
-            Self { cleanup: Some(f) }
-        }
-        pub fn dismiss(&mut self) {
-            self.cleanup = None;
-        }
-    }
-    impl<F: FnOnce()> Drop for Defer<F> {
-        fn drop(&mut self) {
-            if let Some(cleanup) = self.cleanup.take() {
-                cleanup();
-            }
-        }
-    }
-    #[macro_export]
-    macro_rules! defer {
-        ($name:ident, $cleanup:block) => {
-            let mut $name = $crate::utils::defer::Defer::new(|| $cleanup);
-        };
-    }
-    #[macro_export]
-    macro_rules! dismiss_defer {
-        ($name:ident) => {
-            $name.dismiss();
-        };
     }
 }
 
@@ -3921,16 +3623,6 @@ pub fn get_rand_btc_address_p2wpkh(network: Network) -> String {
     .to_string()
 }
 
-pub fn get_rand_btc_address_p2pkh(network: Network) -> String {
-    let secp = Secp256k1::new();
-    Address::p2pkh(
-        CompressedPublicKey::try_from(PrivateKey::generate(network).public_key(&secp))
-            .expect("Could not compress public key"),
-        network,
-    )
-    .to_string()
-}
-
 pub fn get_rand_goat_address() -> String {
     EvmAddress::from_slice(&generate_random_bytes(20)).to_string()
 }
@@ -3979,16 +3671,6 @@ pub fn reflect_goat_address(addr_op: Option<String>) -> (bool, Option<String>) {
         return (true, Some(addr.to_string()));
     }
     (false, None)
-}
-
-pub async fn operator_scan_ready_proof(
-    _local_db: &LocalDB,
-    _remote_proof_server_socket: Option<String>,
-    _uri: &str,
-) -> Result<()> {
-    tracing::info!("start operator_scan_ready_proof");
-    // todo
-    Ok(())
 }
 
 pub fn generate_local_key() -> libp2p::identity::Keypair {
@@ -4737,48 +4419,6 @@ pub async fn get_graph_by_instance_id_and_operator_pubkey(
     }
 }
 
-pub async fn get_latest_pegout_finalized_graph(
-    local_db: &LocalDB,
-    operator_pubkey: &PublicKey,
-) -> Result<Option<(u64, Uuid)>> {
-    // get latest pegout finalized graph nonce & id from local db
-    let statuses: Vec<String> =
-        GraphStatus::get_closed_status().iter().map(|status| status.to_string()).collect();
-    let mut storage_processor = local_db.acquire().await?;
-    let graphs = storage_processor
-        .get_operator_graphs(
-            GraphQuery::default()
-                .with_operator_pubkey(operator_pubkey.to_string())
-                .with_statuses(statuses)
-                .with_order("kickoff_index DESC".to_string())
-                .with_limit(1),
-        )
-        .await?;
-    if graphs.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some((graphs[0].kickoff_index as u64, graphs[0].graph_id)))
-    }
-}
-
-pub async fn get_graph_id_by_nonce(
-    local_db: &LocalDB,
-    graph_nonce: u64,
-    operator_pubkey: &PublicKey,
-) -> Result<Option<(Uuid, Uuid)>> {
-    // get instance_id & graph_id by graph_nonce and operator_pubkey from local db
-    let mut storage_processor = local_db.acquire().await?;
-    let graphs = storage_processor
-        .get_operator_graphs(
-            GraphQuery::default()
-                .with_operator_pubkey(operator_pubkey.to_string())
-                .with_kickoff_index(graph_nonce as i64)
-                .with_limit(1),
-        )
-        .await?;
-    if graphs.is_empty() { Ok(None) } else { Ok(Some((graphs[0].instance_id, graphs[0].graph_id))) }
-}
-
 pub async fn upsert_pegin_instance_process_data(
     storage_processor: &mut StorageProcessor<'_>,
     instance_id: Uuid,
@@ -5248,19 +4888,6 @@ pub async fn has_required_presigned_graphs(local_db: &LocalDB, instance_id: Uuid
     Ok(get_endorsed_graph_count(local_db, instance_id).await? >= min_required_operator())
 }
 
-/// A graph of the instance is finalized and endorsed locally: the Instance aggregate re-checks
-/// the Presigned threshold.
-pub async fn notify_graph_endorsed(
-    local_db: &LocalDB,
-    instance_id: Uuid,
-    graph_id: Uuid,
-) -> Result<()> {
-    crate::engine_bridge::submit_event(
-        local_db,
-        crate::aggregates::instance::graph_endorsed_event(instance_id, graph_id)?,
-    )
-    .await
-}
 pub async fn store_committee_pub_nonce_for_instance(
     local_db: &LocalDB,
     instance_id: Uuid,
@@ -5469,58 +5096,6 @@ pub async fn get_committee_endorse_sigs_for_pegin(
         .collect::<Vec<(PublicKey, Vec<u8>)>>())
 }
 
-pub async fn graph_exists(local_db: &LocalDB, instance_id: Uuid, graph_id: Uuid) -> Result<bool> {
-    let mut storage_processor = local_db.acquire().await?;
-    if let Some(graph) = storage_processor.find_graph(&graph_id).await?
-        && graph.instance_id == instance_id
-    {
-        Ok(true)
-    } else {
-        Ok(false)
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub async fn try_update_graph_challenge_txid(
-    btc_client: &BTCClient,
-    local_db: &LocalDB,
-    graph_id: Uuid,
-    kickoff_txid: Txid,
-    connector_a_vout: u64,
-    take1_txid: Txid,
-) -> Result<()> {
-    let graph = {
-        let mut storage_processor = local_db.acquire().await?;
-        match storage_processor.find_graph(&graph_id).await? {
-            Some(graph) => graph,
-            None => {
-                warn!("graph{graph_id} not in db");
-                return Ok(());
-            }
-        }
-    };
-
-    if graph.challenge_txid.is_none()
-        && let Some(spent_txid) =
-            outpoint_spent_txid(btc_client, &kickoff_txid, connector_a_vout).await?
-        && spent_txid != take1_txid
-    {
-        info!(
-            "try_update_graph_challenge_txid update challenge_txid: {spent_txid} for graph {graph_id}"
-        );
-        let mut storage_processor = local_db.acquire().await?;
-        storage_processor
-            .update_graph_runtime(
-                &GraphRuntimeUpdate::new(graph.instance_id, graph_id)
-                    .with_challenge_txid(spent_txid.into()),
-            )
-            .await?;
-    } else {
-        info!("try_update_graph_challenge_txid no need to challenge_txid for graph {graph_id}");
-    }
-    Ok(())
-}
-
 pub async fn update_graph_status(
     local_db: &LocalDB,
     instance_id: Uuid,
@@ -5583,15 +5158,6 @@ pub(crate) async fn obsolete_instance_graphs_except(
     }
 
     Ok(obsoleted_graph_ids)
-}
-
-pub async fn get_graph_ids_for_instance(
-    local_db: &LocalDB,
-    instance_id: Uuid,
-) -> Result<Vec<Uuid>> {
-    let mut storage_processor = local_db.acquire().await?;
-    let graphs = storage_processor.get_graphs_by_instance_id(&instance_id).await?;
-    Ok(graphs.into_iter().map(|v| v.graph_id).collect())
 }
 
 pub fn gen_instance_parameters_local(
@@ -5718,61 +5284,6 @@ pub(crate) async fn get_bridge_out_global_stats<'a>(
             updated_at: 0,
         }),
     }
-}
-
-pub async fn get_largest_watchtower_challenge_block(
-    graph: &BitvmGcGraph,
-    btc_client: &BTCClient,
-) -> anyhow::Result<BlockHash> {
-    let watchtower_challenge_init_txid = graph.watchtower_challenge_init.tx().compute_txid();
-    let mut largest_watchtower_challenge_block_height = 0u32;
-    let mut largest_watchtower_challenge_block_hash: BlockHash =
-        BlockHash::from_slice(&[0u8; 32]).unwrap();
-    for watchtower_index in 0..graph.parameters.watchtower_pubkeys.len() {
-        let watchtower_challenge_vout =
-            output_topology::watchtower_challenge_init::watchtower_connector(watchtower_index)
-                as u64;
-        match outpoint_spent_txid(
-            btc_client,
-            &watchtower_challenge_init_txid,
-            watchtower_challenge_vout,
-        )
-        .await
-        {
-            Ok(Some(txid)) => {
-                let tx_status = btc_client.get_tx_status(&txid).await?;
-                if let Some(block_height) = tx_status.block_height {
-                    if block_height > largest_watchtower_challenge_block_height {
-                        largest_watchtower_challenge_block_height = block_height;
-                        largest_watchtower_challenge_block_hash = tx_status.block_hash.ok_or_else(|| {
-                            anyhow!(
-                                "Watchtower challenge tx {txid} for graph {}, index: {watchtower_index} is confirmed at height {block_height} without a block hash",
-                                graph.parameters.graph_id
-                            )
-                        })?;
-                    }
-                } else {
-                    anyhow::bail!(
-                        "Watchtower challenge tx {txid} for graph {}, index: {watchtower_index} not confirmed yet",
-                        graph.parameters.graph_id
-                    );
-                }
-            }
-            Ok(None) => {
-                anyhow::bail!(
-                    "Watchtower challenge connector {watchtower_index} for graph {}, index: {watchtower_index} not spent yet",
-                    graph.parameters.graph_id
-                );
-            }
-            Err(e) => {
-                anyhow::bail!(
-                    "Error checking watchtower challenge connector graph: {}, index: {watchtower_index} spent status: {e}",
-                    graph.parameters.graph_id
-                );
-            }
-        }
-    }
-    Ok(largest_watchtower_challenge_block_hash)
 }
 
 pub(crate) fn babe_setup_state_root(local_db: &LocalDB) -> PathBuf {

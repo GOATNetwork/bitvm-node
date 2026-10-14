@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use crate::action::NodeInfo;
 use alloy::primitives::Address as EvmAddress;
 use alloy::primitives::Address;
@@ -61,7 +60,6 @@ pub const ENV_BITVM_SECRET: &str = "BITVM_SECRET";
 pub const ENV_PEER_KEY: &str = "PEER_KEY";
 pub const ENV_PROOF_SEVER_URL: &str = "PROOF_SEVER_URL";
 pub const ENV_ACTOR: &str = "ACTOR";
-pub const ENV_IPFS_ENDPOINT: &str = "IPFS_ENDPOINT";
 pub const ENV_COMMITTEE_NUM: &str = "COMMITTEE_NUM";
 pub const ENV_MIN_REQUIRED_VERIFIER: &str = "MIN_REQUIRED_VERIFIER";
 pub const ENV_VERIFIER_CANDIDATE_BACKUP_COUNT: &str = "VERIFIER_CANDIDATE_BACKUP_COUNT";
@@ -69,9 +67,6 @@ pub const ENV_VERIFIER_CANDIDATE_COLLECTION_WINDOW_SECS: &str =
     "VERIFIER_CANDIDATE_COLLECTION_WINDOW_SECS";
 pub const ENV_EXTERNAL_SOCKET_ADDR: &str = "EXTERNAL_SOCKET_ADDR";
 pub const COMMITTEE_INSTANCE_KEYS_DIR: &str = "cache/committee-instance-keys/";
-pub const SCRIPT_CACHE_FILE_NAME: &str = "cache/partial_script.bin";
-pub const ASSERT_COMMITS_CACHE_DIR: &str = "cache/assert_commits_cache/";
-pub const IPFS_GRAPH_CACHE_DIR: &str = "cache/graph_cache/";
 pub const DUST_AMOUNT: u64 = goat::transactions::base::DUST_AMOUNT;
 pub const MAX_CUSTOM_INPUTS: usize = 100;
 
@@ -100,7 +95,6 @@ pub const ENV_SGC_COMPACT_OUT_INDICES_PATH: &str = "SGC_COMPACT_OUT_INDICES_PATH
 pub const ENV_BABE_SETUP_STATE_DIR: &str = "BABE_SETUP_STATE_DIR";
 pub const ENV_SOLDERING_PROOF_PAYLOAD_STORE_PATH: &str = "SOLDERING_PROOF_PAYLOAD_STORE_PATH";
 
-pub const ENV_ALWAYS_CHALLENGE: &str = "ALWAYS_CHALLENGE";
 pub const ENV_GENESIS_SEQUENCER_COMMIT_TXID: &str = "GENESIS_SEQUENCER_COMMIT_TXID";
 pub const ENV_SEQUENCER_SET_MONITOR_START_COSMOS_BLOCK: &str =
     "SEQUENCER_SET_MONITOR_START_COSMOS_BLOCK";
@@ -109,22 +103,11 @@ pub const DEFAULT_COSMOS_RPC_URL: &str = "https://rpc.testnet3.goat.network/goat
 
 // Conservative fee-reserve estimates, not exact serialized transaction sizes.
 pub const CHECKSIG_P2WSH_INPUT_VBYTES_ESTIMATE: u64 = 100;
-pub const CHECKSIG_P2TR_INPUT_VBYTES_ESTIMATE: u64 = 100;
 pub const P2WSH_OUTPUT_VBYTES: u64 = 50;
-pub const P2TR_OUTPUT_VBYTES: u64 = 50;
-pub const P2A_OUTPUT_VBYTES: u64 = 50;
 pub const PRE_KICKOFF_BASE_VBYTES: u64 = 300;
-pub const PEGIN_BASE_VBYTES: u64 = 300;
-pub const CHALLENGE_BASE_VBYTES: u64 = 300;
 pub const ANCHOR_CHILD_BASE_VBYTES: u64 = 200;
 
 // reduce costs to facilitate testing
-pub const MIN_SATKE_AMOUNT: u64 = 4_000_000; // 0.04 BTC
-pub const MIN_CHALLENGE_AMOUNT: u64 = 1_000_000; // 0.01 BTC
-pub const STAKE_RATE: u64 = 0; // 0%
-pub const CHALLENGE_RATE: u64 = 0; // 0%
-
-const COMMITTEE_MEMBER_NUMBER: usize = 2;
 
 // use to judge load history event thread is dead
 pub const LOAD_HISTORY_EVENT_NO_WOKING_MAX_SECS: i64 = 600;
@@ -400,9 +383,6 @@ pub fn get_local_node_info() -> NodeInfo {
         binding_sig,
         binding_issued_at: issued_at,
     }
-}
-pub fn get_committee_member_num() -> usize {
-    COMMITTEE_MEMBER_NUMBER
 }
 
 #[derive(Clone, Copy, Display, EnumString)]
@@ -886,13 +866,6 @@ pub fn get_engine_apply_timeout_secs(default: u64) -> u64 {
 
 pub fn get_engine_recheck_interval_secs(default: u64) -> u64 {
     engine_setting(ENV_ENGINE_RECHECK_INTERVAL_SECS, default, 1, 3600)
-}
-
-pub fn should_always_challenge() -> bool {
-    match std::env::var(ENV_ALWAYS_CHALLENGE) {
-        Ok(val) => val.to_lowercase() == "true",
-        Err(_) => false,
-    }
 }
 
 pub fn get_genesis_sequencer_commit_id() -> [u8; 32] {

@@ -36,7 +36,7 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use std::sync::Arc;
-use store::localdb::{InstanceUpdate, LocalDB, StorageProcessor};
+use store::localdb::{InstanceUpdate, LocalDB};
 use store::{Instance, InstanceBridgeInStatus, SerializableTxid};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -97,7 +97,7 @@ pub fn instance_ref(instance_id: Uuid) -> AggregateRef {
 pub fn phase_of(status: InstanceBridgeInStatus) -> &'static str {
     use InstanceBridgeInStatus::*;
     match status {
-        UserIniting | UserInited => PHASE_ANSWER,
+        UserInited => PHASE_ANSWER,
         CommitteesAnswered => PHASE_AWAIT_PREPARE,
         UserBroadcastPeginPrepare => PHASE_PRESIGN,
         Presigned => PHASE_CONFIRM,
@@ -306,7 +306,6 @@ impl AnswerWindow {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeginRequested {
     pub tx_hash: String,
-    pub height: i64,
 }
 
 /// One event per request transaction: a re-indexed request is a new event.
@@ -715,10 +714,6 @@ impl InstanceAggregate {
         self
     }
 
-    pub fn deadlines(&self) -> &PeginDeadlines {
-        &self.deadlines
-    }
-
     fn job(&self, ctx: &mut ApplyContext<'_>, action: &str, params: Vec<u8>) {
         ctx.effects.enqueue_job(JobSpec::new(
             &ctx.aggregate,
@@ -972,10 +967,7 @@ impl InstanceAggregate {
         status: InstanceBridgeInStatus,
         payload: &[u8],
     ) -> ApplyOutcome {
-        if !matches!(
-            status,
-            InstanceBridgeInStatus::UserIniting | InstanceBridgeInStatus::UserInited
-        ) {
+        if status != InstanceBridgeInStatus::UserInited {
             return ApplyOutcome::Applied;
         }
         if self.actor == Actor::Committee {
@@ -1018,10 +1010,7 @@ impl InstanceAggregate {
         // The round's parameters derive from the committee answers; a message
         // that arrives before the window closed here (a node catching up)
         // waits for them instead of running a job that cannot aggregate.
-        if matches!(
-            status,
-            InstanceBridgeInStatus::UserIniting | InstanceBridgeInStatus::UserInited
-        ) {
+        if status == InstanceBridgeInStatus::UserInited {
             return ApplyOutcome::Waiting(WaitingFor::on(
                 &ctx.aggregate,
                 "committee answers not recorded yet",
@@ -1388,17 +1377,6 @@ pub fn pegin_txids(
     ))
 }
 
-/// Read helper for callers outside an apply.
-pub async fn find_instance_status(
-    storage: &mut StorageProcessor<'_>,
-    instance_id: Uuid,
-) -> anyhow::Result<Option<InstanceBridgeInStatus>> {
-    Ok(storage
-        .find_instance(&instance_id)
-        .await?
-        .and_then(|instance| InstanceBridgeInStatus::from_str(&instance.status).ok()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1634,7 +1612,7 @@ mod tests {
         let c = snap.event(id).unwrap().event_id;
         assert!(a != b && b != c && a != c);
         assert_eq!(graph_endorsed_event(id, id).unwrap().aggregate, instance_ref(id));
-        let request = PeginRequested { tx_hash: "0xreq".into(), height: 7 };
+        let request = PeginRequested { tx_hash: "0xreq".into() };
         let event = pegin_request_event(id, &request).unwrap();
         assert_eq!(event.kind, EVENT_PEGIN_REQUEST);
         assert_eq!(event.event_id, format!("instance:{id}:pegin-request:0xreq"));

@@ -662,7 +662,6 @@ async fn plan_cut_circuits(
         );
     }
     plan.close_rows.push(outbox_id(graph_id, "InitGraph", None));
-    plan.state.candidates_frozen = Some(true);
     Ok(())
 }
 
@@ -976,12 +975,10 @@ async fn build_graph(deps: &GraphJobDeps, graph_id: Uuid, _params: &[u8]) -> Res
         }
     };
     let graph_nonce = graph.parameters.graph_nonce;
-    let verifier_count = graph.parameters.gc_data.len();
-    let committee_count = committee_pubkeys(deps, instance_id).await?.len();
 
     let mut plan = GraphPlan::default();
     if !already_finalized {
-        let mut ack_peers = selected_verifier_peer_ids.clone();
+        let mut ack_peers = selected_verifier_peer_ids;
         ack_peers.extend(committee_ack_peers());
         plan.send(
             planned(
@@ -1010,11 +1007,7 @@ async fn build_graph(deps: &GraphJobDeps, graph_id: Uuid, _params: &[u8]) -> Res
         instance_id: Some(instance_id),
         operator_pubkey: Some(local_operator_pubkey.to_string()),
         graph_nonce: Some(graph_nonce),
-        verifier_count: Some(verifier_count),
-        committee_count: Some(committee_count),
-        selected_verifier_peers: Some(selected_verifier_peer_ids),
         finalized: Some(already_finalized),
-        ..Default::default()
     };
     Step::done(plan)
 }
@@ -1077,7 +1070,6 @@ async fn after_committee_value(
 ) -> Result<Step> {
     let mut plan = GraphPlan::default();
     plan.state.instance_id = Some(instance_id);
-    plan.state.verifier_count = Some(graph.parameters.gc_data.len());
     plan.state.operator_pubkey = Some(graph.parameters.operator_pubkey.to_string());
     plan.state.graph_nonce = Some(graph.parameters.graph_nonce);
     match deps.actor {
@@ -1089,7 +1081,6 @@ async fn after_committee_value(
         Actor::Committee => {
             let committee = committee_pubkeys(deps, instance_id).await?;
             let collected = collections(deps, instance_id, graph_id).await?;
-            plan.state.committee_count = Some(committee.len());
             if collected.pub_nonces >= committee.len() {
                 plan.then(JOB_COMMITTEE_VOTE, Vec::new(), None);
             }
@@ -1338,9 +1329,6 @@ async fn finalize_graph(deps: &GraphJobDeps, graph_id: Uuid, _params: &[u8]) -> 
         operator_pubkey: Some(operator_pubkey),
         graph_nonce: Some(graph_nonce),
         finalized: Some(true),
-        committee_count: Some(committee.len()),
-        verifier_count: Some(graph.parameters.gc_data.len()),
-        ..Default::default()
     };
     Step::done(plan)
 }
@@ -1487,7 +1475,6 @@ async fn verifier_setup(deps: &GraphJobDeps, graph_id: Uuid, params: &[u8]) -> R
     plan.state = GraphStateUpdate {
         instance_id: Some(instance_id),
         operator_pubkey: Some(init.operator_pubkey.to_string()),
-        operator_peer: Some(operator_peer),
         ..Default::default()
     };
     Step::done(plan)
@@ -1592,7 +1579,6 @@ async fn verifier_solder(deps: &GraphJobDeps, graph_id: Uuid, params: &[u8]) -> 
         .await?,
     );
     plan.state.instance_id = Some(instance_id);
-    plan.state.operator_peer = Some(operator_peer);
     Step::done(plan)
 }
 
@@ -1703,7 +1689,6 @@ async fn verifier_validate_graph(
         instance_id: Some(instance_id),
         operator_pubkey: Some(graph.parameters.operator_pubkey.to_string()),
         graph_nonce: Some(graph_nonce),
-        verifier_count: Some(graph.parameters.gc_data.len()),
         ..Default::default()
     };
     Step::done(plan)
@@ -1751,7 +1736,6 @@ async fn committee_ingest_graph(
     deps.metrics_state.record_graph_validation(validation.is_ok());
     validation?;
     store_operator_presigned_graph(&deps.local_db, &graph).await?;
-    let committee = committee_pubkeys(deps, instance_id).await?;
     let verifier_count = graph.parameters.gc_data.len();
     let endorsements =
         get_verifier_graph_params_endorsements_for_graph(&deps.local_db, instance_id, graph_id)
@@ -1761,8 +1745,6 @@ async fn committee_ingest_graph(
             instance_id: Some(instance_id),
             operator_pubkey: Some(graph.parameters.operator_pubkey.to_string()),
             graph_nonce: Some(graph_nonce),
-            verifier_count: Some(verifier_count),
-            committee_count: Some(committee.len()),
             ..Default::default()
         },
         ..Default::default()
@@ -1833,7 +1815,6 @@ async fn ingest_verifier_endorsement(
             .await?;
     let mut plan = GraphPlan::default();
     plan.state.instance_id = Some(instance_id);
-    plan.state.verifier_count = Some(graph.parameters.gc_data.len());
     if endorsements.len() >= graph.parameters.gc_data.len() {
         plan.then(JOB_COMMITTEE_NONCES, Vec::new(), None);
     }
@@ -1921,8 +1902,6 @@ async fn committee_nonces(deps: &GraphJobDeps, graph_id: Uuid, _params: &[u8]) -
     let nonces =
         get_committee_pub_nonces_for_graph(&deps.local_db, instance_id, graph_id).await?.len();
     plan.state.instance_id = Some(instance_id);
-    plan.state.committee_count = Some(committee.len());
-    plan.state.verifier_count = Some(graph.parameters.gc_data.len());
     if nonces >= committee.len() {
         plan.then(JOB_COMMITTEE_VOTE, Vec::new(), None);
     }
@@ -2352,9 +2331,7 @@ async fn ingest_finalized(deps: &GraphJobDeps, graph_id: Uuid, params: &[u8]) ->
             instance_id: Some(instance_id),
             operator_pubkey: Some(operator_pubkey),
             graph_nonce: Some(graph_nonce),
-            verifier_count: Some(graph.parameters.gc_data.len()),
             finalized: Some(true),
-            ..Default::default()
         },
         ..Default::default()
     };

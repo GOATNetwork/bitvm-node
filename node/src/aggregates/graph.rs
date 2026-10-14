@@ -185,11 +185,6 @@ pub struct OperatorStart {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GraphPosted {
-    pub instance_id: Uuid,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GraphPull {
     pub lookup: GraphLookup,
 }
@@ -232,11 +227,6 @@ pub struct GraphStateUpdate {
     pub instance_id: Option<Uuid>,
     pub operator_pubkey: Option<String>,
     pub graph_nonce: Option<u64>,
-    pub operator_peer: Option<String>,
-    pub verifier_count: Option<usize>,
-    pub committee_count: Option<usize>,
-    pub selected_verifier_peers: Option<Vec<String>>,
-    pub candidates_frozen: Option<bool>,
     pub finalized: Option<bool>,
 }
 
@@ -245,7 +235,6 @@ pub struct GraphStateUpdate {
 pub struct GraphPlan {
     pub messages: Vec<PlannedMessage>,
     pub close_rows: Vec<String>,
-    pub close_phases: Vec<String>,
     pub next: Vec<NextStep>,
     pub state: GraphStateUpdate,
     pub delete_pending_session: bool,
@@ -284,17 +273,8 @@ pub struct GraphState {
     pub instance_id: Option<Uuid>,
     pub operator_pubkey: Option<String>,
     pub graph_nonce: Option<u64>,
-    pub operator_peer: Option<String>,
-    pub verifier_count: Option<usize>,
-    pub committee_count: Option<usize>,
-    #[serde(default)]
-    pub selected_verifier_peers: Vec<String>,
-    #[serde(default)]
-    pub candidates_frozen: bool,
     #[serde(default)]
     pub finalized: bool,
-    #[serde(default)]
-    pub pending_session: bool,
     /// The operator's live `InitWithdraw` (its Goat tx hash): Kickoff phase.
     #[serde(default)]
     pub withdraw: Option<String>,
@@ -323,21 +303,6 @@ impl GraphState {
         }
         if update.graph_nonce.is_some() {
             self.graph_nonce = update.graph_nonce;
-        }
-        if update.operator_peer.is_some() {
-            self.operator_peer = update.operator_peer;
-        }
-        if update.verifier_count.is_some() {
-            self.verifier_count = update.verifier_count;
-        }
-        if update.committee_count.is_some() {
-            self.committee_count = update.committee_count;
-        }
-        if let Some(peers) = update.selected_verifier_peers {
-            self.selected_verifier_peers = peers;
-        }
-        if let Some(frozen) = update.candidates_frozen {
-            self.candidates_frozen = frozen;
         }
         if let Some(finalized) = update.finalized {
             self.finalized = finalized;
@@ -514,13 +479,13 @@ pub fn graph_pulled_event(
     ))
 }
 
-pub fn graph_posted_event(instance_id: Uuid, graph_id: Uuid) -> anyhow::Result<NewEvent> {
+pub fn graph_posted_event(graph_id: Uuid) -> anyhow::Result<NewEvent> {
     Ok(NewEvent::new(
         format!("graph:{graph_id}:posted"),
         graph_ref(graph_id),
         EVENT_GRAPH_POSTED,
         EventSource::Chain,
-        bincode::serialize(&GraphPosted { instance_id })?,
+        Vec::new(),
     ))
 }
 
@@ -761,7 +726,6 @@ impl GraphAggregate {
                 if status.is_some() {
                     return Ok(ApplyOutcome::Applied);
                 }
-                state.operator_peer = Some(inbound.author.clone());
             }
             "GenCircuits" | "SolderingProofReady" => {
                 let pending = ctx.storage.find_pending_graph_init_by_graph_id(&graph_id).await?;
@@ -769,7 +733,6 @@ impl GraphAggregate {
                     debug!(event = "graph_apply", graph_id = %graph_id, kind, "no pending setup session; message ignored");
                     return Ok(ApplyOutcome::Applied);
                 }
-                state.pending_session = true;
             }
             "CutCircuits" => {}
             "CreateGraph" => {
@@ -930,16 +893,6 @@ impl GraphAggregate {
         for row in plan.close_rows {
             ctx.effects.close_outbox(EngineOutboxCloseTarget::Row(row), "superseded");
         }
-        for phase in plan.close_phases {
-            ctx.effects.close_outbox(
-                EngineOutboxCloseTarget::Phase {
-                    aggregate_kind: GRAPH_KIND.to_string(),
-                    aggregate_id: graph_id.to_string(),
-                    phase_ref: phase,
-                },
-                "phase over",
-            );
-        }
         for step in plan.next {
             match step {
                 NextStep::Job { action, .. } if action == JOB_BUILD_GRAPH => {
@@ -968,7 +921,6 @@ impl GraphAggregate {
                 (state.instance_id, state.operator_pubkey.as_deref())
         {
             ctx.storage.delete_pending_graph_init(&instance_id, operator_pubkey).await?;
-            state.pending_session = false;
         }
         if plan.notify_instance_endorsed
             && let Some(instance_id) = state.instance_id
@@ -1047,7 +999,6 @@ impl GraphAggregate {
                     ctx.storage.find_pending_graph_init_by_graph_id(&graph_id).await?
                 {
                     release_setup_session(ctx, &session, "setup abandoned").await?;
-                    state.pending_session = false;
                 }
             }
             None => {
@@ -1057,7 +1008,6 @@ impl GraphAggregate {
                     return Ok(ApplyOutcome::Applied);
                 };
                 release_setup_session(ctx, &session, "setup abandoned").await?;
-                state.pending_session = false;
             }
         }
         state.abandoned = true;
@@ -1188,7 +1138,6 @@ impl AggregateHandler for GraphAggregate {
                     // built, to start.
                     state.instance_id = Some(start.instance_id);
                     state.operator_pubkey = Some(start.operator_pubkey.clone());
-                    state.pending_session = true;
                     self.ingest_job(ctx, JOB_OPERATOR_INIT, payload);
                     ApplyOutcome::Applied
                 }
@@ -1466,12 +1415,12 @@ mod tests {
             ack_set: Some(BTreeMap::from([("p".to_string(), "d".to_string())])),
         })
         .then(JOB_FREEZE_CANDIDATES, vec![7], Some(15));
-        plan.state.verifier_count = Some(2);
+        plan.state.graph_nonce = Some(2);
         let decoded = GraphPlan::decode(&plan.encode().unwrap()).unwrap();
         assert_eq!(decoded, plan);
         let mut state = GraphState::default();
         state.merge(decoded.state);
-        assert_eq!(state.verifier_count, Some(2));
+        assert_eq!(state.graph_nonce, Some(2));
         let json = serde_json::to_string(&state).unwrap();
         assert_eq!(GraphState::load(Some(&json)), state);
         assert_eq!(GraphState::load(Some("garbage")), GraphState::default());

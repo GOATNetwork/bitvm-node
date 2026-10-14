@@ -31,7 +31,6 @@ pub struct BitvmNodeProcessor {
 
 pub struct ImmediateMessage {
     pub source: PeerId,
-    pub id: MessageId,
     pub message: GOATMessage,
     _bytes: OwnedSemaphorePermit,
 }
@@ -82,16 +81,10 @@ where
 }
 
 impl WorkerControl {
-    pub fn enqueue(
-        &self,
-        source: PeerId,
-        id: MessageId,
-        message: GOATMessage,
-        bytes: usize,
-    ) -> bool {
+    pub fn enqueue(&self, source: PeerId, message: GOATMessage, bytes: usize) -> bool {
         let Ok(bytes) = u32::try_from(bytes.max(1)) else { return false };
         let Ok(permit) = self.bytes.clone().try_acquire_many_owned(bytes) else { return false };
-        self.immediate.try_send(ImmediateMessage { source, id, message, _bytes: permit }).is_ok()
+        self.immediate.try_send(ImmediateMessage { source, message, _bytes: permit }).is_ok()
     }
 }
 
@@ -367,13 +360,12 @@ mod tests {
                 super::GOATMessageContent::RequestNodeInfo(crate::action::NodeInfo::default()),
             )
         };
-        let id = || libp2p::gossipsub::MessageId(b"test".to_vec());
-        assert!(!control.enqueue(source, id(), message(), 5));
-        assert!(control.enqueue(source, id(), message(), 4));
-        assert!(!control.enqueue(source, id(), message(), 1));
+        assert!(!control.enqueue(source, message(), 5));
+        assert!(control.enqueue(source, message(), 4));
+        assert!(!control.enqueue(source, message(), 1));
         drop(rx.recv().await.unwrap());
-        assert!(control.enqueue(source, id(), message(), 1));
-        assert!(!control.enqueue(source, id(), message(), 1));
+        assert!(control.enqueue(source, message(), 1));
+        assert!(!control.enqueue(source, message(), 1));
         assert_eq!(control.bytes.available_permits(), 3, "failed enqueue releases its permits");
     }
     use crate::action::{GOATMessage, GOATMessageContent, NodeInfo, send_to_peer};

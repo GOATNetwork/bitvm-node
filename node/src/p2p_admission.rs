@@ -1641,6 +1641,7 @@ impl CooldownGate {
     }
 
     /// Whether `key` is inside its cooldown. Records nothing.
+    #[cfg(test)]
     pub fn is_cooling(&self, key: &str, now: Instant) -> bool {
         let seen = self.seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         seen.is_live(key, self.cooldown, now)

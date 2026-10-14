@@ -1,6 +1,5 @@
 use thiserror::Error;
 
-#[allow(dead_code)]
 #[derive(Debug, Error)]
 pub enum SpecialError {
     #[error("Invalid Pegin Request: {0}")]
@@ -12,17 +11,11 @@ pub enum SpecialError {
     #[error("Invalid Graph: {0}")]
     InvalidGraph(String),
 
-    #[error("Contract Call Reverted: {0}")]
-    EvmReverted(String),
-
     #[error("Invalid Committee: {0}")]
     InvalidCommittee(String),
 
     #[error("Insufficient Balance: {0}")]
     InsufficientBalance(String),
-
-    #[error("Other Error: {0}")]
-    Other(String),
 }
 
 /// How a failed step is retried.
@@ -56,21 +49,31 @@ pub fn permanent_rejection(error: &anyhow::Error) -> Option<String> {
                 SpecialError::InvalidPeginRequest(message)
                 | SpecialError::InvalidPeginData(message)
                 | SpecialError::InvalidGraph(message)
-                | SpecialError::InvalidCommittee(message)
-                | SpecialError::EvmReverted(message) => Some(message.clone()),
-                SpecialError::InsufficientBalance(_) | SpecialError::Other(_) => None,
+                | SpecialError::InvalidCommittee(message) => Some(message.clone()),
+                SpecialError::InsufficientBalance(_) => None,
             };
         }
-        if cause.downcast_ref::<alloy::contract::Error>().is_some()
-            || cause.downcast_ref::<alloy::transports::TransportError>().is_some()
-        {
-            let message = cause.to_string();
-            if message.contains("execution reverted") || message.contains("revert") {
-                return Some(format!("contract call reverted: {message}"));
-            }
+        if let Some(message) = revert_message(cause) {
+            return Some(format!("contract call reverted: {message}"));
         }
     }
     None
+}
+
+/// Whether the contract refused the call (an `execution reverted` answer from
+/// a Goat node anywhere in the chain).
+pub fn is_contract_revert(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| revert_message(cause).is_some())
+}
+
+fn revert_message(cause: &(dyn std::error::Error + 'static)) -> Option<String> {
+    if cause.downcast_ref::<alloy::contract::Error>().is_none()
+        && cause.downcast_ref::<alloy::transports::TransportError>().is_none()
+    {
+        return None;
+    }
+    let message = cause.to_string();
+    (message.contains("execution reverted") || message.contains("revert")).then_some(message)
 }
 
 fn is_transient(error: &anyhow::Error) -> bool {

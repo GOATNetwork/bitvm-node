@@ -203,16 +203,4 @@ impl Effects {
             .push(store::EngineAckTarget { peer: peer.into(), delivery_id: delivery_id.into() });
         self
     }
-
-    pub fn is_empty(&self) -> bool {
-        self.status.is_none()
-            && self.phase.is_none()
-            && self.state.is_none()
-            && self.outbox.is_empty()
-            && self.outbox_closes.is_empty()
-            && self.jobs.is_empty()
-            && self.job_cancels.is_empty()
-            && self.wake_refs.is_empty()
-            && self.acks.is_empty()
-    }
 }

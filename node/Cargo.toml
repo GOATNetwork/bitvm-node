@@ -60,7 +60,6 @@ libp2p = { workspace = true, features = [
     "quic",
     "websocket",
     "request-response",
-    "json",
 ] }
 libp2p-swarm-derive = { workspace = true }
 libp2p-metrics = { workspace = true }

@@ -19,8 +19,8 @@ use client::btc_chain::BTCClient;
 use client::goat_chain::GOATClient;
 use client::http_client::async_client::HttpAsyncClient;
 use engine::{
-    AckReceiver, AggregateRef, Engine, EngineBuilder, EngineConfig, EngineHandle, EngineMetrics,
-    NewEvent, Transport,
+    AckReceiver, Engine, EngineBuilder, EngineConfig, EngineHandle, EngineMetrics, NewEvent,
+    Transport,
 };
 use libp2p::gossipsub::IdentTopic;
 use libp2p_metrics::Registry;
@@ -215,12 +215,6 @@ pub async fn submit_event(local_db: &LocalDB, event: NewEvent) -> anyhow::Result
         }
     }
     Ok(())
-}
-
-pub fn wake(aggregate: &AggregateRef) {
-    if let Some(engine) = engine_handle() {
-        engine.wake_for(aggregate);
-    }
 }
 
 /// Turn ACK requests from the engine into `GraphSetupAck` messages. The engine

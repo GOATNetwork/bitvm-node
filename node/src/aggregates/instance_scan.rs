@@ -363,7 +363,7 @@ pub async fn gather_snapshot(
         }
         // Nothing of the Answer phase is decided on Bitcoin: the Prepare txid is unknown, so a
         // spent input may be the user's own Prepare.
-        UserIniting | UserInited | UserCanceled | NoEnoughCommitteesAnswered | UserDiscarded => {
+        UserInited | UserCanceled | NoEnoughCommitteesAnswered | UserDiscarded => {
             return Ok(None);
         }
     }

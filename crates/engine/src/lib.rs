@@ -30,7 +30,7 @@ pub use metrics::EngineMetrics;
 pub use outbox::Transport;
 pub use runtime::{Engine, EngineBuilder, EngineHandle, EngineSnapshot, SubmitOutcome};
 pub use store::{
-    EngineAckTarget as AckTarget, EngineAggregate, EngineInboxEvent, EngineInboxState, EngineJob,
-    EngineJobInsert, EngineJobState, EngineOutboxAck, EngineOutboxCloseTarget, EngineOutboxMessage,
+    EngineAggregate, EngineInboxEvent, EngineInboxState, EngineJob, EngineJobInsert,
+    EngineJobState, EngineOutboxAck, EngineOutboxCloseTarget, EngineOutboxMessage,
     EngineOutboxState, EnginePoison, EngineWaitingEvent,
 };

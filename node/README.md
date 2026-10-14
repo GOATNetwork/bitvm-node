@@ -881,7 +881,6 @@ real graph raw data in the database.
 | `ENABLE_RELAYER` | No | Enable relayer mode for Committee nodes | `false` |
 | `ENABLE_BABE_SETUP_STATE_CLEANUP` | No | Enable scheduled BABE setup state cleanup for Operator/Verifier nodes | `false` |
 | `BTC_CHAIN_URL` | No | Bitcoin Esplora API endpoint | Public Esplora |
-| `GOAT_PROOF_BUILD_URL` | No | Proof Builder RPC endpoint | - |
 | `NODE_NAME` | No | Node display name | `ZKM` |
 | `OPERATOR_NODE_SERVICE_FEE` | No | Operator service fee rate | `0.001` |
 | `ENABLE_COMMITTEE_INSTANCE_KEY_DELETE` | No | Delete the committee instance key envelope when the instance fails (except `Timeout`) or 32 blocks after the Peg-In-Confirm confirmed; off, the intent is only logged | `false` |

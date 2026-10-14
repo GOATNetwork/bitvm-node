@@ -14,7 +14,7 @@ use client::goat_chain::GOATClient;
 use client::graphs::graph_query::BridgeInRequestEvent;
 use engine::EngineHandle;
 use store::localdb::LocalDB;
-use store::{GoatTxProcessingStatus, GoatTxType, InstanceBridgeInStatus};
+use store::{GoatTxProcessingStatus, GoatTxType};
 use tracing::{info, warn};
 
 /// Store pending Goat bridge-in requests. Submit pegin_request events only while
@@ -106,24 +106,14 @@ pub async fn pegin_request_monitor(
                     );
                 }
             } else {
-                // A row created by the RPC (UserIniting) is refreshed; a row
-                // that moved on is left alone.
-                tx.upsert_pegin_request_instance(
-                    &instance,
-                    &[
-                        InstanceBridgeInStatus::UserIniting.to_string(),
-                        InstanceBridgeInStatus::UserInited.to_string(),
-                    ],
-                )
-                .await?;
+                // A re-indexed request refreshes its row; a row that moved on is
+                // left alone.
+                tx.upsert_pegin_request_instance(&instance).await?;
                 record_event_in(
                     &mut tx,
                     pegin_request_event(
                         instance_id,
-                        &PeginRequested {
-                            tx_hash: tx_record.tx_hash.clone(),
-                            height: tx_record.height,
-                        },
+                        &PeginRequested { tx_hash: tx_record.tx_hash.clone() },
                     )?,
                 )
                 .await?;

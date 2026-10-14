@@ -37,10 +37,7 @@ pub(crate) mod v1 {
     // pub const PROOFS_BASE: &str = "/v1/proofs";
     pub const PROOFS_CHAIN_PROOFS_DESC: &str = "/v1/proofs/chain_proofs_desc";
     pub const NODES_WATCHTOWER_BASE: &str = "/v1/proofs/watchtower_proofs";
-    #[allow(dead_code)]
     pub const NODES_OPERATOR_BASE: &str = "/v1/proofs/operator_proofs";
     pub const PROOFS_OPERATOR_PROOF_DESC: &str = "/v1/proofs/operator_proofs_desc";
     pub const PROOFS_WATCHTOWER_PROOF_TIMEOUT: &str = "/v1/proofs/watchtower_proofs_timeout";
-    #[allow(dead_code)]
-    pub const PROOFS_OPERATOR_PROOF_TIMEOUT: &str = "/v1/proofs/operator_proofs_timeout";
 }

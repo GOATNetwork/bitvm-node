@@ -100,7 +100,6 @@ pub fn pegout_job_pool(action: &str) -> JobPool {
 /// `InitWithdraw` / `CancelWithdraw` on Goat.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WithdrawEvent {
-    pub instance_id: Uuid,
     pub tx_hash: String,
 }
 
@@ -150,7 +149,6 @@ pub enum PegoutSignal {
     DisproveSent {
         disprove_type: DisproveTxType,
         index: usize,
-        challenge_start_txid: Option<Txid>,
         challenge_finish_txid: Txid,
     },
     Take2Ready,
@@ -210,26 +208,17 @@ impl ChainScan {
     }
 }
 
-pub fn withdraw_init_event(
-    instance_id: Uuid,
-    graph_id: Uuid,
-    tx_hash: &str,
-) -> anyhow::Result<NewEvent> {
-    withdraw_event(EVENT_WITHDRAW_INIT, "withdraw-init", instance_id, graph_id, tx_hash)
+pub fn withdraw_init_event(graph_id: Uuid, tx_hash: &str) -> anyhow::Result<NewEvent> {
+    withdraw_event(EVENT_WITHDRAW_INIT, "withdraw-init", graph_id, tx_hash)
 }
 
-pub fn withdraw_cancel_event(
-    instance_id: Uuid,
-    graph_id: Uuid,
-    tx_hash: &str,
-) -> anyhow::Result<NewEvent> {
-    withdraw_event(EVENT_WITHDRAW_CANCEL, "withdraw-cancel", instance_id, graph_id, tx_hash)
+pub fn withdraw_cancel_event(graph_id: Uuid, tx_hash: &str) -> anyhow::Result<NewEvent> {
+    withdraw_event(EVENT_WITHDRAW_CANCEL, "withdraw-cancel", graph_id, tx_hash)
 }
 
 fn withdraw_event(
     kind: &str,
     key: &str,
-    instance_id: Uuid,
     graph_id: Uuid,
     tx_hash: &str,
 ) -> anyhow::Result<NewEvent> {
@@ -238,7 +227,7 @@ fn withdraw_event(
         super::graph::graph_ref(graph_id),
         kind,
         EventSource::Chain,
-        serde_json::to_vec(&WithdrawEvent { instance_id, tx_hash: tx_hash.to_string() })?,
+        serde_json::to_vec(&WithdrawEvent { tx_hash: tx_hash.to_string() })?,
     ))
 }
 
@@ -728,7 +717,6 @@ mod tests {
         let signal = DisproveSent {
             disprove_type: DisproveTxType::QuickChallenge,
             index: 0,
-            challenge_start_txid: None,
             challenge_finish_txid: Txid::from_str(&"33".repeat(32)).unwrap(),
         };
         assert_eq!(PegoutSignal::decode(&signal.encode().unwrap()).unwrap(), signal);

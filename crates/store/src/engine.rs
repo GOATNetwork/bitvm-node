@@ -1259,22 +1259,6 @@ impl<'a> StorageProcessor<'a> {
         Ok(EngineOutboxAck::NoMatch)
     }
 
-    pub async fn list_open_engine_outbox_for_aggregate(
-        &mut self,
-        aggregate_kind: &str,
-        aggregate_id: &str,
-    ) -> anyhow::Result<Vec<EngineOutboxMessage>> {
-        let rows = sqlx::query(&format!(
-            "SELECT {ENGINE_OUTBOX_COLUMNS} FROM engine_outbox \
-             WHERE aggregate_kind = ? AND aggregate_id = ? AND state = 'Open' ORDER BY created_at"
-        ))
-        .bind(aggregate_kind)
-        .bind(aggregate_id)
-        .fetch_all(self.conn())
-        .await?;
-        rows.iter().map(|row| Ok(engine_outbox_message_from_row(row)?)).collect()
-    }
-
     /// Startup: leases held by a previous process are void.
     pub async fn reset_engine_outbox_leases(&mut self) -> anyhow::Result<u64> {
         Ok(sqlx::query(
@@ -2113,7 +2097,6 @@ mod tests {
             phase_ref: "setup".to_string(),
         };
         assert_eq!(s.close_engine_outbox(&target, "evidence", 17).await.unwrap(), 1);
-        assert!(s.list_open_engine_outbox_for_aggregate("graph", "g1").await.unwrap().is_empty());
         // Aggregate close and row close.
         assert!(s.insert_engine_outbox_message(&outbox("o3", None), 18).await.unwrap());
         assert!(s.insert_engine_outbox_message(&outbox("o4", None), 18).await.unwrap());

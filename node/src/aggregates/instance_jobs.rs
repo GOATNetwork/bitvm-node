@@ -125,9 +125,7 @@ fn fails_on_rejection(action: &str, error: &anyhow::Error) -> bool {
         | JOB_PEGIN_CONFIRM_VOTE
         | JOB_PEGIN_CONFIRM_SIGN
         | JOB_BROADCAST_PEGIN_CONFIRM => true,
-        JOB_ANSWER_PEGIN_REQUEST => {
-            matches!(error.downcast_ref::<SpecialError>(), Some(SpecialError::EvmReverted(_)))
-        }
+        JOB_ANSWER_PEGIN_REQUEST => crate::error::is_contract_revert(error),
         _ => false,
     }
 }
@@ -359,7 +357,7 @@ async fn answer_pegin_request(deps: &InstanceJobDeps, instance_id: Uuid) -> Resu
         return Step::ignore("only committee nodes answer");
     }
     match instance_status(deps, instance_id).await? {
-        Some(InstanceBridgeInStatus::UserIniting | InstanceBridgeInStatus::UserInited) => {}
+        Some(InstanceBridgeInStatus::UserInited) => {}
         other => return Step::ignore(format!("instance is {other:?}; answer window closed")),
     }
     let (_, _, answered_by) =

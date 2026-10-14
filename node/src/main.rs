@@ -283,7 +283,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     metrics_state.mark_startup_ready();
 
     // Both listeners share the same application and metrics state.
-    let app_state = rpc_service::AppState::create_arc_app_state_with_engine(
+    let app_state = rpc_service::AppState::create_arc_app_state(
         local_db.clone(),
         actor.clone(),
         peer_id_string.clone(),

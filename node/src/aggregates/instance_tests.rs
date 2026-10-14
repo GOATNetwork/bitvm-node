@@ -728,7 +728,7 @@ async fn a_confirm_plan_opens_the_operator_session_and_starts_the_graph() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_pegin_request_is_answered_by_committee_nodes_until_the_window_closes() {
     use InstanceBridgeInStatus::*;
-    let request = PeginRequested { tx_hash: "0xreq".to_string(), height: 100 };
+    let request = PeginRequested { tx_hash: "0xreq".to_string() };
 
     let t = start(Actor::Operator, false, false).await;
     let id = t.insert(&instance_row(UserInited, 0)).await;
@@ -751,7 +751,7 @@ async fn a_pegin_request_is_answered_by_committee_nodes_until_the_window_closes(
     let window = AnswerWindow { goat_height: 200, window_blocks: 50, quorum: 1, answers };
     t.submit(window.event(id).unwrap()).await;
     t.wait_status(id, CommitteesAnswered).await;
-    let late = PeginRequested { tx_hash: "0xagain".to_string(), height: 100 };
+    let late = PeginRequested { tx_hash: "0xagain".to_string() };
     let event = pegin_request_event(id, &late).unwrap();
     let event_id = event.event_id.clone();
     t.submit(event).await;

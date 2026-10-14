@@ -204,7 +204,6 @@ pub struct CommitteeSignatures {
 )]
 pub enum InstanceBridgeInStatus {
     #[default]
-    UserIniting, // front has call contract, but node not get event
     UserInited, // from contract event request
     // committee won't answer if userRequest is invalid(e.g. insufficient fee)
     CommitteesAnswered,        // enough committee responsed & window expired
@@ -238,10 +237,6 @@ impl InstanceBridgeInStatus {
         self == InstanceBridgeInStatus::RelayerL2Minted
     }
 
-    pub fn is_terminal(self) -> bool {
-        self.is_failed() || self.is_success()
-    }
-
     /// Entering this failure state deletes the committee instance key in the
     /// same transaction. `Timeout` keeps the key for manual handling.
     pub fn deletes_key_on_entry(self) -> bool {
@@ -251,10 +246,6 @@ impl InstanceBridgeInStatus {
                 | InstanceBridgeInStatus::UserDiscarded
                 | InstanceBridgeInStatus::UserCanceled
         )
-    }
-
-    pub fn failed_statuses() -> Vec<String> {
-        Self::FAILED.iter().map(ToString::to_string).collect()
     }
 }
 
@@ -785,68 +776,6 @@ impl ProofState {
 }
 
 #[derive(Clone, FromRow, Debug, Serialize, Deserialize, Default)]
-pub struct WatchtowerProof {
-    pub id: i64,
-    pub instance_id: Uuid,
-    pub graph_id: Uuid,
-    pub public_key: String,
-    pub challenge_txid: SerializableTxid,
-    pub challenge_init_txid: SerializableTxid,
-    pub execution_layer_block_number: i64,
-    pub path_to_proof: Option<String>,
-    pub public_value_hex: Option<String>,
-    pub proof_size: i64,
-    pub cycles: i64,
-    pub proof_state: i64,
-    pub total_time_to_proof: i64,
-    pub proving_time: i64,
-    pub zkm_version: String,
-    pub node_index: i32,
-    pub included: bool,
-    pub extra: Option<String>,
-    pub created_at: i64,
-    pub updated_at: i64,
-}
-
-#[derive(Clone, FromRow, Debug, Serialize, Deserialize, Default)]
-pub struct OperatorProof {
-    pub id: i64,
-    pub instance_id: Uuid,
-    pub graph_id: Uuid,
-    pub operator_committed_blockhash: String,
-    pub execution_layer_block_number: i64,
-    pub path_to_proof: Option<String>,
-    pub public_value_hex: Option<String>,
-    pub proof_size: i64,
-    pub cycles: i64,
-    pub proof_state: i64,
-    pub total_time_to_proof: i64,
-    pub proving_time: i64,
-    pub zkm_version: String,
-    pub extra: Option<String>,
-    pub created_at: i64,
-    pub updated_at: i64,
-}
-
-#[derive(Clone, FromRow, Debug, Serialize, Deserialize, Default)]
-pub struct LongRunningTaskProof {
-    pub block_start: i64,
-    pub block_end: i64,
-    pub chain_name: String,
-    pub path_to_proof: Option<String>,
-    pub public_value_hex: Option<String>,
-    pub proof_size: i64,
-    pub cycles: i64,
-    pub proof_state: i64,
-    pub total_time_to_proof: i64,
-    pub proving_time: i64,
-    pub zkm_version: String,
-    pub extra: Option<String>,
-    pub created_at: i64,
-    pub updated_at: i64,
-}
-
-#[derive(Clone, FromRow, Debug, Serialize, Deserialize, Default)]
 pub struct SequencerSetHashChange {
     pub id: i64,
     pub cosmos_block_height: i64,
@@ -901,19 +830,17 @@ mod tests {
         use InstanceBridgeInStatus::*;
         for status in InstanceBridgeInStatus::FAILED {
             assert!(status.is_failed());
-            assert!(status.is_terminal());
             assert!(!status.is_success());
         }
-        assert!(RelayerL2Minted.is_success() && RelayerL2Minted.is_terminal());
+        assert!(RelayerL2Minted.is_success() && !RelayerL2Minted.is_failed());
         for status in [
-            UserIniting,
             UserInited,
             CommitteesAnswered,
             UserBroadcastPeginPrepare,
             Presigned,
             RelayerL1Broadcasted,
         ] {
-            assert!(!status.is_terminal());
+            assert!(!status.is_failed() && !status.is_success());
         }
         assert!(!Timeout.deletes_key_on_entry());
         assert!(UserCanceled.deletes_key_on_entry());

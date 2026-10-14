@@ -14,12 +14,6 @@ pub enum SigningAuthorization {
     Conflict { existing_digest: String },
 }
 
-impl SigningAuthorization {
-    pub fn allows_signing(&self) -> bool {
-        !matches!(self, SigningAuthorization::Conflict { .. })
-    }
-}
-
 impl<'a> StorageProcessor<'a> {
     /// Authorize `nonce_id` for `transcript_digest` under `scope_kind:scope_id`.
     pub async fn authorize_signing(
@@ -59,27 +53,6 @@ impl<'a> StorageProcessor<'a> {
             Ok(SigningAuthorization::Conflict { existing_digest: existing })
         }
     }
-
-    pub async fn find_signing_authorization(
-        &mut self,
-        nonce_id: &str,
-    ) -> anyhow::Result<Option<(String, String, String)>> {
-        let row = sqlx::query(
-            "SELECT scope_kind, scope_id, transcript_digest FROM signing_authorization \
-             WHERE nonce_id = ?",
-        )
-        .bind(nonce_id)
-        .fetch_optional(self.conn())
-        .await?;
-        Ok(match row {
-            Some(row) => Some((
-                row.try_get("scope_kind")?,
-                row.try_get("scope_id")?,
-                row.try_get("transcript_digest")?,
-            )),
-            None => None,
-        })
-    }
 }
 
 #[cfg(test)]
@@ -101,11 +74,5 @@ mod tests {
         );
         let conflict = storage.authorize_signing("graph", "g1", "n1", "t2", 3).await.unwrap();
         assert_eq!(conflict, SigningAuthorization::Conflict { existing_digest: "t1".into() });
-        assert!(!conflict.allows_signing());
-        assert_eq!(
-            storage.find_signing_authorization("n1").await.unwrap(),
-            Some(("graph".into(), "g1".into(), "t1".into()))
-        );
-        assert_eq!(storage.find_signing_authorization("n2").await.unwrap(), None);
     }
 }

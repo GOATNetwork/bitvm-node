@@ -423,7 +423,6 @@ async fn a_message_becomes_an_ingest_job_and_its_plan_is_committed() {
         state: GraphStateUpdate {
             instance_id: Some(instance_id),
             graph_nonce: Some(0),
-            committee_count: Some(3),
             ..Default::default()
         },
         ..Default::default()
@@ -451,7 +450,6 @@ async fn a_message_becomes_an_ingest_job_and_its_plan_is_committed() {
     assert_eq!(vote.params.as_deref(), Some(&[9][..]));
     let row = t.aggregate(graph_id).await;
     let state: GraphState = serde_json::from_str(row.state.as_deref().unwrap()).unwrap();
-    assert_eq!(state.committee_count, Some(3));
     assert_eq!(state.instance_id, Some(instance_id));
     // No graph row yet: the phase is still Setup.
     assert_eq!(row.phase, PHASE_SETUP);
@@ -667,7 +665,7 @@ async fn the_operator_start_runs_the_setup_and_posting_closes_every_delivery() {
     t.insert_graph_with_id(instance_id, graph_id).await;
     t.set_status(instance_id, graph_id, GraphStatus::CommitteePresigned).await;
     t.set_status(instance_id, graph_id, GraphStatus::OperatorDataPushed).await;
-    let posted = t.submit(graph_posted_event(instance_id, graph_id).unwrap()).await;
+    let posted = t.submit(graph_posted_event(graph_id).unwrap()).await;
     t.wait_inbox(&posted, EngineInboxState::Applied).await;
     t.wait_outbox(&outbox_id(graph_id, "CreateGraph", None), EngineOutboxState::Closed).await;
     assert_eq!(
@@ -1097,7 +1095,7 @@ async fn a_withdraw_waits_for_the_previous_slot_and_kicks_off_once_it_settles() 
     let previous = t.insert_graph(instance_id, 0, GraphStatus::OperatorDataPushed).await;
     let graph_id = t.insert_graph(instance_id, 1, GraphStatus::OperatorDataPushed).await;
 
-    let init = t.submit(withdraw_init_event(instance_id, graph_id, "0xinit").unwrap()).await;
+    let init = t.submit(withdraw_init_event(graph_id, "0xinit").unwrap()).await;
     let row = t.wait_waiting(&init).await;
     assert_eq!(row.waiting_ref.as_deref(), Some(slot_ref(OPERATOR, 0).as_str()));
     // Meanwhile a job settles the earlier slots from chain facts.
@@ -1126,9 +1124,9 @@ async fn a_cancelled_withdraw_never_kicks_off_and_a_new_one_starts_over() {
     let previous = t.insert_graph(instance_id, 0, GraphStatus::OperatorKickOff).await;
     let graph_id = t.insert_graph(instance_id, 1, GraphStatus::OperatorDataPushed).await;
 
-    let init = t.submit(withdraw_init_event(instance_id, graph_id, "0xfirst").unwrap()).await;
+    let init = t.submit(withdraw_init_event(graph_id, "0xfirst").unwrap()).await;
     t.wait_waiting(&init).await;
-    let cancel = t.submit(withdraw_cancel_event(instance_id, graph_id, "0xcancel").unwrap()).await;
+    let cancel = t.submit(withdraw_cancel_event(graph_id, "0xcancel").unwrap()).await;
     t.wait_inbox(&cancel, EngineInboxState::Applied).await;
     t.wait_phase(graph_id, PHASE_AWAIT_WITHDRAW).await;
 
@@ -1140,7 +1138,7 @@ async fn a_cancelled_withdraw_never_kicks_off_and_a_new_one_starts_over() {
     assert!(t.called(JOB_KICKOFF).is_empty());
 
     // A new InitWithdraw gets jobs of its own.
-    let again = t.submit(withdraw_init_event(instance_id, graph_id, "0xsecond").unwrap()).await;
+    let again = t.submit(withdraw_init_event(graph_id, "0xsecond").unwrap()).await;
     t.wait_inbox(&again, EngineInboxState::Applied).await;
     t.wait_job(graph_id, JOB_KICKOFF, EngineJobState::Done).await;
     let params: KickoffParams = serde_json::from_slice(&t.job_params(JOB_KICKOFF)).unwrap();
@@ -1155,10 +1153,10 @@ async fn a_new_withdraw_replaces_the_active_one() {
     let previous = t.insert_graph(instance_id, 0, GraphStatus::OperatorKickOff).await;
     let graph_id = t.insert_graph(instance_id, 1, GraphStatus::OperatorDataPushed).await;
 
-    let first = t.submit(withdraw_init_event(instance_id, graph_id, "0xfirst").unwrap()).await;
+    let first = t.submit(withdraw_init_event(graph_id, "0xfirst").unwrap()).await;
     t.wait_waiting(&first).await;
     // Its cancel never reached this node: the next init takes over.
-    let second = t.submit(withdraw_init_event(instance_id, graph_id, "0xsecond").unwrap()).await;
+    let second = t.submit(withdraw_init_event(graph_id, "0xsecond").unwrap()).await;
     t.wait_waiting(&second).await;
     let state = t.graph_state(graph_id).await;
     assert_eq!(state.withdraw.as_deref(), Some("0xsecond"));
@@ -1184,11 +1182,11 @@ async fn only_the_owning_operator_acts_on_a_withdraw() {
     let instance_id = t.insert_instance(InstanceBridgeInStatus::RelayerL2Minted).await;
     let foreign =
         t.insert_graph_of(OTHER_OPERATOR, instance_id, 0, GraphStatus::OperatorDataPushed).await;
-    let init = t.submit(withdraw_init_event(instance_id, foreign, "0xother").unwrap()).await;
+    let init = t.submit(withdraw_init_event(foreign, "0xother").unwrap()).await;
     t.wait_inbox(&init, EngineInboxState::Applied).await;
     // The first slot has no predecessor: the own graph kicks off at once.
     let own = t.insert_graph(instance_id, 0, GraphStatus::OperatorDataPushed).await;
-    let init = t.submit(withdraw_init_event(instance_id, own, "0xown").unwrap()).await;
+    let init = t.submit(withdraw_init_event(own, "0xown").unwrap()).await;
     t.wait_inbox(&init, EngineInboxState::Applied).await;
     t.wait_job(own, JOB_KICKOFF, EngineJobState::Done).await;
     assert!(t.jobs_of(foreign).await.is_empty());
@@ -1197,7 +1195,7 @@ async fn only_the_owning_operator_acts_on_a_withdraw() {
     let t = start(Actor::Verifier, false).await;
     let instance_id = t.insert_instance(InstanceBridgeInStatus::RelayerL2Minted).await;
     let graph_id = t.insert_graph(instance_id, 0, GraphStatus::OperatorDataPushed).await;
-    let init = t.submit(withdraw_init_event(instance_id, graph_id, "0xv").unwrap()).await;
+    let init = t.submit(withdraw_init_event(graph_id, "0xv").unwrap()).await;
     t.wait_inbox(&init, EngineInboxState::Applied).await;
     settle().await;
     assert!(t.calls().is_empty());

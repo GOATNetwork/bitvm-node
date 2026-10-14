@@ -277,14 +277,6 @@ impl EngineHandle {
             poisoned: storage.list_engine_poisons(None, 256).await?,
         })
     }
-
-    pub fn clock(&self) -> Arc<dyn Clock> {
-        self.inner.clock.clone()
-    }
-
-    pub fn config(&self) -> Arc<EngineConfig> {
-        self.inner.config.clone()
-    }
 }
 
 impl Engine {

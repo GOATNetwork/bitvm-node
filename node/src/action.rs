@@ -1,7 +1,3 @@
-#![allow(clippy::collapsible_match)]
-#![allow(clippy::single_match)]
-#![allow(clippy::collapsible_else_if)]
-
 //! Wire messages of the node and the gossip entry point: the envelope, the
 //! message kinds and their routing table, admission of an inbound gossip
 //! message into the engine inbox or the control queue, and the single
@@ -35,7 +31,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use store::localdb::LocalDB;
-use strum::{Display, EnumDiscriminants, EnumIter, EnumString, IntoStaticStr};
+use strum::{Display, EnumDiscriminants, EnumIter, IntoStaticStr};
 use uuid::Uuid;
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -77,23 +73,13 @@ pub enum BusinessRef {
     Unscoped,
 }
 
-impl BusinessRef {
-    pub const fn primary_id(self) -> Option<Uuid> {
-        match self {
-            Self::Instance { instance_id } => Some(instance_id),
-            Self::Graph { graph_id, .. } => Some(graph_id),
-            Self::Unscoped => None,
-        }
-    }
-}
-
 pub trait HasBusinessRef {
     fn business_ref(&self) -> BusinessRef;
 }
 
 #[derive(Serialize, Deserialize, Clone, EnumDiscriminants, MessageBusinessRef)]
 #[strum_discriminants(name(MessageKind))]
-#[strum_discriminants(derive(Hash, Display, EnumString, EnumIter, IntoStaticStr))]
+#[strum_discriminants(derive(Display, EnumIter, IntoStaticStr))]
 pub enum GOATMessageContent {
     #[business_ref(graph)]
     CreateGraph(CreateGraph),
@@ -594,7 +580,7 @@ pub async fn handle_inbound_p2p_message(
             Ok(())
         }
         InboundVerdict::Immediate(decoded) => {
-            if !worker.enqueue(from_peer_id, id.clone(), decoded, message.len()) {
+            if !worker.enqueue(from_peer_id, decoded, message.len()) {
                 report_gossip_validation(
                     swarm,
                     &id,

@@ -327,7 +327,7 @@ fn get_bridge_in_status_time_window_secs(status: &str, response_window_blocks: i
         + INSTANCE_RELAYER_L1_BROADCAST_STATUS_DURATION_SECS;
 
     match InstanceBridgeInStatus::from_str(status) {
-        Ok(InstanceBridgeInStatus::UserIniting) | Ok(InstanceBridgeInStatus::UserInited) => {
+        Ok(InstanceBridgeInStatus::UserInited) => {
             (response_window_blocks_with_margin * GOAT_BLOCK_INTERVAL_SECS, total_time)
         }
         Ok(InstanceBridgeInStatus::CommitteesAnswered) => {

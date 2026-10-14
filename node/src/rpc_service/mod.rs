@@ -83,15 +83,6 @@ impl AppState {
         actor: Actor,
         peer_id: String,
         metrics_state: MetricsState,
-    ) -> anyhow::Result<Arc<AppState>> {
-        Self::create_arc_app_state_with_engine(local_db, actor, peer_id, metrics_state, None).await
-    }
-
-    pub async fn create_arc_app_state_with_engine(
-        local_db: LocalDB,
-        actor: Actor,
-        peer_id: String,
-        metrics_state: MetricsState,
         engine: Option<engine::EngineHandle>,
     ) -> anyhow::Result<Arc<AppState>> {
         let btc_client = BTCClient::new(get_network(), get_btc_url_from_env().as_deref());
@@ -282,18 +273,6 @@ async fn serve_with_listener(
             Ok("rpc_shutdown".to_string())
         }
     }
-}
-
-pub async fn serve(
-    addr: String,
-    local_db: LocalDB,
-    actor: Actor,
-    peer_id: String,
-    metrics_state: MetricsState,
-    cancellation_token: CancellationToken,
-) -> anyhow::Result<String> {
-    let app_state = AppState::create_arc_app_state(local_db, actor, peer_id, metrics_state).await?;
-    serve_with_app_state(addr, app_state, cancellation_token).await
 }
 
 /// Validates the path the dedicated metrics listener will expose.
@@ -857,6 +836,7 @@ mod tests {
                 Actor::Verifier,
                 generate_local_key().public().to_peer_id().to_string(),
                 MetricsState::new(Arc::new(Mutex::new(Registry::default()))),
+                None,
             )
             .await?,
             CancellationToken::new(),
@@ -1059,6 +1039,7 @@ mod tests {
                 actor.clone(),
                 peer_id.clone(),
                 MetricsState::new(Arc::new(Mutex::new(Registry::default()))),
+                None,
             )
             .await?,
             CancellationToken::new(),
@@ -1188,6 +1169,7 @@ mod tests {
                 committee,
                 committee_peer_id,
                 MetricsState::new(Arc::new(Mutex::new(Registry::default()))),
+                None,
             )
             .await?,
             CancellationToken::new(),

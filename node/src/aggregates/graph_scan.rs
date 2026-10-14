@@ -73,21 +73,6 @@ pub struct ChallengeSubStatus {
     pub disprove_index: i32,
 }
 
-impl ChallengeSubStatus {
-    pub fn is_watchtower_challenge_success(&self, required_watchtower_num: usize) -> bool {
-        self.watchtower_challenge_status
-            .iter()
-            .filter(|&&status| status)
-            .take(required_watchtower_num)
-            .count()
-            == required_watchtower_num
-    }
-
-    pub fn is_disproved(&self) -> bool {
-        self.disprove_type.is_some()
-    }
-}
-
 // ------------------------------------------------------------------- marks
 
 /// `(height, status)` of the last scan recorded per graph: a scan at the same
@@ -485,7 +470,6 @@ fn edge_signals(chain: &GraphChainScan) -> Vec<PegoutSignal> {
                 signals.push(PegoutSignal::DisproveSent {
                     disprove_type: disprove.disprove_type,
                     index: disprove.index,
-                    challenge_start_txid: disprove.challenge_start_txid,
                     challenge_finish_txid: disprove.challenge_finish_txid,
                 });
             }
@@ -912,7 +896,6 @@ mod tests {
         disproved.disprove = Some(DetectedDisprove {
             disprove_type: DisproveTxType::Disprove,
             index: 1,
-            challenge_start_txid: Some(challenge_txid),
             challenge_finish_txid: challenge_txid,
         });
         let signals = edge_signals(&disproved);

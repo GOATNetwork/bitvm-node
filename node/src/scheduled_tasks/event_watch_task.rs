@@ -5,7 +5,6 @@ use crate::aggregates::graph_pegout::{
 };
 use crate::aggregates::instance::l2_minted_event;
 use crate::engine_bridge::record_event_in;
-use crate::env;
 use crate::env::{
     ENV_GOAT_GATEWAY_CONTRACT_ADDRESS, ENV_GOAT_SWAP_CONTRACT_ADDRESS,
     LOAD_HISTORY_EVENT_NO_WOKING_MAX_SECS, get_goat_address_from_env,
@@ -236,8 +235,7 @@ pub async fn fetch_and_handle_gateway_events<'a>(
     );
     handle_user_withdraw_events(storage_processor, init_withdraw_events, cancel_withdraw_events)
         .await?;
-    handle_proceed_withdraw_events(actor.clone(), storage_processor, proceed_withdraw_events)
-        .await?;
+    handle_proceed_withdraw_events(storage_processor, proceed_withdraw_events).await?;
     handle_withdraw_paths_events(storage_processor, withdraw_paths_events).await?;
     handle_withdraw_disproved_events(storage_processor, withdraw_disproved_events).await?;
     handle_bridge_in_request_events(storage_processor, bridge_in_request_events).await?;
@@ -354,7 +352,7 @@ async fn handle_user_withdraw_events<'a>(
                 // The Graph aggregate takes the withdraw from here.
                 record_event_in(
                     storage_processor,
-                    withdraw_init_event(instance_id, graph_id, &init_event.transaction_hash)?,
+                    withdraw_init_event(graph_id, &init_event.transaction_hash)?,
                 )
                 .await?;
                 storage_processor
@@ -391,7 +389,7 @@ async fn handle_user_withdraw_events<'a>(
                 }
                 record_event_in(
                     storage_processor,
-                    withdraw_cancel_event(instance_id, graph_id, &cancel_event.transaction_hash)?,
+                    withdraw_cancel_event(graph_id, &cancel_event.transaction_hash)?,
                 )
                 .await?;
                 storage_processor
@@ -414,15 +412,11 @@ async fn handle_user_withdraw_events<'a>(
 }
 
 async fn handle_proceed_withdraw_events<'a>(
-    actor: Actor,
     storage_processor: &mut StorageProcessor<'a>,
     proceed_withdraw_events: Vec<ProceedWithdrawEvent>,
 ) -> anyhow::Result<()> {
-    let processing_status = if actor == Actor::Operator && env::get_proof_server_url().is_none() {
-        GoatTxProcessingStatus::Pending.to_string()
-    } else {
-        GoatTxProcessingStatus::Skipped.to_string()
-    };
+    // The record only marks the event as seen; nothing reads its status.
+    let processing_status = GoatTxProcessingStatus::Skipped.to_string();
     for event in proceed_withdraw_events {
         let graph_id = Uuid::from_str(&strip_hex_prefix_owned(&event.graph_id))?;
         let instance_id = Uuid::from_str(&strip_hex_prefix_owned(&event.instance_id))?;
@@ -452,16 +446,6 @@ async fn handle_proceed_withdraw_events<'a>(
                 extra: None,
                 created_at: current_time_secs(),
             })
-            .await?;
-
-        // for history events
-        storage_processor
-            .update_goat_tx_record_processing_status(
-                &graph_id,
-                &instance_id,
-                &GoatTxType::InitWithdraw.to_string(),
-                &GoatTxProcessingStatus::Processed.to_string(),
-            )
             .await?;
     }
     Ok(())
@@ -1114,8 +1098,7 @@ async fn handle_post_graph_data_events<'a>(
                     .await?;
                 }
                 // Posted: the Graph aggregate closes every delivery of the graph.
-                record_event_in(storage_processor, graph_posted_event(instance_id, graph_id)?)
-                    .await?;
+                record_event_in(storage_processor, graph_posted_event(graph_id)?).await?;
             }
             _ => warn!("failed to parse graph event identifiers: {event:?}"),
         }
@@ -1396,24 +1379,6 @@ pub async fn run_watch_event_task(
         ),
         (
             Actor::Operator,
-            vec![WatchEventConfig::Gateway(TheGraphConfig {
-                address: gateway_contract,
-                the_graph_url: get_goat_gateway_the_graph_urls_from_env(),
-                event_entities: vec![
-                    GatewayEventEntity::InitWithdraws,
-                    GatewayEventEntity::CancelWithdraws,
-                    GatewayEventEntity::ProceedWithdraws,
-                    GatewayEventEntity::WithdrawHappyPaths,
-                    GatewayEventEntity::WithdrawUnhappyPaths,
-                    GatewayEventEntity::WithdrawDisproveds,
-                    GatewayEventEntity::BridgeInRequests,
-                    GatewayEventEntity::BridgeIns,
-                    GatewayEventEntity::PostGraphDatas,
-                ],
-            })],
-        ),
-        (
-            Actor::Verifier,
             vec![WatchEventConfig::Gateway(TheGraphConfig {
                 address: gateway_contract,
                 the_graph_url: get_goat_gateway_the_graph_urls_from_env(),

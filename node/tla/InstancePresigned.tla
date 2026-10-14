@@ -13,7 +13,7 @@
 (* `update_graph_status_guarded` (node/src/utils.rs, ~5195) both write     *)
 (* `InstanceBridgeInStatus::Presigned` unconditionally as a side effect of *)
 (* a graph reaching `CommitteePresigned`, reachable from independent P2P-  *)
-(* message handlers (handle.rs) and chain-rescans (graph_maintenance_tasks) *)
+(* message handlers (handle.rs) and chain-rescans (graph_scan)             *)
 (* with no coordination - so a stale/replayed event could revert an        *)
 (* instance that already progressed past Presigned (e.g. to                *)
 (* RelayerL1Broadcasted or RelayerL2Minted, written by instance_btc_tx_monitor *)
