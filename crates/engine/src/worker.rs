@@ -16,7 +16,8 @@ use std::sync::Arc;
 use std::time::Instant;
 use store::localdb::{LocalDB, StorageProcessor};
 use store::{
-    EngineAggregate, EngineAggregateUpdate, EngineInboxEvent, NewEngineJob, NewEngineOutboxMessage,
+    EngineAggregate, EngineAggregateUpdate, EngineInboxEvent, EngineJobInsert, EngineJobState,
+    NewEngineJob, NewEngineOutboxMessage,
 };
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
@@ -227,6 +228,7 @@ pub(crate) async fn process_event(
             let now = deps.clock.now();
             let mut storage = deps.db.acquire().await?;
             storage.mark_engine_inbox_failed(&event.event_id, &reason, now).await?;
+            storage.release_engine_poison(&aggregate.kind, &aggregate.id, &kind).await?;
             drop(storage);
             PostCommit {
                 acks: event.ack_target().into_iter().collect(),
@@ -309,21 +311,33 @@ async fn commit_apply(
         tx.close_engine_outbox(target, reason, now).await?;
     }
     for job in &effects.jobs {
-        tx.insert_engine_job(
-            &NewEngineJob {
-                job_id: job.job_id.clone(),
-                aggregate_kind: aggregate.kind.clone(),
-                aggregate_id: aggregate.id.clone(),
-                phase: job.phase.clone(),
-                action: job.action.clone(),
-                pool: job.pool.as_str().to_string(),
-                params: job.params.clone(),
-                deadline_at: job.deadline_at,
-                first_at: job.run_after.unwrap_or(now).max(now),
-            },
-            now,
-        )
-        .await?;
+        let inserted = tx
+            .insert_engine_job(
+                &NewEngineJob {
+                    job_id: job.job_id.clone(),
+                    aggregate_kind: aggregate.kind.clone(),
+                    aggregate_id: aggregate.id.clone(),
+                    phase: job.phase.clone(),
+                    action: job.action.clone(),
+                    pool: job.pool.as_str().to_string(),
+                    params: job.params.clone(),
+                    deadline_at: job.deadline_at,
+                    first_at: job.run_after.unwrap_or(now).max(now),
+                },
+                now,
+            )
+            .await?;
+        match inserted {
+            EngineJobInsert::Inserted => {}
+            EngineJobInsert::Existing(EngineJobState::Pending | EngineJobState::Running) => {
+                debug!(event = "engine_jobs", outcome = "already_open", job_id = %job.job_id, action = %job.action, "job is already queued or running");
+            }
+            EngineJobInsert::Existing(state) => {
+                // Same id means same params: the job ran (or was cancelled)
+                // before and the engine will not run it again.
+                warn!(event = "engine_jobs", outcome = "reenqueue_ignored", job_id = %job.job_id, action = %job.action, event_id = %event.event_id, state = %state, "job re-enqueued after a terminal state; not run again");
+            }
+        }
     }
     for cancel in &effects.job_cancels {
         match cancel {
@@ -341,23 +355,13 @@ async fn commit_apply(
             }
         }
     }
-    // A new fact lifts the poison, once the backoff of this many poisons has
-    // passed; a job result reporting on the poisoned action itself does not.
-    let backoff_over = current.is_none_or(|current| {
-        !current.poisoned
-            || current.poisoned_at.is_none_or(|poisoned_at| {
-                now >= poisoned_at + deps.config.poison_backoff.delay(current.poison_count)
-            })
-    });
+    // The handler ran this kind to a decision: a poison it carried is over.
+    tx.release_engine_poison(&aggregate.kind, &aggregate.id, &event.kind).await?;
     let update = EngineAggregateUpdate {
         status: effects.status.clone(),
         phase: effects.phase.clone(),
         state: effects.state.clone(),
-        waiting: Some(waiting.as_ref().map(|w| (w.wake_ref.clone(), w.detail.clone()))),
         last_event_id: Some(event.event_id.clone()),
-        clear_poison: waiting.is_none()
-            && event.source != crate::event::EventSource::Job.as_str()
-            && backoff_over,
     };
     let updated = tx.upsert_engine_aggregate(&aggregate.kind, &aggregate.id, &update, now).await?;
     let changed =
@@ -440,7 +444,15 @@ async fn poison(
     let now = deps.clock.now();
     let mut tx = deps.db.start_immediate_transaction().await?;
     tx.mark_engine_inbox_poisoned(&event.event_id, reason, now).await?;
-    tx.mark_engine_aggregate_poisoned(&aggregate.kind, &aggregate.id, &event.kind, reason, now)
+    let poison = tx
+        .mark_engine_aggregate_poisoned(
+            &aggregate.kind,
+            &aggregate.id,
+            &event.kind,
+            reason,
+            now,
+            &|count| deps.config.poison_backoff.delay(count),
+        )
         .await?;
     tx.commit().await?;
     deps.metrics.record_poisoned();
@@ -449,8 +461,10 @@ async fn poison(
         event_id = %event.event_id,
         aggregate = %aggregate,
         kind = %event.kind,
+        poison_count = poison.poison_count,
+        blocked_until = poison.blocked_until,
         reason = %reason,
-        "event poisoned; aggregate flagged until the next successful apply or a manual clear"
+        "event poisoned; later events of this kind wait for the backoff, a clean apply or a manual clear"
     );
     Ok(())
 }

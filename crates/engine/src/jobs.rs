@@ -72,6 +72,9 @@ pub(crate) async fn run_executor(
         if cancel.is_cancelled() {
             return;
         }
+        if let Err(error) = finish_lapsed_cancelled(&deps).await {
+            warn!(event = "engine_jobs", outcome = "cancel_sweep_failed", error = %error, "could not finish lapsed cancelled jobs");
+        }
         for (pool, semaphore) in &pools {
             if let Err(error) = claim_and_spawn(&deps, *pool, semaphore, &cancel).await {
                 warn!(event = "engine_jobs", outcome = "claim_failed", pool = pool.as_str(), error = %error, "job claim failed");
@@ -84,6 +87,47 @@ pub(crate) async fn run_executor(
             _ = tokio::time::sleep(deps.config.job_poll_interval) => {}
         }
     }
+}
+
+/// A cancelled job whose holder went away (crash, restart) is not run again:
+/// it finishes as `Cancelled` here and its result reaches the aggregate.
+async fn finish_lapsed_cancelled(deps: &ExecutorDeps) -> anyhow::Result<()> {
+    let now = deps.clock.now();
+    let mut tx = deps.db.start_immediate_transaction().await?;
+    let jobs = tx.finish_lapsed_cancelled_engine_jobs(now).await?;
+    if jobs.is_empty() {
+        tx.commit().await?;
+        return Ok(());
+    }
+    let mut aggregates = Vec::with_capacity(jobs.len());
+    for job in &jobs {
+        let aggregate = AggregateRef::new(&job.aggregate_kind, &job.aggregate_id);
+        let event = JobResultEvent {
+            job_id: job.job_id.clone(),
+            phase: job.phase.clone(),
+            action: job.action.clone(),
+            generation: job.generation,
+            stale: false,
+            outcome: JobResultOutcome::Cancelled,
+        }
+        .into_new_event(aggregate.clone())?;
+        tx.insert_engine_inbox_event(&event.into_store(), now).await?;
+        aggregates.push(aggregate);
+    }
+    tx.commit().await?;
+    for (job, aggregate) in jobs.iter().zip(&aggregates) {
+        deps.metrics.record_job_run(&job.action, "cancelled");
+        info!(
+            event = "engine_jobs",
+            outcome = "cancelled",
+            job_id = %job.job_id,
+            action = %job.action,
+            generation = job.generation,
+            "cancelled job lost its holder; finished without re-running"
+        );
+        deps.wake.worker_for(aggregate);
+    }
+    Ok(())
 }
 
 async fn claim_and_spawn(
@@ -272,6 +316,19 @@ fn spawn_lease_renewal(
             match renewed {
                 Ok(true) => {}
                 Ok(false) => {
+                    // Our own finish may have committed just before this tick.
+                    let finished = match deps.db.acquire().await {
+                        Ok(mut storage) => storage.find_engine_job(&job_id).await.ok().flatten(),
+                        Err(_) => None,
+                    }
+                    .is_some_and(|row| {
+                        row.generation == generation
+                            && row.state != EngineJobState::Running.to_string()
+                    });
+                    if finished {
+                        debug!(event = "engine_jobs", outcome = "renewal_done", job_id = %job_id, generation, "job finished; lease renewal stopped");
+                        return;
+                    }
                     warn!(
                         event = "engine_jobs",
                         outcome = "lease_lost",
@@ -332,26 +389,35 @@ async fn record_job_finish(
         }
         (EngineJobFinishOutcome::Missing, _) => (true, None, "missing".to_string()),
     };
-    if let (EngineJobFinishOutcome::Applied { .. }, EngineJobFinish::Poisoned(reason)) =
-        (&outcome, finish)
-    {
-        tx.mark_engine_aggregate_poisoned(
-            &job.aggregate_kind,
-            &job.aggregate_id,
-            &job.action,
-            reason,
-            now,
-        )
-        .await?;
-        deps.metrics.record_poisoned();
-        error!(
-            event = "engine_poisoned",
-            job_id = %job.job_id,
-            aggregate = %aggregate,
-            action = %job.action,
-            reason = %reason,
-            "job panicked; aggregate poisoned for this action until the next successful apply or a manual clear"
-        );
+    match (&outcome, finish) {
+        (EngineJobFinishOutcome::Applied { .. }, EngineJobFinish::Poisoned(reason)) => {
+            let poison = tx
+                .mark_engine_aggregate_poisoned(
+                    &job.aggregate_kind,
+                    &job.aggregate_id,
+                    &job.action,
+                    reason,
+                    now,
+                    &|count| deps.config.poison_backoff.delay(count),
+                )
+                .await?;
+            deps.metrics.record_poisoned();
+            error!(
+                event = "engine_poisoned",
+                job_id = %job.job_id,
+                aggregate = %aggregate,
+                action = %job.action,
+                poison_count = poison.poison_count,
+                blocked_until = poison.blocked_until,
+                reason = %reason,
+                "job panicked; this action waits for the backoff, a clean run or a manual clear"
+            );
+        }
+        (EngineJobFinishOutcome::Applied { .. }, _) => {
+            // The action ran to a result without panicking: its poison is over.
+            tx.release_engine_poison(&job.aggregate_kind, &job.aggregate_id, &job.action).await?;
+        }
+        _ => {}
     }
     let mut wake_worker = false;
     if let Some(result_outcome) = result_outcome {

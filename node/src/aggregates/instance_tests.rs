@@ -573,7 +573,13 @@ async fn a_failed_instance_keeps_the_settlement_jobs_of_its_graphs() {
             ("post", crate::aggregates::graph::PHASE_POST, "post_graph_data"),
             ("challenge", "Settlement", "challenge_kickoff"),
         ] {
-            assert!(storage.insert_engine_job(&job(job_id, phase, action), 1).await.unwrap());
+            assert!(
+                storage
+                    .insert_engine_job(&job(job_id, phase, action), 1)
+                    .await
+                    .unwrap()
+                    .is_inserted()
+            );
         }
     }
     t.snapshot(id, presign_snapshot(1_070, TxFact::UNKNOWN, TxFact::confirmed_at(1_069))).await;

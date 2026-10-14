@@ -13,15 +13,16 @@ use crate::env::{get_btc_url_from_env, get_goat_network, get_network, goat_confi
 use crate::metrics_service::{MetricsState, metrics_handler, metrics_middleware};
 use crate::rpc_service::auth::require_request_auth;
 use crate::rpc_service::cors_config::CorsConfig;
+#[cfg(feature = "rpc-debug-endpoints")]
+use crate::rpc_service::handler::{
+    clear_engine_poison, get_debug_engine, get_debug_status, send_challenge,
+    send_verifier_challenge,
+};
 use crate::rpc_service::handler::{
     get_chain_proof_desc, get_graph, get_graph_neighbor_ids, get_graph_tx, get_graph_txn,
     get_graphs, get_instance, get_instances, get_instances_overview, get_node, get_nodes,
     get_nodes_overview, get_operator_proof_desc, get_ready_to_kickoff_graph, get_swap, get_swaps,
     get_unsigned_pegin_txn, instance_settings, pegout,
-};
-#[cfg(feature = "rpc-debug-endpoints")]
-use crate::rpc_service::handler::{
-    get_debug_engine, get_debug_status, send_challenge, send_verifier_challenge,
 };
 use anyhow::Context;
 use axum::body::Body;
@@ -188,7 +189,8 @@ pub(crate) fn build_business_router(app_state: Arc<AppState>) -> Router {
     #[cfg(feature = "rpc-debug-endpoints")]
     let signed_routes = signed_routes
         .route(routes::v1::GRAPHS_SEND_CHALLENGE, post(send_challenge))
-        .route(routes::v1::GRAPHS_SEND_VERIFIER_CHALLENGE, post(send_verifier_challenge));
+        .route(routes::v1::GRAPHS_SEND_VERIFIER_CHALLENGE, post(send_verifier_challenge))
+        .route(routes::v1::DEBUG_ENGINE_CLEAR_POISON, post(clear_engine_poison));
 
     let signed_routes = signed_routes
         .route_layer(middleware::from_fn_with_state(app_state.clone(), require_request_auth));

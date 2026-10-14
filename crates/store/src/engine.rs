@@ -161,15 +161,6 @@ pub struct EngineAggregate {
     pub status: String,
     pub phase: String,
     pub state: Option<String>,
-    pub waiting_ref: Option<String>,
-    pub waiting_detail: Option<String>,
-    pub waiting_since: Option<i64>,
-    pub poisoned: bool,
-    pub poison_action: Option<String>,
-    pub poison_reason: Option<String>,
-    /// Poisons since the last manual clear; drives the re-arm backoff.
-    pub poison_count: i64,
-    pub poisoned_at: Option<i64>,
     pub version: i64,
     pub last_event_id: Option<String>,
     pub created_at: i64,
@@ -177,8 +168,7 @@ pub struct EngineAggregate {
 }
 
 const ENGINE_AGGREGATE_COLUMNS: &str = "aggregate_kind, aggregate_id, status, phase, state, \
-     waiting_ref, waiting_detail, waiting_since, poisoned, poison_action, poison_reason, \
-     poison_count, poisoned_at, version, last_event_id, created_at, updated_at";
+     version, last_event_id, created_at, updated_at";
 
 fn engine_aggregate_from_row(row: &SqliteRow) -> Result<EngineAggregate, sqlx::Error> {
     Ok(EngineAggregate {
@@ -187,14 +177,6 @@ fn engine_aggregate_from_row(row: &SqliteRow) -> Result<EngineAggregate, sqlx::E
         status: row.try_get("status")?,
         phase: row.try_get("phase")?,
         state: row.try_get("state")?,
-        waiting_ref: row.try_get("waiting_ref")?,
-        waiting_detail: row.try_get("waiting_detail")?,
-        waiting_since: row.try_get("waiting_since")?,
-        poisoned: row.try_get::<i64, _>("poisoned")? != 0,
-        poison_action: row.try_get("poison_action")?,
-        poison_reason: row.try_get("poison_reason")?,
-        poison_count: row.try_get("poison_count")?,
-        poisoned_at: row.try_get("poisoned_at")?,
         version: row.try_get("version")?,
         last_event_id: row.try_get("last_event_id")?,
         created_at: row.try_get("created_at")?,
@@ -209,10 +191,47 @@ pub struct EngineAggregateUpdate {
     pub status: Option<String>,
     pub phase: Option<String>,
     pub state: Option<Option<String>>,
-    /// `Some(Some((ref, detail)))` registers a wait, `Some(None)` clears it.
-    pub waiting: Option<Option<(String, String)>>,
     pub last_event_id: Option<String>,
-    pub clear_poison: bool,
+}
+
+/// An action (job action or event kind) of an aggregate that panicked. It is
+/// held back until `blocked_until`; the backoff grows with `poison_count`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnginePoison {
+    pub aggregate_kind: String,
+    pub aggregate_id: String,
+    pub action: String,
+    pub reason: String,
+    pub poison_count: i64,
+    pub poisoned_at: i64,
+    pub blocked_until: i64,
+}
+
+/// A parked inbox event: what it waits on and since when.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EngineWaitingEvent {
+    pub event_id: String,
+    pub aggregate_kind: String,
+    pub aggregate_id: String,
+    pub kind: String,
+    pub waiting_ref: String,
+    pub waiting_detail: Option<String>,
+    pub next_at: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EngineJobInsert {
+    Inserted,
+    /// A job with this id exists already; it is run again only if it is still open.
+    Existing(EngineJobState),
+}
+
+impl EngineJobInsert {
+    pub fn is_inserted(&self) -> bool {
+        matches!(self, EngineJobInsert::Inserted)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -513,13 +532,17 @@ impl<'a> StorageProcessor<'a> {
         now: i64,
     ) -> anyhow::Result<Option<EngineInboxEvent>> {
         let row = sqlx::query(&format!(
-            "SELECT {ENGINE_INBOX_COLUMNS} FROM engine_inbox \
-             WHERE state = 'Pending' AND next_at <= ? AND (shard_key % ?) = ? \
-             ORDER BY seq LIMIT 1"
+            "SELECT {ENGINE_INBOX_COLUMNS} FROM engine_inbox e \
+             WHERE e.state = 'Pending' AND e.next_at <= ? AND (e.shard_key % ?) = ? \
+               AND NOT EXISTS (SELECT 1 FROM engine_aggregate_poison p \
+                 WHERE p.aggregate_kind = e.aggregate_kind AND p.aggregate_id = e.aggregate_id \
+                   AND p.action = e.kind AND p.blocked_until > ?) \
+             ORDER BY e.seq LIMIT 1"
         ))
         .bind(now)
         .bind(shard_count)
         .bind(shard)
+        .bind(now)
         .fetch_optional(self.conn())
         .await?;
         Ok(row.map(|row| engine_inbox_event_from_row(&row)).transpose()?)
@@ -556,7 +579,7 @@ impl<'a> StorageProcessor<'a> {
     ) -> anyhow::Result<bool> {
         Ok(sqlx::query(
             "UPDATE engine_inbox SET waiting_ref = ?, waiting_detail = ?, next_at = ?, \
-             attempts = attempts + 1, updated_at = ? \
+             updated_at = ? \
              WHERE event_id = ? AND state = 'Pending'",
         )
         .bind(waiting_ref)
@@ -805,60 +828,36 @@ impl<'a> StorageProcessor<'a> {
         .bind(now)
         .execute(self.conn())
         .await?;
-        let mut sql =
-            String::from("UPDATE engine_aggregate SET version = version + 1, updated_at = ?");
-        let mut params: Vec<Option<String>> = vec![Some(now.to_string())];
-        if let Some(status) = &update.status {
-            sql.push_str(", status = ?");
-            params.push(Some(status.clone()));
-        }
-        if let Some(phase) = &update.phase {
-            sql.push_str(", phase = ?");
-            params.push(Some(phase.clone()));
-        }
-        if let Some(state) = &update.state {
-            sql.push_str(", state = ?");
-            params.push(state.clone());
-        }
-        match &update.waiting {
-            Some(Some((waiting_ref, waiting_detail))) => {
-                sql.push_str(
-                    ", waiting_ref = ?, waiting_detail = ?, \
-                     waiting_since = COALESCE(waiting_since, ?)",
-                );
-                params.push(Some(waiting_ref.clone()));
-                params.push(Some(waiting_detail.clone()));
-                params.push(Some(now.to_string()));
-            }
-            Some(None) => {
-                sql.push_str(", waiting_ref = NULL, waiting_detail = NULL, waiting_since = NULL");
-            }
-            None => {}
-        }
-        if let Some(last_event_id) = &update.last_event_id {
-            sql.push_str(", last_event_id = ?");
-            params.push(Some(last_event_id.clone()));
-        }
-        if update.clear_poison {
-            sql.push_str(", poisoned = 0, poison_action = NULL, poison_reason = NULL");
-        }
-        sql.push_str(" WHERE aggregate_kind = ? AND aggregate_id = ?");
-        let mut query = sqlx::query(&sql);
-        for (index, param) in params.iter().enumerate() {
-            // The first parameter is `updated_at`, which is an integer column.
-            if index == 0 {
-                query = query.bind(now);
-            } else {
-                query = query.bind(param.clone());
-            }
-        }
-        query = query.bind(aggregate_kind).bind(aggregate_id);
-        query.execute(self.conn()).await?;
+        let (set_state, state) = match &update.state {
+            Some(state) => (true, state.clone()),
+            None => (false, None),
+        };
+        sqlx::query(
+            "UPDATE engine_aggregate SET version = version + 1, updated_at = ?, \
+                 status = COALESCE(?, status), phase = COALESCE(?, phase), \
+                 state = CASE WHEN ? THEN ? ELSE state END, \
+                 last_event_id = COALESCE(?, last_event_id) \
+             WHERE aggregate_kind = ? AND aggregate_id = ?",
+        )
+        .bind(now)
+        .bind(&update.status)
+        .bind(&update.phase)
+        .bind(set_state)
+        .bind(state)
+        .bind(&update.last_event_id)
+        .bind(aggregate_kind)
+        .bind(aggregate_id)
+        .execute(self.conn())
+        .await?;
         self.find_engine_aggregate(aggregate_kind, aggregate_id).await?.ok_or_else(|| {
             anyhow::anyhow!("engine aggregate {aggregate_kind}:{aggregate_id} vanished")
         })
     }
 
+    /// Record a panic of `action` on the aggregate: the action is held back for
+    /// `backoff_secs(count)` seconds, where `count` is the number of consecutive
+    /// poisons of this action. The row survives until the action runs cleanly
+    /// or the aggregate is cleared by hand.
     pub async fn mark_engine_aggregate_poisoned(
         &mut self,
         aggregate_kind: &str,
@@ -866,17 +865,18 @@ impl<'a> StorageProcessor<'a> {
         action: &str,
         reason: &str,
         now: i64,
-    ) -> anyhow::Result<()> {
-        sqlx::query(
-            "INSERT INTO engine_aggregate \
-             (aggregate_kind, aggregate_id, status, phase, poisoned, poison_action, poison_reason, \
-              poison_count, poisoned_at, version, created_at, updated_at) \
-             VALUES (?, ?, '', '', 1, ?, ?, 1, ?, 0, ?, ?) \
-             ON CONFLICT(aggregate_kind, aggregate_id) DO UPDATE SET \
-               poisoned = 1, poison_action = excluded.poison_action, \
-               poison_reason = excluded.poison_reason, \
-               poison_count = engine_aggregate.poison_count + 1, \
-               poisoned_at = excluded.poisoned_at, updated_at = excluded.updated_at",
+        backoff_secs: &(dyn Fn(i64) -> i64 + Sync),
+    ) -> anyhow::Result<EnginePoison> {
+        let row = sqlx::query(
+            "INSERT INTO engine_aggregate_poison \
+             (aggregate_kind, aggregate_id, action, reason, poison_count, poisoned_at, \
+              blocked_until, updated_at) \
+             VALUES (?, ?, ?, ?, 1, ?, ?, ?) \
+             ON CONFLICT(aggregate_kind, aggregate_id, action) DO UPDATE SET \
+               reason = excluded.reason, \
+               poison_count = engine_aggregate_poison.poison_count + 1, \
+               poisoned_at = excluded.poisoned_at, updated_at = excluded.updated_at \
+             RETURNING poison_count",
         )
         .bind(aggregate_kind)
         .bind(aggregate_id)
@@ -885,58 +885,138 @@ impl<'a> StorageProcessor<'a> {
         .bind(now)
         .bind(now)
         .bind(now)
+        .fetch_one(self.conn())
+        .await?;
+        let poison_count: i64 = row.try_get("poison_count")?;
+        let blocked_until = now.saturating_add(backoff_secs(poison_count).max(0));
+        sqlx::query(
+            "UPDATE engine_aggregate_poison SET blocked_until = ? \
+             WHERE aggregate_kind = ? AND aggregate_id = ? AND action = ?",
+        )
+        .bind(blocked_until)
+        .bind(aggregate_kind)
+        .bind(aggregate_id)
+        .bind(action)
         .execute(self.conn())
         .await?;
-        Ok(())
+        Ok(EnginePoison {
+            aggregate_kind: aggregate_kind.to_string(),
+            aggregate_id: aggregate_id.to_string(),
+            action: action.to_string(),
+            reason: reason.to_string(),
+            poison_count,
+            poisoned_at: now,
+            blocked_until,
+        })
     }
 
-    /// A manual clear: the flag goes and the backoff starts over.
-    pub async fn clear_engine_aggregate_poison(
+    /// `action` ran cleanly: it is no longer poisoned and its count starts over.
+    pub async fn release_engine_poison(
         &mut self,
         aggregate_kind: &str,
         aggregate_id: &str,
-        now: i64,
+        action: &str,
     ) -> anyhow::Result<bool> {
         Ok(sqlx::query(
-            "UPDATE engine_aggregate SET poisoned = 0, poison_action = NULL, poison_reason = NULL, \
-             poison_count = 0, poisoned_at = NULL, updated_at = ? \
-             WHERE aggregate_kind = ? AND aggregate_id = ? AND poisoned = 1",
+            "DELETE FROM engine_aggregate_poison \
+             WHERE aggregate_kind = ? AND aggregate_id = ? AND action = ?",
         )
-        .bind(now)
         .bind(aggregate_kind)
         .bind(aggregate_id)
+        .bind(action)
         .execute(self.conn())
         .await?
         .rows_affected()
             > 0)
     }
 
-    pub async fn list_engine_aggregates_waiting(
+    /// A manual clear of one action or of every action of the aggregate.
+    pub async fn clear_engine_aggregate_poison(
         &mut self,
-        limit: i64,
-    ) -> anyhow::Result<Vec<EngineAggregate>> {
-        let rows = sqlx::query(&format!(
-            "SELECT {ENGINE_AGGREGATE_COLUMNS} FROM engine_aggregate \
-             WHERE waiting_ref IS NOT NULL ORDER BY waiting_since LIMIT ?"
-        ))
-        .bind(limit)
-        .fetch_all(self.conn())
-        .await?;
-        rows.iter().map(|row| Ok(engine_aggregate_from_row(row)?)).collect()
+        aggregate_kind: &str,
+        aggregate_id: &str,
+        action: Option<&str>,
+    ) -> anyhow::Result<u64> {
+        Ok(sqlx::query(
+            "DELETE FROM engine_aggregate_poison \
+             WHERE aggregate_kind = ? AND aggregate_id = ? AND (? IS NULL OR action = ?)",
+        )
+        .bind(aggregate_kind)
+        .bind(aggregate_id)
+        .bind(action)
+        .bind(action)
+        .execute(self.conn())
+        .await?
+        .rows_affected())
     }
 
-    pub async fn list_engine_aggregates_poisoned(
+    pub async fn list_engine_poisons(
         &mut self,
+        aggregate: Option<(&str, &str)>,
         limit: i64,
-    ) -> anyhow::Result<Vec<EngineAggregate>> {
-        let rows = sqlx::query(&format!(
-            "SELECT {ENGINE_AGGREGATE_COLUMNS} FROM engine_aggregate \
-             WHERE poisoned = 1 ORDER BY updated_at LIMIT ?"
-        ))
+    ) -> anyhow::Result<Vec<EnginePoison>> {
+        let (aggregate_kind, aggregate_id) = match aggregate {
+            Some((kind, id)) => (Some(kind), Some(id)),
+            None => (None, None),
+        };
+        let rows = sqlx::query(
+            "SELECT aggregate_kind, aggregate_id, action, reason, poison_count, poisoned_at, \
+                    blocked_until \
+             FROM engine_aggregate_poison \
+             WHERE (? IS NULL OR aggregate_kind = ?) AND (? IS NULL OR aggregate_id = ?) \
+             ORDER BY poisoned_at, aggregate_kind, aggregate_id, action LIMIT ?",
+        )
+        .bind(aggregate_kind)
+        .bind(aggregate_kind)
+        .bind(aggregate_id)
+        .bind(aggregate_id)
         .bind(limit)
         .fetch_all(self.conn())
         .await?;
-        rows.iter().map(|row| Ok(engine_aggregate_from_row(row)?)).collect()
+        rows.iter()
+            .map(|row| {
+                Ok(EnginePoison {
+                    aggregate_kind: row.try_get("aggregate_kind")?,
+                    aggregate_id: row.try_get("aggregate_id")?,
+                    action: row.try_get("action")?,
+                    reason: row.try_get("reason")?,
+                    poison_count: row.try_get("poison_count")?,
+                    poisoned_at: row.try_get("poisoned_at")?,
+                    blocked_until: row.try_get("blocked_until")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Parked events, oldest park first.
+    pub async fn list_engine_inbox_waiting(
+        &mut self,
+        limit: i64,
+    ) -> anyhow::Result<Vec<EngineWaitingEvent>> {
+        let rows = sqlx::query(
+            "SELECT event_id, aggregate_kind, aggregate_id, kind, waiting_ref, waiting_detail, \
+                    next_at, created_at, updated_at \
+             FROM engine_inbox WHERE state = 'Pending' AND waiting_ref IS NOT NULL \
+             ORDER BY updated_at, seq LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(self.conn())
+        .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(EngineWaitingEvent {
+                    event_id: row.try_get("event_id")?,
+                    aggregate_kind: row.try_get("aggregate_kind")?,
+                    aggregate_id: row.try_get("aggregate_id")?,
+                    kind: row.try_get("kind")?,
+                    waiting_ref: row.try_get("waiting_ref")?,
+                    waiting_detail: row.try_get("waiting_detail")?,
+                    next_at: row.try_get("next_at")?,
+                    created_at: row.try_get("created_at")?,
+                    updated_at: row.try_get("updated_at")?,
+                })
+            })
+            .collect()
     }
 
     // ----------------------------------------------------------------- outbox
@@ -1207,13 +1287,14 @@ impl<'a> StorageProcessor<'a> {
 
     // ------------------------------------------------------------------- jobs
 
-    /// Insert once; re-creating a known job id is a no-op.
+    /// Insert once; a known job id is left as it is, and the caller learns in
+    /// which state it was found.
     pub async fn insert_engine_job(
         &mut self,
         job: &NewEngineJob,
         now: i64,
-    ) -> anyhow::Result<bool> {
-        Ok(sqlx::query(
+    ) -> anyhow::Result<EngineJobInsert> {
+        let inserted = sqlx::query(
             "INSERT OR IGNORE INTO engine_job \
              (job_id, aggregate_kind, aggregate_id, phase, action, pool, params, state, \
               generation, lease_until, attempts, next_at, deadline_at, cancel_requested, \
@@ -1234,7 +1315,19 @@ impl<'a> StorageProcessor<'a> {
         .execute(self.conn())
         .await?
         .rows_affected()
-            > 0)
+            > 0;
+        if inserted {
+            return Ok(EngineJobInsert::Inserted);
+        }
+        let state: String = sqlx::query("SELECT state FROM engine_job WHERE job_id = ?")
+            .bind(&job.job_id)
+            .fetch_one(self.conn())
+            .await?
+            .try_get("state")?;
+        let state = state
+            .parse::<EngineJobState>()
+            .map_err(|_| anyhow::anyhow!("unknown engine job state {state:?}"))?;
+        Ok(EngineJobInsert::Existing(state))
     }
 
     pub async fn find_engine_job(&mut self, job_id: &str) -> anyhow::Result<Option<EngineJob>> {
@@ -1247,13 +1340,15 @@ impl<'a> StorageProcessor<'a> {
     }
 
     /// Claim up to `limit` due jobs of `pool`: pending rows whose `next_at`
-    /// passed, or running rows whose lease lapsed. Each claim increments the
-    /// generation so a late completion from the previous holder is fenced.
-    /// Jobs whose aggregate is poisoned for the same action are skipped, and
-    /// so is every job of an aggregate that already has a job running under a
-    /// live lease, in any pool: the jobs of one aggregate read and write the
-    /// same rows and run one at a time (the apply is serialized the same way).
-    /// Candidates are read first so an idle executor never takes the write lock.
+    /// passed, or running rows whose lease lapsed without a cancel request (a
+    /// cancelled one is finished by `finish_lapsed_cancelled_engine_jobs`).
+    /// Each claim increments the generation so a late completion from the
+    /// previous holder is fenced. Jobs whose action is poisoned on their
+    /// aggregate are skipped while the poison's backoff runs, and so is every
+    /// job of an aggregate that already has a job running under a live lease,
+    /// in any pool: the jobs of one aggregate read and write the same rows and
+    /// run one at a time (the apply is serialized the same way). Candidates are
+    /// read first so an idle executor never takes the write lock.
     pub async fn claim_due_engine_jobs(
         &mut self,
         pool: &str,
@@ -1263,18 +1358,19 @@ impl<'a> StorageProcessor<'a> {
     ) -> anyhow::Result<Vec<EngineJob>> {
         let candidates = sqlx::query(
             "SELECT j.job_id FROM engine_job j \
-             LEFT JOIN engine_aggregate a \
-               ON a.aggregate_kind = j.aggregate_kind AND a.aggregate_id = j.aggregate_id \
              WHERE j.pool = ? \
                AND ((j.state = 'Pending' AND j.next_at <= ?) \
-                 OR (j.state = 'Running' AND j.lease_until <= ?)) \
-               AND NOT (COALESCE(a.poisoned, 0) = 1 AND a.poison_action = j.action) \
+                 OR (j.state = 'Running' AND j.lease_until <= ? AND j.cancel_requested = 0)) \
+               AND NOT EXISTS (SELECT 1 FROM engine_aggregate_poison p \
+                 WHERE p.aggregate_kind = j.aggregate_kind AND p.aggregate_id = j.aggregate_id \
+                   AND p.action = j.action AND p.blocked_until > ?) \
                AND NOT EXISTS (SELECT 1 FROM engine_job r \
                  WHERE r.aggregate_kind = j.aggregate_kind AND r.aggregate_id = j.aggregate_id \
                    AND r.job_id <> j.job_id AND r.state = 'Running' AND r.lease_until > ?) \
              ORDER BY j.next_at, j.created_at LIMIT ?",
         )
         .bind(pool)
+        .bind(now)
         .bind(now)
         .bind(now)
         .bind(now)
@@ -1289,7 +1385,7 @@ impl<'a> StorageProcessor<'a> {
                      lease_until = ?, attempts = attempts + 1, updated_at = ? \
                  WHERE job_id = ? \
                    AND ((state = 'Pending' AND next_at <= ?) \
-                     OR (state = 'Running' AND lease_until <= ?)) \
+                     OR (state = 'Running' AND lease_until <= ? AND cancel_requested = 0)) \
                    AND NOT EXISTS (SELECT 1 FROM engine_job r \
                      WHERE r.aggregate_kind = engine_job.aggregate_kind \
                        AND r.aggregate_id = engine_job.aggregate_id \
@@ -1310,6 +1406,27 @@ impl<'a> StorageProcessor<'a> {
             }
         }
         Ok(claimed)
+    }
+
+    /// Running jobs that were asked to cancel and whose lease lapsed (a crash
+    /// or restart took their holder away) finish as `Cancelled` instead of being
+    /// run again; the rows are returned so their results can be reported.
+    pub async fn finish_lapsed_cancelled_engine_jobs(
+        &mut self,
+        now: i64,
+    ) -> anyhow::Result<Vec<EngineJob>> {
+        let rows = sqlx::query(&format!(
+            "UPDATE engine_job SET state = 'Cancelled', last_error = 'cancelled', \
+                 lease_until = 0, finished_at = ?, updated_at = ? \
+             WHERE state = 'Running' AND lease_until <= ? AND cancel_requested = 1 \
+             RETURNING {ENGINE_JOB_COLUMNS}"
+        ))
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .fetch_all(self.conn())
+        .await?;
+        rows.iter().map(|row| Ok(engine_job_from_row(row)?)).collect()
     }
 
     /// Extend the lease; false when the caller no longer holds the job.
@@ -1605,11 +1722,13 @@ impl<'a> StorageProcessor<'a> {
              UNION ALL \
              SELECT 'job' AS tbl, state, COUNT(*) AS count FROM engine_job GROUP BY state \
              UNION ALL \
-             SELECT 'aggregate' AS tbl, 'Poisoned' AS state, COUNT(*) AS count FROM engine_aggregate \
-               WHERE poisoned = 1 \
+             SELECT 'aggregate' AS tbl, 'Poisoned' AS state, \
+                    COUNT(DISTINCT aggregate_kind || ':' || aggregate_id) AS count \
+               FROM engine_aggregate_poison \
              UNION ALL \
-             SELECT 'aggregate' AS tbl, 'Waiting' AS state, COUNT(*) AS count FROM engine_aggregate \
-               WHERE waiting_ref IS NOT NULL",
+             SELECT 'aggregate' AS tbl, 'Waiting' AS state, \
+                    COUNT(DISTINCT aggregate_kind || ':' || aggregate_id) AS count \
+               FROM engine_inbox WHERE state = 'Pending' AND waiting_ref IS NOT NULL",
         )
         .fetch_all(self.conn())
         .await?;
@@ -1840,48 +1959,91 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn aggregate_upsert_waiting_and_poison() {
+    async fn aggregate_upsert_and_poison_per_action() {
         let db = setup_db().await;
         let mut s = db.acquire().await.unwrap();
         let update = EngineAggregateUpdate {
             status: Some("Presigned".to_string()),
             phase: Some("Confirm".to_string()),
             state: Some(Some("{\"n\":1}".to_string())),
-            waiting: Some(Some(("graph:g0".to_string(), "need g0".to_string()))),
             last_event_id: Some("e1".to_string()),
-            clear_poison: false,
         };
         let aggregate = s.upsert_engine_aggregate("instance", "i1", &update, 10).await.unwrap();
         assert_eq!(aggregate.status, "Presigned");
         assert_eq!(aggregate.phase, "Confirm");
         assert_eq!(aggregate.state.as_deref(), Some("{\"n\":1}"));
-        assert_eq!(aggregate.waiting_ref.as_deref(), Some("graph:g0"));
-        assert_eq!(aggregate.waiting_since, Some(10));
+        assert_eq!(aggregate.last_event_id.as_deref(), Some("e1"));
         assert_eq!(aggregate.version, 1);
-        // Waiting since is kept while the wait continues, cleared on Some(None).
-        let again = EngineAggregateUpdate {
-            waiting: Some(Some(("graph:g0".to_string(), "still".to_string()))),
-            ..Default::default()
-        };
+        // Untouched fields keep their value; `Some(None)` clears the state.
+        let again = EngineAggregateUpdate { phase: Some("Post".to_string()), ..Default::default() };
         let aggregate = s.upsert_engine_aggregate("instance", "i1", &again, 20).await.unwrap();
-        assert_eq!(aggregate.waiting_since, Some(10));
+        assert_eq!((aggregate.status.as_str(), aggregate.phase.as_str()), ("Presigned", "Post"));
+        assert_eq!(aggregate.state.as_deref(), Some("{\"n\":1}"));
         assert_eq!(aggregate.version, 2);
-        assert_eq!(s.list_engine_aggregates_waiting(10).await.unwrap().len(), 1);
-        let clear = EngineAggregateUpdate { waiting: Some(None), ..Default::default() };
+        let clear = EngineAggregateUpdate { state: Some(None), ..Default::default() };
         let aggregate = s.upsert_engine_aggregate("instance", "i1", &clear, 30).await.unwrap();
-        assert!(aggregate.waiting_ref.is_none() && aggregate.waiting_since.is_none());
+        assert!(aggregate.state.is_none());
         assert_eq!(aggregate.status, "Presigned");
-        // Poison flags and clears.
-        s.mark_engine_aggregate_poisoned("instance", "i1", "sign", "panic", 40).await.unwrap();
-        let poisoned = s.find_engine_aggregate("instance", "i1").await.unwrap().unwrap();
-        assert!(poisoned.poisoned);
-        assert_eq!(poisoned.poison_action.as_deref(), Some("sign"));
-        assert_eq!(s.list_engine_aggregates_poisoned(10).await.unwrap().len(), 1);
-        let clear = EngineAggregateUpdate { clear_poison: true, ..Default::default() };
-        assert!(!s.upsert_engine_aggregate("instance", "i1", &clear, 50).await.unwrap().poisoned);
-        s.mark_engine_aggregate_poisoned("instance", "i2", "x", "panic", 60).await.unwrap();
-        assert!(s.clear_engine_aggregate_poison("instance", "i2", 61).await.unwrap());
-        assert!(!s.clear_engine_aggregate_poison("instance", "i2", 62).await.unwrap());
+        // Poison is per action: the first poison blocks for backoff(1), the
+        // second for backoff(2); a clean run of the action releases it.
+        let backoff = |count: i64| if count <= 1 { 0 } else { 600 };
+        let first = s
+            .mark_engine_aggregate_poisoned("instance", "i1", "sign", "panic", 40, &backoff)
+            .await
+            .unwrap();
+        assert_eq!((first.poison_count, first.blocked_until), (1, 40));
+        let second = s
+            .mark_engine_aggregate_poisoned("instance", "i1", "sign", "panic again", 41, &backoff)
+            .await
+            .unwrap();
+        assert_eq!((second.poison_count, second.blocked_until), (2, 641));
+        assert_eq!(second.reason, "panic again");
+        s.mark_engine_aggregate_poisoned("instance", "i1", "vote", "panic", 42, &backoff)
+            .await
+            .unwrap();
+        let listed = s.list_engine_poisons(Some(("instance", "i1")), 10).await.unwrap();
+        assert_eq!(
+            listed.iter().map(|p| (p.action.as_str(), p.poison_count)).collect::<Vec<_>>(),
+            vec![("sign", 2), ("vote", 1)]
+        );
+        assert!(s.release_engine_poison("instance", "i1", "vote").await.unwrap());
+        assert!(!s.release_engine_poison("instance", "i1", "vote").await.unwrap());
+        assert_eq!(s.list_engine_poisons(None, 10).await.unwrap().len(), 1);
+        // A manual clear removes every action of the aggregate.
+        s.mark_engine_aggregate_poisoned("instance", "i2", "x", "panic", 60, &backoff)
+            .await
+            .unwrap();
+        assert_eq!(s.clear_engine_aggregate_poison("instance", "i1", None).await.unwrap(), 1);
+        assert_eq!(s.clear_engine_aggregate_poison("instance", "i1", None).await.unwrap(), 0);
+        assert_eq!(s.clear_engine_aggregate_poison("instance", "i2", Some("y")).await.unwrap(), 0);
+        assert_eq!(s.clear_engine_aggregate_poison("instance", "i2", Some("x")).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn poisoned_event_kinds_wait_out_their_backoff() {
+        let db = setup_db().await;
+        let mut s = db.acquire().await.unwrap();
+        s.insert_engine_inbox_event(&event("e1", "a"), 10).await.unwrap();
+        let backoff = |_: i64| 100;
+        s.mark_engine_aggregate_poisoned("test", "a", "ping", "panic", 10, &backoff).await.unwrap();
+        // The kind is held back while the backoff runs, other kinds and aggregates are not.
+        assert!(s.next_runnable_engine_inbox_event(1, 0, 50).await.unwrap().is_none());
+        let mut other = event("e2", "a");
+        other.kind = "pong".to_string();
+        s.insert_engine_inbox_event(&other, 11).await.unwrap();
+        let next = s.next_runnable_engine_inbox_event(1, 0, 50).await.unwrap().unwrap();
+        assert_eq!(next.event_id, "e2");
+        s.mark_engine_inbox_applied("e2", 51).await.unwrap();
+        assert_eq!(
+            s.next_runnable_engine_inbox_event(1, 0, 110).await.unwrap().unwrap().event_id,
+            "e1"
+        );
+        // Parking does not count as an attempt.
+        assert!(s.mark_engine_inbox_waiting("e1", "x", "y", 200, 111).await.unwrap());
+        assert_eq!(s.find_engine_inbox_event("e1").await.unwrap().unwrap().attempts, 0);
+        let waiting = s.list_engine_inbox_waiting(10).await.unwrap();
+        assert_eq!(waiting.len(), 1);
+        assert_eq!((waiting[0].event_id.as_str(), waiting[0].waiting_ref.as_str()), ("e1", "x"));
     }
 
     fn outbox(id: &str, ack_set: Option<BTreeMap<String, String>>) -> NewEngineOutboxMessage {
@@ -2000,7 +2162,7 @@ mod tests {
         let same_pool = job("j2", "ingest");
         let network = NewEngineJob { pool: "network".to_string(), ..job("j3", "fetch") };
         for row in [&job("j1", "sign"), &same_pool, &network, &other] {
-            assert!(s.insert_engine_job(row, 10).await.unwrap());
+            assert!(s.insert_engine_job(row, 10).await.unwrap().is_inserted());
         }
         // The oldest job of g1 is claimed; its siblings wait in every pool,
         // another aggregate's job does not.
@@ -2023,8 +2185,11 @@ mod tests {
     async fn job_lease_generation_fencing_and_cancel() {
         let db = setup_db().await;
         let mut s = db.acquire().await.unwrap();
-        assert!(s.insert_engine_job(&job("j1", "broadcast"), 10).await.unwrap());
-        assert!(!s.insert_engine_job(&job("j1", "broadcast"), 11).await.unwrap());
+        assert!(s.insert_engine_job(&job("j1", "broadcast"), 10).await.unwrap().is_inserted());
+        assert_eq!(
+            s.insert_engine_job(&job("j1", "broadcast"), 11).await.unwrap(),
+            EngineJobInsert::Existing(EngineJobState::Pending)
+        );
         // First claim: generation 1, leased until 100.
         let first = s.claim_due_engine_jobs("cpu", 10, 100, 10).await.unwrap();
         assert_eq!(first.len(), 1);
@@ -2081,10 +2246,10 @@ mod tests {
             EngineJobFinishOutcome::Missing
         );
         // Cancel: pending is cancelled at once, running finishes as Cancelled.
-        assert!(s.insert_engine_job(&job("j2", "broadcast"), 600).await.unwrap());
+        assert!(s.insert_engine_job(&job("j2", "broadcast"), 600).await.unwrap().is_inserted());
         assert!(s.cancel_engine_job("j2", 601).await.unwrap());
         assert_eq!(s.find_engine_job("j2").await.unwrap().unwrap().state, "Cancelled");
-        assert!(s.insert_engine_job(&job("j3", "broadcast"), 600).await.unwrap());
+        assert!(s.insert_engine_job(&job("j3", "broadcast"), 600).await.unwrap().is_inserted());
         let running = s.claim_due_engine_jobs("cpu", 600, 700, 10).await.unwrap();
         assert_eq!(running[0].job_id, "j3");
         assert!(s.cancel_engine_job("j3", 602).await.unwrap());
@@ -2093,34 +2258,39 @@ mod tests {
             EngineJobFinishOutcome::Applied { state: EngineJobState::Cancelled }
         );
         // Phase cancel and poison isolation.
-        assert!(s.insert_engine_job(&job("j4", "sign"), 700).await.unwrap());
-        assert!(s.insert_engine_job(&job("j5", "broadcast"), 700).await.unwrap());
-        s.mark_engine_aggregate_poisoned("graph", "g1", "sign", "panic", 701).await.unwrap();
+        assert!(s.insert_engine_job(&job("j4", "sign"), 700).await.unwrap().is_inserted());
+        assert!(s.insert_engine_job(&job("j5", "broadcast"), 700).await.unwrap().is_inserted());
+        let backoff = |_: i64| 100;
+        s.mark_engine_aggregate_poisoned("graph", "g1", "sign", "panic", 701, &backoff)
+            .await
+            .unwrap();
         let claimable = s.claim_due_engine_jobs("cpu", 701, 800, 10).await.unwrap();
         assert_eq!(claimable.iter().map(|j| j.job_id.as_str()).collect::<Vec<_>>(), vec!["j5"]);
-        assert!(s.clear_engine_aggregate_poison("graph", "g1", 702).await.unwrap());
+        assert_eq!(s.clear_engine_aggregate_poison("graph", "g1", None).await.unwrap(), 1);
         assert_eq!(s.cancel_engine_jobs_for_phase("graph", "g1", "kickoff", 703).await.unwrap(), 2);
         assert_eq!(s.find_engine_job("j4").await.unwrap().unwrap().state, "Cancelled");
         assert!(s.find_engine_job("j5").await.unwrap().unwrap().cancel_requested);
-        // Startup lease reset makes the stale running job claimable at once.
-        assert!(s.insert_engine_job(&job("j6", "broadcast"), 800).await.unwrap());
+        assert!(s.insert_engine_job(&job("j6", "broadcast"), 800).await.unwrap().is_inserted());
         // j5 is still running (leased until 800): its sibling j6 waits.
         assert!(s.claim_due_engine_jobs("cpu", 799, 900, 10).await.unwrap().is_empty());
+        // Startup lease reset: the cancelled running job is not run again but
+        // finished as Cancelled (the executor sweeps before it claims), then j6 runs.
         assert_eq!(s.reset_engine_job_leases().await.unwrap(), 1);
-        // The lapsed jobs and j6 run one at a time, oldest first.
-        let mut order = Vec::new();
-        loop {
-            let now = 801 + order.len() as i64;
-            let claimed = s.claim_due_engine_jobs("cpu", now, 900, 10).await.unwrap();
-            assert!(claimed.len() <= 1, "one job of the aggregate at a time");
-            let Some(job) = claimed.into_iter().next() else { break };
-            s.finish_engine_job(&job.job_id, job.generation, &EngineJobFinish::Done(vec![]), now)
-                .await
-                .unwrap();
-            order.push((job.job_id, job.generation));
-        }
-        assert!(order.contains(&("j6".to_string(), 1)), "{order:?}");
-        assert!(order.iter().any(|(id, generation)| id == "j5" && *generation == 2), "{order:?}");
+        let swept = s.finish_lapsed_cancelled_engine_jobs(801).await.unwrap();
+        assert_eq!(swept.iter().map(|j| j.job_id.as_str()).collect::<Vec<_>>(), vec!["j5"]);
+        assert_eq!(swept[0].state, "Cancelled");
+        assert!(s.finish_lapsed_cancelled_engine_jobs(802).await.unwrap().is_empty());
+        let claimed = s.claim_due_engine_jobs("cpu", 802, 900, 10).await.unwrap();
+        assert_eq!(claimed.iter().map(|j| j.job_id.as_str()).collect::<Vec<_>>(), vec!["j6"]);
+        // A poisoned action is claimable again once its backoff passed.
+        assert!(s.insert_engine_job(&job("j7", "sign"), 900).await.unwrap().is_inserted());
+        s.finish_engine_job("j6", 1, &EngineJobFinish::Done(vec![]), 900).await.unwrap();
+        s.mark_engine_aggregate_poisoned("graph", "g1", "sign", "panic", 900, &backoff)
+            .await
+            .unwrap();
+        assert!(s.claim_due_engine_jobs("cpu", 950, 1000, 10).await.unwrap().is_empty());
+        let claimed = s.claim_due_engine_jobs("cpu", 1000, 1100, 10).await.unwrap();
+        assert_eq!(claimed.iter().map(|j| j.job_id.as_str()).collect::<Vec<_>>(), vec!["j7"]);
     }
 
     #[tokio::test]

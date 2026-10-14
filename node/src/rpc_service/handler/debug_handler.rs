@@ -3,7 +3,7 @@ use crate::rpc_service::{AppState, current_time_secs};
 use axum::Json;
 use axum::extract::State;
 use http::StatusCode;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 #[derive(Serialize)]
@@ -63,4 +63,41 @@ pub async fn get_debug_engine(
     };
     let snapshot = engine.snapshot().await.api_error("GET_DEBUG_ENGINE_ERROR")?;
     ok_response(snapshot)
+}
+
+#[derive(Deserialize)]
+pub struct ClearPoisonRequest {
+    pub aggregate_kind: String,
+    pub aggregate_id: String,
+    /// One poisoned action; every action of the aggregate when omitted.
+    pub action: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct ClearPoisonResponse {
+    pub cleared: u64,
+}
+
+/// Manual release of poisoned actions: the held-back jobs and events run again
+/// at once and the backoff count starts over.
+#[axum::debug_handler]
+pub async fn clear_engine_poison(
+    State(app_state): State<Arc<AppState>>,
+    Json(request): Json<ClearPoisonRequest>,
+) -> ApiResult<ClearPoisonResponse> {
+    let Some(engine) = app_state.engine.as_ref() else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "ENGINE_UNAVAILABLE".to_string(),
+                message: "the execution engine handle is not available on this node".to_string(),
+            }),
+        ));
+    };
+    let aggregate = engine::AggregateRef::new(&request.aggregate_kind, &request.aggregate_id);
+    let cleared = engine
+        .clear_poison(&aggregate, request.action.as_deref())
+        .await
+        .api_error("CLEAR_ENGINE_POISON_ERROR")?;
+    ok_response(ClearPoisonResponse { cleared })
 }

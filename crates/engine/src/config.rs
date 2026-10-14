@@ -56,10 +56,11 @@ pub struct EngineConfig {
     pub job_lease_renew_interval: Duration,
     pub job_retry_backoff: Backoff,
     pub job_poll_interval: Duration,
-    /// How long after the n-th poison of an aggregate (since its last manual
-    /// clear) a new fact may lift it again. The first poison lifts at once;
-    /// a job that panics on every block then waits out growing steps instead
-    /// of re-running on every block.
+    /// How long the n-th consecutive poison of one action (a job action or an
+    /// event kind of an aggregate) holds that action back. The first poison
+    /// holds nothing back; an action that panics on every block then waits out
+    /// growing steps instead of re-running on every block. A clean run of the
+    /// action or a manual clear starts the count over.
     pub poison_backoff: Backoff,
     /// Concurrent CPU-bound jobs (the `J` slots).
     pub cpu_pool_slots: usize,

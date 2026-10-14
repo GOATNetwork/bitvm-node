@@ -16,7 +16,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use store::localdb::{LocalDB, StorageProcessor};
 use store::{
-    EngineAggregate, EngineInboxInsert, EngineInboxState, EngineOutboxAck, EngineStateCount,
+    EngineAggregate, EngineInboxInsert, EngineInboxState, EngineOutboxAck, EnginePoison,
+    EngineStateCount, EngineWaitingEvent,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -128,8 +129,10 @@ pub enum SubmitOutcome {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EngineSnapshot {
     pub counts: Vec<EngineStateCount>,
-    pub waiting: Vec<EngineAggregate>,
-    pub poisoned: Vec<EngineAggregate>,
+    /// Parked events, oldest park first.
+    pub waiting: Vec<EngineWaitingEvent>,
+    /// Actions held back by a panic, oldest first.
+    pub poisoned: Vec<EnginePoison>,
 }
 
 /// Producer-side handle: record events, apply ACKs, wake waiters.
@@ -234,15 +237,28 @@ impl EngineHandle {
         self.inner.wake.executor();
     }
 
-    pub async fn clear_poison(&self, aggregate: &AggregateRef) -> anyhow::Result<bool> {
-        let now = self.inner.clock.now();
+    /// Manual clear of one poisoned action, or of every action of the aggregate.
+    /// Returns how many actions were released.
+    pub async fn clear_poison(
+        &self,
+        aggregate: &AggregateRef,
+        action: Option<&str>,
+    ) -> anyhow::Result<u64> {
         let mut storage = self.inner.db.acquire().await?;
         let cleared =
-            storage.clear_engine_aggregate_poison(&aggregate.kind, &aggregate.id, now).await?;
-        if cleared {
+            storage.clear_engine_aggregate_poison(&aggregate.kind, &aggregate.id, action).await?;
+        drop(storage);
+        if cleared > 0 {
             self.inner.wake.executor();
+            self.inner.wake.worker_for(aggregate);
         }
         Ok(cleared)
+    }
+
+    /// Actions of `aggregate` currently poisoned.
+    pub async fn poisons(&self, aggregate: &AggregateRef) -> anyhow::Result<Vec<EnginePoison>> {
+        let mut storage = self.inner.db.acquire().await?;
+        storage.list_engine_poisons(Some((&aggregate.kind, &aggregate.id)), 256).await
     }
 
     pub async fn aggregate(
@@ -257,8 +273,8 @@ impl EngineHandle {
         let mut storage = self.inner.db.acquire().await?;
         Ok(EngineSnapshot {
             counts: storage.engine_state_counts().await?,
-            waiting: storage.list_engine_aggregates_waiting(256).await?,
-            poisoned: storage.list_engine_aggregates_poisoned(256).await?,
+            waiting: storage.list_engine_inbox_waiting(256).await?,
+            poisoned: storage.list_engine_poisons(None, 256).await?,
         })
     }
 

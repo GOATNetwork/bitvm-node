@@ -99,6 +99,14 @@ impl AggregateHandler for TestHandler {
             }
             "reject" => Ok(ApplyOutcome::Rejected("nope".into())),
             "panic" => panic!("boom in apply"),
+            "panic_unless_status" => {
+                if ctx.current.as_ref().is_some_and(|row| row.status == payload) {
+                    ctx.effects.set_status("survived");
+                    Ok(ApplyOutcome::Applied)
+                } else {
+                    panic!("boom until {payload}")
+                }
+            }
             "invariant" => Err(ApplyError::invariant(anyhow::anyhow!("broken"))),
             "slow" => {
                 let millis: u64 = payload.parse().expect("slow millis");
@@ -222,7 +230,10 @@ struct BoomRunner;
 
 #[async_trait]
 impl JobRunner for BoomRunner {
-    async fn run(&self, _ctx: JobContext) -> JobOutcome {
+    async fn run(&self, ctx: JobContext) -> JobOutcome {
+        if ctx.job.params.as_deref() == Some(b"ok") {
+            return JobOutcome::Done(b"boom-ok".to_vec());
+        }
         panic!("boom in job")
     }
 }
@@ -552,7 +563,7 @@ async fn transient_failures_back_off_and_never_poison() {
     for attempt in 1..=3 {
         let row = t.wait_inbox_attempts("e1", attempt).await;
         assert_eq!(row.state, "Pending", "attempt {attempt}");
-        assert!(!t.handle.aggregate(&t.agg("a")).await.unwrap().is_some_and(|a| a.poisoned));
+        assert!(t.handle.poisons(&t.agg("a")).await.unwrap().is_empty());
         t.clock.advance(1);
     }
     t.wait_status("a", "recovered").await;
@@ -574,54 +585,78 @@ async fn apply_timeout_is_a_transient_failure() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn repeated_poisons_wait_out_their_backoff() {
+async fn repeated_poisons_of_a_kind_wait_out_their_backoff() {
     let config = EngineConfig { poison_backoff: Backoff::Steps(vec![0, 3_600]), ..fast_config() };
     let t = start_with(config, async |_| {}).await;
-    // The first poison is lifted by the next fact at once.
+    // The first poison holds nothing back; other kinds are never held back.
     t.submit("a", "e1", "panic", "").await;
     t.wait_inbox_state("e1", EngineInboxState::Poisoned).await;
+    let poisons = t.handle.poisons(&t.agg("a")).await.unwrap();
+    assert_eq!(poisons.len(), 1);
+    assert_eq!((poisons[0].action.as_str(), poisons[0].poison_count), ("panic", 1));
+    assert_eq!(poisons[0].blocked_until, poisons[0].poisoned_at);
     t.submit("a", "e2", "set_status", "alive").await;
-    assert!(!t.wait_status("a", "alive").await.poisoned);
-    // The second one stays for an hour, whatever facts arrive meanwhile.
+    t.wait_status("a", "alive").await;
+    assert_eq!(t.handle.poisons(&t.agg("a")).await.unwrap().len(), 1, "other kinds do not lift it");
+    // The second poison of the kind holds it back for an hour.
     t.submit("a", "e3", "panic", "").await;
     t.wait_inbox_state("e3", EngineInboxState::Poisoned).await;
-    t.submit("a", "e4", "set_status", "still").await;
-    let agg = t.wait_status("a", "still").await;
-    assert!(agg.poisoned, "the second poison waits out its backoff");
-    assert_eq!(agg.poison_count, 2);
-    // Once the backoff passed, the next fact lifts it.
+    let poisons = t.handle.poisons(&t.agg("a")).await.unwrap();
+    assert_eq!(poisons[0].poison_count, 2);
+    assert_eq!(poisons[0].blocked_until, poisons[0].poisoned_at + 3_600);
+    t.submit("a", "e4", "panic", "").await;
+    t.submit("a", "e5", "set_status", "still").await;
+    t.wait_status("a", "still").await;
+    settle().await;
+    let held = t.inbox("e4").await.unwrap();
+    assert_eq!((held.state.as_str(), held.attempts), ("Pending", 0), "the kind is held back");
+    // Once the backoff passed the kind runs again (and poisons again).
     t.clock.advance(3_600);
-    t.submit("a", "e5", "set_status", "later").await;
-    assert!(!t.wait_status("a", "later").await.poisoned);
-    // A manual clear starts the count over.
+    t.wait_inbox_state("e4", EngineInboxState::Poisoned).await;
+    assert_eq!(t.handle.poisons(&t.agg("a")).await.unwrap()[0].poison_count, 3);
+    // A manual clear releases the kind and starts the count over.
+    assert_eq!(t.handle.clear_poison(&t.agg("a"), None).await.unwrap(), 1);
     t.submit("a", "e6", "panic", "").await;
     t.wait_inbox_state("e6", EngineInboxState::Poisoned).await;
-    assert!(t.handle.clear_poison(&t.agg("a")).await.unwrap());
-    assert_eq!(t.handle.aggregate(&t.agg("a")).await.unwrap().unwrap().poison_count, 0);
+    assert_eq!(t.handle.poisons(&t.agg("a")).await.unwrap()[0].poison_count, 1);
     t.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn panics_and_invariants_poison_until_a_new_fact_applies() {
+async fn a_clean_apply_of_the_kind_releases_its_poison() {
+    let config = EngineConfig { poison_backoff: Backoff::Steps(vec![0]), ..fast_config() };
+    let t = start_with(config, async |_| {}).await;
+    t.submit("a", "e1", "panic_unless_status", "ready").await;
+    t.wait_inbox_state("e1", EngineInboxState::Poisoned).await;
+    assert_eq!(t.handle.poisons(&t.agg("a")).await.unwrap().len(), 1);
+    t.submit("a", "e2", "set_status", "ready").await;
+    t.wait_status("a", "ready").await;
+    t.submit("a", "e3", "panic_unless_status", "ready").await;
+    t.wait_status("a", "survived").await;
+    assert!(t.handle.poisons(&t.agg("a")).await.unwrap().is_empty());
+    t.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn panics_and_invariants_poison_their_kind() {
     let t = start().await;
     t.submit("a", "e1", "panic", "").await;
     let row = t.wait_inbox_state("e1", EngineInboxState::Poisoned).await;
     assert!(row.last_error.as_deref().unwrap_or("").contains("boom in apply"));
-    let agg = wait_for(WAIT, || async {
-        t.handle.aggregate(&t.agg("a")).await.unwrap().filter(|a| a.poisoned)
-    })
-    .await;
-    assert_eq!(agg.poison_action.as_deref(), Some("panic"));
+    let poisons = t.handle.poisons(&t.agg("a")).await.unwrap();
+    assert_eq!(poisons.len(), 1);
+    assert_eq!(poisons[0].action, "panic");
     assert_eq!(t.handle.snapshot().await.unwrap().poisoned.len(), 1);
-    // Later events for the aggregate still apply, and a successful apply clears the flag.
+    // Other kinds of the aggregate still apply.
     t.submit("a", "e2", "set_status", "alive").await;
-    let agg = t.wait_status("a", "alive").await;
-    assert!(!agg.poisoned);
-    // An explicit invariant violation poisons too, and can be cleared by hand.
+    t.wait_status("a", "alive").await;
+    // An explicit invariant violation poisons its kind too; a manual clear
+    // releases every action of the aggregate.
     t.submit("a", "e3", "invariant", "").await;
     t.wait_inbox_state("e3", EngineInboxState::Poisoned).await;
-    assert!(t.handle.clear_poison(&t.agg("a")).await.unwrap());
-    assert!(!t.handle.aggregate(&t.agg("a")).await.unwrap().unwrap().poisoned);
+    assert_eq!(t.handle.poisons(&t.agg("a")).await.unwrap().len(), 2);
+    assert_eq!(t.handle.clear_poison(&t.agg("a"), None).await.unwrap(), 2);
+    assert!(t.handle.poisons(&t.agg("a")).await.unwrap().is_empty());
     // Poisoned rows are terminal: a duplicate is ignored.
     assert_eq!(
         t.submit("a", "e1", "panic", "").await,
@@ -909,7 +944,8 @@ async fn concurrent_acks_close_the_row_exactly_once() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn job_transient_failures_retry_and_panics_poison_the_action() {
-    let t = start().await;
+    let config = EngineConfig { poison_backoff: Backoff::Steps(vec![3_600]), ..fast_config() };
+    let t = start_with(config, async |_| {}).await;
     t.submit("a", "e1", "job", "flaky|p|").await;
     let flaky_id = engine::stable_job_id(&t.agg("a"), "p", "flaky", b"");
     for attempt in 1..=2 {
@@ -932,22 +968,23 @@ async fn job_transient_failures_retry_and_panics_poison_the_action() {
     let fail_id = engine::stable_job_id(&t.agg("a"), "p", "fail", b"");
     assert_eq!(t.wait_job_state(&fail_id, "Failed").await.attempts, 1);
     t.wait_status("a", "job_failed:permanent").await;
-    // A panic poisons the job and isolates the action on the aggregate.
+    // A panic poisons the job and holds the action back on the aggregate.
     t.submit("a", "e3", "job", "boom|p|first").await;
     let boom_id = engine::stable_job_id(&t.agg("a"), "p", "boom", b"first");
     t.wait_job_state(&boom_id, "Poisoned").await;
-    let agg = wait_for(WAIT, || async {
-        t.handle.aggregate(&t.agg("a")).await.unwrap().filter(|a| a.poisoned)
+    let poisons = wait_for(WAIT, || async {
+        Some(t.handle.poisons(&t.agg("a")).await.unwrap()).filter(|p| !p.is_empty())
     })
     .await;
-    assert_eq!(agg.poison_action.as_deref(), Some("boom"));
+    assert_eq!((poisons[0].action.as_str(), poisons[0].poison_count), ("boom", 1));
     t.wait_status("a", "job_poisoned:boom in job").await;
-    assert!(
-        t.handle.aggregate(&t.agg("a")).await.unwrap().unwrap().poisoned,
+    assert_eq!(
+        t.handle.poisons(&t.agg("a")).await.unwrap().len(),
+        1,
         "a job result does not lift the poison"
     );
     // A second job for the poisoned action, created without a new event, is
-    // held back by the executor while the poison stands.
+    // held back by the executor while the backoff runs.
     let second_id = engine::stable_job_id(&t.agg("a"), "p", "boom", b"second");
     {
         let mut s = t.db.acquire().await.unwrap();
@@ -968,6 +1005,7 @@ async fn job_transient_failures_retry_and_panics_poison_the_action() {
             )
             .await
             .unwrap()
+            .is_inserted()
         );
     }
     t.handle.wake_all();
@@ -977,13 +1015,23 @@ async fn job_transient_failures_retry_and_panics_poison_the_action() {
         0,
         "same action is held back"
     );
-    // A new fact clears the poison: other actions keep running and the held
-    // job runs too (and poisons the action again).
+    // Other actions keep running meanwhile.
     t.submit("a", "e5", "job", "echo|p|still-works").await;
     let echo_id = engine::stable_job_id(&t.agg("a"), "p", "echo", b"still-works");
     t.wait_job_state(&echo_id, "Done").await;
     t.wait_inbox_state(&JobResultEvent::event_id(&echo_id, 1), EngineInboxState::Applied).await;
+    assert_eq!(t.wait_job_state(&second_id, "Pending").await.attempts, 0);
+    // Once the backoff passed the held job runs (and poisons the action again).
+    t.clock.advance(3_600);
     t.wait_job_state(&second_id, "Poisoned").await;
+    assert_eq!(t.handle.poisons(&t.agg("a")).await.unwrap()[0].poison_count, 2);
+    // A manual clear lets the action run; a clean run releases the poison.
+    assert_eq!(t.handle.clear_poison(&t.agg("a"), Some("boom")).await.unwrap(), 1);
+    t.submit("a", "e6", "job", "boom|p|ok").await;
+    let ok_id = engine::stable_job_id(&t.agg("a"), "p", "boom", b"ok");
+    t.wait_job_state(&ok_id, "Done").await;
+    t.wait_status("a", "job_done:boom-ok").await;
+    assert!(t.handle.poisons(&t.agg("a")).await.unwrap().is_empty());
     t.stop().await;
 }
 
