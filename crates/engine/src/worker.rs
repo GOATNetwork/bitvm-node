@@ -332,10 +332,19 @@ async fn commit_apply(
             EngineJobInsert::Existing(EngineJobState::Pending | EngineJobState::Running) => {
                 debug!(event = "engine_jobs", outcome = "already_open", job_id = %job.job_id, action = %job.action, "job is already queued or running");
             }
-            EngineJobInsert::Existing(state) => {
+            EngineJobInsert::Existing(
+                state @ (EngineJobState::Done | EngineJobState::Cancelled),
+            ) => {
                 // Same id means same params: the job ran (or was cancelled)
-                // before and the engine will not run it again.
-                warn!(event = "engine_jobs", outcome = "reenqueue_ignored", job_id = %job.job_id, action = %job.action, event_id = %event.event_id, state = %state, "job re-enqueued after a terminal state; not run again");
+                // before and the engine will not run it again. Aggregates that
+                // derive their jobs from chain state ask for the same job on
+                // every scan, so a finished one is routine.
+                debug!(event = "engine_jobs", outcome = "reenqueue_ignored", job_id = %job.job_id, action = %job.action, event_id = %event.event_id, state = %state, "job already ran; not run again");
+            }
+            EngineJobInsert::Existing(state) => {
+                // A job that failed or panicked is asked for again: it stays
+                // where it is, which is worth a look.
+                warn!(event = "engine_jobs", outcome = "reenqueue_ignored", job_id = %job.job_id, action = %job.action, event_id = %event.event_id, state = %state, "job re-enqueued after a terminal failure; not run again");
             }
         }
     }
