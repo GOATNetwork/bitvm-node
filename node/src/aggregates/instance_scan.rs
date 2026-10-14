@@ -6,8 +6,8 @@
 
 use super::common::ScanMarks;
 use super::instance::{AnswerWindow, BtcSnapshot, TxFact};
+use crate::clock::current_time_secs;
 use crate::env::{get_instance_maintenance_batch_size, is_enable_committee_instance_key_delete};
-use crate::rpc_service::current_time_secs;
 use crate::utils::check_bridge_in_uxto_available_or_self_spent;
 use bitcoin::Txid;
 use bitvm_lib::actors::Actor;

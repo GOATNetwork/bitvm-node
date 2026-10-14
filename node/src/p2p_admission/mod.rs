@@ -381,7 +381,7 @@ pub enum InboundVerdict {
 /// after `REJECTED_EVENT_TTL_SECS`. The sender's outbox re-sends what still
 /// matters; the terminal retention of the engine is for audit, not quota.
 pub async fn purge_stale_network_events(local_db: &LocalDB) -> Result<u64> {
-    let before = crate::rpc_service::current_time_secs() - REJECTED_EVENT_TTL_SECS;
+    let before = crate::clock::current_time_secs() - REJECTED_EVENT_TTL_SECS;
     let purged = local_db.acquire().await?.purge_rejected_network_inbox_rows(before).await?;
     if purged > 0 {
         tracing::info!(event = "p2p_admission", purged, "rejected network events purged");

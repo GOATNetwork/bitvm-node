@@ -3,7 +3,8 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use crate::rpc_service::{AppState, current_time_secs};
+use crate::clock::current_time_secs;
+use crate::rpc_service::AppState;
 use alloy::primitives::U256;
 use axum::extract::{MatchedPath, Request, State};
 use axum::http::{HeaderMap, StatusCode};

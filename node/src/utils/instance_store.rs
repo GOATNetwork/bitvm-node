@@ -1,8 +1,8 @@
 //! Instance parameters and process data.
 
+use crate::clock::current_time_secs;
 use crate::env::*;
 use crate::error::SpecialError;
-use crate::rpc_service::current_time_secs;
 use alloy::primitives::Address as EvmAddress;
 use anyhow::{Context, Result, bail};
 use bitcoin::address::NetworkUnchecked;

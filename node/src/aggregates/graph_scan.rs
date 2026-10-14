@@ -9,8 +9,8 @@ use super::common::ScanMarks;
 use super::graph::{SetupAbandoned, setup_abandoned_event};
 use super::graph_pegout::{ChainScan, PegoutSignal, Unusable};
 use super::instance::PeginDeadlines;
+use crate::clock::current_time_secs;
 use crate::env::{get_network, get_node_pubkey};
-use crate::rpc_service::current_time_secs;
 use crate::utils::{
     GraphChainScan, load_validated_graph_definition, outpoint_spent_confirmed, outpoint_spent_txid,
     scan_graph_chain_state,

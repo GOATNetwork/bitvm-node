@@ -5,9 +5,9 @@
 //! `crate::aggregates::instance_scan`.
 
 use crate::aggregates::instance::{PeginRequested, pegin_request_event};
+use crate::clock::current_time_secs;
 use crate::engine_bridge::record_event_in;
 use crate::error::{FailureClass, classify_failure};
-use crate::rpc_service::current_time_secs;
 use crate::scheduled_tasks::event_watch_task::generate_instance_from_bridge_in_request_event;
 use client::btc_chain::BTCClient;
 use client::goat_chain::GOATClient;

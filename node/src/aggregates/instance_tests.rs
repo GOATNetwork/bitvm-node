@@ -311,7 +311,7 @@ impl Harness {
             .await
             .unwrap();
         let job_id = format!("job:{graph_id}");
-        let far = crate::rpc_service::current_time_secs() + 3_600;
+        let far = crate::clock::current_time_secs() + 3_600;
         storage
             .insert_engine_job(
                 &NewEngineJob {
@@ -336,7 +336,7 @@ impl Harness {
     /// waiting start would be; once woken it re-parks on its own ref.
     async fn insert_parked_event(&self, wake_ref: &str) -> String {
         let event_id = format!("parked:{}", Uuid::new_v4());
-        let now = crate::rpc_service::current_time_secs();
+        let now = crate::clock::current_time_secs();
         let mut storage = self.db.acquire().await.unwrap();
         storage
             .insert_engine_inbox_event(

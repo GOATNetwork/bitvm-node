@@ -38,18 +38,13 @@ use client::goat_chain::GOATClient;
 use client::http_client::async_client::HttpAsyncClient;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::Duration;
 use store::localdb::LocalDB;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tower_http::classify::ServerErrorsFailureClass;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
-
-#[inline(always)]
-pub fn current_time_secs() -> i64 {
-    std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64
-}
 
 /// Create secure CORS layer
 pub fn create_secure_cors_layer() -> CorsLayer {
@@ -347,6 +342,7 @@ pub async fn serve_metrics(
 
 #[cfg(test)]
 mod tests {
+    use crate::clock::current_time_secs;
     use crate::env::{
         ENV_BITVM_SECRET, ENV_GOAT_CHAIN_URL, ENV_GOAT_GATEWAY_CONTRACT_ADDRESS,
         ENV_PROOF_SEVER_URL, get_network,
@@ -360,7 +356,7 @@ mod tests {
         InstanceListResponse, InstanceOverviewResponse, InstanceSettingResponse,
     };
     use crate::rpc_service::node::{NodeListResponse, NodeOverViewResponse};
-    use crate::rpc_service::{self, Actor, AppState, current_time_secs, routes};
+    use crate::rpc_service::{self, Actor, AppState, routes};
     use crate::utils::{
         generate_local_key, generate_random_bytes, get_rand_btc_address_p2wpkh,
         get_rand_goat_address, temp_sqlite_db_path,

@@ -4,6 +4,7 @@ use crate::aggregates::graph_pegout::{
     goat_status_event, withdraw_cancel_event, withdraw_init_event,
 };
 use crate::aggregates::instance::l2_minted_event;
+use crate::clock::current_time_secs;
 use crate::engine_bridge::record_event_in;
 use crate::env::{
     ENV_GOAT_GATEWAY_CONTRACT_ADDRESS, ENV_GOAT_SWAP_CONTRACT_ADDRESS,
@@ -13,7 +14,6 @@ use crate::env::{
     get_goat_swap_event_filter_gap_from_env, get_goat_swap_the_graph_urls_from_env, get_network,
 };
 use crate::metrics_service::{EventWatchState, MetricsState};
-use crate::rpc_service::current_time_secs;
 use crate::scheduled_tasks::get_timestamp_from_contract_data;
 use crate::utils::evm_swap_utils::{extract_claim_data_from_tx, extract_escrow_data_from_tx};
 use crate::utils::{

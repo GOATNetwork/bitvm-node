@@ -36,13 +36,13 @@ use crate::action::{
     GOATMessageContent, GenCircuits, GraphFinalize, NonceGeneration,
     VerifierGraphParamsEndorsement, verify_init_graph_signature,
 };
+use crate::clock::current_time_secs;
 use crate::engine_bridge::submit_event;
 use crate::env::{
     get_babe_gc_asset_paths, get_bitvm_key, get_node_goat_address, get_peer_id,
     get_soldering_proof_payload_store_path, get_verifier_candidate_collection_window_secs,
 };
 use crate::error::{FailureClass, SpecialError, classify_failure};
-use crate::rpc_service::current_time_secs;
 use crate::soldering_payload_store::{
     read_soldering_proof_store_payload, soldering_proof_payload_store_path,
 };

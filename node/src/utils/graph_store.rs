@@ -1,9 +1,9 @@
 //! Graph definitions in the store: ingest, raw data, lookups and status
 //! transitions.
 
+use crate::clock::current_time_secs;
 use crate::env::*;
 use crate::error::SpecialError;
-use crate::rpc_service::current_time_secs;
 use anyhow::{Result, bail};
 use bitcoin::PublicKey;
 use bitvm_lib::committee::*;

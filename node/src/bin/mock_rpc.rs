@@ -11,12 +11,13 @@ use alloy::primitives::U256;
 use anyhow::{Context, Result};
 use bitcoin::Network;
 use bitvm_lib::actors::Actor;
+use bitvm_noded::clock::current_time_secs;
 use bitvm_noded::env::{
     ENV_BITCOIN_NETWORK, ENV_BITVM_SECRET, ENV_GOAT_ADDRESS, ENV_GOAT_GATEWAY_CONTRACT_ADDRESS,
     ENV_GOAT_NETWORK, ENV_GOAT_SWAP_CONTRACT_ADDRESS,
 };
 use bitvm_noded::metrics_service::MetricsState;
-use bitvm_noded::rpc_service::{self, AppState, current_time_secs};
+use bitvm_noded::rpc_service::{self, AppState};
 use bitvm_noded::utils::{generate_local_key, get_rand_btc_address_p2wpkh, get_rand_goat_address};
 use clap::Parser;
 use client::Utxo;

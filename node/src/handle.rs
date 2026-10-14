@@ -3,8 +3,8 @@
 //! recorded for the engine by `action::handle_inbound_p2p_message`.
 
 use crate::action::*;
+use crate::clock::current_time_secs;
 use crate::middleware::publisher::MessagePublisher;
-use crate::rpc_service::current_time_secs;
 use crate::utils::*;
 use anyhow::Result;
 use bitvm_lib::actors::Actor;
