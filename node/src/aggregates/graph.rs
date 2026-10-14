@@ -1040,6 +1040,15 @@ impl GraphAggregate {
                         None,
                     )
                     .await?;
+                // A build whose result has not applied yet still holds the
+                // session; the retired graph drops that result, so the session
+                // is released here.
+                if let Some(session) =
+                    ctx.storage.find_pending_graph_init_by_graph_id(&graph_id).await?
+                {
+                    release_setup_session(ctx, &session, "setup abandoned").await?;
+                    state.pending_session = false;
+                }
             }
             None => {
                 let Some(session) =
@@ -1082,7 +1091,7 @@ impl GraphAggregate {
                 ctx.effects.wake(slot_ref(&row.operator_pubkey, row.kickoff_index as u64));
             }
             if signing_round_over(status) {
-                for phase in [PHASE_SIGNING, PHASE_ENDORSE, PHASE_SETUP] {
+                for phase in [PHASE_COLLECT, PHASE_SIGNING, PHASE_ENDORSE, PHASE_SETUP] {
                     ctx.effects.close_outbox(
                         EngineOutboxCloseTarget::Phase {
                             aggregate_kind: GRAPH_KIND.to_string(),

@@ -881,13 +881,17 @@ async fn entering_presigned_starts_the_round_and_failure_cancels_it() {
     t.snapshot(id, presign_snapshot(1_070, TxFact::UNKNOWN, TxFact::confirmed_at(1_069))).await;
     t.wait_status(id, UserCanceled).await;
     t.wait_outbox(&format!("instance:{id}:PeginConfirmNonce"), "Closed").await;
-    let states: Vec<(String, String)> =
-        t.jobs_of(id).await.into_iter().map(|job| (job.action, job.state)).collect();
-    for (action, state) in &states {
-        if action == JOB_INGEST_PEGIN_CONFIRM_NONCE {
-            assert!(state == "Cancelled" || state == "Done", "{action}: {state}");
-        }
-    }
+    // The round's ingest job ends Cancelled, or Done when it had already run;
+    // its finish may still be waiting for the write lock when the outbox closes.
+    wait_for(|| async {
+        let jobs = t.jobs_of(id).await;
+        let ingest: Vec<_> =
+            jobs.iter().filter(|job| job.action == JOB_INGEST_PEGIN_CONFIRM_NONCE).collect();
+        (!ingest.is_empty()
+            && ingest.iter().all(|job| job.state == "Cancelled" || job.state == "Done"))
+        .then_some(())
+    })
+    .await;
     t.wait_key_deleted(id).await;
     t.stop().await;
 }

@@ -22,7 +22,7 @@ use crate::env::{
     get_bitvm_key, get_operator_graph_start_cutoff_blocks, is_enable_committee_instance_key_delete,
     is_relayer,
 };
-use crate::error::SpecialError;
+use crate::error::{FailureClass, SpecialError, classify_failure};
 use crate::metrics_service::MetricsState;
 use crate::rpc_service::current_time_secs;
 use crate::utils::{
@@ -114,19 +114,6 @@ impl Step {
     }
 }
 
-/// A verdict that retrying cannot change: the message, request or data is
-/// invalid, or the contract refused the call.
-fn permanent_rejection(error: &anyhow::Error) -> Option<String> {
-    match error.downcast_ref::<SpecialError>() {
-        Some(SpecialError::InvalidPeginRequest(message))
-        | Some(SpecialError::InvalidPeginData(message))
-        | Some(SpecialError::InvalidCommittee(message))
-        | Some(SpecialError::InvalidGraph(message))
-        | Some(SpecialError::EvmReverted(message)) => Some(message.clone()),
-        _ => None,
-    }
-}
-
 /// Rejections that need a human: the node's own signing steps, the
 /// relayer's broadcast and the reading of a confirmed peg-in on any, the
 /// committee's answer only when Goat refused it (a request the user got
@@ -158,6 +145,7 @@ impl JobRunner for InstanceJobRunner {
         };
         let params = ctx.job.params.clone().unwrap_or_default();
         let action = ctx.job.action.clone();
+        let attempts = ctx.job.attempts;
         match run_step(&self.deps, &action, instance_id, &params).await {
             Ok(Step::Plan(plan)) => match plan.encode() {
                 Ok(bytes) => JobOutcome::Done(bytes),
@@ -166,22 +154,37 @@ impl JobRunner for InstanceJobRunner {
             Ok(Step::Retry { reason, after_secs }) => {
                 JobOutcome::Transient { error: reason, retry_after_secs: after_secs }
             }
-            Err(error) => match permanent_rejection(&error) {
-                Some(reason) if fails_on_rejection(&action, &error) => JobOutcome::Failed(reason),
-                Some(reason) => {
+            Err(error) => match classify_failure(&error) {
+                FailureClass::Permanent(reason) if fails_on_rejection(&action, &error) => {
+                    JobOutcome::Failed(reason)
+                }
+                FailureClass::Permanent(reason) => {
                     warn!(event = "instance_job", instance_id = %instance_id, action = %action, reason = %reason, "rejected");
                     match InstancePlan::noted(format!("rejected: {reason}")).encode() {
                         Ok(bytes) => JobOutcome::Done(bytes),
                         Err(error) => JobOutcome::Failed(format!("encode plan: {error}")),
                     }
                 }
-                None => {
+                FailureClass::Transient => {
+                    JobOutcome::Transient { error: format!("{error:#}"), retry_after_secs: None }
+                }
+                // Round steps are bounded by the instance's own deadlines, so an
+                // unrecognised failure keeps retrying; it is reported every so often.
+                FailureClass::Unknown => {
+                    if attempts >= UNKNOWN_FAILURE_ALERT_EVERY
+                        && attempts % UNKNOWN_FAILURE_ALERT_EVERY == 0
+                    {
+                        warn!(event = "instance_job", instance_id = %instance_id, action = %action, attempts, error = %format!("{error:#}"), "step keeps failing for an unknown reason");
+                        self.deps.metrics_state.record_instance_alert("instance_job_stuck");
+                    }
                     JobOutcome::Transient { error: format!("{error:#}"), retry_after_secs: None }
                 }
             },
         }
     }
 }
+
+const UNKNOWN_FAILURE_ALERT_EVERY: i64 = 20;
 
 async fn run_step(
     deps: &InstanceJobDeps,

@@ -22,8 +22,8 @@ use super::graph_setup::{
     CandidateReadiness, build_babe_prover_state, build_signed_init_graph,
     candidate_freeze_readiness, cut_circuits_owed, decode_soldering_proof_payload,
     find_verifier_index_by_pubkey, freeze_operator_candidates, message_identity_matches,
-    permanent_rejection, record_candidate_gc_data, seal_selected_verifiers,
-    selected_candidate_for_graph_index, selected_gc_data, validate_verifier_slot,
+    record_candidate_gc_data, seal_selected_verifiers, selected_candidate_for_graph_index,
+    selected_gc_data, validate_verifier_slot,
 };
 use super::instance::{SigningGate, signing_gate};
 use crate::action::{
@@ -37,7 +37,7 @@ use crate::env::{
     get_soldering_proof_payload_store_path, get_verifier_candidate_collection_window_secs,
     is_relayer,
 };
-use crate::error::SpecialError;
+use crate::error::{FailureClass, SpecialError, classify_failure};
 use crate::metrics_service::MetricsState;
 use crate::middleware::publisher::NetworkPublisher;
 use crate::rpc_service::current_time_secs;
@@ -161,7 +161,9 @@ impl JobRunner for GraphJobRunner {
         };
         let params = ctx.job.params.clone().unwrap_or_default();
         let action = ctx.job.action.clone();
-        match run_step(&self.deps, &action, graph_id, &params, ctx.job.attempts).await {
+        let attempts = ctx.job.attempts;
+        let pegout = PEGOUT_JOBS.contains(&action.as_str());
+        match run_step(&self.deps, &action, graph_id, &params, attempts).await {
             Ok(Step::Plan(plan)) => match plan.encode() {
                 Ok(bytes) => JobOutcome::Done(bytes),
                 Err(error) => JobOutcome::Failed(format!("encode plan: {error}")),
@@ -169,8 +171,8 @@ impl JobRunner for GraphJobRunner {
             Ok(Step::Retry { reason, after_secs }) => {
                 JobOutcome::Transient { error: reason, retry_after_secs: after_secs }
             }
-            Err(error) => match permanent_rejection(&error) {
-                Some(reason) if PEGOUT_JOBS.contains(&action.as_str()) => {
+            Err(error) => match classify_failure(&error) {
+                FailureClass::Permanent(reason) if pegout => {
                     // A Goat revert on a peg-out call: retrying cannot help.
                     warn!(event = "graph_job", graph_id = %graph_id, action = %action, reason = %reason, "peg-out action rejected");
                     self.deps.metrics_state.record_instance_alert("pegout_action_rejected");
@@ -179,7 +181,7 @@ impl JobRunner for GraphJobRunner {
                         Err(error) => JobOutcome::Failed(format!("encode plan: {error}")),
                     }
                 }
-                Some(reason) => {
+                FailureClass::Permanent(reason) => {
                     warn!(event = "graph_job", graph_id = %graph_id, action = %action, reason = %reason, "message rejected");
                     self.deps.metrics_state.record_graph_validation(false);
                     match GraphPlan::noted(format!("rejected: {reason}")).encode() {
@@ -187,13 +189,35 @@ impl JobRunner for GraphJobRunner {
                         Err(error) => JobOutcome::Failed(format!("encode plan: {error}")),
                     }
                 }
-                None => {
+                FailureClass::Transient => {
+                    JobOutcome::Transient { error: format!("{error:#}"), retry_after_secs: None }
+                }
+                // A setup step failing for no recognised reason is given up on
+                // after a while: its session and slot are released and the
+                // failure is reported. Peg-out steps guard funds and keep
+                // retrying, with an alert every so often.
+                FailureClass::Unknown if !pegout && attempts >= UNKNOWN_FAILURE_RETRIES => {
+                    warn!(event = "graph_job", graph_id = %graph_id, action = %action, attempts, error = %format!("{error:#}"), "setup step keeps failing for an unknown reason; giving up");
+                    self.deps.metrics_state.record_instance_alert("graph_job_gave_up");
+                    JobOutcome::Failed(format!("gave up after {attempts} attempts: {error:#}"))
+                }
+                FailureClass::Unknown => {
+                    if attempts >= UNKNOWN_FAILURE_RETRIES
+                        && attempts % UNKNOWN_FAILURE_RETRIES == 0
+                    {
+                        warn!(event = "graph_job", graph_id = %graph_id, action = %action, attempts, error = %format!("{error:#}"), "peg-out step keeps failing for an unknown reason");
+                        self.deps.metrics_state.record_instance_alert("pegout_job_stuck");
+                    }
                     JobOutcome::Transient { error: format!("{error:#}"), retry_after_secs: None }
                 }
             },
         }
     }
 }
+
+/// Attempts a step failing for an unrecognised reason gets before a setup
+/// step is failed and a peg-out step raises an alert (then every so many).
+const UNKNOWN_FAILURE_RETRIES: i64 = 20;
 
 async fn run_step(
     deps: &GraphJobDeps,

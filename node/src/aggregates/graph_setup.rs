@@ -5,7 +5,6 @@ use crate::action::{InitGraph, SolderingProofReady, sign_init_graph};
 use crate::env::{
     get_peer_id, get_verifier_candidate_backup_count, get_verifier_candidate_collection_window_secs,
 };
-use crate::error::SpecialError;
 use crate::utils::{
     OperatorBabeSetupState, OperatorVerifierCandidate, min_required_verifier,
     soldering_payload_hash, soldering_payload_hash_hex,
@@ -370,16 +369,4 @@ pub(crate) fn decode_soldering_proof_payload(
         bail!("SolderingProof payload hash mismatch");
     }
     bincode::deserialize(payload).context("deserialize compact soldering proof payload")
-}
-
-/// A permanent verdict on a graph or committee value, as opposed to a failure
-/// to ask the chain: the message is dropped and never retried.
-pub(crate) fn permanent_rejection(error: &anyhow::Error) -> Option<String> {
-    match error.downcast_ref::<SpecialError>() {
-        Some(SpecialError::InvalidGraph(message))
-        | Some(SpecialError::InvalidCommittee(message))
-        | Some(SpecialError::InvalidPeginData(message))
-        | Some(SpecialError::EvmReverted(message)) => Some(message.clone()),
-        _ => None,
-    }
 }
