@@ -35,7 +35,6 @@ use crate::engine_bridge::submit_event;
 use crate::env::{
     get_babe_gc_asset_paths, get_bitvm_key, get_node_goat_address, get_peer_id,
     get_soldering_proof_payload_store_path, get_verifier_candidate_collection_window_secs,
-    is_relayer,
 };
 use crate::error::{FailureClass, SpecialError, classify_failure};
 use crate::metrics_service::MetricsState;
@@ -103,6 +102,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 pub struct GraphJobDeps {
+    pub relayer: bool,
     pub local_db: LocalDB,
     pub btc_client: Arc<BTCClient>,
     pub goat_client: Arc<GOATClient>,
@@ -428,7 +428,7 @@ async fn ensure_committee_sender(
 
 // ----------------------------------------------------------------- operator
 
-async fn operator_init_graph(deps: &GraphJobDeps, graph_id: Uuid, params: &[u8]) -> Result<Step> {
+async fn operator_init_graph(_deps: &GraphJobDeps, graph_id: Uuid, params: &[u8]) -> Result<Step> {
     let start: OperatorStart = bincode::deserialize(params).context("decode operator_start")?;
     let (master, operator_pubkey) = local_operator_pubkey()?;
     let init = build_signed_init_graph(start.instance_id, graph_id, &master.master_keypair())?;
@@ -449,7 +449,6 @@ async fn operator_init_graph(deps: &GraphJobDeps, graph_id: Uuid, params: &[u8])
         operator_pubkey: Some(operator_pubkey.to_string()),
         ..Default::default()
     };
-    let _ = deps;
     Step::done(plan)
 }
 
@@ -587,7 +586,7 @@ struct FreezeParams {
 
 async fn freeze_candidates(deps: &GraphJobDeps, graph_id: Uuid, params: &[u8]) -> Result<Step> {
     let _: FreezeParams = bincode::deserialize(params).context("decode freeze params")?;
-    let Some((instance_id, _)) = pending_session(deps, graph_id).await? else {
+    let Some(instance_id) = pending_session(deps, graph_id).await? else {
         return Step::ignore("no pending graph session");
     };
     let mut state =
@@ -620,14 +619,15 @@ async fn freeze_candidates(deps: &GraphJobDeps, graph_id: Uuid, params: &[u8]) -
 }
 
 /// The operator's pending session for a graph: `(instance_id, operator_pubkey)`.
-async fn pending_session(deps: &GraphJobDeps, graph_id: Uuid) -> Result<Option<(Uuid, String)>> {
+/// The instance of the graph's pending setup session, if any.
+async fn pending_session(deps: &GraphJobDeps, graph_id: Uuid) -> Result<Option<Uuid>> {
     Ok(deps
         .local_db
         .acquire()
         .await?
         .find_pending_graph_init_by_graph_id(&graph_id)
         .await?
-        .map(|pending| (pending.instance_id, pending.operator_pubkey)))
+        .map(|pending| pending.instance_id))
 }
 
 /// CutCircuits for every frozen candidate still owed one, closing InitGraph.
@@ -861,7 +861,7 @@ async fn proof_collection_step(
 
 async fn seal_proofs(deps: &GraphJobDeps, graph_id: Uuid, params: &[u8]) -> Result<Step> {
     let _: SealParams = bincode::deserialize(params).context("decode seal params")?;
-    let Some((instance_id, _)) = pending_session(deps, graph_id).await? else {
+    let Some(instance_id) = pending_session(deps, graph_id).await? else {
         return Step::ignore("no pending graph session");
     };
     let mut state = load_babe_setup_state(&deps.local_db, instance_id, graph_id)?
@@ -873,7 +873,7 @@ async fn seal_proofs(deps: &GraphJobDeps, graph_id: Uuid, params: &[u8]) -> Resu
 }
 
 async fn build_graph(deps: &GraphJobDeps, graph_id: Uuid, _params: &[u8]) -> Result<Step> {
-    let Some((instance_id, _)) = pending_session(deps, graph_id).await? else {
+    let Some(instance_id) = pending_session(deps, graph_id).await? else {
         return Step::ignore("no pending graph session");
     };
     let (operator_master_key, local_operator_pubkey) = local_operator_pubkey()?;
@@ -1080,8 +1080,11 @@ async fn after_committee_value(
         }
         Actor::Committee => {
             let committee = committee_pubkeys(deps, instance_id).await?;
-            let collected = collections(deps, instance_id, graph_id).await?;
-            if collected.pub_nonces >= committee.len() {
+            let pub_nonces =
+                get_committee_pub_nonces_for_graph(&deps.local_db, instance_id, graph_id)
+                    .await?
+                    .len();
+            if pub_nonces >= committee.len() {
                 plan.then(JOB_COMMITTEE_VOTE, Vec::new(), None);
             }
         }
@@ -1112,26 +1115,17 @@ async fn ingest_presign(deps: &GraphJobDeps, graph_id: Uuid, params: &[u8]) -> R
     let Some(graph) = get_graph(&deps.local_db, instance_id, graph_id).await? else {
         return Step::retry("graph definition not stored yet", 30);
     };
-    let full_graph = BitvmGcGraph::from_simplified(&graph)?;
-    let committee = committee_pubkeys(deps, instance_id).await?;
-    let pub_nonces_unchecked =
-        get_committee_pub_nonces_for_graph(&deps.local_db, instance_id, graph_id).await?;
-    if pub_nonces_unchecked.len() != committee.len() {
+    let Some(consensus) = nonce_consensus(deps, instance_id, graph_id, &graph).await? else {
         return Step::retry("waiting for committee public nonces", 30);
-    }
-    let Some(received_pub_nonces) = pub_nonces_unchecked
+    };
+    let NonceConsensus { full_graph, committee, pub_nonces, agg_nonces, .. } = consensus;
+    let Some(received_pub_nonces) = committee
         .iter()
-        .find(|(pubkey, _)| *pubkey == committee_pubkey)
-        .map(|(_, pub_nonces)| pub_nonces.clone())
+        .position(|pubkey| *pubkey == committee_pubkey)
+        .map(|index| pub_nonces[index].clone())
     else {
         return invalid(format!("missing signer pub nonces for {committee_pubkey}"));
     };
-    let pub_nonces =
-        order_committee_values(&committee, pub_nonces_unchecked, "graph committee pub nonces")
-            .map_err(|error| {
-                SpecialError::InvalidGraph(format!("invalid pub nonce set: {error}"))
-            })?;
-    let agg_nonces = nonces_aggregation(&pub_nonces)?;
     if agg_nonces != received_agg_nonces {
         return invalid(format!("agg_nonces mismatch from {committee_pubkey}"));
     }
@@ -1357,14 +1351,9 @@ async fn selected_verifier_peers(
         .collect())
 }
 
-async fn graph_identity(deps: &GraphJobDeps, graph_id: Uuid) -> Result<Option<(Uuid, String)>> {
-    Ok(deps
-        .local_db
-        .acquire()
-        .await?
-        .find_graph(&graph_id)
-        .await?
-        .map(|row| (row.instance_id, row.operator_pubkey)))
+/// The instance of a stored graph row, if any.
+async fn graph_instance(deps: &GraphJobDeps, graph_id: Uuid) -> Result<Option<Uuid>> {
+    Ok(deps.local_db.acquire().await?.find_graph(&graph_id).await?.map(|row| row.instance_id))
 }
 
 /// Reconcile the finalized graph against both chains; a failure here is only
@@ -1604,7 +1593,7 @@ async fn verifier_validate_graph(
         "CreateGraph",
         instance_id,
         graph_id,
-        Some(graph_nonce),
+        graph_nonce,
         graph.parameters.instance_parameters.instance_id,
         graph.parameters.graph_id,
         graph.parameters.graph_nonce,
@@ -1718,7 +1707,7 @@ async fn committee_ingest_graph(
         "CreateGraph",
         instance_id,
         graph_id,
-        Some(graph_nonce),
+        graph_nonce,
         graph.parameters.instance_parameters.instance_id,
         graph.parameters.graph_id,
         graph.parameters.graph_nonce,
@@ -1824,7 +1813,7 @@ async fn ingest_verifier_endorsement(
 /// Start the committee's signing round for a validated, fully endorsed graph:
 /// the deterministic nonces, stored before they are sent.
 async fn committee_nonces(deps: &GraphJobDeps, graph_id: Uuid, _params: &[u8]) -> Result<Step> {
-    let Some((instance_id, _)) = graph_identity(deps, graph_id).await? else {
+    let Some(instance_id) = graph_instance(deps, graph_id).await? else {
         return Step::ignore("graph not stored locally");
     };
     let Some(graph) = get_graph(&deps.local_db, instance_id, graph_id).await? else {
@@ -1912,6 +1901,8 @@ async fn committee_nonces(deps: &GraphJobDeps, graph_id: Uuid, _params: &[u8]) -
 struct NonceConsensus {
     full_graph: BitvmGcGraph,
     committee: Vec<PublicKey>,
+    /// Every member's public nonces, in committee order.
+    pub_nonces: Vec<bitvm_lib::committee::CommitteePubNonces>,
     agg_nonces: bitvm_lib::committee::CommitteeAggNonces,
     consensus_hash: [u8; 32],
 }
@@ -1941,11 +1932,17 @@ async fn nonce_consensus(
     let ordered = order_committee_values(&committee, checked, "graph committee pub nonces")?;
     let agg_nonces = nonces_aggregation(&ordered)?;
     let consensus_hash = committee_nonce_consensus_hash(&full_graph, &committee, &ordered)?;
-    Ok(Some(NonceConsensus { full_graph, committee, agg_nonces, consensus_hash }))
+    Ok(Some(NonceConsensus {
+        full_graph,
+        committee,
+        pub_nonces: ordered,
+        agg_nonces,
+        consensus_hash,
+    }))
 }
 
 async fn committee_vote(deps: &GraphJobDeps, graph_id: Uuid, _params: &[u8]) -> Result<Step> {
-    let Some((instance_id, _)) = graph_identity(deps, graph_id).await? else {
+    let Some(instance_id) = graph_instance(deps, graph_id).await? else {
         return Step::ignore("graph not stored locally");
     };
     let Some(graph) = get_graph(&deps.local_db, instance_id, graph_id).await? else {
@@ -2112,7 +2109,7 @@ async fn ingest_vote(deps: &GraphJobDeps, graph_id: Uuid, params: &[u8]) -> Resu
 }
 
 async fn committee_presign(deps: &GraphJobDeps, graph_id: Uuid, _params: &[u8]) -> Result<Step> {
-    let Some((instance_id, _)) = graph_identity(deps, graph_id).await? else {
+    let Some(instance_id) = graph_instance(deps, graph_id).await? else {
         return Step::ignore("graph not stored locally");
     };
     let Some(graph) = get_graph(&deps.local_db, instance_id, graph_id).await? else {
@@ -2225,7 +2222,7 @@ async fn committee_presign(deps: &GraphJobDeps, graph_id: Uuid, _params: &[u8]) 
 }
 
 async fn committee_endorse(deps: &GraphJobDeps, graph_id: Uuid, _params: &[u8]) -> Result<Step> {
-    let Some((instance_id, _)) = graph_identity(deps, graph_id).await? else {
+    let Some(instance_id) = graph_instance(deps, graph_id).await? else {
         return Step::ignore("graph not stored locally");
     };
     let Some(graph) = get_graph(&deps.local_db, instance_id, graph_id).await? else {
@@ -2294,7 +2291,7 @@ async fn ingest_finalized(deps: &GraphJobDeps, graph_id: Uuid, params: &[u8]) ->
         "GraphFinalize",
         instance_id,
         graph_id,
-        Some(graph_nonce),
+        graph_nonce,
         graph.parameters.instance_parameters.instance_id,
         graph.parameters.graph_id,
         graph.parameters.graph_nonce,
@@ -2335,7 +2332,7 @@ async fn ingest_finalized(deps: &GraphJobDeps, graph_id: Uuid, params: &[u8]) ->
         },
         ..Default::default()
     };
-    if is_relayer() {
+    if deps.relayer {
         plan.then(JOB_POST_GRAPH_DATA, Vec::new(), None);
     }
     Step::done(plan)
@@ -2343,10 +2340,10 @@ async fn ingest_finalized(deps: &GraphJobDeps, graph_id: Uuid, params: &[u8]) ->
 
 /// The relayer's `postGraphData` once the peg-in is withdrawable (Post phase).
 async fn post_graph_data(deps: &GraphJobDeps, graph_id: Uuid, _params: &[u8]) -> Result<Step> {
-    if !is_relayer() {
+    if !deps.relayer {
         return Step::ignore("not a relayer");
     }
-    let Some((instance_id, _)) = graph_identity(deps, graph_id).await? else {
+    let Some(instance_id) = graph_instance(deps, graph_id).await? else {
         return Step::ignore("graph not stored locally");
     };
     if instance_status(deps, instance_id).await?.is_some_and(|status| status.is_failed()) {
@@ -2441,7 +2438,9 @@ async fn fetch_graph(
             ));
             plan.wake_refs.push(slot_ref(&found.operator_pubkey, found.graph_nonce));
             plan.wake_refs.push(graph_ref(found.graph_id).wake_ref());
-            plan.wake_refs.push(graph_ref(graph_id).wake_ref());
+            if found.graph_id != graph_id {
+                plan.wake_refs.push(graph_ref(graph_id).wake_ref());
+            }
             Step::done(plan)
         }
         Ok(None) => give_up(format!("no peer served {lookup:?}")),

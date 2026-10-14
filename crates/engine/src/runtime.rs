@@ -269,6 +269,12 @@ impl EngineHandle {
         storage.find_engine_aggregate(&aggregate.kind, &aggregate.id).await
     }
 
+    /// Row counts by table and state, without the parked and poisoned listings.
+    pub async fn state_counts(&self) -> anyhow::Result<Vec<EngineStateCount>> {
+        let mut storage = self.inner.db.acquire().await?;
+        storage.engine_state_counts().await
+    }
+
     pub async fn snapshot(&self) -> anyhow::Result<EngineSnapshot> {
         let mut storage = self.inner.db.acquire().await?;
         Ok(EngineSnapshot {

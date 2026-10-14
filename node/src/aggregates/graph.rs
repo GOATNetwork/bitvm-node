@@ -1065,7 +1065,6 @@ impl GraphAggregate {
             }
             if retired(status) {
                 ctx.effects.cancel_phase_jobs(JOB_PHASE);
-                ctx.effects.cancel_phase_jobs(PHASE_POST);
             }
             // Taken, disproved or skipped: the slot can no longer be kicked off. Obsoleted
             // alone forbids nothing.

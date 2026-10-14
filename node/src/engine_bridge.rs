@@ -20,7 +20,7 @@ use client::goat_chain::GOATClient;
 use client::http_client::async_client::HttpAsyncClient;
 use engine::{
     AckReceiver, Engine, EngineBuilder, EngineConfig, EngineHandle, EngineMetrics, NewEvent,
-    Transport,
+    SubmitOutcome, Transport,
 };
 use libp2p::gossipsub::IdentTopic;
 use libp2p_metrics::Registry;
@@ -43,27 +43,7 @@ impl GossipTransport {
 #[async_trait]
 impl Transport for GossipTransport {
     async fn publish(&self, topic: &str, payload: &[u8]) -> anyhow::Result<()> {
-        // Receivers drop what exceeds their envelope limit without telling
-        // anyone, so an outgrown message has to be loud on the sending side.
-        let limits = crate::p2p_admission::inbound_limits();
-        let receiver_limit = if GOATMessage::is_binary_envelope(payload) {
-            limits.max_binary_bytes
-        } else {
-            limits.max_json_bytes
-        };
-        if payload.len() > receiver_limit {
-            if let Some(metrics) = node_metrics_state() {
-                metrics.record_p2p_oversized_message();
-            }
-            tracing::error!(
-                event = "p2p_message_publish",
-                outcome = "oversized",
-                topic,
-                content_size = payload.len(),
-                receiver_limit,
-                "outbound protocol message exceeds the inbound size limit peers enforce"
-            );
-        }
+        crate::action::note_oversized_payload(payload, topic, "outbox");
         let mut publisher = self.publisher.clone();
         let result = publisher.publish_message(IdentTopic::new(topic), payload.to_vec()).await;
         if let Some(metrics) = node_metrics_state() {
@@ -138,6 +118,7 @@ pub fn build_engine(
         builder,
         Arc::new(InstanceJobDeps {
             actor: deps.actor.clone(),
+            relayer: crate::env::is_relayer(),
             local_db: deps.local_db.clone(),
             btc_client: deps.btc_client.clone(),
             goat_client: deps.goat_client.clone(),
@@ -147,6 +128,7 @@ pub fn build_engine(
     let builder = register_graph_jobs(
         builder,
         Arc::new(GraphJobDeps {
+            relayer: crate::env::is_relayer(),
             local_db: deps.local_db,
             btc_client: deps.btc_client,
             goat_client: deps.goat_client,
@@ -203,18 +185,17 @@ pub async fn record_event_in(
     Ok(())
 }
 
-/// Record an event on its own connection and wake its worker.
-pub async fn submit_event(local_db: &LocalDB, event: NewEvent) -> anyhow::Result<()> {
+/// Record an event on its own connection and wake its worker. Without an
+/// engine handle (tests) the row is inserted directly and counts as new.
+pub async fn submit_event(local_db: &LocalDB, event: NewEvent) -> anyhow::Result<SubmitOutcome> {
     match engine_handle() {
-        Some(engine) => {
-            engine.submit(event).await?;
-        }
+        Some(engine) => engine.submit(event).await,
         None => {
             let mut storage = local_db.acquire().await?;
             storage.insert_engine_inbox_event(&event.into_store(), current_time_secs()).await?;
+            Ok(SubmitOutcome::Inserted)
         }
     }
-    Ok(())
 }
 
 /// Turn ACK requests from the engine into `GraphSetupAck` messages. The engine

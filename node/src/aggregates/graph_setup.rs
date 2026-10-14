@@ -39,15 +39,14 @@ pub(crate) fn message_identity_matches(
     message_kind: &str,
     message_instance_id: Uuid,
     message_graph_id: Uuid,
-    message_graph_nonce: Option<u64>,
+    message_graph_nonce: u64,
     graph_instance_id: Uuid,
     graph_graph_id: Uuid,
     graph_nonce: u64,
 ) -> bool {
-    let nonce_matches = message_graph_nonce.is_none_or(|nonce| nonce == graph_nonce);
     if message_instance_id == graph_instance_id
         && message_graph_id == graph_graph_id
-        && nonce_matches
+        && message_graph_nonce == graph_nonce
     {
         return true;
     }
@@ -265,12 +264,10 @@ pub(crate) fn build_babe_prover_state(
     Ok(BabeProverState { package: setup_package.clone(), finalized, soldering, h_msgs })
 }
 
-pub(crate) fn validate_verifier_slot_lengths(
-    verifier_index: usize,
-    gc_data_len: usize,
-    verifier_asserts_len: usize,
-    disproves_len: usize,
-) -> Result<()> {
+pub(crate) fn validate_verifier_slot(graph: &BitvmGcGraph, verifier_index: usize) -> Result<()> {
+    let gc_data_len = graph.parameters.gc_data.len();
+    let verifier_asserts_len = graph.verifier_asserts.len();
+    let disproves_len = graph.disproves.len();
     if gc_data_len == 0 {
         bail!("graph has no verifier GC slots");
     }
@@ -283,15 +280,6 @@ pub(crate) fn validate_verifier_slot_lengths(
         bail!("verifier index {verifier_index} out of range for {gc_data_len} slots");
     }
     Ok(())
-}
-
-pub(crate) fn validate_verifier_slot(graph: &BitvmGcGraph, verifier_index: usize) -> Result<()> {
-    validate_verifier_slot_lengths(
-        verifier_index,
-        graph.parameters.gc_data.len(),
-        graph.verifier_asserts.len(),
-        graph.disproves.len(),
-    )
 }
 
 pub(crate) fn find_verifier_index_by_pubkey(

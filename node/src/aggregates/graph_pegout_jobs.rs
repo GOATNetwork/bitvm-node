@@ -23,7 +23,7 @@ use super::graph_setup::{
 };
 use super::instance::{PeginDeadlines, TxFact};
 use crate::engine_bridge::submit_event;
-use crate::env::{get_bitvm_key, get_soldering_proof_payload_store_path, is_relayer};
+use crate::env::{get_bitvm_key, get_soldering_proof_payload_store_path};
 use crate::metrics_service::node_metrics_state;
 use crate::soldering_payload_store::{
     read_soldering_proof_store_payload, soldering_proof_payload_store_path,
@@ -322,8 +322,12 @@ async fn settle_predecessors(deps: &GraphJobDeps, graph_id: Uuid, params: &[u8])
         return Ok(step);
     }
     let graph_nonce = row.kickoff_index as u64;
+    let chain = ChainClock {
+        height: i64::from(deps.btc_client.get_height().await?),
+        deadlines: PeginDeadlines::from_env(),
+    };
     for slot in first_open_slot(&deps.local_db, &row).await?..graph_nonce {
-        let mut facts = slot_facts(deps, &row.operator_pubkey, slot).await?;
+        let mut facts = slot_facts(deps, &row.operator_pubkey, slot, &chain).await?;
         let mut verdict = decide_slot(&facts, &row.operator_pubkey);
         if let SlotVerdict::Pull(lookup) = &verdict {
             match fetch_and_store_graph(
@@ -341,7 +345,7 @@ async fn settle_predecessors(deps: &GraphJobDeps, graph_id: Uuid, params: &[u8])
                         graph_pulled_event(found.graph_id, found.instance_id, found.finalized)?,
                     )
                     .await?;
-                    facts = slot_facts(deps, &row.operator_pubkey, slot).await?;
+                    facts = slot_facts(deps, &row.operator_pubkey, slot, &chain).await?;
                     verdict = decide_slot(&facts, &row.operator_pubkey);
                 }
                 Ok(None) => {
@@ -413,7 +417,18 @@ async fn first_open_slot(local_db: &LocalDB, row: &Graph) -> Result<u64> {
 }
 
 /// Facts about one slot: the local copy, then the chain.
-async fn slot_facts(deps: &GraphJobDeps, operator_pubkey: &str, slot: u64) -> Result<SlotFacts> {
+/// The Bitcoin height and peg-in deadlines a settle run judges every slot by.
+struct ChainClock {
+    height: i64,
+    deadlines: PeginDeadlines,
+}
+
+async fn slot_facts(
+    deps: &GraphJobDeps,
+    operator_pubkey: &str,
+    slot: u64,
+    chain: &ChainClock,
+) -> Result<SlotFacts> {
     let mut facts = SlotFacts { slot, ..Default::default() };
     let (row, instance, definition) = {
         let mut storage = deps.local_db.acquire().await?;
@@ -470,10 +485,10 @@ async fn slot_facts(deps: &GraphJobDeps, operator_pubkey: &str, slot: u64) -> Re
     }
     let finalized = graph.committee_pre_signed();
     if let Some(instance) = &instance {
-        let height = i64::from(btc.get_height().await?);
-        facts.past_abandon_height = PeginDeadlines::from_env()
+        facts.past_abandon_height = chain
+            .deadlines
             .abandon_height(instance.btc_height)
-            .is_some_and(|abandon_height| height >= abandon_height);
+            .is_some_and(|abandon_height| chain.height >= abandon_height);
     }
     facts.local = Some(LocalSlot {
         graph_id: row.graph_id,
@@ -976,7 +991,6 @@ async fn disprove(
     verifier_index: usize,
 ) -> Result<Step> {
     let btc = &deps.btc_client;
-    validate_verifier_slot(graph, verifier_index)?;
     validate_expected_challenge_assert_txid(graph, verifier_index, challenge_assert_txid)?;
     if graph.parameters.gc_data[verifier_index].verifier_pubkey != local_verifier_pubkey()? {
         return Step::ignore(format!("local verifier does not own slot {verifier_index}"));
@@ -996,15 +1010,12 @@ async fn disprove(
     if height < disprove_height {
         return after_blocks(deps, "disprove timelock has not expired", disprove_height - height);
     }
-    if let Some(spent_txid) = outpoint_spent_txid(btc, &challenge_assert_txid, 0).await? {
-        if !btc.get_tx_status(&spent_txid).await?.confirmed {
-            return after_blocks(
-                deps,
-                format!("verifier assertion output spent by unconfirmed {spent_txid}"),
-                1,
-            );
-        }
-        return Step::ignore(format!("verifier assertion output already spent by {spent_txid}"));
+    if let Some(step) = settled_by(
+        deps,
+        &spend_of(btc, &challenge_assert_txid, 0).await?,
+        "verifier assertion output",
+    ) {
+        return step;
     }
     let disprove_tx = build_disprove_tx(graph, verifier_index, None)?;
     let input_amount =
@@ -1328,7 +1339,6 @@ async fn wrongly_challenged(
     let btc = &deps.btc_client;
     let instance_id = graph.parameters.instance_parameters.instance_id;
     let graph_id = graph.parameters.graph_id;
-    validate_verifier_slot(graph, verifier_index)?;
     validate_expected_challenge_assert_txid(graph, verifier_index, challenge_assert_txid)?;
     // Wrongly-Challenged and Disprove both spend the ChallengeAssert output:
     // one on chain (ours included) ends the job.
@@ -1654,7 +1664,7 @@ async fn proceed_withdraw(
     graph: &BitvmGcGraph,
     attempts: i64,
 ) -> Result<Step> {
-    if !is_relayer() {
+    if !deps.relayer {
         return Step::ignore("not a relayer");
     }
     let btc = &deps.btc_client;
@@ -1716,7 +1726,7 @@ async fn spv_covered(deps: &GraphJobDeps, txid: &Txid, what: &str) -> Result<Opt
 
 /// Take-1 confirmed: `finishWithdrawHappyPath`.
 async fn finish_happy(deps: &GraphJobDeps, graph: &BitvmGcGraph, attempts: i64) -> Result<Step> {
-    if !is_relayer() {
+    if !deps.relayer {
         return Step::ignore("not a relayer");
     }
     let graph_id = graph.parameters.graph_id;
@@ -1750,7 +1760,7 @@ async fn finish_happy(deps: &GraphJobDeps, graph: &BitvmGcGraph, attempts: i64) 
 
 /// Take-2 confirmed: `finishWithdrawUnhappyPath`.
 async fn finish_unhappy(deps: &GraphJobDeps, graph: &BitvmGcGraph, attempts: i64) -> Result<Step> {
-    if !is_relayer() {
+    if !deps.relayer {
         return Step::ignore("not a relayer");
     }
     let graph_id = graph.parameters.graph_id;
@@ -1791,7 +1801,7 @@ async fn finish_disproved(
     challenge_finish_txid: Txid,
     attempts: i64,
 ) -> Result<Step> {
-    if !is_relayer() {
+    if !deps.relayer {
         return Step::ignore("not a relayer");
     }
     let btc = &deps.btc_client;

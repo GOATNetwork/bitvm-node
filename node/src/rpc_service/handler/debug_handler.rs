@@ -30,7 +30,7 @@ pub async fn get_debug_status(
         app_state.goat_client.btc_spv_latest_height(),
     );
     let engine = match app_state.engine.as_ref() {
-        Some(engine) => Some(engine.snapshot().await.api_error("GET_DEBUG_STATUS_ERROR")?.counts),
+        Some(engine) => Some(engine.state_counts().await.api_error("GET_DEBUG_STATUS_ERROR")?),
         None => None,
     };
 

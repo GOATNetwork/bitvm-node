@@ -697,15 +697,9 @@ async fn record_engine_message(
     from_peer_id: PeerId,
     content_size: usize,
 ) -> Result<()> {
-    let outcome = match crate::engine_bridge::engine_handle() {
-        Some(engine) => engine.submit(event).await.context("record inbound message")?,
-        None => {
-            crate::engine_bridge::submit_event(local_db, event)
-                .await
-                .context("record inbound message")?;
-            engine::SubmitOutcome::Inserted
-        }
-    };
+    let outcome = crate::engine_bridge::submit_event(local_db, event)
+        .await
+        .context("record inbound message")?;
     if matches!(outcome, engine::SubmitOutcome::Duplicate { .. }) {
         crate::p2p_admission::record_drop(crate::p2p_admission::DropReason::DuplicatePayload);
     }
@@ -865,6 +859,31 @@ pub async fn run_p2p_admission_maintenance(local_db: &LocalDB, goat_client: &Arc
     }
 }
 
+/// Receivers drop what exceeds their envelope limit without telling anyone,
+/// so an outgrown message is reported loudly on the sending side.
+pub(crate) fn note_oversized_payload(payload: &[u8], target: &str, message_type: &str) {
+    let limits = crate::p2p_admission::inbound_limits();
+    let receiver_limit = if GOATMessage::is_binary_envelope(payload) {
+        limits.max_binary_bytes
+    } else {
+        limits.max_json_bytes
+    };
+    if payload.len() > receiver_limit {
+        if let Some(metrics_state) = crate::metrics_service::node_metrics_state() {
+            metrics_state.record_p2p_oversized_message();
+        }
+        tracing::error!(
+            event = "p2p_message_publish",
+            outcome = "oversized",
+            target,
+            message_type,
+            content_size = payload.len(),
+            receiver_limit,
+            "outbound protocol message exceeds the inbound size limit peers enforce"
+        );
+    }
+}
+
 /// Publish one message on its role topic; every sender goes through here.
 pub async fn publish_to_role(
     swarm: &mut dyn MessagePublisher,
@@ -883,28 +902,7 @@ pub async fn publish_to_role(
             return Err(error);
         }
     };
-    // Receivers drop what exceeds their envelope limit without telling anyone,
-    // so an outgrown message has to be loud on the sending side.
-    let limits = crate::p2p_admission::inbound_limits();
-    let receiver_limit = if GOATMessage::is_binary_envelope(&serialized) {
-        limits.max_binary_bytes
-    } else {
-        limits.max_json_bytes
-    };
-    if serialized.len() > receiver_limit {
-        if let Some(metrics_state) = crate::metrics_service::node_metrics_state() {
-            metrics_state.record_p2p_oversized_message();
-        }
-        tracing::error!(
-            event = "p2p_message_publish",
-            outcome = "oversized",
-            target_actor,
-            message_type,
-            content_size = serialized.len(),
-            receiver_limit,
-            "outbound protocol message exceeds the inbound size limit peers enforce"
-        );
-    }
+    note_oversized_payload(&serialized, &target_actor, message_type);
     match swarm.publish_message(gossipsub_topic, serialized).await {
         Ok(message_id) => {
             if let Some(metrics_state) = crate::metrics_service::node_metrics_state() {

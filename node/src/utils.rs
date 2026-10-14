@@ -1443,7 +1443,7 @@ pub(crate) async fn scan_graph_chain_state(
     // closed and never scanned again, so a Skip-Kickoff that is only in the
     // mempool must not hide the Kickoff that replaces it, and a mempool
     // Kickoff replaced by the Skip must not strand the graph at OperatorKickOff.
-    let kickoff_connector_vout = 1;
+    let kickoff_connector_vout = output_topology::prekickoff::kickoff_connector() as u64;
     let kickoff_connector_spent =
         outpoint_spent_confirmed(btc_client, &prekickoff_txid, kickoff_connector_vout).await?;
     match kickoff_connector_spent {
@@ -1573,28 +1573,6 @@ pub(crate) async fn scan_graph_chain_state(
     }
 
     if current_status == GraphStatus::Challenge {
-        if let Some(disprove) = detect_guardian_disprove(btc_client, graph).await? {
-            sub_status.disprove_type = Some(disprove.disprove_type);
-            sub_status.disprove_index = disprove.index as i32;
-            return Ok(GraphChainScan {
-                status: GraphStatus::Disprove,
-                sub_status,
-                challenge_txid,
-                disprove: Some(disprove),
-            });
-        }
-
-        if let Some(disprove) = detect_watchtower_flow_disprove(btc_client, graph).await? {
-            sub_status.disprove_type = Some(disprove.disprove_type);
-            sub_status.disprove_index = disprove.index as i32;
-            return Ok(GraphChainScan {
-                status: GraphStatus::Disprove,
-                sub_status,
-                challenge_txid,
-                disprove: Some(disprove),
-            });
-        }
-
         // TBD: add GraphStatus::Assert
         let mut detected_disprove = None;
         for verifier_index in 0..verifier_num {

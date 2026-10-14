@@ -20,7 +20,6 @@ use crate::action::{
 };
 use crate::env::{
     get_bitvm_key, get_operator_graph_start_cutoff_blocks, is_enable_committee_instance_key_delete,
-    is_relayer,
 };
 use crate::error::{FailureClass, SpecialError, classify_failure};
 use crate::metrics_service::MetricsState;
@@ -64,6 +63,7 @@ use uuid::Uuid;
 
 pub struct InstanceJobDeps {
     pub actor: Actor,
+    pub relayer: bool,
     pub local_db: LocalDB,
     pub btc_client: Arc<BTCClient>,
     pub goat_client: Arc<GOATClient>,
@@ -540,8 +540,8 @@ async fn partial_sigs_complete(deps: &InstanceJobDeps, instance_id: Uuid) -> Res
 }
 
 /// The relayer aggregates and broadcasts once the last partial signature is in.
-fn then_broadcast(plan: &mut InstancePlan) {
-    if is_relayer() {
+fn then_broadcast(deps: &InstanceJobDeps, plan: &mut InstancePlan) {
+    if deps.relayer {
         plan.then(JOB_BROADCAST_PEGIN_CONFIRM, Vec::new(), None);
     }
 }
@@ -888,7 +888,7 @@ async fn pegin_confirm_sign(deps: &InstanceJobDeps, instance_id: Uuid) -> Result
         .await?,
     );
     if partial_sigs_complete(deps, instance_id).await? {
-        then_broadcast(&mut plan);
+        then_broadcast(deps, &mut plan);
     }
     Step::done(plan)
 }
@@ -926,7 +926,7 @@ async fn ingest_pegin_confirm_partial_sig(
         return invalid(format!("missing signer pub nonce for {committee_pubkey}"));
     };
     let Some(consensus) = nonce_consensus(deps, instance_id).await? else {
-        return Step::retry("waiting for committee public nonces", 30);
+        bail!("committee public nonces changed while a partial signature was verified");
     };
     if !votes_complete(deps, instance_id, &consensus).await? {
         return Step::retry("waiting for committee PeginConfirm agg nonce consensus", 30);
@@ -978,7 +978,7 @@ async fn ingest_pegin_confirm_partial_sig(
     .await?;
     let mut plan = InstancePlan::default();
     if partial_sigs_complete(deps, instance_id).await? {
-        then_broadcast(&mut plan);
+        then_broadcast(deps, &mut plan);
     }
     Step::done(plan)
 }
@@ -1015,7 +1015,7 @@ async fn broadcast_pegin_confirm(
     instance_id: Uuid,
     params: &[u8],
 ) -> Result<Step> {
-    if !is_relayer() {
+    if !deps.relayer {
         return Step::ignore("not a relayer");
     }
     // The first attempt (from the signatures) carries no height.
@@ -1102,7 +1102,7 @@ pub async fn post_pegin_data(
     deps: &InstanceJobDeps,
     instance_id: Uuid,
 ) -> anyhow::Result<PostOutcome> {
-    if !is_relayer() {
+    if !deps.relayer {
         warn!(event = "instance_post", instance_id = %instance_id, outcome = "not_relayer", "post job on a node that is not a relayer");
         return Ok(PostOutcome::Done);
     }
