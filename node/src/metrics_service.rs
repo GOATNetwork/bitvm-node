@@ -266,7 +266,7 @@ impl MetricsState {
             );
             registry.register(
                 "bitvm_node_message_dispatch",
-                "Total number of protocol message dispatches",
+                "Total number of control message dispatches (NodeInfo, GraphSetupAck)",
                 message_dispatch_total.clone(),
             );
             registry.register(

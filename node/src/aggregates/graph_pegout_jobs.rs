@@ -8,13 +8,13 @@ use super::graph::{GraphPlan, graph_pulled_event, slot_ref};
 use super::graph_fetch::fetch_and_store_graph;
 use super::graph_jobs::{GraphJobDeps, Step};
 use super::graph_pegout::{
-    JOB_CHALLENGE_ACK, JOB_CHALLENGE_KICKOFF, JOB_CHALLENGE_NACK, JOB_CHECK_PREVIOUS_GRAPH,
-    JOB_COMMIT_PUBIN, JOB_COMMIT_TIMEOUT, JOB_DISPROVE, JOB_FINISH_DISPROVED, JOB_FINISH_HAPPY,
-    JOB_FINISH_UNHAPPY, JOB_KICKOFF, JOB_PROCEED_WITHDRAW, JOB_PROVER_ASSERT,
+    JOB_CHALLENGE_ACK, JOB_CHALLENGE_KICKOFF, JOB_CHALLENGE_NACK, JOB_COMMIT_PUBIN,
+    JOB_COMMIT_TIMEOUT, JOB_DISPROVE, JOB_ENFORCE_PREVIOUS_SLOT, JOB_FINISH_DISPROVED,
+    JOB_FINISH_HAPPY, JOB_FINISH_UNHAPPY, JOB_KICKOFF, JOB_PROCEED_WITHDRAW, JOB_PROVER_ASSERT,
     JOB_SETTLE_PREDECESSORS, JOB_TAKE1, JOB_TAKE2, JOB_VERIFIER_ASSERT, JOB_WATCHTOWER_CHALLENGE,
     JOB_WATCHTOWER_CHALLENGE_INIT, JOB_WATCHTOWER_PROOF_TIMEOUT, JOB_WATCHTOWER_TIMEOUT,
-    JOB_WRONGLY_CHALLENGED, KickoffConnector, KickoffParams, LocalSlot, PegoutSignal, SlotFacts,
-    SlotVerdict, decide_slot,
+    JOB_WRONGLY_CHALLENGED, KickoffConnectorSpend, KickoffParams, LocalSlot, PegoutSignal,
+    SlotFacts, SlotVerdict, decide_slot,
 };
 use super::graph_scan::{connector_zero_taken, prekickoff_input_spent};
 use super::graph_setup::{
@@ -89,13 +89,13 @@ async fn settlement_step(
             | JOB_FINISH_HAPPY
             | JOB_FINISH_UNHAPPY
             | JOB_FINISH_DISPROVED
-            | JOB_CHECK_PREVIOUS_GRAPH
+            | JOB_ENFORCE_PREVIOUS_SLOT
     );
     if closed(row) && !after_close {
         return Step::ignore(format!("graph is {}", row.status));
     }
     match (action, signal) {
-        (JOB_CHECK_PREVIOUS_GRAPH, _) => check_previous_graph(deps, &graph).await,
+        (JOB_ENFORCE_PREVIOUS_SLOT, _) => enforce_previous_slot(deps, &graph).await,
         (JOB_PROCEED_WITHDRAW, _) => proceed_withdraw(deps, row, &graph, attempts).await,
         (JOB_CHALLENGE_KICKOFF, _) => challenge_kickoff(deps, &graph).await,
         (JOB_WATCHTOWER_CHALLENGE_INIT, ChallengeSent { challenge_txid }) => {
@@ -245,7 +245,7 @@ fn local_operator() -> Result<(OperatorMasterKey, PublicKey)> {
 /// The step that ends an operator's kickoff job unless its withdraw is live
 /// on Goat. `None` is a lagging Goat node (the `InitWithdraw` came from a
 /// finalized block), so it is looked at again; any other status is over.
-async fn withdraw_not_live(
+async fn step_unless_withdraw_live(
     deps: &GraphJobDeps,
     graph_id: Uuid,
     tx_hash: &str,
@@ -272,7 +272,7 @@ async fn kickoff(deps: &GraphJobDeps, graph_id: Uuid, params: &[u8]) -> Result<S
     if graph.parameters.operator_pubkey != operator_pubkey {
         return Step::ignore("not this operator's graph");
     }
-    if let Some(step) = withdraw_not_live(deps, graph_id, &params.tx_hash).await? {
+    if let Some(step) = step_unless_withdraw_live(deps, graph_id, &params.tx_hash).await? {
         return Ok(step);
     }
     let kickoff_txid = graph.kickoff.tx().compute_txid();
@@ -318,7 +318,7 @@ async fn settle_predecessors(deps: &GraphJobDeps, graph_id: Uuid, params: &[u8])
     if row.operator_pubkey != operator_pubkey.to_string() {
         return Step::ignore("not this operator's graph");
     }
-    if let Some(step) = withdraw_not_live(deps, graph_id, &params.tx_hash).await? {
+    if let Some(step) = step_unless_withdraw_live(deps, graph_id, &params.tx_hash).await? {
         return Ok(step);
     }
     let graph_nonce = row.kickoff_index as u64;
@@ -436,16 +436,16 @@ async fn slot_facts(deps: &GraphJobDeps, operator_pubkey: &str, slot: u64) -> Re
     facts.kickoff_connector =
         match outpoint_spent_txid(btc, &prekickoff_txid, kickoff_connector).await? {
             Some(spent_by) if spent_by == graph.kickoff.tx().compute_txid() => {
-                KickoffConnector::ByKickoff
+                KickoffConnectorSpend::ByKickoff
             }
             // Settled only once the Skip / Force-Skip confirmed.
             Some(spent_by) if btc.get_tx_status(&spent_by).await?.confirmed => {
-                KickoffConnector::ByOther
+                KickoffConnectorSpend::ByOther
             }
-            _ => KickoffConnector::Unspent,
+            _ => KickoffConnectorSpend::Unspent,
         };
-    if facts.kickoff_connector == KickoffConnector::Unspent
-        && !tx_on_chain(btc, &prekickoff_txid).await?
+    if facts.kickoff_connector == KickoffConnectorSpend::Unspent
+        && !tx_visible(btc, &prekickoff_txid).await?
     {
         facts.prekickoff_dead = prekickoff_input_spent(btc, &graph).await?.is_some();
     }
@@ -493,7 +493,7 @@ async fn slot_facts(deps: &GraphJobDeps, operator_pubkey: &str, slot: u64) -> Re
 /// settled, or skipped. Force-Skip it if Kickoff-(N−1) never appeared,
 /// Quick-Challenge it if it is still unsettled. The previous definition comes
 /// from the store or, if missing, from the relayer / committee.
-async fn check_previous_graph(deps: &GraphJobDeps, graph: &BitvmGcGraph) -> Result<Step> {
+async fn enforce_previous_slot(deps: &GraphJobDeps, graph: &BitvmGcGraph) -> Result<Step> {
     let graph_nonce = graph.parameters.graph_nonce;
     if graph_nonce == 0 {
         return Step::ignore("first slot of the operator");
@@ -557,7 +557,7 @@ async fn check_previous_graph(deps: &GraphJobDeps, graph: &BitvmGcGraph) -> Resu
     };
     let stage = scan_graph_chain_state(btc, &deps.goat_client, &previous).await?.status;
     let previous_kickoff = previous.kickoff.tx().compute_txid();
-    if !tx_on_chain(btc, &previous_kickoff).await? {
+    if !tx_visible(btc, &previous_kickoff).await? {
         let previous_prekickoff = previous.cur_prekickoff.tx().compute_txid();
         let kickoff_connector = output_topology::prekickoff::kickoff_connector() as u64;
         let spend = spend_of(btc, &previous_prekickoff, kickoff_connector).await?;
@@ -1549,7 +1549,7 @@ async fn watchtower_challenge(
         return Step::ignore("not a watchtower of this graph");
     };
     let wci_txid = graph.watchtower_challenge_init.tx().compute_txid();
-    if !tx_on_chain(btc, &wci_txid).await? {
+    if !tx_visible(btc, &wci_txid).await? {
         return after_blocks(deps, "watchtower challenge init is not on chain", 1);
     }
     let vout = output_topology::watchtower_challenge_init::watchtower_connector(index) as u64;

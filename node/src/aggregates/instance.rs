@@ -1016,11 +1016,11 @@ impl InstanceAggregate {
                 "committee answers not recorded yet",
             ));
         }
-        let round_over = status.is_failed()
+        let ingest_closed = status.is_failed()
             || status == InstanceBridgeInStatus::RelayerL2Minted
             || (status == InstanceBridgeInStatus::RelayerL1Broadcasted
                 && kind != "PeginConfirmPartialSig");
-        if round_over {
+        if ingest_closed {
             debug!(event = "instance_apply", instance_id = %instance_id, kind, status = %status, "PeginConfirm round is over; message ignored");
             return ApplyOutcome::Applied;
         }
@@ -1217,7 +1217,7 @@ impl InstanceAggregate {
 
     /// Every partial signature of the committee is stored locally: the
     /// relayer can aggregate.
-    async fn partial_sigs_complete(
+    async fn all_partial_sigs_stored(
         &self,
         ctx: &mut ApplyContext<'_>,
         instance: &Instance,
@@ -1278,7 +1278,7 @@ impl AggregateHandler for InstanceAggregate {
                 // is abandoned.
                 if self.relayer
                     && rebroadcast_due(status, &transition, &snapshot)
-                    && self.partial_sigs_complete(ctx, &instance).await?
+                    && self.all_partial_sigs_stored(ctx, &instance).await?
                 {
                     self.job(
                         ctx,

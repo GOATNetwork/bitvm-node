@@ -3,7 +3,7 @@
 //! configuration from the environment, aggregate registration, and the
 //! process-wide handle producers use to record events.
 
-use crate::action::{GOATMessage, GOATMessageContent, GraphSetupAck, send_to_peer};
+use crate::action::{GOATMessage, GOATMessageContent, GraphSetupAck, publish_to_role};
 use crate::aggregates::graph::{GRAPH_KIND, GraphAggregate};
 use crate::aggregates::graph_jobs::{GraphJobDeps, register_graph_jobs};
 use crate::aggregates::instance::{INSTANCE_KIND, InstanceAggregate};
@@ -131,7 +131,7 @@ pub fn build_engine(
             GRAPH_KIND,
             Arc::new(
                 GraphAggregate::new(deps.actor.clone(), env::is_relayer(), deps.local_peer.clone())
-                    .with_local_operator(local_operator(&deps.actor)),
+                    .with_local_operator(own_operator_pubkey(&deps.actor)),
             ),
         );
     let builder = register_instance_jobs(
@@ -161,7 +161,7 @@ pub fn build_engine(
 }
 
 /// The operator key this node withdraws with, as graphs store it.
-fn local_operator(actor: &Actor) -> Option<String> {
+fn own_operator_pubkey(actor: &Actor) -> Option<String> {
     if *actor != Actor::Operator {
         return None;
     }
@@ -239,7 +239,7 @@ pub async fn run_ack_forwarder(
                 delivery_id: request.delivery_id.clone(),
             }),
         );
-        if let Err(error) = send_to_peer(&mut publisher, message).await {
+        if let Err(error) = publish_to_role(&mut publisher, message).await {
             tracing::debug!(
                 event = "engine_ack",
                 outcome = "publish_failed",

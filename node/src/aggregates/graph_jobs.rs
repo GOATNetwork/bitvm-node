@@ -1299,7 +1299,7 @@ async fn finalize_graph(deps: &GraphJobDeps, graph_id: Uuid, _params: &[u8]) -> 
     mark_graph_as_endorsed(&deps.local_db, instance_id, graph_id).await?;
     let graph_nonce = graph.parameters.graph_nonce;
     let operator_pubkey = graph.parameters.operator_pubkey.to_string();
-    refresh_and_compensate(deps, instance_id, graph_id, &graph).await;
+    try_refresh_graph(deps, instance_id, graph_id, &graph).await;
 
     let mut ack_peers = committee_ack_peers();
     ack_peers.extend(selected_verifier_peers(deps, instance_id, graph_id).await?);
@@ -1370,7 +1370,7 @@ async fn graph_identity(deps: &GraphJobDeps, graph_id: Uuid) -> Result<Option<(U
 /// Reconcile the finalized graph against both chains; a failure here is only
 /// logged, the finalized definition is already stored. What the chain asks
 /// of this node next comes from the graph's chain scans.
-async fn refresh_and_compensate(
+async fn try_refresh_graph(
     deps: &GraphJobDeps,
     instance_id: Uuid,
     graph_id: Uuid,
@@ -2322,7 +2322,7 @@ async fn ingest_finalized(deps: &GraphJobDeps, graph_id: Uuid, params: &[u8]) ->
     .await?;
     mark_graph_as_endorsed(&deps.local_db, instance_id, graph_id).await?;
     let full_graph = BitvmGcGraph::from_simplified(&graph)?;
-    refresh_and_compensate(deps, instance_id, graph_id, &full_graph).await;
+    try_refresh_graph(deps, instance_id, graph_id, &full_graph).await;
     let operator_pubkey = graph.parameters.operator_pubkey.to_string();
     let mut plan = GraphPlan {
         notify_instance_endorsed: true,

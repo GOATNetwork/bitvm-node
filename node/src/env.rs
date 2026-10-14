@@ -803,7 +803,7 @@ pub fn get_p2p_max_per_peer() -> u32 {
     p2p_connection_limit(ENV_P2P_MAX_CONNECTIONS_PER_PEER, DEFAULT_P2P_MAX_CONNECTIONS_PER_PEER)
 }
 
-pub fn get_p2p_inbox_max_queued_bytes() -> i64 {
+pub fn get_p2p_inbox_max_bytes() -> i64 {
     std::env::var(ENV_P2P_INBOX_MAX_QUEUED_BYTES)
         .ok()
         .and_then(|value| value.parse::<i64>().ok())

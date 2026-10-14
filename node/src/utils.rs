@@ -1,4 +1,6 @@
-use crate::action::{GOATMessage, GOATMessageContent, NodeInfo, SolderingProofReady, send_to_peer};
+use crate::action::{
+    GOATMessage, GOATMessageContent, NodeInfo, SolderingProofReady, publish_to_role,
+};
 use crate::env::*;
 use crate::error::SpecialError;
 use crate::middleware::AllBehaviours;
@@ -1528,7 +1530,7 @@ pub(crate) async fn scan_graph_chain_state(
 
         let watchtower_challenge_init_txid = graph.watchtower_challenge_init.tx().compute_txid();
         let watchtower_challenge_init_on_chain =
-            tx_on_chain(btc_client, &watchtower_challenge_init_txid).await?;
+            tx_visible(btc_client, &watchtower_challenge_init_txid).await?;
         if watchtower_challenge_init_on_chain {
             for watchtower_index in 0..watchtower_num {
                 let watchtower_vout =
@@ -1558,7 +1560,7 @@ pub(crate) async fn scan_graph_chain_state(
             });
         }
         let operator_assert_txid = graph.operator_assert.tx().compute_txid();
-        let operator_assert_on_chain = tx_on_chain(btc_client, &operator_assert_txid).await?;
+        let operator_assert_on_chain = tx_visible(btc_client, &operator_assert_txid).await?;
         if !operator_assert_on_chain {
             return Ok(GraphChainScan {
                 status: current_status,
@@ -1598,7 +1600,7 @@ pub(crate) async fn scan_graph_chain_state(
         for verifier_index in 0..verifier_num {
             let verifier_assert_txid = graph.verifier_asserts[verifier_index].tx().compute_txid();
             let disprove_txid = graph.disproves[verifier_index].tx().compute_txid();
-            if tx_on_chain(btc_client, &verifier_assert_txid).await? {
+            if tx_visible(btc_client, &verifier_assert_txid).await? {
                 if let Some(spent_txid) =
                     outpoint_spent_confirmed(btc_client, &verifier_assert_txid, 0).await?
                 {
@@ -3024,12 +3026,12 @@ pub async fn operator_skip_graph(btc_client: &BTCClient, graph: &mut BitvmGcGrap
     )? {
         Some(skip_kickoff_tx) => {
             let skip_kickoff_txid = skip_kickoff_tx.compute_txid();
-            if !tx_on_chain(btc_client, &prekickoff_txid).await? {
+            if !tx_visible(btc_client, &prekickoff_txid).await? {
                 broadcast_package(btc_client, &[prekickoff_tx, skip_kickoff_tx], true).await?;
                 if let Some(child_tx) = child_tx {
                     broadcast_tx(btc_client, &child_tx).await?;
                 }
-            } else if !tx_on_chain(btc_client, &skip_kickoff_txid).await? {
+            } else if !tx_visible(btc_client, &skip_kickoff_txid).await? {
                 if let Some(child_tx) = child_tx {
                     broadcast_package(btc_client, &[skip_kickoff_tx, child_tx], true).await?;
                 } else {
@@ -3039,12 +3041,12 @@ pub async fn operator_skip_graph(btc_client: &BTCClient, graph: &mut BitvmGcGrap
         }
         None => match child_tx {
             Some(tx) => {
-                if !tx_on_chain(btc_client, &prekickoff_txid).await? {
+                if !tx_visible(btc_client, &prekickoff_txid).await? {
                     broadcast_package(btc_client, &[prekickoff_tx, tx], true).await?;
                 }
             }
             None => {
-                if !tx_on_chain(btc_client, &prekickoff_txid).await? {
+                if !tx_visible(btc_client, &prekickoff_txid).await? {
                     broadcast_tx(btc_client, &prekickoff_tx).await?;
                 }
             }
@@ -3089,10 +3091,10 @@ pub async fn operator_kickoff(btc_client: &BTCClient, graph: &mut BitvmGcGraph) 
 
     // If a tx is already on-chain, skip rebroadcasting and move to the next one.
     let mut kickoff_child_broadcasted = false;
-    if !tx_on_chain(btc_client, &prekickoff_txid).await? {
+    if !tx_visible(btc_client, &prekickoff_txid).await? {
         // Parent not on-chain yet: broadcast parent and kickoff together as a package.
         broadcast_package(btc_client, &[prekickoff_tx, kickoff_tx], true).await?;
-    } else if !tx_on_chain(btc_client, &kickoff_txid).await? {
+    } else if !tx_visible(btc_client, &kickoff_txid).await? {
         // Parent is on-chain, but kickoff isn't: try kickoff (and its CPFP child if present).
         if let Some(child) = kickoff_child_tx.as_ref() {
             broadcast_package(btc_client, &[kickoff_tx, child.clone()], true).await?;
@@ -3103,7 +3105,7 @@ pub async fn operator_kickoff(btc_client: &BTCClient, graph: &mut BitvmGcGraph) 
     }
 
     // Ensure both transactions are seen on-chain and then handle CPFP children.
-    if !tx_on_chain(btc_client, &prekickoff_txid).await? {
+    if !tx_visible(btc_client, &prekickoff_txid).await? {
         bail!("prekickoff tx not on chain after broadcasting");
     }
     if let Some(prekickoff_child_tx) = prekickoff_child_tx
@@ -3111,7 +3113,7 @@ pub async fn operator_kickoff(btc_client: &BTCClient, graph: &mut BitvmGcGraph) 
     {
         tracing::warn!("failed to broadcast prekickoff child tx: {e}");
     }
-    if !tx_on_chain(btc_client, &kickoff_txid).await? {
+    if !tx_visible(btc_client, &kickoff_txid).await? {
         bail!("kickoff tx not on chain after broadcasting");
     }
     if !kickoff_child_broadcasted
@@ -3311,8 +3313,8 @@ pub fn verify_verifier_graph_params_endorsement(
         .is_ok())
 }
 
-/// Validates whether the given kickoff transaction has been confirmed on Layer 1.
-pub async fn tx_on_chain(client: &BTCClient, txid: &Txid) -> Result<bool> {
+/// Whether the backend knows the transaction: confirmed, or still in its mempool.
+pub async fn tx_visible(client: &BTCClient, txid: &Txid) -> Result<bool> {
     match client.get_tx(txid).await? {
         Some(_) => Ok(true),
         _ => Ok(false),
@@ -3600,7 +3602,7 @@ pub async fn detect_heart_beat(swarm: &mut Swarm<AllBehaviours>) -> Result<()> {
     // send to actor
     let actors = get_rpc_support_actors();
     for actor in actors {
-        match send_to_peer(swarm, GOATMessage::new(actor, message_content.clone())).await {
+        match publish_to_role(swarm, GOATMessage::new(actor, message_content.clone())).await {
             Ok(_) => {}
             Err(err) => warn!("{err}"),
         }

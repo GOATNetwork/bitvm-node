@@ -93,8 +93,8 @@ pub struct FetchedGraph {
     pub finalized: bool,
 }
 
-/// Candidate peers in the order the spec prescribes: relayer / committee
-/// first, the operator last.
+/// Candidate peers: the registered committee members first, then the
+/// graph's operator when its key is known (slot lookups), never this node.
 pub fn fetch_candidates(operator_pubkey: Option<&str>) -> Vec<PeerId> {
     let now = std::time::Instant::now();
     let registry = crate::p2p_admission::peer_registry();

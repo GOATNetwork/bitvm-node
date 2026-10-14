@@ -35,7 +35,7 @@ use crate::utils::{
     local_committee_membership, order_committee_values, read_instance_info_from_goat,
     read_pegin_request, store_committee_agg_nonce_consensus_for_instance,
     store_committee_endorse_sig_for_pegin, store_committee_partial_sig_for_instance,
-    store_committee_pub_nonce_for_instance, store_instance_parameters, tx_on_chain,
+    store_committee_pub_nonce_for_instance, store_instance_parameters, tx_visible,
     validate_committee, verify_pegin_endorsement,
 };
 use anyhow::{Context, Result, anyhow, bail};
@@ -417,7 +417,7 @@ async fn confirm_instance(deps: &InstanceJobDeps, instance_id: Uuid) -> Result<S
     }
     let instance_params = read_instance_info_from_goat(&deps.goat_client, instance_id).await?;
     let pegin_deposit_txid = instance_params.build_pegin_tx()?.0.tx().compute_txid();
-    if !tx_on_chain(&deps.btc_client, &pegin_deposit_txid).await? {
+    if !tx_visible(&deps.btc_client, &pegin_deposit_txid).await? {
         // The scan saw the Prepare confirmed; the backend is lagging.
         return Step::retry(
             format!("pegin deposit tx {pegin_deposit_txid} not found on chain yet"),

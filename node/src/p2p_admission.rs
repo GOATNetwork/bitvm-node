@@ -92,30 +92,30 @@ impl Quota {
 pub struct InboundLimits {
     pub max_json_bytes: usize,
     pub max_binary_bytes: usize,
-    /// Every queued row, whatever its class.
+    /// Every stored network event, whatever its class.
     pub global: Quota,
-    /// Global queue capacity reserved for committee.
+    /// Part of the global budget only committee senders may fill.
     pub committee_reserve: Quota,
-    /// Every queued row of one registered sender, in whichever class.
+    /// Every stored network event of one registered sender, in whichever class.
     pub registered_peer: Quota,
 }
 
 impl InboundLimits {
     /// Derive byte quotas from the global ceiling; row limits remain fixed.
-    pub fn with_queued_bytes(max_json_bytes: usize, max_queued_bytes: i64) -> Self {
+    pub fn with_inbox_bytes(max_json_bytes: usize, max_inbox_bytes: i64) -> Self {
         Self {
             max_json_bytes,
             max_binary_bytes: MAX_GOSSIPSUB_TRANSMIT_SIZE,
-            global: Quota { rows: 16_384, bytes: max_queued_bytes },
-            committee_reserve: Quota { rows: 4_096, bytes: max_queued_bytes / 4 },
-            registered_peer: Quota { rows: 1_024, bytes: max_queued_bytes / 8 },
+            global: Quota { rows: 16_384, bytes: max_inbox_bytes },
+            committee_reserve: Quota { rows: 4_096, bytes: max_inbox_bytes / 4 },
+            registered_peer: Quota { rows: 1_024, bytes: max_inbox_bytes / 8 },
         }
     }
 
     pub fn from_env() -> Self {
-        Self::with_queued_bytes(
+        Self::with_inbox_bytes(
             crate::env::get_p2p_max_json_message_bytes(),
-            crate::env::get_p2p_inbox_max_queued_bytes(),
+            crate::env::get_p2p_inbox_max_bytes(),
         )
     }
 }
@@ -563,7 +563,6 @@ impl PeerRegistry {
         looked_up && !self.sender_class(peer, now).is_registered()
     }
 
-    /// Registered verifier peer IDs; `None` means not yet fetched.
     /// Committee peers the cache currently holds as registered, for ack sets.
     pub fn committee_peer_ids(&self, now: Instant) -> Vec<PeerId> {
         let state = self.lock();
@@ -2382,7 +2381,7 @@ mod tests {
         );
         let bytes = message.serialize_message().await.unwrap();
         assert!(GOATMessage::is_binary_envelope(&bytes));
-        let limits = InboundLimits::with_queued_bytes(2 << 20, 2 << 30);
+        let limits = InboundLimits::with_inbox_bytes(2 << 20, 2 << 30);
         assert!(bytes.len() > limits.max_json_bytes, "GenCircuits is {} bytes", bytes.len());
         assert!(
             bytes.len() * 5 <= limits.max_binary_bytes * 4,
@@ -2451,7 +2450,7 @@ mod tests {
 
     #[test]
     fn derived_quotas_nest_inside_the_global_ceiling() {
-        let limits = InboundLimits::with_queued_bytes(2 << 20, 2 << 30);
+        let limits = InboundLimits::with_inbox_bytes(2 << 20, 2 << 30);
         assert!(limits.registered_peer.bytes < limits.global.bytes);
         assert!(limits.committee_reserve.bytes < limits.global.bytes);
         assert!(limits.registered_peer.rows < limits.global.rows);

@@ -35,7 +35,7 @@ pub const PHASE_SETTLEMENT: &str = "Settlement";
 pub const JOB_KICKOFF: &str = "kickoff";
 pub const JOB_SETTLE_PREDECESSORS: &str = "settle_predecessors";
 // Settlement, by the signal that triggers them.
-pub const JOB_CHECK_PREVIOUS_GRAPH: &str = "check_previous_graph";
+pub const JOB_ENFORCE_PREVIOUS_SLOT: &str = "enforce_previous_slot";
 pub const JOB_PROCEED_WITHDRAW: &str = "proceed_withdraw";
 pub const JOB_CHALLENGE_KICKOFF: &str = "challenge_kickoff";
 pub const JOB_WATCHTOWER_CHALLENGE_INIT: &str = "watchtower_challenge_init";
@@ -59,7 +59,7 @@ pub const JOB_FINISH_UNHAPPY: &str = "finish_unhappy";
 pub const PEGOUT_JOBS: &[&str] = &[
     JOB_KICKOFF,
     JOB_SETTLE_PREDECESSORS,
-    JOB_CHECK_PREVIOUS_GRAPH,
+    JOB_ENFORCE_PREVIOUS_SLOT,
     JOB_PROCEED_WITHDRAW,
     JOB_CHALLENGE_KICKOFF,
     JOB_WATCHTOWER_CHALLENGE_INIT,
@@ -259,7 +259,7 @@ pub fn route_signal(
     use Actor::{Committee, Operator, Verifier, Watchtower};
     use PegoutSignal::*;
     Some(match (signal, actor) {
-        (PreKickoffSent, Verifier) => JOB_CHECK_PREVIOUS_GRAPH,
+        (PreKickoffSent, Verifier) => JOB_ENFORCE_PREVIOUS_SLOT,
         (KickoffSent, Committee) if relayer => JOB_PROCEED_WITHDRAW,
         (KickoffSent, Verifier) => JOB_CHALLENGE_KICKOFF,
         (ChallengeSent { .. }, Operator) if own => JOB_WATCHTOWER_CHALLENGE_INIT,
@@ -302,7 +302,7 @@ pub fn decide_status(scan: &ChainScan, instance_failed: bool) -> Option<GraphSta
 
 /// How a Kickoff Connector was spent.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum KickoffConnector {
+pub enum KickoffConnectorSpend {
     /// Unspent, or its Pre-Kickoff is not on chain.
     #[default]
     Unspent,
@@ -327,7 +327,7 @@ pub struct LocalSlot {
 pub struct SlotFacts {
     pub slot: u64,
     pub local: Option<LocalSlot>,
-    pub kickoff_connector: KickoffConnector,
+    pub kickoff_connector: KickoffConnectorSpend,
     /// An input of the slot's Pre-Kickoff was spent by another transaction.
     pub prekickoff_dead: bool,
     /// L2 `GraphData` of the graph is posted.
@@ -368,10 +368,12 @@ pub fn decide_slot(facts: &SlotFacts, operator_pubkey: &str) -> SlotVerdict {
             graph_nonce: slot,
         });
     };
-    if facts.kickoff_connector == KickoffConnector::ByOther || local.status.is_closed() {
+    if facts.kickoff_connector == KickoffConnectorSpend::ByOther || local.status.is_closed() {
         return SlotVerdict::Settled;
     }
-    if facts.kickoff_connector == KickoffConnector::ByKickoff || local.status.is_pegout_started() {
+    if facts.kickoff_connector == KickoffConnectorSpend::ByKickoff
+        || local.status.is_pegout_started()
+    {
         return SlotVerdict::Wait(format!("slot {slot} is in peg-out"));
     }
     if facts.prekickoff_dead {
@@ -696,7 +698,7 @@ mod tests {
         assert_eq!(route_signal(&Take1Sent, &Committee, false, false), None);
         assert_eq!(
             route_signal(&PreKickoffSent, &Verifier, false, false),
-            Some(JOB_CHECK_PREVIOUS_GRAPH)
+            Some(JOB_ENFORCE_PREVIOUS_SLOT)
         );
         assert_eq!(
             route_signal(&KickoffSent, &Verifier, false, false),
@@ -838,7 +840,7 @@ mod tests {
         use InstanceBridgeInStatus::*;
         // Skipped or force-skipped on chain, or closed locally: settled.
         let mut facts = local(Obsoleted, true, Timeout);
-        facts.kickoff_connector = KickoffConnector::ByOther;
+        facts.kickoff_connector = KickoffConnectorSpend::ByOther;
         assert_eq!(decide_slot(&facts, "op"), SlotVerdict::Settled);
         assert_eq!(
             decide_slot(&local(OperatorTake1, true, RelayerL2Minted), "op"),
@@ -846,7 +848,7 @@ mod tests {
         );
         // Kicked off: wait for its settlement, never skip.
         let mut facts = local(Obsoleted, true, RelayerL2Minted);
-        facts.kickoff_connector = KickoffConnector::ByKickoff;
+        facts.kickoff_connector = KickoffConnectorSpend::ByKickoff;
         facts.connector_zero_taken = true;
         assert!(matches!(decide_slot(&facts, "op"), SlotVerdict::Wait(_)));
         // Posted and available: the successor waits (withdraw it first).

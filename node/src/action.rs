@@ -4,7 +4,7 @@
 //! publish function every sender goes through.
 
 use crate::aggregates::graph::inbound_event;
-use crate::handle::{HandlerContext, dispatch as handle_dispatch};
+use crate::handle::{ControlContext, dispatch_control};
 use crate::metrics_service::MetricsState;
 use crate::middleware::AllBehaviours;
 use crate::middleware::publisher::MessagePublisher;
@@ -424,7 +424,7 @@ impl GOATMessage {
                 message.append(&mut encoded);
                 Ok(message)
             } else {
-                serde_json::to_vec(&cloned).context("failed to serialize legacy JSON GOATMessage")
+                serde_json::to_vec(&cloned).context("failed to serialize JSON GOATMessage")
             }
         })
         .await?
@@ -441,8 +441,7 @@ impl GOATMessage {
             if let Some(encoded) = cloned.strip_prefix(GOAT_MESSAGE_BIN_PREFIX) {
                 bincode::deserialize(encoded).context("failed to deserialize bincode GOATMessage")
             } else {
-                serde_json::from_slice(&cloned)
-                    .context("failed to deserialize legacy JSON GOATMessage")
+                serde_json::from_slice(&cloned).context("failed to deserialize JSON GOATMessage")
             }
         })
         .await?
@@ -609,10 +608,10 @@ pub(crate) async fn dispatch_immediate_message(
 ) -> Result<()> {
     let message_type = message.content.event_type();
     let started_at = Instant::now();
-    let mut handler_ctx = HandlerContext { publisher, local_db, goat_client, from_peer_id };
+    let mut handler_ctx = ControlContext { publisher, local_db, goat_client, from_peer_id };
     let result = match tokio::time::timeout(
         IMMEDIATE_DISPATCH_TIMEOUT,
-        handle_dispatch(&mut handler_ctx, message.content()),
+        dispatch_control(&mut handler_ctx, message.content()),
     )
     .await
     {
@@ -867,7 +866,7 @@ pub async fn run_p2p_admission_maintenance(local_db: &LocalDB, goat_client: &Arc
 }
 
 /// Publish one message on its role topic; every sender goes through here.
-pub async fn send_to_peer(
+pub async fn publish_to_role(
     swarm: &mut dyn MessagePublisher,
     message: GOATMessage,
 ) -> Result<MessageId> {

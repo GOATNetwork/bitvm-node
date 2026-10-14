@@ -338,7 +338,7 @@ pub async fn gather_chain_scan(
     } else {
         None
     };
-    let mut signals = edge_signals(&chain);
+    let mut signals = stage_signals(&chain);
     match chain.status {
         GraphStatus::OperatorKickOff => {
             let timelocks = graph_timelocks(&graph)?;
@@ -449,7 +449,7 @@ pub async fn connector_zero_taken(
 }
 
 /// Signals implied by chain progress, including stages crossed between scans.
-fn edge_signals(chain: &GraphChainScan) -> Vec<PegoutSignal> {
+fn stage_signals(chain: &GraphChainScan) -> Vec<PegoutSignal> {
     use GraphStatus::*;
     let stage = chain.status;
     let mut signals = Vec::new();
@@ -883,11 +883,11 @@ mod tests {
 
     #[test]
     fn edges_follow_the_chain_stage() {
-        assert!(edge_signals(&chain(OperatorDataPushed)).is_empty());
-        assert_eq!(edge_signals(&chain(PreKickoff)), vec![PegoutSignal::PreKickoffSent]);
-        assert_eq!(edge_signals(&chain(Skipped)), vec![PegoutSignal::PreKickoffSent]);
+        assert!(stage_signals(&chain(OperatorDataPushed)).is_empty());
+        assert_eq!(stage_signals(&chain(PreKickoff)), vec![PegoutSignal::PreKickoffSent]);
+        assert_eq!(stage_signals(&chain(Skipped)), vec![PegoutSignal::PreKickoffSent]);
         assert_eq!(
-            edge_signals(&chain(OperatorTake1)),
+            stage_signals(&chain(OperatorTake1)),
             vec![PegoutSignal::PreKickoffSent, PegoutSignal::KickoffSent, PegoutSignal::Take1Sent]
         );
         let challenge_txid = Txid::from_str(&"44".repeat(32)).unwrap();
@@ -898,7 +898,7 @@ mod tests {
             index: 1,
             challenge_finish_txid: challenge_txid,
         });
-        let signals = edge_signals(&disproved);
+        let signals = stage_signals(&disproved);
         assert!(signals.contains(&PegoutSignal::ChallengeSent { challenge_txid }));
         assert!(signals.iter().any(|signal| matches!(
             signal,

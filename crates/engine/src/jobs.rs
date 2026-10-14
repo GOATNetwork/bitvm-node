@@ -248,8 +248,8 @@ async fn execute_job(deps: ExecutorDeps, job: EngineJob, cancel: CancellationTok
             }
             Err(error) => {
                 attempt += 1;
-                let lease_lost = cancel.is_cancelled();
-                if lease_lost {
+                let cancelled = cancel.is_cancelled();
+                if cancelled {
                     attempts_after_loss += 1;
                 }
                 warn!(
@@ -258,7 +258,7 @@ async fn execute_job(deps: ExecutorDeps, job: EngineJob, cancel: CancellationTok
                     job_id = %job.job_id,
                     generation,
                     attempt,
-                    lease_lost,
+                    cancelled,
                     error = %error,
                     "could not record job completion; retrying"
                 );
@@ -280,7 +280,7 @@ async fn execute_job(deps: ExecutorDeps, job: EngineJob, cancel: CancellationTok
         generation,
         attempts = attempt,
         error = %last_error,
-        "could not record job completion before the lease was lost; a newer holder re-runs the job"
+        "could not record job completion before the lease was lost or the engine stopped; a newer holder re-runs the job"
     );
 }
 

@@ -543,8 +543,9 @@ pub fn signing_round_over(status: Option<GraphStatus>) -> bool {
     status.is_some_and(|status| !matches!(status, GraphStatus::OperatorPresigned))
 }
 
-/// Posted or later: every delivery of the graph is closed.
-pub fn posted_or_later(status: Option<GraphStatus>) -> bool {
+/// Past the signing phases (posted, obsoleted or skipped): every delivery
+/// of the graph is closed.
+pub fn past_signing(status: Option<GraphStatus>) -> bool {
     status.is_some_and(|status| {
         !matches!(status, GraphStatus::OperatorPresigned | GraphStatus::CommitteePresigned)
     })
@@ -659,14 +660,14 @@ impl GraphAggregate {
         if self.membership.is_registered_peer(&inbound.author) {
             let params = bincode::serialize(&lookup)
                 .map_err(|error| anyhow!("encode graph lookup: {error}"))?;
-            self.ingest_job(ctx, JOB_FETCH_GRAPH, &params);
+            self.enqueue_setup_job(ctx, JOB_FETCH_GRAPH, &params);
         } else {
             debug!(event = "graph_apply", graph_id = %graph_id, author = %inbound.author, detail = %waiting.detail, "author is not a registered peer; waiting without a pull");
         }
         Ok(ApplyOutcome::Waiting(waiting))
     }
 
-    fn ingest_job(&self, ctx: &mut ApplyContext<'_>, action: &str, payload: &[u8]) {
+    fn enqueue_setup_job(&self, ctx: &mut ApplyContext<'_>, action: &str, payload: &[u8]) {
         ctx.effects.enqueue_job(JobSpec::new(
             &ctx.aggregate,
             JOB_PHASE,
@@ -812,7 +813,7 @@ impl GraphAggregate {
             }
             _ => {}
         }
-        self.ingest_job(ctx, action, payload);
+        self.enqueue_setup_job(ctx, action, payload);
         Ok(ApplyOutcome::Applied)
     }
 
@@ -960,7 +961,7 @@ impl GraphAggregate {
                 format!("graph {builder} is building slot {slot}"),
             )));
         }
-        self.ingest_job(ctx, JOB_BUILD_GRAPH, &[]);
+        self.enqueue_setup_job(ctx, JOB_BUILD_GRAPH, &[]);
         Ok(ApplyOutcome::Applied)
     }
 
@@ -1052,7 +1053,7 @@ impl GraphAggregate {
                     );
                 }
             }
-            if posted_or_later(status) {
+            if past_signing(status) {
                 ctx.effects.close_outbox(
                     EngineOutboxCloseTarget::Aggregate {
                         aggregate_kind: GRAPH_KIND.to_string(),
@@ -1138,7 +1139,7 @@ impl AggregateHandler for GraphAggregate {
                     // built, to start.
                     state.instance_id = Some(start.instance_id);
                     state.operator_pubkey = Some(start.operator_pubkey.clone());
-                    self.ingest_job(ctx, JOB_OPERATOR_INIT, payload);
+                    self.enqueue_setup_job(ctx, JOB_OPERATOR_INIT, payload);
                     ApplyOutcome::Applied
                 }
             }
@@ -1156,7 +1157,7 @@ impl AggregateHandler for GraphAggregate {
                 }
                 // Pulled definitions lack EVM endorsements. Keep accepting GraphFinalize for
                 // those endorsements, and queue publishing for a finalized, unposted copy.
-                if self.relayer && pulled.finalized && !posted_or_later(status) {
+                if self.relayer && pulled.finalized && !past_signing(status) {
                     ctx.effects.enqueue_job(JobSpec::new(
                         &ctx.aggregate,
                         PHASE_POST,
@@ -1204,7 +1205,7 @@ impl AggregateHandler for GraphAggregate {
                 if row.is_none() {
                     let params = bincode::serialize(&pull.lookup)
                         .map_err(|error| anyhow::anyhow!("encode graph lookup: {error}"))?;
-                    self.ingest_job(ctx, JOB_FETCH_GRAPH, &params);
+                    self.enqueue_setup_job(ctx, JOB_FETCH_GRAPH, &params);
                 }
                 ApplyOutcome::Applied
             }
@@ -1395,9 +1396,7 @@ mod tests {
         assert!(
             signing_round_over(Some(CommitteePresigned)) && signing_round_over(Some(Obsoleted))
         );
-        assert!(
-            !posted_or_later(Some(CommitteePresigned)) && posted_or_later(Some(OperatorDataPushed))
-        );
+        assert!(!past_signing(Some(CommitteePresigned)) && past_signing(Some(OperatorDataPushed)));
         assert!(
             retired(Some(Obsoleted)) && retired(Some(OperatorTake1)) && !retired(Some(PreKickoff))
         );

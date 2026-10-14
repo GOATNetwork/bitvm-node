@@ -470,7 +470,7 @@ async fn apply_gateway_graph_status<'a>(
             Ok(GraphStatusTransitionOutcome::Rejected { current })
         }
         GraphStatusTransitionOutcome::NotFound => {
-            warn!("ignore gateway graph event for missing graph {graph_id}: target={target}");
+            warn!("no local row for graph {graph_id}; gateway event ignored: target={target}");
             Ok(GraphStatusTransitionOutcome::NotFound)
         }
     }
@@ -702,7 +702,7 @@ async fn handle_committee_response_events<'a>(
                         )
                         .await?;
                 } else {
-                    warn!("committee_pubkey length is not 32 bytes: {}", event.committee_pubkey);
+                    warn!("committee_pubkey length is not 33 bytes: {}", event.committee_pubkey);
                 }
             } else {
                 warn!("failed to decode committee_pubkey: {}", event.committee_pubkey);

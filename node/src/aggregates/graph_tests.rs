@@ -1206,7 +1206,7 @@ async fn only_the_owning_operator_acts_on_a_withdraw() {
 async fn a_chain_scan_records_the_stage_and_runs_each_roles_job() {
     let signals = vec![PegoutSignal::PreKickoffSent, PegoutSignal::KickoffSent];
     for (actor, relayer, expected) in [
-        (Actor::Verifier, false, vec![JOB_CHECK_PREVIOUS_GRAPH, JOB_CHALLENGE_KICKOFF]),
+        (Actor::Verifier, false, vec![JOB_ENFORCE_PREVIOUS_SLOT, JOB_CHALLENGE_KICKOFF]),
         (Actor::Committee, true, vec![JOB_PROCEED_WITHDRAW]),
         (Actor::Committee, false, vec![]),
         (Actor::Watchtower, false, vec![]),
@@ -1237,7 +1237,7 @@ async fn a_chain_scan_records_the_stage_and_runs_each_roles_job() {
         expected.sort();
         assert_eq!(called, expected, "{actor} relayer={relayer}");
         if actor == Actor::Verifier {
-            let check = PegoutSignal::decode(&t.job_params(JOB_CHECK_PREVIOUS_GRAPH)).unwrap();
+            let check = PegoutSignal::decode(&t.job_params(JOB_ENFORCE_PREVIOUS_SLOT)).unwrap();
             assert_eq!(check, PegoutSignal::PreKickoffSent);
         }
         t.stop().await;
@@ -1347,7 +1347,7 @@ async fn an_obsoleted_graph_stays_monitored_and_follows_the_chain() {
     );
     t.submit(prekicked.event(graph_id).unwrap()).await;
     t.wait_status(graph_id, GraphStatus::PreKickoff).await;
-    t.wait_job(graph_id, JOB_CHECK_PREVIOUS_GRAPH, EngineJobState::Done).await;
+    t.wait_job(graph_id, JOB_ENFORCE_PREVIOUS_SLOT, EngineJobState::Done).await;
     // Skipped: closed, out of the monitoring set.
     let skipped = scan(
         13,
@@ -1359,7 +1359,7 @@ async fn an_obsoleted_graph_stays_monitored_and_follows_the_chain() {
     t.submit(skipped.event(graph_id).unwrap()).await;
     t.wait_status(graph_id, GraphStatus::Skipped).await;
     t.wait_phase(graph_id, PHASE_CLOSED).await;
-    assert_eq!(t.called(JOB_CHECK_PREVIOUS_GRAPH).len(), 1, "a signal runs its job once");
+    assert_eq!(t.called(JOB_ENFORCE_PREVIOUS_SLOT).len(), 1, "a signal runs its job once");
     t.stop().await;
 }
 

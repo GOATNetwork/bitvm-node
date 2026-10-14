@@ -1,6 +1,6 @@
-//! Control message handling: ACKs update the engine outbox, and NodeInfo
-//! messages update peer information and registration. Durable business messages
-//! are submitted to the engine.
+//! Control message handling: ACKs settle the engine outbox, NodeInfo messages
+//! update peer information and registration. Every other message kind is
+//! recorded for the engine by `action::handle_inbound_p2p_message`.
 
 use crate::action::*;
 use crate::middleware::publisher::MessagePublisher;
@@ -14,7 +14,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use store::localdb::LocalDB;
 
-pub struct HandlerContext<'a> {
+pub struct ControlContext<'a> {
     /// `Sync` so handlers may hold the context across awaits in a `Send` task.
     pub publisher: &'a mut (dyn MessagePublisher + Sync),
     pub local_db: &'a LocalDB,
@@ -22,7 +22,10 @@ pub struct HandlerContext<'a> {
     pub from_peer_id: PeerId,
 }
 
-pub async fn dispatch(ctx: &mut HandlerContext<'_>, content: &GOATMessageContent) -> Result<()> {
+pub async fn dispatch_control(
+    ctx: &mut ControlContext<'_>,
+    content: &GOATMessageContent,
+) -> Result<()> {
     match content {
         GOATMessageContent::GraphSetupAck(GraphSetupAck { delivery_id }) => {
             // ACKs settle the engine outbox.
@@ -51,7 +54,7 @@ pub async fn dispatch(ctx: &mut HandlerContext<'_>, content: &GOATMessageContent
 /// A `NodeInfo` payload is entirely self-declared, so only accept it as the
 /// sender's own record: the registry is keyed by `peer_id`, and without this
 /// check any peer could overwrite any other node's row.
-fn accept_node_info(ctx: &HandlerContext<'_>, node_info: &NodeInfo, message_kind: &str) -> bool {
+fn accept_node_info(ctx: &ControlContext<'_>, node_info: &NodeInfo, message_kind: &str) -> bool {
     let Err(reason) = check_node_info(ctx, node_info) else {
         return true;
     };
@@ -69,7 +72,7 @@ fn accept_node_info(ctx: &HandlerContext<'_>, node_info: &NodeInfo, message_kind
 }
 
 fn check_node_info(
-    ctx: &HandlerContext<'_>,
+    ctx: &ControlContext<'_>,
     node_info: &NodeInfo,
 ) -> std::result::Result<(), String> {
     if !node_info_matches_sender(node_info, &ctx.from_peer_id) {
@@ -125,7 +128,7 @@ async fn learn_node_info_binding(
 }
 
 /// Store accepted NodeInfo within the unregistered-row limit and learn its binding.
-async fn record_node_info(ctx: &HandlerContext<'_>, node_info: &NodeInfo) -> Result<()> {
+async fn record_node_info(ctx: &ControlContext<'_>, node_info: &NodeInfo) -> Result<()> {
     let registered = crate::p2p_admission::peer_registry()
         .sender_class(&ctx.from_peer_id, std::time::Instant::now())
         .is_registered();
@@ -162,7 +165,7 @@ async fn record_node_info(ctx: &HandlerContext<'_>, node_info: &NodeInfo) -> Res
 }
 
 async fn handle_request_node_info(
-    ctx: &mut HandlerContext<'_>,
+    ctx: &mut ControlContext<'_>,
     node_info: &NodeInfo,
 ) -> Result<()> {
     if accept_node_info(ctx, node_info, "RequestNodeInfo") {
@@ -179,7 +182,7 @@ async fn handle_request_node_info(
 
 async fn publish_node_info_response(swarm: &mut dyn MessagePublisher) -> Result<()> {
     let message_content = GOATMessageContent::ResponseNodeInfo(crate::env::get_local_node_info());
-    send_to_peer(swarm, GOATMessage::new(Actor::All, message_content)).await?;
+    publish_to_role(swarm, GOATMessage::new(Actor::All, message_content)).await?;
     Ok(())
 }
 
@@ -200,7 +203,7 @@ pub async fn flush_deferred_node_info_response(swarm: &mut dyn MessagePublisher)
 }
 
 async fn handle_response_node_info(
-    ctx: &mut HandlerContext<'_>,
+    ctx: &mut ControlContext<'_>,
     node_info: &NodeInfo,
 ) -> Result<()> {
     if accept_node_info(ctx, node_info, "ResponseNodeInfo") {

@@ -2,7 +2,7 @@
 //! worker for `NodeInfo` and ACKs, the admission maintenance task and the
 //! direct `GetGraph` service. Protocol work runs on the engine.
 
-use crate::action::{GOATMessage, GOATMessageContent, handle_inbound_p2p_message, send_to_peer};
+use crate::action::{GOATMessage, GOATMessageContent, handle_inbound_p2p_message, publish_to_role};
 use crate::env::get_local_node_info;
 use crate::metrics_service::MetricsState;
 use crate::middleware::get_graph::{GetGraphRequest, GetGraphResponse};
@@ -237,7 +237,7 @@ impl P2pMessageHandler for BitvmNodeProcessor {
     ) -> anyhow::Result<()> {
         if topic == Actor::All.to_string() {
             let message_content = GOATMessageContent::RequestNodeInfo(get_local_node_info());
-            match send_to_peer(swarm, GOATMessage::new(Actor::All, message_content)).await {
+            match publish_to_role(swarm, GOATMessage::new(Actor::All, message_content)).await {
                 Ok(_) => {}
                 Err(e) => {
                     println!("finish_subscribe_topic: send request NodeInfo {e}");
@@ -368,7 +368,7 @@ mod tests {
         assert!(!control.enqueue(source, message(), 1));
         assert_eq!(control.bytes.available_permits(), 3, "failed enqueue releases its permits");
     }
-    use crate::action::{GOATMessage, GOATMessageContent, NodeInfo, send_to_peer};
+    use crate::action::{GOATMessage, GOATMessageContent, NodeInfo, publish_to_role};
     use crate::env::get_rpc_support_actors;
     use crate::middleware::swarm::{
         BitvmNetworkManager, BitvmSwarmConfig, BitvmSwarmWrapper, P2pMessageHandler,
@@ -455,7 +455,7 @@ mod tests {
         // send to actor
         let actors = get_rpc_support_actors();
         for actor in actors {
-            match send_to_peer(swarm, GOATMessage::new(actor, message_content.clone())).await {
+            match publish_to_role(swarm, GOATMessage::new(actor, message_content.clone())).await {
                 Ok(_) => {}
                 Err(err) => warn!("{err}"),
             }
