@@ -1,5 +1,5 @@
 mod babe_setup_state_cleanup_task;
-mod event_watch_task;
+mod event_watch;
 mod node_maintenance_tasks;
 mod sequencer_set_hash_monitor_task;
 mod spv_maintenance_tasks;
@@ -24,7 +24,7 @@ use bitvm_lib::actors::Actor;
 use client::btc_chain::BTCClient;
 use client::goat_chain::GOATClient;
 use engine::EngineHandle;
-pub use event_watch_task::{is_processing_gateway_history_events, run_watch_event_task};
+pub use event_watch::{is_processing_gateway_history_events, run_watch_event_task};
 pub use sequencer_set_hash_monitor_task::run_sequencer_set_hash_monitor_task;
 use std::future::Future;
 use std::sync::Arc;
