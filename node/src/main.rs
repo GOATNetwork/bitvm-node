@@ -251,6 +251,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         shutdown_token: cancellation_token.clone(),
         worker: Default::default(),
     };
+    handler.start(bitvm_network_manager.publisher());
 
     tracing::info!(
         event = "service_started",

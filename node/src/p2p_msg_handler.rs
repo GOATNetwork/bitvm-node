@@ -96,14 +96,24 @@ impl WorkerControl {
 }
 
 impl BitvmNodeProcessor {
+    /// Start the control worker and the admission maintenance task. Called at
+    /// boot so maintenance (verifier-set retries, registry refreshes, drop
+    /// summaries) runs before the first gossip message arrives.
+    pub fn start(&self, publisher: NetworkPublisher) {
+        self.worker.get_or_init(|| self.spawn_worker(publisher));
+    }
+
     fn worker(&self, swarm: &BitvmSwarmWrapper) -> &WorkerControl {
-        self.worker.get_or_init(|| {
+        self.worker.get_or_init(|| self.spawn_worker(swarm.publisher()))
+    }
+
+    fn spawn_worker(&self, publisher: NetworkPublisher) -> WorkerControl {
+        {
             // Control dispatch (NodeInfo, ACKs) runs on its own thread, off
             // the network loop; the engine runs everything else.
             let (tx, rx) = mpsc::channel(16);
             let mut processor = self.clone();
             processor.worker = Default::default();
-            let publisher = swarm.publisher();
             let control_processor = processor.clone();
             let control_publisher = publisher.clone();
             let control_join = spawn_isolated_worker(
@@ -119,7 +129,7 @@ impl BitvmNodeProcessor {
                 bytes: Arc::new(Semaphore::new(16 * 1024 * 1024)),
                 joins: tokio::sync::Mutex::new(vec![control_join, maintenance_join]),
             }
-        })
+        }
     }
 
     async fn run_immediate_worker(
@@ -143,8 +153,9 @@ impl BitvmNodeProcessor {
         }
     }
 
-    /// Independently refresh registrations, persist replay marks and report clock skew.
-    /// This task is the sole caller of admission maintenance.
+    /// Refresh registrations, report drops and clock skew, purge stale node
+    /// rows and flush deferred NodeInfo answers. This task is the sole caller
+    /// of admission maintenance.
     async fn run_admission_maintenance(self, mut publisher: NetworkPublisher) {
         let mut clock = tokio::time::interval(std::time::Duration::from_secs(
             crate::env::REGULAR_TASK_INTERVAL_SECOND,

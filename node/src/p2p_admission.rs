@@ -779,6 +779,21 @@ impl PeerRegistry {
         }
     }
 
+    /// Claim only a candidate's committee lookup, using the discovery budget;
+    /// the verifier set is left to [`refresh_registry_in_background`].
+    pub fn plan_candidate_lookup(&self, peer: &PeerId, now: Instant) -> bool {
+        self.lock().claim_committee_lookup(peer, LookupBudget::Candidate, now)
+    }
+
+    /// Whether the registry has never classified `peer`: no committee verdict,
+    /// not in the verifier set and no operator binding.
+    pub fn is_unclassified(&self, peer: &PeerId) -> bool {
+        let state = self.lock();
+        !state.committee.contains_key(peer)
+            && !state.verifiers.contains(&peer.to_bytes())
+            && !state.operators.contains_key(peer)
+    }
+
     /// Claim only the neighbour's committee lookup, using the neighbour budget.
     pub fn plan_neighbour_lookup(&self, peer: &PeerId, now: Instant) -> bool {
         self.lock().claim_committee_lookup(peer, LookupBudget::Neighbour, now)
@@ -1079,10 +1094,31 @@ pub fn refresh_due_registrations_in_background(local_db: &LocalDB, goat_client: 
 /// spent, or before a restart, is classified by the maintenance tick instead
 /// of by its first message.
 const COMMITTEE_CANDIDATES_PER_TICK: u32 = 64;
+const COMMITTEE_CANDIDATE_SCAN_INTERVAL: Duration = Duration::from_secs(60);
+static COMMITTEE_CANDIDATES_SCANNED_AT: Mutex<Option<Instant>> = Mutex::new(None);
 
+fn committee_candidate_scan_due(now: Instant) -> bool {
+    let mut scanned_at =
+        COMMITTEE_CANDIDATES_SCANNED_AT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if scanned_at
+        .is_some_and(|at| now.saturating_duration_since(at) < COMMITTEE_CANDIDATE_SCAN_INTERVAL)
+    {
+        return false;
+    }
+    *scanned_at = Some(now);
+    true
+}
+
+/// Look up the self-declared committee peers the registry has never
+/// classified. Peers with a verdict, registered or not, are refreshed by their
+/// own messages; the scan only covers announcements that arrived while the
+/// discovery budget was spent or before a restart.
 pub async fn revalidate_committee_candidates(local_db: &LocalDB, goat_client: &Arc<GOATClient>) {
     let registry = peer_registry();
     let now = Instant::now();
+    if !committee_candidate_scan_due(now) {
+        return;
+    }
     let candidates = match local_db.acquire().await {
         Ok(mut storage) => {
             storage
@@ -1105,10 +1141,10 @@ pub async fn revalidate_committee_candidates(local_db: &LocalDB, goat_client: &A
     };
     for node in candidates {
         let Ok(peer) = PeerId::from_str(&node.peer_id) else { continue };
-        if registry.sender_class(&peer, now).is_registered() {
+        if !registry.is_unclassified(&peer) {
             continue;
         }
-        if registry.plan_refresh(Some(&peer), now).committee_peer {
+        if registry.plan_candidate_lookup(&peer, now) {
             spawn_committee_lookup(local_db, goat_client, peer);
         }
     }
