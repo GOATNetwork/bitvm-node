@@ -14,6 +14,7 @@ use client::goat_chain::utils::{
     get_committee_management_contract, get_gateway_relay_contracts, is_validate_committee,
 };
 use client::goat_chain::{GoatInitConfig, GoatNetwork};
+use client::timeout_config::get_goat_rpc_timeout_secs;
 use libp2p::PeerId;
 use reqwest::Url;
 use sha2::{Digest, Sha256};
@@ -487,6 +488,44 @@ pub fn get_goat_swap_the_graph_urls_from_env() -> String {
         .unwrap_or("https://graph.goat.network/subgraphs/name/bitvm_escrow_manager_dev".to_string())
 }
 
+const GOAT_BOOT_RETRY_ATTEMPTS: u32 = 12;
+const GOAT_BOOT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Retries a Goat read the node needs to boot, so a restart during a Goat
+/// outage waits for the RPC (about a minute) instead of dying at once.
+async fn retry_at_boot<T, E, F, Fut>(what: &str, rpc_url: &Url, mut call: F) -> Result<T, String>
+where
+    E: std::fmt::Display,
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
+    // The boot provider has no request timeout of its own: bound every call
+    // so a peer that accepts the connection but never answers still retries.
+    let timeout = std::time::Duration::from_secs(get_goat_rpc_timeout_secs());
+    let mut attempt = 1;
+    loop {
+        let error = match tokio::time::timeout(timeout, call()).await {
+            Ok(Ok(value)) => return Ok(value),
+            Ok(Err(error)) => error.to_string(),
+            Err(_) => format!("timed out after {} s", timeout.as_secs()),
+        };
+        if attempt >= GOAT_BOOT_RETRY_ATTEMPTS {
+            return Err(error);
+        }
+        warn!(
+            event = "goat_boot_retry",
+            what,
+            attempt,
+            max_attempts = GOAT_BOOT_RETRY_ATTEMPTS,
+            rpc_url = %rpc_url,
+            error = %error,
+            "Goat RPC unavailable at boot; retrying"
+        );
+        tokio::time::sleep(GOAT_BOOT_RETRY_DELAY).await;
+        attempt += 1;
+    }
+}
+
 pub async fn goat_config_from_env() -> GoatInitConfig {
     let rpc_url = get_goat_url_from_env();
     let private_key = std::env::var(ENV_GOAT_PRIVATE_KEY).ok();
@@ -499,11 +538,13 @@ pub async fn goat_config_from_env() -> GoatInitConfig {
         peg_btc_address,
     ) = {
         let provider = ProviderBuilder::new().connect_http(rpc_url.clone());
-        let chain_id = provider
-            .get_chain_id()
+        let chain_id = retry_at_boot("eth_chainId", &rpc_url, || provider.get_chain_id())
             .await
-            .unwrap_or_else(|_| panic!("cannot get chain_id from {rpc_url}"))
-            as u32;
+            .unwrap_or_else(|error| {
+                panic!(
+                    "cannot get chain_id from {rpc_url} after {GOAT_BOOT_RETRY_ATTEMPTS} attempts: {error}"
+                )
+            }) as u32;
 
         let (
             committee_management_address,
@@ -512,9 +553,13 @@ pub async fn goat_config_from_env() -> GoatInitConfig {
             peg_btc_address,
         ) = if let Some(gateway_address) = gateway_address {
             let (committee_management_address, stake_management_address, btc_spv_address, peg_btc_address) =
-                    get_gateway_relay_contracts(&provider, gateway_address).await.expect(
-                        "fail to get committee, stake management, btc spv, peg btc contract online addresses",
-                    );
+                retry_at_boot("gateway relay contracts", &rpc_url, || {
+                    get_gateway_relay_contracts(&provider, gateway_address)
+                })
+                .await
+                .expect(
+                    "fail to get committee, stake management, btc spv, peg btc contract online addresses",
+                );
             (
                 Some(committee_management_address),
                 Some(stake_management_address),
