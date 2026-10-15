@@ -263,6 +263,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         rpc_addr = %opt.rpc_addr,
         metrics_addr = opt.metrics_addr.as_deref().unwrap_or("disabled"),
         min_required_verifier,
+        btc_chain_url = get_btc_url_from_env().unwrap_or_default(),
+        goat_chain_url = %env::get_goat_url_from_env(),
+        gateway_graph_url = env::get_goat_gateway_the_graph_urls_from_env(),
+        btc_request_timeout_secs = client::timeout_config::get_btc_request_timeout_secs(),
+        goat_rpc_timeout_secs = client::timeout_config::get_goat_rpc_timeout_secs(),
+        http_request_timeout_secs = client::timeout_config::get_http_request_timeout_secs(),
+        maintenance_interval_secs = env::REGULAR_TASK_INTERVAL_SECOND,
         "node initialization completed"
     );
 

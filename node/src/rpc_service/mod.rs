@@ -22,9 +22,9 @@ use crate::rpc_service::handler::{
 };
 use crate::rpc_service::handler::{
     get_chain_proof_desc, get_graph, get_graph_neighbor_ids, get_graph_tx, get_graph_txn,
-    get_graphs, get_instance, get_instances, get_instances_overview, get_node, get_nodes,
-    get_nodes_overview, get_operator_proof_desc, get_ready_to_kickoff_graph, get_swap, get_swaps,
-    get_unsigned_pegin_txn, instance_settings, pegout,
+    get_graphs, get_health, get_instance, get_instances, get_instances_overview, get_node,
+    get_nodes, get_nodes_overview, get_operator_proof_desc, get_ready_to_kickoff_graph, get_swap,
+    get_swaps, get_unsigned_pegin_txn, instance_settings, pegout,
 };
 use anyhow::Context;
 use axum::body::Body;
@@ -148,6 +148,7 @@ async fn root() -> &'static str {
 pub(crate) fn build_business_router(app_state: Arc<AppState>) -> Router {
     let public_routes = Router::new()
         .route(routes::ROOT, get(root))
+        .route(routes::v1::HEALTH, get(get_health))
         .route(routes::v1::NODES_BASE, get(get_nodes))
         .route(routes::v1::NODES_BY_ID, get(get_node))
         .route(routes::v1::NODES_OVERVIEW, get(get_nodes_overview))

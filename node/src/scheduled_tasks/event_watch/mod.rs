@@ -40,10 +40,8 @@ async fn refresh_event_watch_metrics(
     goat_client: &GOATClient,
     metrics_state: &MetricsState,
 ) -> anyhow::Result<()> {
-    let finalized_height = goat_client.get_finalized_block_number().await.map_err(|error| {
-        metrics_state.record_goat_backend_probe(false);
-        warn!(event = "metrics_backend_probe", backend = "goat", operation = "get_finalized_block_number", error = %error, "event watcher lag probe failed");
-        error
+    let finalized_height = goat_client.get_finalized_block_number().await.inspect_err(|error| {
+        metrics_state.backend_probe_failed("goat", "get_finalized_block_number", error);
     })?;
     metrics_state.record_goat_backend_probe(true);
 
@@ -263,7 +261,10 @@ pub async fn monitor_events_item(
         .get_sync_block_height(&watch_contract.the_graph_url)
         .await
     {
-        Ok(Some(v)) => v,
+        Ok(Some(v)) => {
+            crate::metrics_service::record_backend_ok("graph");
+            v
+        }
         Ok(None) => {
             warn!(
                 "monitor_events_item:fail to get graph sync block height, will try later, empty value returned"
@@ -271,8 +272,10 @@ pub async fn monitor_events_item(
             return Ok(());
         }
         Err(e) => {
-            warn!(
-                "monitor_events_item:fail to get graph sync block height, will try later, err:{e:#}"
+            crate::metrics_service::record_backend_failure(
+                "graph",
+                "get_sync_block_height",
+                &format!("{e:#}"),
             );
             return Ok(());
         }
@@ -475,7 +478,11 @@ pub async fn run_watch_event_task(
                                 .await
                                 {
                                     metrics_state.set_event_watch_state(EventWatchState::Failed);
-                                    warn!(event = "metrics_event_watch", error = %error, "failed to refresh event watcher metrics");
+                                    if metrics_state.backend_unavailable("goat") {
+                                        tracing::debug!(event = "metrics_event_watch", error = %error, "failed to refresh event watcher metrics (Goat unavailable)");
+                                    } else {
+                                        warn!(event = "metrics_event_watch", error = %error, "failed to refresh event watcher metrics");
+                                    }
                                 }
                             });
                         }

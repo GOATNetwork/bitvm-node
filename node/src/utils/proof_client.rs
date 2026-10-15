@@ -154,7 +154,11 @@ pub async fn get_watchtower_commitment(
                     )
                 },
             )
-            .await?;
+            .await
+            .inspect(|_| crate::metrics_service::record_backend_ok("proof"))
+            .inspect_err(|error| {
+                crate::metrics_service::record_backend_failure("proof", "watchtower_proofs", error)
+            })?;
         match response.proof_data {
             Some(proof_data) => {
                 let watchtower_commitment = gen_watchtower_commitment(graph_id, proof_data)?;
@@ -471,7 +475,11 @@ pub async fn get_operator_proof(
                 )
             },
         )
-        .await?;
+        .await
+        .inspect(|_| crate::metrics_service::record_backend_ok("proof"))
+        .inspect_err(|error| {
+            crate::metrics_service::record_backend_failure("proof", "operator_proofs", error)
+        })?;
 
     let Some(proof_data) = operator_response.proof_data else {
         if let Some(error) = operator_response.error {

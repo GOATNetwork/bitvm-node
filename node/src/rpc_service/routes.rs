@@ -4,6 +4,8 @@ pub(crate) mod v1 {
     pub const NODES_BASE: &str = "/v1/nodes";
     pub const NODES_BY_ID: &str = "/v1/nodes/{:id}";
     pub const NODES_OVERVIEW: &str = "/v1/nodes/overview";
+    /// Liveness / readiness of this node, served from memory.
+    pub const HEALTH: &str = "/v1/health";
 
     pub const INSTANCES_BASE: &str = "/v1/instances";
     pub const INSTANCES_SETTINGS: &str = "/v1/instances/settings";

@@ -52,15 +52,14 @@ async fn refresh_alert_health(
             Some(height)
         }
         Err(error) => {
-            metrics_state.record_btc_backend_probe(false);
-            warn!(event = "metrics_backend_probe", backend = "btc", error = %error, "BTC backend health probe failed");
+            metrics_state.backend_probe_failed("btc", "get_height", &error);
             None
         }
     };
     let goat_height_healthy = goat_height.is_ok();
-    metrics_state.record_goat_backend_probe(goat_height_healthy);
-    if let Err(error) = goat_height {
-        warn!(event = "metrics_backend_probe", backend = "goat", operation = "get_latest_block_number", error = %error, "Goat backend health probe failed");
+    match &goat_height {
+        Ok(_) => metrics_state.record_goat_backend_probe(true),
+        Err(error) => metrics_state.backend_probe_failed("goat", "get_latest_block_number", error),
     }
     let goat_spv_height = match goat_spv_height {
         Ok(height) => {
@@ -68,8 +67,7 @@ async fn refresh_alert_health(
             Some(height)
         }
         Err(error) => {
-            metrics_state.record_goat_backend_probe(false);
-            warn!(event = "metrics_backend_probe", backend = "goat", operation = "btc_spv_latest_height", error = %error, "Goat SPV health probe failed");
+            metrics_state.backend_probe_failed("goat", "btc_spv_latest_height", &error);
             None
         }
     };
@@ -79,8 +77,7 @@ async fn refresh_alert_health(
             metrics_state.set_peg_btc_decimals(decimals);
         }
         Err(error) => {
-            metrics_state.record_goat_backend_probe(false);
-            warn!(event = "metrics_backend_probe", backend = "goat", operation = "peg_btc_decimals", error = %error, "failed to load pegBTC decimals");
+            metrics_state.backend_probe_failed("goat", "peg_btc_decimals", &error);
         }
     }
     metrics_state.apply_chain_health(btc_height, goat_spv_height);
@@ -100,8 +97,7 @@ async fn refresh_alert_health(
                     );
                 }
                 Err(error) => {
-                    metrics_state.record_btc_backend_probe(false);
-                    warn!(event = "metrics_backend_probe", backend = "btc", operation = "get_address_utxo", error = %error, "BTC fee wallet probe failed");
+                    metrics_state.backend_probe_failed("btc", "get_address_utxo", &error);
                 }
             }
         }
@@ -117,8 +113,7 @@ async fn refresh_alert_health(
                 metrics_state.apply_goat_gas_balance(balance);
             }
             Err(error) => {
-                metrics_state.record_goat_backend_probe(false);
-                warn!(event = "metrics_backend_probe", backend = "goat", operation = "native_balance", error = %error, "Goat gas balance probe failed");
+                metrics_state.backend_probe_failed("goat", "native_balance", &error);
             }
         }
     }
@@ -143,8 +138,7 @@ async fn refresh_alert_health(
                 metrics_state.apply_required_stake(sufficient);
             }
             Err(error) => {
-                metrics_state.record_goat_backend_probe(false);
-                warn!(event = "metrics_backend_probe", backend = "goat", operation = "required_stake", error = %error, "required stake probe failed");
+                metrics_state.backend_probe_failed("goat", "required_stake", &error);
             }
         }
     } else {
