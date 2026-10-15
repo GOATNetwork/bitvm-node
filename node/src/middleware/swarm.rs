@@ -12,13 +12,14 @@ use libp2p::multiaddr::Protocol;
 use libp2p::request_response;
 use libp2p::request_response::ResponseChannel;
 use libp2p::swarm::SwarmEvent;
+use libp2p::swarm::dial_opts::{DialOpts, PeerCondition};
 use libp2p::{Multiaddr, PeerId, Swarm, gossipsub, kad, noise, tcp, yamux};
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::registry::Registry;
 use std::collections::HashMap;
 
 use std::net::Ipv4Addr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::select;
 use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
@@ -132,6 +133,14 @@ pub struct BitvmSwarmConfig {
     pub regular_task_interval: u64,
 }
 
+/// A bootnode whose last connection closed is re-dialled after this delay, then
+/// every `BOOTNODE_REDIAL_RETRY` until it is connected again: libp2p does not
+/// reconnect on its own and the periodic Kademlia bootstrap only runs every
+/// five minutes.
+const BOOTNODE_REDIAL_DELAY: Duration = Duration::from_secs(5);
+const BOOTNODE_REDIAL_RETRY: Duration = Duration::from_secs(20);
+const BOOTNODE_REDIAL_TICK: Duration = Duration::from_secs(5);
+
 pub struct BitvmNetworkManager {
     config: BitvmSwarmConfig,
     peer_id: PeerId,
@@ -140,6 +149,9 @@ pub struct BitvmNetworkManager {
     required_topics_healthy: Gauge,
     publish_commands: tokio::sync::mpsc::Receiver<super::publisher::PublishCommand>,
     pending_graph_requests: PendingGraphRequests,
+    bootnodes: Vec<(PeerId, Multiaddr)>,
+    /// Disconnected bootnodes and when to dial them next.
+    bootnode_redials: HashMap<PeerId, Instant>,
 }
 impl BitvmNetworkManager {
     pub fn new(
@@ -173,9 +185,11 @@ impl BitvmNetworkManager {
             .build();
 
         debug!("bootnodes: {:?}", config.bootnodes);
+        let mut bootnodes = Vec::with_capacity(config.bootnodes.len());
         for peer in &config.bootnodes {
             let (peer_id, multi_addr) = parse_boot_node_str(peer)?;
-            swarm.behaviour_mut().kademlia.add_address(&peer_id, multi_addr);
+            swarm.behaviour_mut().kademlia.add_address(&peer_id, multi_addr.clone());
+            bootnodes.push((peer_id, multi_addr));
         }
         let (publisher, publish_commands) = super::publisher::channel();
         Ok(BitvmNetworkManager {
@@ -186,7 +200,40 @@ impl BitvmNetworkManager {
             required_topics_healthy,
             publish_commands,
             pending_graph_requests: PendingGraphRequests::new(),
+            bootnodes,
+            bootnode_redials: HashMap::new(),
         })
+    }
+
+    fn is_bootnode(&self, peer_id: &PeerId) -> bool {
+        self.bootnodes.iter().any(|(id, _)| id == peer_id)
+    }
+
+    /// Dials every bootnode whose redial is due and still disconnected.
+    fn redial_bootnodes(&mut self) {
+        let now = Instant::now();
+        for (peer_id, address) in self.bootnodes.clone() {
+            if self.swarm.is_connected(&peer_id) {
+                self.bootnode_redials.remove(&peer_id);
+                continue;
+            }
+            if self.bootnode_redials.get(&peer_id).is_none_or(|due| *due > now) {
+                continue;
+            }
+            let opts = DialOpts::peer_id(peer_id)
+                .addresses(vec![address])
+                .condition(PeerCondition::Disconnected)
+                .build();
+            match self.swarm.dial(opts) {
+                Ok(()) => info!(
+                    event = "p2p_bootnode_redial",
+                    peer_id = %peer_id,
+                    "re-dialling a disconnected bootnode"
+                ),
+                Err(error) => debug!(%peer_id, %error, "bootnode redial not started"),
+            }
+            self.bootnode_redials.insert(peer_id, now + BOOTNODE_REDIAL_RETRY);
+        }
     }
 
     pub fn get_peer_id_string(&self) -> String {
@@ -250,10 +297,17 @@ impl BitvmNetworkManager {
         let mut interval = interval(Duration::from_secs(self.config.regular_task_interval));
         // Use Delay ticks and coalesced worker notifications.
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut redial_interval = tokio::time::interval(BOOTNODE_REDIAL_TICK);
+        redial_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             select! {
                     Some(command) = self.publish_commands.recv() => {
                         command.execute(&mut self.swarm, &mut self.pending_graph_requests);
+                    }
+                    _ = redial_interval.tick() => {
+                        if !self.bootnode_redials.is_empty() {
+                            self.redial_bootnodes();
+                        }
                     }
                     _ = cancellation_token.cancelled() => {
                         info!("Swarm received shutdown signal");
@@ -396,10 +450,17 @@ impl BitvmNetworkManager {
                         }
                         SwarmEvent::ConnectionEstablished {peer_id, connection_id, endpoint, .. } => {
                             self.connected_peers.set(self.swarm.connected_peers().count() as i64);
+                            if self.bootnode_redials.remove(&peer_id).is_some() {
+                                info!(event = "p2p_bootnode_connected", peer_id = %peer_id, "bootnode connection restored");
+                            }
                             debug!("connected to {peer_id}: {connection_id}, endpoint: {:?}", endpoint);
                         }
-                        SwarmEvent::ConnectionClosed {peer_id, connection_id, .. } => {
+                        SwarmEvent::ConnectionClosed {peer_id, connection_id, num_established, cause, .. } => {
                             self.connected_peers.set(self.swarm.connected_peers().count() as i64);
+                            if num_established == 0 && self.is_bootnode(&peer_id) {
+                                self.bootnode_redials.insert(peer_id, Instant::now() + BOOTNODE_REDIAL_DELAY);
+                                info!(event = "p2p_bootnode_disconnected", peer_id = %peer_id, cause = ?cause, "lost the last connection to a bootnode; redial scheduled");
+                            }
                             debug!("disconnected from {peer_id}: {connection_id}");
                         }
                         e => {
