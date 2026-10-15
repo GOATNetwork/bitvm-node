@@ -9,6 +9,7 @@ GOAT Network's BitVM bridge implementation. See [GOAT BitVM Whitepaper](https://
 - `proof-builder-rpc/`: RPC server for offloading proof generation to a separate process
 - `crates/`: Shared Rust crates for common types and utilities
 - `deployment`: Deployment scripts and documentation
+- `scripts/ops/`: Read-only operator helpers for a running node (health triage, log queries, instance / graph traces)
 
 
 ## Formal verification (TLA+)

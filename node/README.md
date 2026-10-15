@@ -893,6 +893,9 @@ real graph raw data in the database.
 | `P2P_INBOX_MAX_QUEUED_BYTES` | No | Payload bytes of admitted network events the engine inbox may hold (the committee reserve and per-peer quotas derive from it; unregistered authors are relayed, never stored) | `2 GiB` |
 | `P2P_MAX_INCOMING_CONNECTIONS` / `P2P_INBOUND_REGISTERED_RESERVE` | No | Inbound connection ceiling and the slots reserved for registered peers | `512` / `128` |
 | `P2P_RESERVED_PEERS` / `P2P_TRUSTED_OPERATOR_BINDINGS` | No | Peers that always get a connection slot; configured operator key bindings | empty |
+| `BTC_REQUEST_TIMEOUT_SECS` / `GOAT_RPC_TIMEOUT_SECS` | No | Per-request timeout of the Esplora and GOAT RPC clients, seconds (clamped to 1–120) | `15` / `20` |
+| `HTTP_REQUEST_TIMEOUT_SECS` | No | Whole-request timeout of the proof-builder HTTP client, seconds (clamped to 1–600); the connect timeout is 10 s | `60` |
+| `MAINTENANCE_RUN_TIMEOUT_SECS` | No | Budget of one maintenance tick (all scans in sequence); a tick over budget is logged `maintenance_tick_result outcome=timed_out` and the next tick covers the same chain state | `60` |
 
 ### Relayer Configuration
 
@@ -922,29 +925,36 @@ Prometheus metrics are not served by the business RPC listener. Set
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/node` | GET | Get current node information |
-| `/nodes` | GET | List connected nodes |
-| `/nodes/overview` | GET | Node statistics overview |
-| `/instances` | GET | List all instances |
-| `/instance/:id` | GET | Get instance details |
-| `/instances/overview` | GET | Instance statistics overview |
-| `/v1/graphs` | GET | List all graphs |
-| `/v1/graphs/:id` | GET | Get graph details |
+| `/v1/health` | GET | Readiness and health of this node (a local database ping, nothing else is called): readiness bits, each backend's availability with its last error, event watcher state and lag, SPV lag, uptime; `200` when ready, `503` otherwise |
+| `/v1/nodes`, `/v1/nodes/:id`, `/v1/nodes/overview` | GET | Known nodes, one node, node statistics |
+| `/v1/instances`, `/v1/instances/:id`, `/v1/instances/overview`, `/v1/instances/settings` | GET | Peg-in instances, one instance, instance statistics, peg-in settings |
+| `/v1/instances/:id/unsigned-pegin-txn` | GET | Unsigned Peg-In-Prepare transaction of an instance |
+| `/v1/graphs`, `/v1/graphs/:id` | GET | List all graphs, get graph details |
 | `/v1/graphs/:id/txn?cursor=0` | GET | Get graph transaction list |
 | `/v1/graphs/:id/tx?tx_name=cur-pre-kickoff.hex` | GET | Get specific transaction hex |
+| `/v1/graphs/:id/neighbor-ids` | GET | Neighbouring graphs of the same instance |
 | `/v1/graphs/ready-to-kickoff` | GET | Get graphs ready for kickoff |
-| `/bridge_in_request` | POST | Initiate Bridge-In request |
-| `/v1/swaps` | GET | List swap bridge-out escrows |
-| `/v1/swaps/:escrow_hash` | GET | Get swap escrow details |
-| `/challenge` | POST | Submit challenge |
+| `/v1/graphs/pegout` | POST | Initiate a peg-out (signed request) |
+| `/v1/swaps`, `/v1/swaps/:escrow_hash` | GET | Swap bridge-out escrows, one escrow |
+| `/v1/proofs/chain_proofs_desc`, `/v1/proofs/operator_proofs_desc` | GET | Proof descriptors, forwarded to `GOAT_PROOF_BUILD_URL` |
 | `/metrics` | GET | Prometheus metrics (dedicated metrics listener only) |
 | `/v1/debug/status`, `/v1/debug/engine` | GET | Node status and the execution engine snapshot (rows by state, waiting and poisoned aggregates); `rpc-debug-endpoints` feature only |
+| `/v1/debug/engine/clear-poison`, `/v1/graphs/:id/send-challenge`, `/v1/graphs/:id/send-verifier-challenge` | POST | Release poisoned actions, send a challenge / verifier challenge (signed requests); `rpc-debug-endpoints` feature only |
+
+### Health and observability
+
+- **Readiness.** `bitvm_node_ready` (and `ready` in `/v1/health`) is the AND of four bits: start-up done, database reachable (pinged by every `/v1/health` call and every metrics scrape), backends reachable (the height probe of every 6th maintenance tick AND none of the Esplora, GOAT and subgraph availability states below is `unavailable`; the proof builder is informational only, it is called too rarely to drive readiness), event watcher healthy. A node that is up but not ready still serves the RPC and the metrics listener.
+- **Backend availability.** The Esplora (`btc`), GOAT RPC (`goat`), subgraph (`graph`) and proof-builder (`proof`) backends each carry one availability state: two consecutive failed calls log a single `event=backend_availability outcome=unavailable` WARN and set `bitvm_node_backend_up{backend}=0` plus `bitvm_node_backend_unavailable_since_seconds{backend}`; once no call has failed for 30 s the next success logs one `outcome=recovered` INFO with `downtime_secs` and `failed_calls`. While a backend is unavailable its individual probe failures are logged at debug. Per-call counters stay in `bitvm_node_btc_backend_requests` / `bitvm_node_goat_backend_requests`.
+- **Start-up.** The GOAT reads needed to boot (`eth_chainId`, the gateway's relay contracts) are retried every 5 s for a minute (`event=goat_boot_retry`) before the node gives up; a restart during a short GOAT outage therefore waits instead of exiting. The `event=service_started` line prints the backend URLs, the client timeouts and the maintenance interval the process runs with.
+- **Peers.** When the last connection to a bootnode closes the node re-dials it after 5 s and then every 20 s (`event=p2p_bootnode_disconnected` / `p2p_bootnode_redial` / `p2p_bootnode_connected`); `bitvm_node_p2p_connected_peers` and `bitvm_node_p2p_required_topics_healthy` show the result.
+- **Maintenance tick.** When the GOAT read that decides whether the gateway history sync is still running fails, the tick is deferred with `maintenance_tick_result outcome=deferred reason=history_sync_check_failed` (WARN) instead of failing; individual scans that fail log `maintenance_subtask_result outcome=failed` and the rest of the tick still runs.
+- **Jobs.** An engine job attempt that fails on an error path logs `event=engine_jobs outcome=attempt_error` (WARN) with the error and the attempt number before the backoff (10, 30, 60, 120, 300, then 600 s); an explicit wait (proof not ready, SPV behind, tx not yet confirmed) logs the reason at INFO. The row's `last_error` keeps the latest reason either way.
+- **Tooling.** `scripts/ops/` holds read-only helpers for one node: `triage.sh` (one-screen health from `/v1/health`, `/metrics`, the debug routes and the log), `logq.sh` (JSON log queries) and `trace.sh` (timeline of one instance or graph across RPC, database and log).
 
 ---
 
 ## Related Documentation
 
-- [Architecture Document](../docs/ARCHITECTURE.md) - Full system architecture
 - [Circuits README](../circuits/README.md) - ZK proof generation
 - [Deployment Guide](../deployment/README.md) - Deployment instructions
 - [Incentives](../docs/incentives.md) - Incentives
