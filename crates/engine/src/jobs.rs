@@ -223,8 +223,24 @@ async fn execute_job(deps: ExecutorDeps, job: EngineJob, cancel: CancellationTok
                 match outcome {
                     Ok(JobOutcome::Done(result)) => EngineJobFinish::Done(result),
                     Ok(JobOutcome::Transient { error, retry_after_secs }) => {
-                        let delay = retry_after_secs
-                            .unwrap_or_else(|| deps.config.job_retry_backoff.delay(job.attempts));
+                        // An explicit wait names its own delay; an error path falls
+                        // back to the backoff and is the one worth a WARN.
+                        let delay = match retry_after_secs {
+                            Some(secs) => secs,
+                            None => {
+                                warn!(
+                                    event = "engine_jobs",
+                                    outcome = "attempt_error",
+                                    job_id = %job.job_id,
+                                    action = %job.action,
+                                    generation,
+                                    attempts = job.attempts + 1,
+                                    error = %error,
+                                    "job attempt failed; retrying with backoff"
+                                );
+                                deps.config.job_retry_backoff.delay(job.attempts)
+                            }
+                        };
                         EngineJobFinish::Retry { error, next_at: deps.clock.now() + delay }
                     }
                     Ok(JobOutcome::Failed(error)) => EngineJobFinish::Failed(error),
@@ -436,8 +452,36 @@ async fn record_job_finish(
     tx.commit().await?;
     deps.metrics.record_job_run(&job.action, &label);
     let elapsed_ms = started.elapsed().as_millis() as u64;
-    match &outcome {
-        EngineJobFinishOutcome::Applied { state } => info!(
+    match (&outcome, finish) {
+        // A retried or failed attempt names its reason here: the row keeps it in
+        // `last_error`, but an operator reading the log must see why.
+        (EngineJobFinishOutcome::Applied { state }, EngineJobFinish::Retry { error, next_at }) => {
+            info!(
+                event = "engine_jobs",
+                outcome = %label,
+                job_id = %job.job_id,
+                action = %job.action,
+                generation,
+                state = %state,
+                attempts = job.attempts + 1,
+                next_at,
+                elapsed_ms,
+                reason = %error,
+                "job attempt ended; retrying"
+            )
+        }
+        (EngineJobFinishOutcome::Applied { state }, EngineJobFinish::Failed(error)) => warn!(
+            event = "engine_jobs",
+            outcome = %label,
+            job_id = %job.job_id,
+            action = %job.action,
+            generation,
+            state = %state,
+            elapsed_ms,
+            error = %error,
+            "job failed"
+        ),
+        (EngineJobFinishOutcome::Applied { state }, _) => info!(
             event = "engine_jobs",
             outcome = %label,
             job_id = %job.job_id,
@@ -447,7 +491,7 @@ async fn record_job_finish(
             elapsed_ms,
             "job finished"
         ),
-        EngineJobFinishOutcome::Stale { current_generation, state } => warn!(
+        (EngineJobFinishOutcome::Stale { current_generation, state }, _) => warn!(
             event = "engine_jobs",
             outcome = "stale_completion",
             job_id = %job.job_id,
@@ -458,7 +502,7 @@ async fn record_job_finish(
             elapsed_ms,
             "late completion fenced; the external result is recorded for reconciliation"
         ),
-        EngineJobFinishOutcome::Missing => warn!(
+        (EngineJobFinishOutcome::Missing, _) => warn!(
             event = "engine_jobs",
             outcome = "missing",
             job_id = %job.job_id,
