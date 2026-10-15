@@ -282,9 +282,19 @@ pub async fn monitor_events_item(
     };
 
     if watch_contract.from_height == 0 || watch_contract.from_height >= current_finalized {
-        warn!(
-            "watch_contract start height is zero or bigger than current height, not do watch jobs"
+        // A misconfigured (zero) or not yet reachable start height: say it once at
+        // WARN, then at debug on every later tick.
+        static WATCH_RANGE_WARNED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        let message = format!(
+            "watch_contract {} start height {} is zero or not below the current height {}, not do watch jobs",
+            watch_contract.contract_addr, watch_contract.from_height, current_finalized
         );
+        if WATCH_RANGE_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::debug!("{message}");
+        } else {
+            warn!("{message}");
+        }
         return Ok(());
     }
     if watch_contract.status == WatchContractStatus::Syncing.to_string()

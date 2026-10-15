@@ -118,10 +118,7 @@ pub async fn fetch_and_handle_gateway_events<'a>(
             };
         }
     }
-    info!(
-        "get user init withdraw events: {}, cancel withdraw events: {}, proceed_withdraw_events: {}, \
-         withdraw_paths_events: {},  withdraw_disproved_events: {}, bridge_in_request_events: {}  \
-         committee_response_events: {}, bridge_in_events: {}  post_graph_data_events: {} block range {from_height}:{to_height}",
+    let event_counts = [
         init_withdraw_events.len(),
         cancel_withdraw_events.len(),
         proceed_withdraw_events.len(),
@@ -131,7 +128,27 @@ pub async fn fetch_and_handle_gateway_events<'a>(
         committee_response_events.len(),
         bridge_in_events.len(),
         post_graph_data_events.len(),
+    ];
+    let summary = format!(
+        "get user init withdraw events: {}, cancel withdraw events: {}, proceed_withdraw_events: {}, \
+         withdraw_paths_events: {},  withdraw_disproved_events: {}, bridge_in_request_events: {}  \
+         committee_response_events: {}, bridge_in_events: {}  post_graph_data_events: {} block range {from_height}:{to_height}",
+        event_counts[0],
+        event_counts[1],
+        event_counts[2],
+        event_counts[3],
+        event_counts[4],
+        event_counts[5],
+        event_counts[6],
+        event_counts[7],
+        event_counts[8],
     );
+    // An empty range every few seconds is the normal idle state: keep it out of the INFO log.
+    if event_counts.iter().any(|count| *count > 0) {
+        info!("{summary}");
+    } else {
+        tracing::debug!("{summary}");
+    }
     handle_user_withdraw_events(storage_processor, init_withdraw_events, cancel_withdraw_events)
         .await?;
     handle_proceed_withdraw_events(storage_processor, proceed_withdraw_events).await?;

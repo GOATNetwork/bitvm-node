@@ -308,7 +308,7 @@ pub async fn get_instance(
 
         ok_response(InstanceGetResponse { instance_wrap })
     } else {
-        tracing::info!("instance_id {} has no record in database", instance_id);
+        tracing::debug!("instance_id {} has no record in database", instance_id);
         ok_response(InstanceGetResponse { instance_wrap: None })
     }
 }
@@ -481,7 +481,7 @@ pub async fn get_graph(
 
         ok_response(graph_extended)
     } else {
-        tracing::warn!("graph:{} is not record in db", graph_id);
+        tracing::debug!("graph:{} is not record in db", graph_id);
         ok_response(GraphExtended::default())
     }
 }
@@ -875,7 +875,7 @@ pub async fn get_graph_tx(
             btc_tx_data: BtcTxData { raw_data, progresses, fail_reason },
         })
     } else {
-        tracing::warn!("graph:{} is not record in db", graph_id);
+        tracing::debug!("graph:{} is not record in db", graph_id);
         Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
