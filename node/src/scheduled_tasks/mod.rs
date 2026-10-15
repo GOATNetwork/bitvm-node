@@ -189,6 +189,9 @@ async fn run_maintenance_subtask<T>(
 enum MaintenanceRunOutcome {
     Completed,
     DeferredHistorySync,
+    /// The history-sync check itself failed (Goat read): protocol work is
+    /// deferred to the next tick, not reported as a tick error.
+    DeferredHistorySyncUnknown,
 }
 
 async fn run(
@@ -229,7 +232,23 @@ async fn run(
         .await;
     }
 
-    if is_processing_gateway_history_events(local_db, goat_client).await? {
+    let history_sync_in_progress = match is_processing_gateway_history_events(local_db, goat_client)
+        .await
+    {
+        Ok(in_progress) => in_progress,
+        Err(error) => {
+            warn!(
+                event = "maintenance_subtask_result",
+                task = "gateway_history_sync",
+                outcome = "failed",
+                error_class = "maintenance",
+                error = %error,
+                "could not check the gateway history sync; protocol work deferred to the next tick"
+            );
+            return Ok(MaintenanceRunOutcome::DeferredHistorySyncUnknown);
+        }
+    };
+    if history_sync_in_progress {
         info!(
             event = "maintenance_subtask_result",
             task = "gateway_history_sync",
@@ -346,6 +365,17 @@ pub async fn run_maintenance_tasks(
                             tick,
                             outcome = "deferred",
                             reason = "history_sync_in_progress",
+                            elapsed_ms = tick_start.elapsed().as_millis() as u64,
+                            "maintenance protocol work was deferred"
+                        );
+                    }
+                    Ok(Ok(MaintenanceRunOutcome::DeferredHistorySyncUnknown)) => {
+                        metrics_state.record_task_run("maintenance", "failed", tick_start.elapsed());
+                        warn!(
+                            event = "maintenance_tick_result",
+                            tick,
+                            outcome = "deferred",
+                            reason = "history_sync_check_failed",
                             elapsed_ms = tick_start.elapsed().as_millis() as u64,
                             "maintenance protocol work was deferred"
                         );
