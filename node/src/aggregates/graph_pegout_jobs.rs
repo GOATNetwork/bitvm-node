@@ -858,7 +858,9 @@ async fn verifier_assert(deps: &JobDeps, graph: &BitvmGcGraph, assert_txid: Txid
         .map_err(|e| anyhow!("failed to extract operator assert witness: {e}"))?;
     let vk = crate::vk::get_vk().await.context("load Groth16 verifying key for operator assert")?;
     let static_input = derive_operator_static_input()?;
-    if pubin_consistent && assert_witness.verify_groth16_proof(&vk, &[static_input]) {
+    if pubin_consistent
+        && bitvm_lib::babe_adapter::verify_operator_assert_proof(&assert_witness, &vk, static_input)
+    {
         return Step::ignore("operator assert proof is valid");
     }
     let broadcast = broadcast_verifier_challenge_assert_tx(
@@ -931,6 +933,8 @@ pub async fn broadcast_verifier_challenge_assert_tx(
         warn!("Ignore AssertSent for {instance_id}:{graph_id}: missing soldering proof reference");
         return Ok(None);
     }
+    #[cfg(feature = "mock-gc")]
+    crate::mock_gc::simulate(crate::mock_gc::GcOp::Challenge).await;
     let challenge_witness = build_real_challenge_assert_witness(
         &saved_verifier_state.private_state,
         &saved_verifier_state.setup_package,
@@ -1423,6 +1427,8 @@ async fn wrongly_challenged(
     let (_, dyn_pubin) = assert_witness.try_recover_pi1_xd().ok_or_else(|| {
         anyhow!("cannot recover dynamic input from challenge witness WOTS signature")
     })?;
+    #[cfg(feature = "mock-gc")]
+    crate::mock_gc::simulate(crate::mock_gc::GcOp::Eval).await;
     let wrongly_challenged_witness = recover_real_wrongly_challenged_witness(
         &prover_state,
         &challenge_witness,

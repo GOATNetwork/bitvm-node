@@ -800,6 +800,26 @@ BITCOIN_NETWORK=testnet4 cargo build -r
 cargo build -r -p bitvm-noded
 ```
 
+### Mock build for local testnets (`mock-gc`)
+
+`cargo build -r -p bitvm-noded --features "rpc-debug-endpoints mock-gc" --bins` replaces the
+garbled-circuit, soldering and proof machinery with deterministic mocks and additionally builds
+`mock-proof-builder` (a stand-in for the proof builder RPC) and `rpc-sign` (prints the
+`x-auth-*` headers of a signed request for shell scripts). Everything on chain stays real:
+epk commitments, hash locks, the soldered wire deltas and the peg-out transactions are the
+genuine ones, so the challenge → assert → disprove / take lifecycle runs unchanged on regtest;
+only the proof verdicts are policy-driven. Never deploy a `mock-gc` build.
+
+Knobs (read at call time, seconds, fractional allowed): `MOCK_GC_BUILDER_INIT_DELAY_SECS`,
+`MOCK_GC_SETUP_DELAY_SECS`, `MOCK_GC_SOLDER_DELAY_SECS`, `MOCK_GC_VERIFY_DELAY_SECS`,
+`MOCK_GC_CHALLENGE_DELAY_SECS`, `MOCK_GC_EVAL_DELAY_SECS` (the last two are capped at 60 s),
+`MOCK_GC_DELAY_SECS` as the fallback; `MOCK_GC_PROOF_VERDICT=valid|always-invalid` decides
+the verifier's verdict on an operator assert. The mock proof builder takes
+`MOCK_PROOF_DELAY_SECS` / `MOCK_PROOF_OPERATOR_DELAY_SECS` / `MOCK_PROOF_WATCHTOWER_DELAY_SECS`
+("not ready" window), `MOCK_PROOF_RESPONSE_LATENCY_MS`, and serves the operator proof fixture
+`node/testdata/test-operator-proof.bin`, so `OPERATOR_VK_HASH` / `OPERATOR_ZKM_VERSION` on the
+nodes must equal the values the mock builder reports (its defaults), not the testnet ones.
+
 ### Generate Node Keys
 
 ```bash
@@ -893,6 +913,7 @@ real graph raw data in the database.
 | `P2P_INBOX_MAX_QUEUED_BYTES` | No | Payload bytes of admitted network events the engine inbox may hold (the committee reserve and per-peer quotas derive from it; unregistered authors are relayed, never stored) | `2 GiB` |
 | `P2P_MAX_INCOMING_CONNECTIONS` / `P2P_INBOUND_REGISTERED_RESERVE` | No | Inbound connection ceiling and the slots reserved for registered peers | `512` / `128` |
 | `P2P_RESERVED_PEERS` / `P2P_TRUSTED_OPERATOR_BINDINGS` | No | Peers that always get a connection slot; configured operator key bindings | empty |
+| `P2P_LISTEN_IP` | No | Interface the p2p listener binds to; `127.0.0.1` keeps a node on a shared host loopback-only | `0.0.0.0` |
 | `BTC_REQUEST_TIMEOUT_SECS` / `GOAT_RPC_TIMEOUT_SECS` | No | Per-request timeout of the Esplora and GOAT RPC clients, seconds (clamped to 1–120) | `15` / `20` |
 | `HTTP_REQUEST_TIMEOUT_SECS` | No | Whole-request timeout of the proof-builder HTTP client, seconds (clamped to 1–600); the connect timeout is 10 s | `60` |
 | `MAINTENANCE_RUN_TIMEOUT_SECS` | No | Budget of one maintenance tick (all scans in sequence); a tick over budget is logged `maintenance_tick_result outcome=timed_out` and the next tick covers the same chain state | `60` |

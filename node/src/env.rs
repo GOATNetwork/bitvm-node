@@ -85,13 +85,22 @@ pub const ENV_OPERATOR_VK_HASH: &str = "OPERATOR_VK_HASH";
 pub const ENV_OPERATOR_ZKM_VERSION: &str = "OPERATOR_ZKM_VERSION";
 pub const DEFAULT_WATCHTOWER_PROOF_WAIT_SECS: usize = 60;
 pub const DEFAULT_OPERATOR_PROOF_WAIT_SECS: usize = 60;
+// Only read by the real `get_babe_gc_asset_paths`; unused under `mock-gc`.
+#[cfg(not(feature = "mock-gc"))]
 pub const ENV_FGC_GATES_PATH: &str = "FGC_GATES_PATH";
+#[cfg(not(feature = "mock-gc"))]
 pub const ENV_FGC_OUT_INDICES_PATH: &str = "FGC_OUT_INDICES_PATH";
+#[cfg(not(feature = "mock-gc"))]
 pub const ENV_SGC_GATES_PATH: &str = "SGC_GATES_PATH";
+#[cfg(not(feature = "mock-gc"))]
 pub const ENV_SGC_OUT_INDICES_PATH: &str = "SGC_OUT_INDICES_PATH";
+#[cfg(not(feature = "mock-gc"))]
 pub const ENV_FGC_COMPACT_GATES_PATH: &str = "FGC_COMPACT_GATES_PATH";
+#[cfg(not(feature = "mock-gc"))]
 pub const ENV_FGC_COMPACT_OUT_INDICES_PATH: &str = "FGC_COMPACT_OUT_INDICES_PATH";
+#[cfg(not(feature = "mock-gc"))]
 pub const ENV_SGC_COMPACT_GATES_PATH: &str = "SGC_COMPACT_GATES_PATH";
+#[cfg(not(feature = "mock-gc"))]
 pub const ENV_SGC_COMPACT_OUT_INDICES_PATH: &str = "SGC_COMPACT_OUT_INDICES_PATH";
 pub const ENV_BABE_SETUP_STATE_DIR: &str = "BABE_SETUP_STATE_DIR";
 pub const ENV_SOLDERING_PROOF_PAYLOAD_STORE_PATH: &str = "SOLDERING_PROOF_PAYLOAD_STORE_PATH";
@@ -725,6 +734,23 @@ pub struct BabeGcAssetPaths {
     pub sgc_compact_out_indices: PathBuf,
 }
 
+/// Under `mock-gc` the 3.3 GB GC gate files are never loaded, so this returns empty paths and
+/// requires no env vars. The two callers (`handle.rs` InitGraph / CutCircuits) discard the value.
+#[cfg(feature = "mock-gc")]
+pub fn get_babe_gc_asset_paths() -> anyhow::Result<BabeGcAssetPaths> {
+    Ok(BabeGcAssetPaths {
+        fgc_gates: PathBuf::new(),
+        fgc_out_indices: PathBuf::new(),
+        sgc_gates: PathBuf::new(),
+        sgc_out_indices: PathBuf::new(),
+        fgc_compact_gates: PathBuf::new(),
+        fgc_compact_out_indices: PathBuf::new(),
+        sgc_compact_gates: PathBuf::new(),
+        sgc_compact_out_indices: PathBuf::new(),
+    })
+}
+
+#[cfg(not(feature = "mock-gc"))]
 pub fn get_babe_gc_asset_paths() -> anyhow::Result<BabeGcAssetPaths> {
     fn read_path(name: &str) -> anyhow::Result<PathBuf> {
         let path =

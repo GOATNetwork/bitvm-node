@@ -628,6 +628,8 @@ async fn ingest_soldering_proof(deps: &JobDeps, graph_id: Uuid, params: &[u8]) -
             .as_ref()
             .context("BABE soldering builder is not initialized for Operator")?,
     );
+    #[cfg(feature = "mock-gc")]
+    crate::mock_gc::simulate(crate::mock_gc::GcOp::Verify).await;
     let verification = {
         let package = setup_package.clone();
         let opened = opened.clone();
@@ -1295,6 +1297,8 @@ async fn verifier_setup(deps: &JobDeps, graph_id: Uuid, params: &[u8]) -> Result
         get_babe_gc_asset_paths()?;
         let vk = crate::vk::get_vk().await.context("load Groth16 verifying key for BABE setup")?;
         let static_input = derive_operator_static_input()?;
+        #[cfg(feature = "mock-gc")]
+        crate::mock_gc::simulate(crate::mock_gc::GcOp::Setup).await;
         let (setup_package, private_state) = tokio::task::spawn_blocking(move || {
             build_real_setup_package(BABE_N_CC, &vk, static_input)
         })
@@ -1402,6 +1406,8 @@ async fn verifier_solder(deps: &JobDeps, graph_id: Uuid, params: &[u8]) -> Resul
                 .as_ref()
                 .context("BABE soldering builder is not initialized for Verifier")?,
         );
+        #[cfg(feature = "mock-gc")]
+        crate::mock_gc::simulate(crate::mock_gc::GcOp::Solder).await;
         let (opened, finalized, soldering) = tokio::task::spawn_blocking(move || {
             open_real_setup_and_solder(
                 &soldering_builder,

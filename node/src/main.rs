@@ -209,8 +209,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Arc::new(GOATClient::new(env::goat_config_from_env().await, env::get_goat_network()));
     let btc_client = Arc::new(BTCClient::new(get_network(), get_btc_url_from_env().as_deref()));
     let http_client = Arc::new(HttpAsyncClient::new(None));
-    let soldering_builder =
-        actor_needs_soldering_builder(&actor).then(|| Arc::new(BabeBundleBuilder::new()));
+    let soldering_builder = if actor_needs_soldering_builder(&actor) {
+        // Under `mock-gc` the builder is a free unit struct, so a configurable delay stands in for
+        // the Ziren soldering-guest setup the real builder performs here.
+        #[cfg(feature = "mock-gc")]
+        bitvm_noded::mock_gc::simulate(bitvm_noded::mock_gc::GcOp::BuilderInit).await;
+        Some(Arc::new(BabeBundleBuilder::new()))
+    } else {
+        None
+    };
     // The execution engine owns the migrated aggregates (Instance and Graph).
     let (engine, engine_acks) = engine_bridge::build_engine(
         bitvm_network_manager.publisher(),

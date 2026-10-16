@@ -37,9 +37,16 @@ path = "src/bin/send_pegout.rs"
 name = "mock-rpc"
 path = "src/bin/mock_rpc.rs"
 
+[[bin]]
+name = "mock-proof-builder"
+path = "src/bin/mock_proof_builder.rs"
+required-features = ["mock-gc"]
+
 [features]
 default = []
 rpc-debug-endpoints = []
+# Localnet-only: replace the real BABE/GC machinery and proof builder with deterministic mocks.
+mock-gc = ["bitvm-lib/mock-gc"]
 
 [dependencies]
 libp2p = { workspace = true, features = [

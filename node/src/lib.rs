@@ -9,6 +9,8 @@ pub mod middleware;
 pub mod p2p_admission;
 pub mod p2p_msg_handler;
 
+#[cfg(feature = "mock-gc")]
+pub mod mock_gc;
 pub mod rpc_service;
 mod scheduled_tasks;
 mod soldering_payload_store;
