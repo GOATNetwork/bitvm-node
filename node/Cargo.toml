@@ -38,6 +38,10 @@ name = "mock-rpc"
 path = "src/bin/mock_rpc.rs"
 
 [[bin]]
+name = "rpc-sign"
+path = "src/bin/rpc_sign.rs"
+
+[[bin]]
 name = "mock-proof-builder"
 path = "src/bin/mock_proof_builder.rs"
 required-features = ["mock-gc"]
