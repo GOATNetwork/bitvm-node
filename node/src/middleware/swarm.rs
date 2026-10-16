@@ -276,15 +276,27 @@ impl BitvmNetworkManager {
             .collect::<HashMap<String, _>>();
         self.refresh_required_topics_health(&actor);
 
+        // P2P listen interface is configurable (default 0.0.0.0 = unchanged behaviour). Setting
+        // P2P_LISTEN_IP=127.0.0.1 keeps the p2p port bound to loopback only (required when the node
+        // runs on a shared host); in that case we must NOT skip the loopback NewListenAddr below,
+        // otherwise the swarm task hangs forever waiting for a non-loopback listen address.
+        let listen_ip = std::env::var("P2P_LISTEN_IP")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| "0.0.0.0".to_string());
+        let allow_loopback = matches!(listen_ip.as_str(), "127.0.0.1" | "localhost");
         if self.config.p2p_port > 0 {
-            self.swarm.listen_on(format!("/ip4/0.0.0.0/tcp/{}", self.config.p2p_port).parse()?)?;
+            self.swarm
+                .listen_on(format!("/ip4/{}/tcp/{}", listen_ip, self.config.p2p_port).parse()?)?;
         } else {
-            self.swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
+            self.swarm.listen_on(format!("/ip4/{}/tcp/0", listen_ip).parse()?)?;
         }
 
         let address = loop {
             if let SwarmEvent::NewListenAddr { address, .. } = self.swarm.select_next_some().await {
-                if address.iter().any(|e| e == Protocol::Ip4(Ipv4Addr::LOCALHOST)) {
+                if !allow_loopback
+                    && address.iter().any(|e| e == Protocol::Ip4(Ipv4Addr::LOCALHOST))
+                {
                     debug!("Ignoring localhost address to make sure the example works in Firefox");
                     continue;
                 }
