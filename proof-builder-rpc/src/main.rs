@@ -2,12 +2,10 @@ mod api;
 mod config;
 mod fleet;
 mod prover;
-mod storage;
 mod task;
 
 use crate::fleet::{FleetEnv, ProgramRecord, ProgramsFile, StorageLock};
 use crate::prover::ProverRuntime;
-use crate::storage::Level;
 use crate::task::{TaskOptions, is_start_generate_proof_tasks, run_generate_proof_tasks};
 use alloy_primitives::Address;
 use anyhow::Context;
@@ -22,7 +20,7 @@ use operator_proof::OperatorProofBuilder;
 use proof_builder::ProofBuilder;
 use state_chain_proof::StateChainProofBuilder;
 use std::collections::{BTreeSet, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal;
@@ -60,11 +58,6 @@ struct Opts {
     #[arg(long)]
     pub print_programs: bool,
 
-    /// Check that the database, config and pending state-chain snapshots keep every proof
-    /// path inside this storage root, then exit.
-    #[arg(long, value_name = "STORAGE_ROOT")]
-    pub check_storage: Option<PathBuf>,
-
     /// How long shutdown waits for the proof in progress to be published and committed.
     #[arg(long, default_value_t = 600)]
     pub drain_timeout_secs: u64,
@@ -95,10 +88,6 @@ async fn main() -> anyhow::Result<()> {
 
     let cfg = ProofBuilderConfig::new(&opt.config)?;
     println!("proof builder config: {:?}", cfg);
-
-    if let Some(root) = &opt.check_storage {
-        return check_storage(root, &cfg, &opt.database_url).await;
-    }
 
     let (runtime, _storage_lock) = match &fleet_env {
         Some(env) => {
@@ -355,38 +344,6 @@ async fn print_programs() -> anyhow::Result<()> {
     })
     .await??;
     println!("{}", serde_json::to_string_pretty(&file)?);
-    Ok(())
-}
-
-/// Reports the storage check and fails when any proof path needs attention.
-async fn check_storage(
-    root: &Path,
-    cfg: &ProofBuilderConfig,
-    database_url: &str,
-) -> anyhow::Result<()> {
-    let database = fleet::sqlite_file(database_url)?;
-    anyhow::ensure!(database.exists(), "database {} does not exist", database.display());
-    // Open without migrating: the check never changes the database it inspects.
-    let local_db = store::localdb::LocalDB::new(database_url, true).await;
-    let findings = storage::check_storage(root, cfg, &local_db).await?;
-    for finding in &findings {
-        let level = match finding.level {
-            Level::Ok => "ok",
-            Level::Legacy => "legacy",
-            Level::Warning => "warning",
-            Level::Error => "error",
-        };
-        println!("[{level}] {}", finding.message);
-    }
-    let count = |level| findings.iter().filter(|f| f.level == level).count();
-    let errors = count(Level::Error);
-    println!(
-        "storage check: {} ok, {} legacy, {} warnings, {errors} errors",
-        count(Level::Ok),
-        count(Level::Legacy),
-        count(Level::Warning)
-    );
-    anyhow::ensure!(errors == 0, "storage check found {errors} errors");
     Ok(())
 }
 

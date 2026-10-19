@@ -116,24 +116,6 @@ Proving behaviour in Fleet mode:
 - The state-chain context builder prepares at most `--state-chain-max-pending-batches`
   unproved batches (default 2; 0 means unlimited).
 
-Before migrating data into a storage root, and before every Fleet enable, run the read-only
-storage check from the working directory with the worker's config and `DATABASE_URL`:
-
-```bash
-proof-builder-rpc --config proof-builder.toml --check-storage /srv/zkm-fleet/apps/goat
-```
-
-It reports every recorded proof, config path and pending state-chain snapshot that is missing or
-outside the root. A proven proof is also reported when a sidecar its readers need is missing,
-or when it is inconsistent with its manifest. Required sidecars:
-
-- every proof: `.public_inputs.bin`, `.vk_hash.bin` and `.zkm_version.bin`;
-- header chain: `.blocks`;
-- commit chain: `.commits`.
-
-The check exits non-zero on any error. Proofs written before atomic publication are reported
-as `legacy`.
-
 ## Metrics
 
 Prometheus metrics use a dedicated listener and are disabled unless `--metrics-addr` is set. The

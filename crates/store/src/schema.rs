@@ -898,17 +898,6 @@ impl OnDemandProofTable {
     }
 }
 
-/// A proof path recorded by one of the proof builder's task tables.
-#[derive(Clone, FromRow, Debug, PartialEq, Eq)]
-pub struct RecordedProofPath {
-    /// `long_running_task_proof`, `operator_proof` or `watchtower_proof`.
-    pub source: String,
-    /// The task within its table: `chain:block_start` or the row id.
-    pub task: String,
-    pub proof_state: i64,
-    pub path_to_proof: String,
-}
-
 /// The result columns written when an on-demand proof task finishes.
 #[derive(Clone, Debug, Default)]
 pub struct OnDemandProofCompletion {

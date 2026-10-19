@@ -5,9 +5,9 @@ use crate::{
     LongRunningTaskProof, Message, MessageDebugOverview, MessageDebugReason, MetricsStateCount,
     Node, NodeAlertMetricsSnapshot, NodesOverview, OnDemandProofCompletion, OnDemandProofTable,
     OperatorProof, P2pInboxAdmissionClass, P2pInboxClassUsage, P2pInboxMessage, P2pOutboxMessage,
-    PeginGraphProcessData, PeginInstanceProcessData, PendingGraphInit, RecordedProofPath,
-    SequencerSetHashChange, SequencerSetScanState, SerializableTxid, SwapEscrow, SwapEscrowStatus,
-    WatchContract, WatchtowerProof,
+    PeginGraphProcessData, PeginInstanceProcessData, PendingGraphInit, SequencerSetHashChange,
+    SequencerSetScanState, SerializableTxid, SwapEscrow, SwapEscrowStatus, WatchContract,
+    WatchtowerProof,
 };
 
 use indexmap::IndexMap;
@@ -4908,29 +4908,6 @@ impl<'a> StorageProcessor<'a> {
         Ok(state)
     }
 
-    /// Lists every non-empty proof path of the proof builder's task tables.
-    pub async fn list_recorded_proof_paths(&mut self) -> anyhow::Result<Vec<RecordedProofPath>> {
-        let rows = sqlx::query_as::<_, RecordedProofPath>(
-            "SELECT 'long_running_task_proof' AS source,
-                    chain_name || ':' || block_start AS task,
-                    proof_state,
-                    path_to_proof
-             FROM long_running_task_proof
-             WHERE path_to_proof IS NOT NULL AND path_to_proof != ''
-             UNION ALL
-             SELECT 'operator_proof', CAST(id AS TEXT), proof_state, path_to_proof
-             FROM operator_proof
-             WHERE path_to_proof IS NOT NULL AND path_to_proof != ''
-             UNION ALL
-             SELECT 'watchtower_proof', CAST(id AS TEXT), proof_state, path_to_proof
-             FROM watchtower_proof
-             WHERE path_to_proof IS NOT NULL AND path_to_proof != ''",
-        )
-        .fetch_all(self.conn())
-        .await?;
-        Ok(rows)
-    }
-
     /// Counts unfinished (`New` or `Proving`) tasks of one proof chain starting at or after
     /// `from_block`.
     pub async fn count_pending_long_running_task_proofs(
@@ -7013,31 +6990,6 @@ mod tests {
                 .unwrap(),
             0
         );
-    }
-
-    #[tokio::test]
-    async fn test_list_recorded_proof_paths() {
-        let db = setup_db().await;
-        let mut s = db.acquire().await.unwrap();
-        let task = new_operator_proof(&mut s).await;
-        s.complete_on_demand_proof_if_new(
-            OnDemandProofTable::Operator,
-            task.id,
-            &on_demand_completion(),
-        )
-        .await
-        .unwrap();
-        let paths = s.list_recorded_proof_paths().await.unwrap();
-        // The migration seeds the genesis header-chain proof.
-        assert!(paths.iter().any(|p| p.source == "long_running_task_proof"
-            && p.task == "header-chain:0"
-            && p.path_to_proof == "../circuits/data/header-chain/0-116000.bin"));
-        assert!(paths.contains(&RecordedProofPath {
-            source: "operator_proof".to_string(),
-            task: task.id.to_string(),
-            proof_state: crate::ProofState::Proven.to_i64(),
-            path_to_proof: "proofs/1.bin".to_string(),
-        }));
     }
 
     #[tokio::test]

@@ -33,17 +33,6 @@ pub struct ManifestEntry {
     pub sha256: String,
 }
 
-/// The publication state of a proof path.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ManifestStatus {
-    /// The manifest exists and every file matches it.
-    Complete,
-    /// No manifest: written before atomic publication, or never completed.
-    Missing,
-    /// The manifest exists but a file is absent or differs.
-    Mismatch(String),
-}
-
 fn tmp_path(path: &Path) -> PathBuf {
     let mut name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
     name.push(format!("{TMP_MARKER}{}", std::process::id()));
@@ -128,35 +117,6 @@ pub fn publish_artifacts(
     sync_dir(dir)
 }
 
-/// Checks the files of a proof path against its manifest.
-pub fn manifest_status(proof_path: impl AsRef<Path>) -> Result<ManifestStatus> {
-    let proof_path = proof_path.as_ref();
-    let manifest_path = suffixed(proof_path, MANIFEST_SUFFIX);
-    let bytes = match fs::read(&manifest_path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(ManifestStatus::Missing);
-        }
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("failed to read {}", manifest_path.display()));
-        }
-    };
-    let manifest: ArtifactManifest = serde_json::from_slice(&bytes)
-        .with_context(|| format!("invalid manifest {}", manifest_path.display()))?;
-    for entry in &manifest.files {
-        let file = suffixed(proof_path, &entry.suffix);
-        match fs::read(&file) {
-            Ok(content) if hex::encode(Sha256::digest(&content)) == entry.sha256 => {}
-            Ok(_) => return Ok(ManifestStatus::Mismatch(format!("{} differs", file.display()))),
-            Err(_) => {
-                return Ok(ManifestStatus::Mismatch(format!("{} is missing", file.display())));
-            }
-        }
-    }
-    Ok(ManifestStatus::Complete)
-}
-
 /// Removes temporary files left in `dir` by interrupted writes of other processes.
 pub fn remove_stale_tmp_files(dir: impl AsRef<Path>) -> Result<usize> {
     let own = format!("{TMP_MARKER}{}", std::process::id());
@@ -182,6 +142,16 @@ pub fn remove_stale_tmp_files(dir: impl AsRef<Path>) -> Result<usize> {
 mod tests {
     use super::*;
 
+    /// Whether every file the manifest of `proof` names exists with its recorded digest.
+    fn manifest_matches(proof: &Path) -> bool {
+        let bytes = fs::read(suffixed(proof, MANIFEST_SUFFIX)).unwrap();
+        let manifest: ArtifactManifest = serde_json::from_slice(&bytes).unwrap();
+        manifest.files.iter().all(|entry| {
+            fs::read(suffixed(proof, &entry.suffix))
+                .is_ok_and(|content| hex::encode(Sha256::digest(&content)) == entry.sha256)
+        })
+    }
+
     #[test]
     fn publication_writes_manifest_last_and_verifies() {
         let dir = tempfile::tempdir().unwrap();
@@ -195,7 +165,7 @@ mod tests {
         .unwrap();
         assert_eq!(fs::read(&proof).unwrap(), b"proof");
         assert_eq!(fs::read(suffixed(&proof, ".public_inputs.bin")).unwrap(), b"pv");
-        assert_eq!(manifest_status(&proof).unwrap(), ManifestStatus::Complete);
+        assert!(manifest_matches(&proof));
         let leftovers: Vec<_> = fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|e| e.ok())
@@ -204,7 +174,7 @@ mod tests {
         assert!(leftovers.is_empty());
 
         fs::write(suffixed(&proof, ".vk_hash.bin"), b"other").unwrap();
-        assert!(matches!(manifest_status(&proof).unwrap(), ManifestStatus::Mismatch(_)));
+        assert!(!manifest_matches(&proof));
     }
 
     #[test]
@@ -216,7 +186,7 @@ mod tests {
         publish_artifacts(&proof, b"new", &[(".public_inputs.bin", b"new")], "watchtower 1")
             .unwrap();
         assert_eq!(fs::read(&proof).unwrap(), b"new");
-        assert_eq!(manifest_status(&proof).unwrap(), ManifestStatus::Complete);
+        assert!(manifest_matches(&proof));
     }
 
     #[test]
@@ -225,11 +195,11 @@ mod tests {
         let proof = dir.path().join("1.bin");
         // A legacy or interrupted proof file without a manifest.
         fs::write(&proof, b"partial").unwrap();
-        assert_eq!(manifest_status(&proof).unwrap(), ManifestStatus::Missing);
+        assert!(!suffixed(&proof, MANIFEST_SUFFIX).exists());
         // An invalid sidecar fails before the proof file or manifest are replaced.
         assert!(publish_artifacts(&proof, b"proof", &[("", b"x")], "operator 1").is_err());
         assert_eq!(fs::read(&proof).unwrap(), b"partial");
-        assert_eq!(manifest_status(&proof).unwrap(), ManifestStatus::Missing);
+        assert!(!suffixed(&proof, MANIFEST_SUFFIX).exists());
     }
 
     #[test]
