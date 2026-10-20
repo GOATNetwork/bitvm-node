@@ -27,7 +27,7 @@ use util::hex_parse;
 static ELF_ID: OnceLock<String> = OnceLock::new();
 
 /// A program that aggregates the proofs of the simple program.
-pub const STATE_CHAIN: &[u8] = include_elf!("guest");
+pub const STATE_CHAIN: &[u8] = include_elf!("state-chain-guest");
 
 use std::fs;
 

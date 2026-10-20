@@ -158,7 +158,7 @@ impl LongRunning for Args {
 }
 
 /// A program that aggregates the proofs of the simple program.
-pub const OPERATOR: &[u8] = include_elf!("guest");
+pub const OPERATOR: &[u8] = include_elf!("operator-guest");
 
 use std::fs;
 

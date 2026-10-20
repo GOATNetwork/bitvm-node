@@ -137,7 +137,7 @@ pub async fn fetch_target_block(
 }
 
 /// A program that aggregates the proofs of the simple program.
-pub const WATCHTOWER: &[u8] = include_elf!("guest");
+pub const WATCHTOWER: &[u8] = include_elf!("watchtower-guest");
 pub struct WatchtowerProofBuilder {
     client: Arc<ProverClient>,
     proving_key: zkm_sdk::ZKMProvingKey,

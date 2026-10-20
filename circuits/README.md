@@ -65,6 +65,15 @@ under 2.0, so the header, commit and state chain proofs restart from genesis at 
 BABE garbled-circuit verifier treats `vkey_hash` and `vk_root` as static inputs and `committed_values_digest`
 as the dynamic one.
 
+## Guest workspace
+
+All guest programs (`*/guest`) form one workspace rooted at `circuits/Cargo.toml`, with a single
+`Cargo.lock` and `[patch.crates-io]`. The guest-side shared crates live in `circuits/crates/`, inside
+that root, because cargo hashes a path dependency outside the workspace root by its absolute path,
+which would make each guest ELF, and so its vk, depend on where the repository is checked out. Keep any
+new guest-side path dependency under `circuits/`. The ELF also depends on `ZKM_IMM_WRAP_VK` and
+`BITCOIN_NETWORK` at build time.
+
 ## Preparation
 
 ```bash

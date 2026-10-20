@@ -1,0 +1,39 @@
+# Workspace for the zkVM guest programs; each host's build.rs builds its guest through zkm-build.
+#
+# The guest-side shared crates live in `crates/` under this workspace root on purpose: cargo
+# hashes a path dependency by its path relative to the workspace root only when it lies under
+# that root, and by its absolute path otherwise, which would make the guest ELFs (and so the
+# program vks) depend on where the repository is checked out. Those crates remain members of
+# the repository root workspace, which they inherit dependencies from, so they are excluded here.
+[workspace]
+resolver = "2"
+members = [
+    "header-chain-proof/guest",
+    "commit-chain-proof/guest",
+    "state-chain-proof/guest",
+    "watchtower-proof/guest",
+    "operator-proof/guest",
+]
+exclude = [
+    "crates",
+    "header-chain-proof/host",
+    "commit-chain-proof/host",
+    "state-chain-proof/host",
+    "watchtower-proof/host",
+    "operator-proof/host",
+    "proof-builder",
+]
+
+[patch.crates-io]
+# Precompile patches
+sha2 = { git = "https://github.com/ziren-patches/RustCrypto-hashes", branch = "patch-sha2-0.10.9", package = "sha2" }
+bn = { git = "https://github.com/ziren-patches/bn", branch = "patch-0.6.0", package = "substrate-bn" }
+k256 = { git = "https://github.com/ziren-patches/elliptic-curves", branch = "patch-k256-0.13.4" }
+p256 = { git = "https://github.com/ziren-patches/elliptic-curves", branch = "patch-p256-0.13.2" }
+alloy-primitives-v1-0-0 = { git = "https://github.com/ziren-patches/core.git", package = "alloy-primitives", branch = "patch-alloy-primitives-1.0.0" }
+alloy-primitives-v1-1-0 = { git = "https://github.com/ziren-patches/core.git", package = "alloy-primitives", branch = "patch-alloy-primitives-1.1.0" }
+alloy-primitives-v1-1-2 = { git = "https://github.com/ziren-patches/core.git", package = "alloy-primitives", branch = "patch-alloy-primitives-1.1.2" }
+alloy-primitives-v1-4-1 = { git = "https://github.com/ziren-patches/core.git", package = "alloy-primitives", branch = "patch-alloy-primitives-1.4.1" }
+secp256k1-v0-29-1 = { git = "https://github.com/ziren-patches/rust-secp256k1", package = "secp256k1", branch = "patch-0.29.1" }
+#secp256k1-v0-30-0 = { git = "https://github.com/ziren-patches/rust-secp256k1", package = "secp256k1", branch = "patch-0.30.0" }
+#bitcoin = { git = "https://github.com/ProjectZKM/rust-bitcoin", branch = "patch-0.32.7" }

@@ -726,10 +726,10 @@ mod tests {
     use super::*;
 
     use bitcoin::Transaction;
-    const PROOF: &[u8] = include_bytes!("../../../circuits/data/watchtower/output3.bin.proof.bin");
+    const PROOF: &[u8] = include_bytes!("../../../data/watchtower/output3.bin.proof.bin");
     const PUBLIC_INPUTS: &[u8] =
-        include_bytes!("../../../circuits/data/watchtower/output3.bin.public_inputs.bin");
-    const VK_HASH: &str = include_str!("../../../circuits/data/watchtower/output3.bin.vk_hash.bin");
+        include_bytes!("../../../data/watchtower/output3.bin.public_inputs.bin");
+    const VK_HASH: &str = include_str!("../../../data/watchtower/output3.bin.vk_hash.bin");
     const ZKM_VERSION: &str = "v1.2.4";
 
     #[test]

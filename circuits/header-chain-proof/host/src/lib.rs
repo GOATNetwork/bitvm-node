@@ -157,7 +157,7 @@ pub fn proof_block_headers(headers: &[CircuitBlockHeader]) -> anyhow::Result<Vec
 }
 
 /// A program that aggregates the proofs of the simple program.
-pub const HEADER_CHAIN: &[u8] = include_elf!("guest");
+pub const HEADER_CHAIN: &[u8] = include_elf!("header-chain-guest");
 pub struct HeaderChainProofBuilder {
     client: Arc<ProverClient>,
     proving_key: zkm_sdk::ZKMProvingKey,

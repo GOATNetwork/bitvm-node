@@ -1322,6 +1322,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "commit-chain-guest"
+version = "1.1.0"
+dependencies = [
+ "alloy-primitives",
+ "bincode",
+ "bitcoin",
+ "commit-chain",
+ "sha2 0.10.9",
+ "tracing",
+ "zkm-zkvm",
+]
+
+[[package]]
 name = "const-hex"
 version = "1.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1842,7 +1855,7 @@ dependencies = [
 [[package]]
 name = "ecdsa"
 version = "0.16.9"
-source = "git+https://github.com/ziren-patches/signatures.git?branch=patch-ecdsa-0.16.9#da0cd8753b243e09acf82f8e58f8da0e28e7287d"
+source = "git+https://github.com/ziren-patches/signatures?branch=patch-ecdsa-0.16.9#da0cd8753b243e09acf82f8e58f8da0e28e7287d"
 dependencies = [
  "der",
  "digest 0.10.7",
@@ -2314,22 +2327,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "guest"
-version = "1.1.0"
-dependencies = [
- "alloy-primitives",
- "bincode",
- "bitcoin",
- "bitcoin-light-client-circuit",
- "commit-chain",
- "header-chain",
- "sha2 0.10.9",
- "state-chain",
- "tracing",
- "zkm-zkvm",
-]
-
-[[package]]
 name = "guest-executor"
 version = "0.1.0"
 source = "git+https://github.com/ProjectZKM/reth-processor?branch=chore%2Fziren-v2-goat#67ea101fca9b9012978fdb07bf51b1ce26f47df3"
@@ -2442,6 +2439,20 @@ dependencies = [
  "sha2 0.10.9",
  "verifier",
  "zkm-primitives",
+ "zkm-zkvm",
+]
+
+[[package]]
+name = "header-chain-guest"
+version = "1.1.0"
+dependencies = [
+ "bincode",
+ "bitcoin",
+ "borsh",
+ "header-chain",
+ "log",
+ "sha2 0.10.9",
+ "tracing",
  "zkm-zkvm",
 ]
 
@@ -3235,6 +3246,22 @@ name = "opaque-debug"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
+
+[[package]]
+name = "operator-guest"
+version = "1.1.0"
+dependencies = [
+ "alloy-primitives",
+ "bincode",
+ "bitcoin",
+ "bitcoin-light-client-circuit",
+ "commit-chain",
+ "header-chain",
+ "sha2 0.10.9",
+ "state-chain",
+ "tracing",
+ "zkm-zkvm",
+]
 
 [[package]]
 name = "p256"
@@ -4753,7 +4780,7 @@ dependencies = [
 [[package]]
 name = "rfc6979"
 version = "0.4.0"
-source = "git+https://github.com/ziren-patches/signatures.git?branch=patch-ecdsa-0.16.9#da0cd8753b243e09acf82f8e58f8da0e28e7287d"
+source = "git+https://github.com/ziren-patches/signatures?branch=patch-ecdsa-0.16.9#da0cd8753b243e09acf82f8e58f8da0e28e7287d"
 dependencies = [
  "hmac",
  "subtle",
@@ -5293,6 +5320,18 @@ dependencies = [
  "tracing",
  "verifier",
  "zkm-primitives",
+ "zkm-zkvm",
+]
+
+[[package]]
+name = "state-chain-guest"
+version = "1.1.0"
+dependencies = [
+ "alloy-primitives",
+ "bincode",
+ "sha2 0.10.9",
+ "state-chain",
+ "tracing",
  "zkm-zkvm",
 ]
 
@@ -5975,6 +6014,22 @@ dependencies = [
  "hashbrown 0.15.5",
  "indexmap 2.14.0",
  "semver 1.0.28",
+]
+
+[[package]]
+name = "watchtower-guest"
+version = "1.1.0"
+dependencies = [
+ "alloy-primitives",
+ "bincode",
+ "bitcoin",
+ "bitcoin-light-client-circuit",
+ "commit-chain",
+ "header-chain",
+ "sha2 0.10.9",
+ "state-chain",
+ "tracing",
+ "zkm-zkvm",
 ]
 
 [[package]]

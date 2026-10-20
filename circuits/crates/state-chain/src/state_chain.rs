@@ -177,10 +177,9 @@ mod tests {
     use super::*;
     #[test]
     fn test_statechain_apply_blocks() {
-        let blocks: Vec<CircuitStateBlock> = serde_json::from_slice(include_bytes!(
-            "../../../circuits/data/state-chain/10346758-10.blocks"
-        ))
-        .unwrap();
+        let blocks: Vec<CircuitStateBlock> =
+            serde_json::from_slice(include_bytes!("../../../data/state-chain/10346758-10.blocks"))
+                .unwrap();
         let block_hash: [u8; 32] = blocks[0].evm_block.current_block.hash_slow().into();
         let block_height = blocks[0].evm_block.current_block.header.number;
         let cosmos_block = blocks[0].cosmos_block.clone();
@@ -188,10 +187,9 @@ mod tests {
 
         chain_state.apply_blocks(blocks);
 
-        let blocks2: Vec<CircuitStateBlock> = serde_json::from_slice(include_bytes!(
-            "../../../circuits/data/state-chain/10346768-10.blocks"
-        ))
-        .unwrap();
+        let blocks2: Vec<CircuitStateBlock> =
+            serde_json::from_slice(include_bytes!("../../../data/state-chain/10346768-10.blocks"))
+                .unwrap();
         chain_state.apply_blocks(blocks2);
     }
 }

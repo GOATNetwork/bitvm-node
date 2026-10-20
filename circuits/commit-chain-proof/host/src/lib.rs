@@ -14,7 +14,7 @@ static ELF_ID: OnceLock<String> = OnceLock::new();
 use anyhow::Context;
 
 /// A program that aggregates the proofs of the simple program.
-pub const COMMIT_CHAIN: &[u8] = include_elf!("guest");
+pub const COMMIT_CHAIN: &[u8] = include_elf!("commit-chain-guest");
 
 use std::fs;
 

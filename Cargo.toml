@@ -13,11 +13,11 @@ members = [
     "crates/node-macros",
     "crates/client",
     "crates/util",
-    "crates/header-chain",
-    "crates/commit-chain",
-    "crates/state-chain",
-    "crates/bitcoin-light-client-circuit",
-    "crates/verifier",
+    "circuits/crates/header-chain",
+    "circuits/crates/commit-chain",
+    "circuits/crates/state-chain",
+    "circuits/crates/bitcoin-light-client-circuit",
+    "circuits/crates/verifier",
     "circuits/header-chain-proof/host",
     "circuits/commit-chain-proof/host",
     "circuits/state-chain-proof/host",
@@ -120,14 +120,14 @@ soldering-host = { git = "https://github.com/GOATNetwork/bitvm-gc", features = [
 store = { path = "crates/store" }
 util = { path = "crates/util" }
 client = { path = "crates/client" }
-bitcoin-light-client-circuit = { path = "crates/bitcoin-light-client-circuit" }
-header-chain = { path = "crates/header-chain" }
+bitcoin-light-client-circuit = { path = "circuits/crates/bitcoin-light-client-circuit" }
+header-chain = { path = "circuits/crates/header-chain" }
 header-chain-proof = { path = "circuits/header-chain-proof/host" }
-commit-chain = { path = "crates/commit-chain" }
+commit-chain = { path = "circuits/crates/commit-chain" }
 commit-chain-proof = { path = "circuits/commit-chain-proof/host" }
 cbft-rpc = { path = "crates/cbft-rpc" }
-state-chain = { path = "crates/state-chain" }
-verifier = { path = "crates/verifier" }
+state-chain = { path = "circuits/crates/state-chain" }
+verifier = { path = "circuits/crates/verifier" }
 state-chain-proof = { path = "circuits/state-chain-proof/host" }
 operator-proof = { path = "circuits/operator-proof/host" }
 watchtower-proof = { path = "circuits/watchtower-proof/host" }
