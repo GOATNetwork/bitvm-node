@@ -10,6 +10,7 @@ GOAT Network's BitVM bridge implementation. See [GOAT BitVM Whitepaper](https://
 - `crates/`: Shared Rust crates for common types and utilities
 - `deployment`: Deployment scripts and documentation
 - `scripts/ops/`: Read-only operator helpers for a running node (health triage, log queries, instance / graph traces)
+- `localnet/`: clone-and-run mock testnet (five `mock-gc` nodes on regtest + anvil + graph-node) and the on-demand e2e suite, see [localnet/README.md](localnet/README.md); `make localnet-reset`, `make e2e-smoke`
 
 
 ## Formal verification (TLA+)
