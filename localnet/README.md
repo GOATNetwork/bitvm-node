@@ -5,7 +5,7 @@ regtest + a local anvil + a local graph-node, every endpoint on 127.0.0.1. The g
 soldering and proofs are deterministic mocks with configurable delays; everything on chain is
 real, so peg-in, peg-out, challenge/assert/take-2 and disprove run the genuine transaction graph
 (see `node/README.md`, "Mock build for local testnets"). The on-demand regression suite lives in
-[e2e/](e2e/README.md).
+[e2e/](e2e/README.md). CI runs the whole suite after pushes to main / dev, see "CI" below.
 
 ## Host requirements
 
@@ -131,6 +131,23 @@ change it there and `scripts/reset.sh --yes`.
 | `make e2e`, all 13 cases, fast delay tier (2 s GC / 5 s proof); three full passes on 2026-10-16 | 95–110 min |
 
 Nodes report `ready=1` two to three minutes after a reset; the suite's pre-check waits for it.
+
+## CI
+
+`.github/workflows/e2e_localnet.yml` runs on the self-hosted `bitvm2-node` runner on every push to
+`main` / `dev` and on manual dispatch (Actions → "Localnet e2e" → Run workflow); the same triggers
+as `ci_time_consuming.yml`. It is informational, not a required check. One run is build →
+`make localnet-reset` → `make e2e` → stop, about two hours; runs queue (`concurrency:
+localnet-e2e`) and a running one is never cancelled.
+
+The CI localnet is a third, private one: `LOCALNET_DATA=/data/actions-runner-bitvm2-node/cache/localnet-e2e/data`,
+`PORT_BASE=25000`, `COMPOSE_PROJECT=bvci`, `CARGO_TARGET_DIR=.../localnet-e2e/target`. The data dir
+is kept between runs (keys, solc and node_modules caches; the reset wipes chains and node DBs), and
+the last 10 result dirs stay in it. The job summary shows `report.md`; the run's result dir
+(`report.json`, per-case logs, `logs.tar.gz`) is uploaded as the `localnet-e2e-<run id>` artifact for
+14 days. The runner user needs docker, passwordless `sudo` for the p2p case (otherwise it is
+reported as SKIP), the zkm toolchain and a free 25000–25999 port range. To reproduce a CI failure
+locally, run the same three make targets with the same three variables (any free `PORT_BASE`).
 
 ## Known limits
 
