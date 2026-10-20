@@ -33,10 +33,10 @@ pub const VK_HASH_SIZE: usize = 66;
 pub const TOTAL_WORK_SIZE: usize = 32;
 pub const CONSENSUS_BLOCK_HEIGHT_SIZE: usize = 4;
 
-// 0xa7dc2490c86669681db61a063cfc879d22c8dc275be1354fb917206a50403f27
+// 0x84c5a537f2970a08850de31b8485cd9468815512136f95314f36b3626639720a
 pub const ROOT_COMMIT_PROGRAM_ID: verifier::ProgramId = [
-    167, 220, 36, 144, 200, 102, 105, 104, 29, 182, 26, 6, 60, 252, 135, 157, 34, 200, 220, 39, 91,
-    225, 53, 79, 185, 23, 32, 106, 80, 64, 63, 39,
+    132, 197, 165, 55, 242, 151, 10, 8, 133, 13, 227, 27, 132, 133, 205, 148, 104, 129, 85, 18, 19,
+    111, 149, 49, 79, 54, 179, 98, 102, 57, 114, 10,
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
