@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE long_running_task_proof\n             SET path_to_proof = ?,\n                 cycles = ?,\n                 proof_state = ?,\n                 total_time_to_proof = ?,\n                 proving_time = ?,\n                 zkm_version = ?,\n                 block_end = ?,\n                 public_value_hex = ?,\n                 proof_size = ?,\n                 updated_at = ?\n             WHERE block_start = ? AND chain_name = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 12
+    },
+    "nullable": []
+  },
+  "hash": "7a2fa2d3bc1b285f0c52f741a03aef2544cd00b381fa78a35811b4dde9e48e24"
+}

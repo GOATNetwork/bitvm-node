@@ -2,6 +2,7 @@ mod goat;
 mod graph;
 mod instance;
 mod node;
+mod proof;
 mod stats;
 mod swap;
 #[cfg(test)]

@@ -1,5 +1,5 @@
 use super::*;
-use crate::{Instance, MetricsStateCount, Node};
+use crate::{Instance, MetricsStateCount, Node, OperatorProof};
 use indexmap::IndexMap;
 use sqlx::types::Uuid;
 
@@ -395,4 +395,36 @@ async fn test_scan_state_upsert_and_get() {
     let state = s.get_sequencer_set_scan_state().await.unwrap().unwrap();
     assert_eq!(state.next_cosmos_block_height, 200);
     assert_eq!(state.latest_validators_hash, "ddeeff");
+}
+
+// proof-builder-rpc keeps its proofs in these tables through the shared store migrations; offline sqlx
+// checks would not notice the tables disappearing from the migrations, this does.
+#[tokio::test]
+async fn test_proof_builder_tables_are_migrated() {
+    let db = setup_db().await;
+    let mut s = db.acquire().await.unwrap();
+
+    let seed = s
+        .find_latest_long_running_task_proof_by_name("header-chain".to_string())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((seed.block_start, seed.block_end), (0, 116000));
+
+    let (instance_id, graph_id) = (Uuid::new_v4(), Uuid::new_v4());
+    let proof = OperatorProof {
+        instance_id,
+        graph_id,
+        operator_committed_blockhash: "00".repeat(32),
+        execution_layer_block_number: 7,
+        ..Default::default()
+    };
+    assert_eq!(s.create_operator_proof(&proof).await.unwrap(), 1);
+    let stored = s
+        .find_operator_proof_by_instance_and_graph(&instance_id, &graph_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.execution_layer_block_number, 7);
+    assert!(s.proof_metrics_state_counts().await.is_ok());
 }

@@ -1,0 +1,98 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT\n                block_start,\n                block_end,\n                chain_name,\n                path_to_proof,\n                public_value_hex,\n                proof_size,\n                cycles,\n                proof_state,\n                total_time_to_proof,\n                proving_time,\n                zkm_version,\n                extra,\n                updated_at,\n                created_at\n            FROM long_running_task_proof\n            WHERE chain_name = ?\n            AND proof_state = ?\n            ORDER BY block_start DESC\n            LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "name": "block_start",
+        "ordinal": 0,
+        "type_info": "Integer"
+      },
+      {
+        "name": "block_end",
+        "ordinal": 1,
+        "type_info": "Integer"
+      },
+      {
+        "name": "chain_name",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "path_to_proof",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "public_value_hex",
+        "ordinal": 4,
+        "type_info": "Text"
+      },
+      {
+        "name": "proof_size",
+        "ordinal": 5,
+        "type_info": "Integer"
+      },
+      {
+        "name": "cycles",
+        "ordinal": 6,
+        "type_info": "Integer"
+      },
+      {
+        "name": "proof_state",
+        "ordinal": 7,
+        "type_info": "Integer"
+      },
+      {
+        "name": "total_time_to_proof",
+        "ordinal": 8,
+        "type_info": "Integer"
+      },
+      {
+        "name": "proving_time",
+        "ordinal": 9,
+        "type_info": "Integer"
+      },
+      {
+        "name": "zkm_version",
+        "ordinal": 10,
+        "type_info": "Text"
+      },
+      {
+        "name": "extra",
+        "ordinal": 11,
+        "type_info": "Text"
+      },
+      {
+        "name": "updated_at",
+        "ordinal": 12,
+        "type_info": "Integer"
+      },
+      {
+        "name": "created_at",
+        "ordinal": 13,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "f7feca95fe5951503f6e2f9bca254cc3717c0b1a27151e9a37c06dd8f20c7356"
+}

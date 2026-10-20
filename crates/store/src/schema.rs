@@ -776,6 +776,68 @@ impl ProofState {
 }
 
 #[derive(Clone, FromRow, Debug, Serialize, Deserialize, Default)]
+pub struct WatchtowerProof {
+    pub id: i64,
+    pub instance_id: Uuid,
+    pub graph_id: Uuid,
+    pub public_key: String,
+    pub challenge_txid: SerializableTxid,
+    pub challenge_init_txid: SerializableTxid,
+    pub execution_layer_block_number: i64,
+    pub path_to_proof: Option<String>,
+    pub public_value_hex: Option<String>,
+    pub proof_size: i64,
+    pub cycles: i64,
+    pub proof_state: i64,
+    pub total_time_to_proof: i64,
+    pub proving_time: i64,
+    pub zkm_version: String,
+    pub node_index: i32,
+    pub included: bool,
+    pub extra: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, FromRow, Debug, Serialize, Deserialize, Default)]
+pub struct OperatorProof {
+    pub id: i64,
+    pub instance_id: Uuid,
+    pub graph_id: Uuid,
+    pub operator_committed_blockhash: String,
+    pub execution_layer_block_number: i64,
+    pub path_to_proof: Option<String>,
+    pub public_value_hex: Option<String>,
+    pub proof_size: i64,
+    pub cycles: i64,
+    pub proof_state: i64,
+    pub total_time_to_proof: i64,
+    pub proving_time: i64,
+    pub zkm_version: String,
+    pub extra: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, FromRow, Debug, Serialize, Deserialize, Default)]
+pub struct LongRunningTaskProof {
+    pub block_start: i64,
+    pub block_end: i64,
+    pub chain_name: String,
+    pub path_to_proof: Option<String>,
+    pub public_value_hex: Option<String>,
+    pub proof_size: i64,
+    pub cycles: i64,
+    pub proof_state: i64,
+    pub total_time_to_proof: i64,
+    pub proving_time: i64,
+    pub zkm_version: String,
+    pub extra: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, FromRow, Debug, Serialize, Deserialize, Default)]
 pub struct SequencerSetHashChange {
     pub id: i64,
     pub cosmos_block_height: i64,

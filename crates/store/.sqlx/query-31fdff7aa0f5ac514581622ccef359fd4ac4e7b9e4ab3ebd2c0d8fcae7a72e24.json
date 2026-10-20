@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE watchtower_proof\n             SET proof_state = ?,\n                 updated_at = ?\n             WHERE   instance_id = ?\n                    AND graph_id = ?\n                    AND  public_key = ? AND proof_state = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 6
+    },
+    "nullable": []
+  },
+  "hash": "31fdff7aa0f5ac514581622ccef359fd4ac4e7b9e4ab3ebd2c0d8fcae7a72e24"
+}

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT\n             INTO long_running_task_proof (block_start, block_end, chain_name, path_to_proof, public_value_hex, proof_size, cycles, proof_state, total_time_to_proof, proving_time,\n                                           zkm_version, extra, updated_at, created_at)\n             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 14
+    },
+    "nullable": []
+  },
+  "hash": "eab1049c16b19bc9fff117a2e00b6fa6c9c3d818981bcde1715bf49f6e943d16"
+}
