@@ -30,10 +30,8 @@ sha2 = { git = "https://github.com/ziren-patches/RustCrypto-hashes", branch = "p
 bn = { git = "https://github.com/ziren-patches/bn", branch = "patch-0.6.0", package = "substrate-bn" }
 k256 = { git = "https://github.com/ziren-patches/elliptic-curves", branch = "patch-k256-0.13.4" }
 p256 = { git = "https://github.com/ziren-patches/elliptic-curves", branch = "patch-p256-0.13.2" }
-alloy-primitives-v1-0-0 = { git = "https://github.com/ziren-patches/core.git", package = "alloy-primitives", branch = "patch-alloy-primitives-1.0.0" }
-alloy-primitives-v1-1-0 = { git = "https://github.com/ziren-patches/core.git", package = "alloy-primitives", branch = "patch-alloy-primitives-1.1.0" }
-alloy-primitives-v1-1-2 = { git = "https://github.com/ziren-patches/core.git", package = "alloy-primitives", branch = "patch-alloy-primitives-1.1.2" }
 alloy-primitives-v1-4-1 = { git = "https://github.com/ziren-patches/core.git", package = "alloy-primitives", branch = "patch-alloy-primitives-1.4.1" }
-secp256k1-v0-29-1 = { git = "https://github.com/ziren-patches/rust-secp256k1", package = "secp256k1", branch = "patch-0.29.1" }
+# secp256k1 0.29 stays unpatched: the patched 0.29.1's secp256k1-sys would share its `links` name
+# with the registry secp256k1-sys that secp256k1 0.30 (alloy, reth) needs.
 #secp256k1-v0-30-0 = { git = "https://github.com/ziren-patches/rust-secp256k1", package = "secp256k1", branch = "patch-0.30.0" }
 #bitcoin = { git = "https://github.com/ProjectZKM/rust-bitcoin", branch = "patch-0.32.7" }
