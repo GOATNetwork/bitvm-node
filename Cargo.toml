@@ -155,10 +155,10 @@ alloy-consensus = { git = "https://github.com/ziren-patches/alloy", branch = "pa
 # workspace
 
 # Reth
-guest-executor = { git = "https://github.com/ProjectZKM/reth-processor", branch = "chore/ziren-v2-goat" }
-host-executor = { git = "https://github.com/ProjectZKM/reth-processor", branch = "chore/ziren-v2-goat", features = ["execution-witness"] }
-primitives = { git = "https://github.com/ProjectZKM/reth-processor", branch = "chore/ziren-v2-goat" }
-provider = { git = "https://github.com/ProjectZKM/reth-processor", branch = "chore/ziren-v2-goat" }
+guest-executor = { git = "https://github.com/ProjectZKM/reth-processor" }
+host-executor = { git = "https://github.com/ProjectZKM/reth-processor", features = ["execution-witness"] }
+primitives = { git = "https://github.com/ProjectZKM/reth-processor" }
+provider = { git = "https://github.com/ProjectZKM/reth-processor" }
 
 reth-chainspec = { git = "https://github.com/ziren-patches/reth", branch = "patch-1.9.3", default-features = false }
 
