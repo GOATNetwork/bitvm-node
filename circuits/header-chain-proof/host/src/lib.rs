@@ -57,6 +57,17 @@ pub struct Args {
 
     #[clap(long, default_value_t = false)]
     pub force_fetch: bool,
+
+    /// Prefer cached headers for the first batch built from Genesis.
+    #[arg(long, default_value_t = false)]
+    #[serde(default)]
+    pub prefer_local_headers_on_init: bool,
+}
+
+impl Args {
+    pub fn is_genesis_batch(&self) -> bool {
+        self.init_input && self.start == 0
+    }
 }
 
 impl LongRunning for Args {
@@ -65,11 +76,14 @@ impl LongRunning for Args {
         next_args.input_proof = self.output_proof.clone();
         next_args.init_input = false;
         next_args.start = self.start + self.batch_size;
+        if self.is_genesis_batch() {
+            next_args.batch_size = 1;
+        }
         next_args.output_proof = format!(
             "{}/{}-{}.bin",
             std::path::Path::new(&self.output_proof).parent().unwrap().to_str().unwrap(),
             next_args.start,
-            self.batch_size
+            next_args.batch_size
         );
         next_args
     }
@@ -82,8 +96,31 @@ pub async fn fetch_header_chain(
     block_header_file: &str,
     force_fetch: bool,
     network: Network,
+    prefer_local_headers_on_init: bool,
 ) -> anyhow::Result<Vec<CircuitBlockHeader>> {
     let btc_client = BTCClient::new(network, Some(esplora_url));
+    fetch_header_chain_with_client(
+        &btc_client,
+        start,
+        batch_size,
+        block_header_file,
+        force_fetch,
+        prefer_local_headers_on_init,
+    )
+    .await
+}
+
+async fn fetch_header_chain_with_client(
+    btc_client: &BTCClient,
+    start: usize,
+    batch_size: usize,
+    block_header_file: &str,
+    force_fetch: bool,
+    prefer_local_headers_on_init: bool,
+) -> anyhow::Result<Vec<CircuitBlockHeader>> {
+    let prefer_local = prefer_local_headers_on_init && start == 0;
+    let end = start.checked_add(batch_size).context("Header batch range overflow")?;
+    anyhow::ensure!(batch_size > 0, "Header batch size must be positive");
 
     let mut writer = std::fs::OpenOptions::new()
         .read(true)
@@ -94,25 +131,46 @@ pub async fn fetch_header_chain(
         .with_context(|| format!("Open {block_header_file} error"))?;
 
     let mut headers: Vec<u8> = Vec::new();
-    writer.read_to_end(&mut headers)?;
+    if prefer_local || force_fetch {
+        let cached_headers = if prefer_local { batch_size } else { start };
+        let bytes = cached_headers.checked_mul(80).context("Header cache range overflow")?;
+        (&mut writer).take(bytes as u64).read_to_end(&mut headers)?;
+    } else {
+        writer.read_to_end(&mut headers)?;
+    }
+    if !prefer_local {
+        anyhow::ensure!(headers.len().is_multiple_of(80), "Invalid block header file length");
+    }
 
     let mut block_headers: Vec<_> = headers
-        .chunks(80)
-        .map(|header| CircuitBlockHeader::try_from_slice(header).unwrap())
-        .collect::<Vec<CircuitBlockHeader>>();
+        .chunks_exact(80)
+        .map(CircuitBlockHeader::try_from_slice)
+        .collect::<Result<Vec<_>, _>>()
+        .with_context(|| format!("Read block headers from {block_header_file}"))?;
 
-    if force_fetch {
-        block_headers.truncate(start);
+    if prefer_local {
+        tracing::info!(
+            cached_headers = block_headers.len(),
+            batch_size,
+            "Loaded local headers for the Genesis batch"
+        );
+        if block_headers.len() == batch_size {
+            return Ok(block_headers);
+        }
+    } else {
+        if force_fetch {
+            block_headers.truncate(start);
+        }
+        assert_eq!(block_headers.len(), start, "Invalid starting block number");
     }
-    assert!(block_headers.len() == start, "Invalid starting block number");
 
     writer.seek(std::io::SeekFrom::Start((block_headers.len() * 80) as u64))?;
 
     let confirmations = get_btc_block_confirms(btc_client.network());
 
-    let mut i = start;
+    let mut i = block_headers.len();
     let mut retries = 9;
-    while i < start + batch_size {
+    while i < end {
         tracing::info!("get block by height: {i}");
         let tip_height = btc_client.get_height().await?;
         if i as u32 + confirmations > tip_height {
@@ -358,6 +416,151 @@ impl ProofBuilder for HeaderChainProofBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    fn test_blocks() -> Vec<bitcoin::Block> {
+        let genesis = bitcoin::constants::genesis_block(Network::Testnet4);
+        let mut second = genesis.clone();
+        second.header.prev_blockhash = genesis.block_hash();
+        second.header.nonce += 1;
+        let mut third = second.clone();
+        third.header.prev_blockhash = second.block_hash();
+        third.header.nonce += 1;
+        vec![genesis, second, third]
+    }
+
+    #[tokio::test]
+    async fn genesis_batch_uses_local_headers_without_rpc_and_preserves_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("headers.bin");
+        let header: CircuitBlockHeader = test_blocks()[0].header.into();
+        let headers = vec![header; 10001];
+        let bytes = proof_block_headers(&headers).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        let (client, _) = BTCClient::new_mock_client();
+
+        // The mock tip is 0, so any RPC fetch would wait for confirmations.
+        for force_fetch in [false, true] {
+            let fetched = tokio::time::timeout(
+                Duration::from_secs(2),
+                fetch_header_chain_with_client(
+                    &client,
+                    0,
+                    10000,
+                    path.to_str().unwrap(),
+                    force_fetch,
+                    true,
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(fetched, headers[..10000]);
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
+    }
+
+    #[tokio::test]
+    async fn genesis_batch_fetches_only_missing_headers() {
+        let blocks = test_blocks();
+        let headers: Vec<CircuitBlockHeader> = blocks.iter().map(|b| b.header.into()).collect();
+        let bytes = proof_block_headers(&headers).unwrap();
+
+        for cached_bytes in [None, Some(0), Some(80), Some(160 + 17)] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("headers.bin");
+            if let Some(len) = cached_bytes {
+                fs::write(&path, &bytes[..len]).unwrap();
+            }
+            let (client, mock) = BTCClient::new_mock_client();
+            mock.set_height(100);
+            let cached_headers = cached_bytes.unwrap_or(0) / 80;
+            for (height, block) in blocks.iter().enumerate().skip(cached_headers) {
+                mock.set_block_hash(height as u32, block.block_hash());
+                mock.set_block(block.block_hash(), block.clone());
+            }
+
+            // Cached heights are absent from the mock and must never be fetched again.
+            let fetched = tokio::time::timeout(
+                Duration::from_secs(2),
+                fetch_header_chain_with_client(&client, 0, 3, path.to_str().unwrap(), true, true),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(fetched, headers);
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
+    }
+
+    #[tokio::test]
+    async fn disabled_preference_and_later_batches_still_fetch_from_rpc() {
+        let blocks = test_blocks();
+        for (start, prefer_local) in [(0, false), (1, true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("headers.bin");
+            let mut cached: Vec<CircuitBlockHeader> =
+                blocks.iter().map(|b| b.header.into()).collect();
+            cached[start].nonce += 100;
+            let mut bytes = proof_block_headers(&cached).unwrap();
+            bytes.extend_from_slice(&[0; 17]);
+            fs::write(&path, bytes).unwrap();
+            let (client, mock) = BTCClient::new_mock_client();
+            mock.set_height(100);
+            let block = &blocks[start];
+            mock.set_block_hash(start as u32, block.block_hash());
+            mock.set_block(block.block_hash(), block.clone());
+
+            let fetched = fetch_header_chain_with_client(
+                &client,
+                start,
+                1,
+                path.to_str().unwrap(),
+                true,
+                prefer_local,
+            )
+            .await
+            .unwrap();
+            let expected: Vec<CircuitBlockHeader> =
+                blocks[..=start].iter().map(|b| b.header.into()).collect();
+            assert_eq!(fetched, expected);
+            assert_eq!(fs::read(&path).unwrap(), proof_block_headers(&expected).unwrap());
+        }
+    }
+
+    #[test]
+    fn genesis_batch_rotates_to_single_block_batches() {
+        let mut args = Args::try_parse_from([
+            "header-chain-proof",
+            "--init-input",
+            "--start",
+            "0",
+            "--batch-size",
+            "10000",
+            "--bitcoin-network",
+            "regtest",
+            "--output-proof",
+            "/tmp/proofs/0-10000.bin",
+            "--prefer-local-headers-on-init",
+        ])
+        .unwrap();
+        assert!(args.prefer_local_headers_on_init && args.is_genesis_batch());
+
+        let next = args.rotate();
+        assert_eq!((next.start, next.batch_size), (10000, 1));
+        assert!(!next.is_genesis_batch());
+        assert_eq!(next.input_proof, args.output_proof);
+        assert_eq!(next.output_proof, "/tmp/proofs/10000-1.bin");
+        let after_next = next.rotate();
+        assert_eq!((after_next.start, after_next.batch_size), (10001, 1));
+        assert_eq!(after_next.output_proof, "/tmp/proofs/10001-1.bin");
+
+        args.init_input = false;
+        assert!(!args.is_genesis_batch());
+        args.init_input = true;
+        args.start = 1;
+        assert!(!args.is_genesis_batch());
+    }
 
     #[test]
     fn proof_block_headers_matches_the_operator_reader() {

@@ -32,3 +32,21 @@ impl ProofBuilderConfig {
         Ok(new_args)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn header_chain_local_preference_is_optional() {
+        let example = include_str!("../proof-builder.toml.example");
+        let without_option = example.replace("prefer_local_headers_on_init = false", "");
+        let config: ProofBuilderConfig = toml::from_str(&without_option).unwrap();
+        assert!(!config.header_chain.prefer_local_headers_on_init);
+
+        let enabled = example
+            .replace("prefer_local_headers_on_init = false", "prefer_local_headers_on_init = true");
+        let config: ProofBuilderConfig = toml::from_str(&enabled).unwrap();
+        assert!(config.header_chain.prefer_local_headers_on_init);
+    }
+}

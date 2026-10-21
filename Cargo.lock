@@ -5468,6 +5468,7 @@ dependencies = [
  "rand 0.8.5",
  "serde",
  "sha2 0.10.9",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber 0.3.23",

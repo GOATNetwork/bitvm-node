@@ -16,6 +16,19 @@ the database.
 
 Field descriptions for the configuration are available in the circuits documentation: [circuits README](../circuits/README.md).
 
+To reuse local Bitcoin headers for the first batch built from Genesis, set
+`prefer_local_headers_on_init = true` in `[header_chain]`, together with `init_input = true`
+and `start = 0`. The option defaults to `false` for existing configurations. Headers are read
+from `block_headers`, which contains consecutive 80-byte headers starting at height 0.
+For `batch_size = 10000`, the first batch uses heights 0 through 9999. A complete local batch
+requires no Bitcoin RPC calls and leaves any later cached headers intact. If the file is absent
+or incomplete, only missing headers are fetched through Esplora; an incomplete trailing header
+is fetched again. This preference overrides `force_fetch` for the Genesis batch only.
+After the first proof succeeds, subsequent batches contain one block and use the existing
+fetching behaviour. Restarting with database progress also resumes with one block per batch.
+When this option is enabled, surplus cached headers are replaced as later batches are fetched,
+including when `force_fetch = false`.
+
 The four Operator/Watchtower task endpoints require signed requests and live GOAT contract
 authorization. Configure the read-only GOAT connection before startup:
 

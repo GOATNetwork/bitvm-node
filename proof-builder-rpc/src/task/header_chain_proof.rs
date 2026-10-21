@@ -32,12 +32,6 @@ pub(crate) fn spawn_header_chain_proof_task(
                 anyhow::bail!("Header chain proof generate task cancelled");
             }
         }
-        assert_eq!(
-            args.batch_size, 1,
-            "Header chain proof batch size must be 1, current batch size: {}",
-            args.batch_size
-        );
-
         let builder = runtime.builder(HeaderChainProofBuilder::with_client).await?;
         loop {
             tokio::select! {
@@ -46,6 +40,7 @@ pub(crate) fn spawn_header_chain_proof_task(
                     if let Some(next_task) = next_task {
                         info!("Header chain's next task: {next_task:?}");
                         args.start = next_task.block_end as usize;
+                        args.batch_size = 1;
                         args.input_proof = next_task.path_to_proof.unwrap();
                         args.output_proof = format!(
                             "{}/{}-{}.bin",
@@ -55,14 +50,20 @@ pub(crate) fn spawn_header_chain_proof_task(
                         );
                         args.init_input = false;
                     }
+                    anyhow::ensure!(
+                        args.batch_size > 0 && (args.batch_size == 1 || args.is_genesis_batch()),
+                        "Header chain proof batch size must be positive and must be 1 after Genesis, current batch size: {}",
+                        args.batch_size
+                    );
                     info!("Header chain proof generate task: generate proof, args: {args:?}");
                     let total_block_headers = match fetch_header_chain(
                         &args.esplora_url,
                         args.start,
                         args.batch_size,
                         &args.block_headers,
-                        args.force_fetch,
+                        args.force_fetch || args.prefer_local_headers_on_init,
                         args.bitcoin_network,
+                        args.prefer_local_headers_on_init && args.is_genesis_batch(),
                     ).await {
                         Ok(data) => data,
                         Err(err) => {
