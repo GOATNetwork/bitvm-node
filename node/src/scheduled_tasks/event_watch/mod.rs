@@ -23,8 +23,8 @@ use client::graphs::graph_query::{
     GatewayEventEntity, SwapConfig, SwapEventEntity, TheGraphConfig, WatchContractType,
     WatchEventConfig,
 };
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use store::localdb::{LocalDB, StorageProcessor};
 use store::{WatchContract, WatchContractStatus};
@@ -34,6 +34,34 @@ use tracing::{info, warn};
 
 use bridge_out::fetch_and_handle_bridge_out_events;
 use gateway::fetch_and_handle_gateway_events;
+
+/// How long a history sync waits when the indexer tip is below its cursor.
+const HISTORY_SYNC_TIP_BEHIND_WAIT: Duration = Duration::from_secs(5);
+
+/// Contracts whose history sync task runs in this process.
+static HISTORY_SYNC_IN_FLIGHT: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// A contract's history-sync slot; dropping it, also when the task panics,
+/// frees the slot.
+struct HistorySyncGuard(String);
+
+impl HistorySyncGuard {
+    fn try_acquire(contract_addr: &str) -> Option<Self> {
+        let mut in_flight =
+            HISTORY_SYNC_IN_FLIGHT.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        in_flight.insert(contract_addr.to_string()).then(|| Self(contract_addr.to_string()))
+    }
+}
+
+impl Drop for HistorySyncGuard {
+    fn drop(&mut self) {
+        HISTORY_SYNC_IN_FLIGHT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.0);
+    }
+}
 
 async fn refresh_event_watch_metrics(
     local_db: &LocalDB,
@@ -154,10 +182,13 @@ pub async fn fetch_history_events(
             };
 
             if watch_contract.from_height > current_finalized {
+                // The indexer tip fell below the cursor (reindex or replica lag):
+                // wait for it to catch up instead of spinning on the RPC.
                 info!(
-                    "Contract {task_name} fetch history events will finish, as current finalize height: {current_finalized} is litter than watch from height: {}",
+                    "Contract {task_name} history sync waits for the indexer: finalized height {current_finalized} is below the watch from height {}",
                     watch_contract.from_height,
                 );
+                sleep(HISTORY_SYNC_TIP_BEHIND_WAIT).await;
                 continue;
             }
 
@@ -304,11 +335,22 @@ pub async fn monitor_events_item(
         return Ok(());
     }
     if watch_contract.from_height + watch_contract.gap < current_finalized {
+        // One history sync per contract. The gate above sees `Syncing` only
+        // after the task commits its first batch, so claim the contract here,
+        // in this process and in its row, before the task starts.
+        let Some(sync_guard) = HistorySyncGuard::try_acquire(&watch_contract.contract_addr) else {
+            info!("Event sync not finished ");
+            return Ok(());
+        };
+        watch_contract.status = WatchContractStatus::Syncing.to_string();
+        watch_contract.updated_at = current_time_secs();
+        storage_processor.upsert_watch_contract(&watch_contract).await?;
         let watch_contract_clone = watch_contract.clone();
         let local_db_clone = local_db.clone();
         let query_client_clone = query_client.clone();
         let watch_events_config_clone = watch_events_config.clone();
         tokio::spawn(async move {
+            let _sync_guard = sync_guard;
             if let Err(error) = fetch_history_events(
                 actor.clone(),
                 btc_client.clone(),
@@ -576,4 +618,19 @@ pub async fn is_processing_gateway_history_events(
     .await?;
     Ok(watch_contract.from_height + watch_contract.gap < current_finalized
         || watch_contract.status == WatchContractStatus::Syncing.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HistorySyncGuard;
+
+    #[test]
+    fn history_sync_guard_is_exclusive_per_contract() {
+        let first = HistorySyncGuard::try_acquire("0xabc").expect("free slot");
+        assert!(HistorySyncGuard::try_acquire("0xabc").is_none());
+        let other = HistorySyncGuard::try_acquire("0xdef").expect("another contract is free");
+        drop(first);
+        assert!(HistorySyncGuard::try_acquire("0xabc").is_some());
+        drop(other);
+    }
 }
