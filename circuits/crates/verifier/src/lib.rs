@@ -122,7 +122,7 @@ pub fn verify_groth16_proof(
 mod tests {
     use super::*;
 
-    /// Pins the Groth16 statement to Ziren `dae4c64d` (circuit version v2.0.0). The Ziren dependency
+    /// Pins the Groth16 statement to Ziren `62acdd5c` (circuit version v2.0.0). The Ziren dependency
     /// has no tag or rev, so a `cargo update` could otherwise move the wrap vk or the recursion vk
     /// root without a reviewable diff. Update these only together with a deliberate Ziren upgrade.
     #[test]
