@@ -6,6 +6,7 @@
 //! cd ../scripts
 //! docker-compose -f docker-compose.yml up -d
 //! ```
+use anyhow::Context;
 use bitcoin::CompressedPublicKey;
 use bitcoin::{
     Address, Amount, OutPoint, PrivateKey, PublicKey, ScriptBuf, Sequence, Transaction, TxIn,
@@ -288,11 +289,15 @@ async fn get_sequencer_set_hash_from_db(
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Derives authorization roots from proofs or initializes them for fresh Header/State chains.
     DeriveProgramHistoryRoot {
-        #[arg(long)]
-        header_chain_input_proof: String,
-        #[arg(long)]
-        state_chain_input_proof: String,
+        /// Initializes roots for fresh Header/State chains without predecessor proofs.
+        #[arg(long, conflicts_with_all = ["header_chain_input_proof", "state_chain_input_proof"])]
+        init_genesis: bool,
+        #[arg(long, required_unless_present = "init_genesis")]
+        header_chain_input_proof: Option<String>,
+        #[arg(long, required_unless_present = "init_genesis")]
+        state_chain_input_proof: Option<String>,
         #[arg(long, env = "PROGRAM_ID_MANIFEST")]
         program_id_manifest: String,
     },
@@ -370,18 +375,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt().with_env_filter(EnvFilter::from_default_env()).try_init();
     let args = Args::parse();
     if let Commands::DeriveProgramHistoryRoot {
+        init_genesis,
         header_chain_input_proof,
         state_chain_input_proof,
         program_id_manifest,
     } = &args.command
     {
         let authorized_program_ids = load_program_id_manifest(program_id_manifest, get_network())?;
-        let (program_history_root, proof_checkpoint_root) = derive_authorization_roots(
-            header_chain_input_proof,
-            state_chain_input_proof,
-            authorized_program_ids.header,
-            authorized_program_ids.state,
-        )?;
+        let (program_history_root, proof_checkpoint_root) = if *init_genesis {
+            initial_authorization_roots(authorized_program_ids.header, authorized_program_ids.state)
+        } else {
+            derive_authorization_roots(
+                header_chain_input_proof
+                    .as_deref()
+                    .context("header chain input proof is required unless --init-genesis is set")?,
+                state_chain_input_proof
+                    .as_deref()
+                    .context("state chain input proof is required unless --init-genesis is set")?,
+                authorized_program_ids.header,
+                authorized_program_ids.state,
+            )?
+        };
         println!("program_history_root=0x{}", hex::encode(program_history_root));
         println!("proof_checkpoint_root=0x{}", hex::encode(proof_checkpoint_root));
         return Ok(());
@@ -628,6 +642,26 @@ fn next_state_history_root(
         verifier::finalize_history(verifier::ProgramType::State, history, next_program_id),
         checkpoint,
     ))
+}
+
+fn initial_authorization_roots(
+    header_program_id: verifier::ProgramId,
+    state_program_id: verifier::ProgramId,
+) -> ([u8; 32], [u8; 32]) {
+    let header_history = verifier::finalize_history(
+        verifier::ProgramType::Header,
+        verifier::initial_history(verifier::ProgramType::Header),
+        header_program_id,
+    );
+    let state_history = verifier::finalize_history(
+        verifier::ProgramType::State,
+        verifier::initial_history(verifier::ProgramType::State),
+        state_program_id,
+    );
+    (
+        verifier::program_history_root(header_history, state_history),
+        verifier::proof_checkpoint_root([0u8; 32], [0u8; 32]),
+    )
 }
 
 /// Verifies the predecessor proofs and derives the root expected from their next recursive steps.
@@ -1233,6 +1267,95 @@ mod tests {
     use bitcoin::secp256k1::SecretKey;
 
     const SIGHASH: [u8; 32] = [42; 32];
+
+    fn parse_root_args(extra_args: &[&str]) -> Result<Args, clap::Error> {
+        let mut args = vec![
+            "sequencer-set-publish",
+            "derive-program-history-root",
+            "--program-id-manifest",
+            "manifest.json",
+        ];
+        args.extend_from_slice(extra_args);
+        Args::try_parse_from(args)
+    }
+
+    #[test]
+    fn genesis_roots_require_no_predecessor_proofs() {
+        let args = parse_root_args(&["--init-genesis"]).unwrap();
+        assert!(matches!(
+            args.command,
+            Commands::DeriveProgramHistoryRoot {
+                init_genesis: true,
+                header_chain_input_proof: None,
+                state_chain_input_proof: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn recursive_roots_require_both_predecessor_proofs() {
+        for args in [
+            &[][..],
+            &["--header-chain-input-proof", "header.bin"][..],
+            &["--state-chain-input-proof", "state.bin"][..],
+        ] {
+            assert_eq!(
+                parse_root_args(args).unwrap_err().kind(),
+                clap::error::ErrorKind::MissingRequiredArgument
+            );
+        }
+
+        let args = parse_root_args(&[
+            "--header-chain-input-proof",
+            "header.bin",
+            "--state-chain-input-proof",
+            "state.bin",
+        ])
+        .unwrap();
+        assert!(matches!(
+            args.command,
+            Commands::DeriveProgramHistoryRoot {
+                init_genesis: false,
+                header_chain_input_proof: Some(header),
+                state_chain_input_proof: Some(state),
+                ..
+            } if header == "header.bin" && state == "state.bin"
+        ));
+    }
+
+    #[test]
+    fn genesis_roots_reject_predecessor_proofs() {
+        for args in [
+            &["--init-genesis", "--header-chain-input-proof", "header.bin"][..],
+            &["--init-genesis", "--state-chain-input-proof", "state.bin"][..],
+            &[
+                "--init-genesis",
+                "--header-chain-input-proof",
+                "header.bin",
+                "--state-chain-input-proof",
+                "state.bin",
+            ][..],
+        ] {
+            assert_eq!(
+                parse_root_args(args).unwrap_err().kind(),
+                clap::error::ErrorKind::ArgumentConflict
+            );
+        }
+    }
+
+    #[test]
+    fn initial_authorization_roots_match_known_vectors() {
+        let (history, checkpoint) = initial_authorization_roots([1; 32], [2; 32]);
+        assert_eq!(
+            hex::encode(history),
+            "c49b3b37c0b09dda163d6dcc5663fe411e5cfe95873105acfe4a51cdd6df44d5"
+        );
+        assert_eq!(
+            hex::encode(checkpoint),
+            "34670e36c21e467eb0519d45b9315d979c0fbd7c39ff99e1dafd42069d94d202"
+        );
+    }
 
     fn secret_key(value: u8) -> SecretKey {
         SecretKey::from_slice(&[value; 32]).expect("valid test secret key")
