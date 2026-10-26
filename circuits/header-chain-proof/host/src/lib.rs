@@ -58,7 +58,7 @@ pub struct Args {
     #[clap(long, default_value_t = false)]
     pub force_fetch: bool,
 
-    /// Prefer cached headers for the first batch built from Genesis.
+    /// Prefer cached headers or the matching proof sidecar for the Genesis batch.
     #[arg(long, default_value_t = false)]
     #[serde(default)]
     pub prefer_local_headers_on_init: bool,
@@ -110,6 +110,57 @@ pub async fn fetch_header_chain(
     .await
 }
 
+fn seed_genesis_header_cache(
+    writer: &mut fs::File,
+    block_header_file: &str,
+    batch_size: usize,
+) -> anyhow::Result<()> {
+    let cached_headers = writer.metadata()?.len() / 80;
+    if cached_headers >= batch_size as u64 {
+        return Ok(());
+    }
+
+    let sidecar_path = std::path::Path::new(block_header_file)
+        .with_file_name(format!("0-{batch_size}.bin.blocks"));
+    let sidecar = match fs::File::open(&sidecar_path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            tracing::info!(
+                source = %sidecar_path.display(),
+                "Genesis header sidecar not found; using the working cache"
+            );
+            return Ok(());
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("Open {} error", sidecar_path.display()));
+        }
+    };
+    let source_headers = (sidecar.metadata()?.len() / 80).min(batch_size as u64);
+    if source_headers <= cached_headers {
+        return Ok(());
+    }
+
+    // Copy whole headers into the mutable cache, leaving the proof sidecar unchanged.
+    let bytes = source_headers * 80;
+    writer.seek(std::io::SeekFrom::Start(0))?;
+    let copied = std::io::copy(&mut sidecar.take(bytes), writer)
+        .with_context(|| format!("Copy {} to {block_header_file}", sidecar_path.display()))?;
+    anyhow::ensure!(
+        copied == bytes,
+        "Header sidecar changed while reading {}",
+        sidecar_path.display()
+    );
+    writer.set_len(bytes)?;
+    writer.seek(std::io::SeekFrom::Start(0))?;
+    tracing::info!(
+        source = %sidecar_path.display(),
+        destination = block_header_file,
+        cached_headers = source_headers,
+        "Seeded Genesis header cache from proof sidecar"
+    );
+    Ok(())
+}
+
 async fn fetch_header_chain_with_client(
     btc_client: &BTCClient,
     start: usize,
@@ -129,6 +180,10 @@ async fn fetch_header_chain_with_client(
         .truncate(false)
         .open(block_header_file)
         .with_context(|| format!("Open {block_header_file} error"))?;
+
+    if prefer_local {
+        seed_genesis_header_cache(&mut writer, block_header_file, batch_size)?;
+    }
 
     let mut headers: Vec<u8> = Vec::new();
     if prefer_local || force_fetch {
@@ -150,6 +205,7 @@ async fn fetch_header_chain_with_client(
 
     if prefer_local {
         tracing::info!(
+            block_header_file,
             cached_headers = block_headers.len(),
             batch_size,
             "Loaded local headers for the Genesis batch"
@@ -405,7 +461,6 @@ impl ProofBuilder for HeaderChainProofBuilder {
                 (".zkm_version.bin", proof.zkm_version.as_bytes()),
                 (".blocks", blocks.as_slice()),
             ],
-            &format!("{} {}", Self::name(), output_proof),
         )?;
 
         tracing::info!("Generate proof successfully, proof: {:?}", proof);
@@ -494,6 +549,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn genesis_batch_loads_matching_sidecar_into_the_working_cache() {
+        let blocks = test_blocks();
+        let headers: Vec<CircuitBlockHeader> = blocks.iter().map(|b| b.header.into()).collect();
+        let bytes = proof_block_headers(&headers).unwrap();
+        let mut next_block = blocks[2].clone();
+        next_block.header.prev_blockhash = blocks[2].block_hash();
+        next_block.header.nonce += 1;
+
+        for cached_bytes in [None, Some(0), Some(80), Some(160 + 17)] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("block_headers.bin");
+            let sidecar = dir.path().join("0-3.bin.blocks");
+            fs::write(&sidecar, &bytes).unwrap();
+            if let Some(len) = cached_bytes {
+                let mut cached = bytes[..len].to_vec();
+                if let Some(first) = cached.first_mut() {
+                    *first ^= 1;
+                }
+                fs::write(&path, cached).unwrap();
+            }
+            let (client, mock) = BTCClient::new_mock_client();
+
+            let fetched = tokio::time::timeout(
+                Duration::from_secs(2),
+                fetch_header_chain_with_client(&client, 0, 3, path.to_str().unwrap(), true, true),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(fetched, headers);
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+            assert_eq!(fs::read(&sidecar).unwrap(), bytes);
+
+            mock.set_height(100);
+            mock.set_block_hash(3, next_block.block_hash());
+            mock.set_block(next_block.block_hash(), next_block.clone());
+            let next =
+                fetch_header_chain_with_client(&client, 3, 1, path.to_str().unwrap(), true, true)
+                    .await
+                    .unwrap();
+            assert_eq!(next.len(), 4);
+            assert_eq!(next[3], next_block.header.into());
+            assert_eq!(fs::read(&path).unwrap(), proof_block_headers(&next).unwrap());
+            assert_eq!(fs::read(&sidecar).unwrap(), bytes);
+        }
+    }
+
+    #[tokio::test]
+    async fn genesis_batch_fetches_only_headers_missing_from_both_local_files() {
+        let blocks = test_blocks();
+        let headers: Vec<CircuitBlockHeader> = blocks.iter().map(|b| b.header.into()).collect();
+        let bytes = proof_block_headers(&headers).unwrap();
+
+        for (cache_len, sidecar_len) in [(80, 160 + 17), (160, 80)] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("block_headers.bin");
+            let sidecar = dir.path().join("0-3.bin.blocks");
+            fs::write(&path, &bytes[..cache_len]).unwrap();
+            fs::write(&sidecar, &bytes[..sidecar_len]).unwrap();
+            let (client, mock) = BTCClient::new_mock_client();
+            mock.set_height(100);
+            mock.set_block_hash(2, blocks[2].block_hash());
+            mock.set_block(blocks[2].block_hash(), blocks[2].clone());
+
+            let fetched = tokio::time::timeout(
+                Duration::from_secs(2),
+                fetch_header_chain_with_client(&client, 0, 3, path.to_str().unwrap(), true, true),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(fetched, headers);
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+            assert_eq!(fs::read(&sidecar).unwrap(), bytes[..sidecar_len]);
+        }
+    }
+
+    #[tokio::test]
     async fn disabled_preference_and_later_batches_still_fetch_from_rpc() {
         let blocks = test_blocks();
         for (start, prefer_local) in [(0, false), (1, true)] {
@@ -505,6 +638,11 @@ mod tests {
             let mut bytes = proof_block_headers(&cached).unwrap();
             bytes.extend_from_slice(&[0; 17]);
             fs::write(&path, bytes).unwrap();
+            fs::write(
+                dir.path().join("0-1.bin.blocks"),
+                proof_block_headers(&cached[..1]).unwrap(),
+            )
+            .unwrap();
             let (client, mock) = BTCClient::new_mock_client();
             mock.set_height(100);
             let block = &blocks[start];

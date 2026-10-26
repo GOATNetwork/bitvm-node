@@ -20,8 +20,15 @@ To reuse local Bitcoin headers for the first batch built from Genesis, set
 `prefer_local_headers_on_init = true` in `[header_chain]`, together with `init_input = true`
 and `start = 0`. The option defaults to `false` for existing configurations. Headers are read
 from `block_headers`, which contains consecutive 80-byte headers starting at height 0.
+If that working cache is missing or incomplete, the builder also checks
+`0-<batch_size>.bin.blocks` in the same directory. A sidecar containing more complete headers
+is copied into the working cache, up to the requested batch size; the source sidecar is unchanged.
+For example, a Genesis batch of 157450 headers can reuse `0-157450.bin.blocks` without changing
+the configured `block_headers` path. Logs identify both the sidecar source and working cache.
+Choose a distinct Genesis `output_proof`, such as `genesis-157450.bin`; the following batch is
+written to `157450-1.bin` in the same output directory.
 For `batch_size = 10000`, the first batch uses heights 0 through 9999. A complete local batch
-requires no Bitcoin RPC calls and leaves any later cached headers intact. If the file is absent
+requires no Bitcoin RPC calls and leaves any later cached headers intact. If local files are absent
 or incomplete, only missing headers are fetched through Esplora; an incomplete trailing header
 is fetched again. This preference overrides `force_fetch` for the Genesis batch only.
 After the first proof succeeds, subsequent batches contain one block and use the existing
@@ -123,9 +130,10 @@ Proving behaviour in Fleet mode:
   Keep that value below the service's `worker_stop_timeout_s`. Exit codes: 0 after a clean stop,
   1 after a task failure or an abandoned proof, 101 after a panic.
 - Proofs and their sidecars are published through synced temporary files and atomic renames.
-  A `<proof>.manifest.json` written last marks a complete set. Sidecars include the header
-  chain's `.blocks`, which operator and watchtower proofs read for SPV. State-chain
-  `.args`/`.ctx` snapshots are written atomically as well.
+  Sidecars are published before the proof file, and the database is updated after all files
+  and the directory are synced. Sidecars include the header chain's `.blocks`, which operator
+  and watchtower proofs read for SPV. State-chain `.args`/`.ctx` snapshots are written atomically
+  as well.
 - The state-chain context builder prepares at most `--state-chain-max-pending-batches`
   unproved batches (default 2; 0 means unlimited).
 

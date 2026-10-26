@@ -329,7 +329,6 @@ impl ProofBuilder for CommitChainProofBuilder {
                 (".zkm_version.bin", proof.zkm_version.as_bytes()),
                 (".commits", latest_commits.as_slice()),
             ],
-            &format!("{} {}", Self::name(), output_proof),
         )?;
         Ok((public_value_hex, proof_size))
     }

@@ -1,37 +1,16 @@
 //! Crash-safe publication of proof artifacts.
 //!
 //! A proof is published as its main file plus sidecar files that share its path as a
-//! prefix. Every file is written through a synced temporary file and an atomic rename;
-//! the manifest is written last and names a complete set of files. Callers record a
-//! proof in the database only after publication, so readers never see partial files.
+//! prefix. Every file is written through a synced temporary file and an atomic rename.
+//! Sidecars are published before the proof file. Callers record a proof in the database
+//! only after all files and the directory have been synced.
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-/// Suffix of the manifest that marks a complete publication.
-pub const MANIFEST_SUFFIX: &str = ".manifest.json";
-const MANIFEST_VERSION: u32 = 1;
 const TMP_MARKER: &str = ".tmp-";
-
-/// The files of one complete publication and their SHA-256 digests.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ArtifactManifest {
-    pub version: u32,
-    /// The task that produced the proof, for operators reading the directory.
-    pub task: String,
-    pub files: Vec<ManifestEntry>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ManifestEntry {
-    /// The suffix appended to the proof path (empty for the proof file itself).
-    pub suffix: String,
-    pub sha256: String,
-}
 
 fn tmp_path(path: &Path) -> PathBuf {
     let mut name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
@@ -79,41 +58,20 @@ pub fn atomic_write(path: impl AsRef<Path>, bytes: &[u8]) -> Result<()> {
 }
 
 /// Publishes a proof file and its sidecars (`(suffix, bytes)` pairs appended to the
-/// proof path). Any earlier manifest is removed first, sidecars are renamed into
-/// place before the proof file, and the new manifest is written last.
+/// proof path). Sidecars are renamed into place before the proof file, then the
+/// directory is synced.
 pub fn publish_artifacts(
     proof_path: impl AsRef<Path>,
     proof: &[u8],
     sidecars: &[(&str, &[u8])],
-    task: &str,
 ) -> Result<()> {
     let proof_path = proof_path.as_ref();
     let dir = parent_dir(proof_path);
-    let manifest_path = suffixed(proof_path, MANIFEST_SUFFIX);
-    match fs::remove_file(&manifest_path) {
-        Ok(()) => sync_dir(dir)?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("failed to remove {}", manifest_path.display()));
-        }
-    }
-
-    let mut files = Vec::with_capacity(sidecars.len() + 1);
     for (suffix, bytes) in sidecars {
-        anyhow::ensure!(!suffix.is_empty() && *suffix != MANIFEST_SUFFIX, "invalid sidecar suffix");
+        anyhow::ensure!(!suffix.is_empty(), "invalid sidecar suffix");
         write_synced(&suffixed(proof_path, suffix), bytes)?;
-        files.push(ManifestEntry {
-            suffix: suffix.to_string(),
-            sha256: hex::encode(Sha256::digest(bytes)),
-        });
     }
     write_synced(proof_path, proof)?;
-    files.push(ManifestEntry { suffix: String::new(), sha256: hex::encode(Sha256::digest(proof)) });
-    sync_dir(dir)?;
-
-    let manifest = ArtifactManifest { version: MANIFEST_VERSION, task: task.to_string(), files };
-    write_synced(&manifest_path, &serde_json::to_vec_pretty(&manifest)?)?;
     sync_dir(dir)
 }
 
@@ -142,64 +100,44 @@ pub fn remove_stale_tmp_files(dir: impl AsRef<Path>) -> Result<usize> {
 mod tests {
     use super::*;
 
-    /// Whether every file the manifest of `proof` names exists with its recorded digest.
-    fn manifest_matches(proof: &Path) -> bool {
-        let bytes = fs::read(suffixed(proof, MANIFEST_SUFFIX)).unwrap();
-        let manifest: ArtifactManifest = serde_json::from_slice(&bytes).unwrap();
-        manifest.files.iter().all(|entry| {
-            fs::read(suffixed(proof, &entry.suffix))
-                .is_ok_and(|content| hex::encode(Sha256::digest(&content)) == entry.sha256)
-        })
-    }
-
     #[test]
-    fn publication_writes_manifest_last_and_verifies() {
+    fn publication_writes_only_proof_and_sidecars() {
         let dir = tempfile::tempdir().unwrap();
         let proof = dir.path().join("10-1.bin");
         publish_artifacts(
             &proof,
             b"proof",
             &[(".public_inputs.bin", b"pv"), (".vk_hash.bin", b"vk")],
-            "header-chain 10",
         )
         .unwrap();
         assert_eq!(fs::read(&proof).unwrap(), b"proof");
         assert_eq!(fs::read(suffixed(&proof, ".public_inputs.bin")).unwrap(), b"pv");
-        assert!(manifest_matches(&proof));
-        let leftovers: Vec<_> = fs::read_dir(dir.path())
+        assert_eq!(fs::read(suffixed(&proof, ".vk_hash.bin")).unwrap(), b"vk");
+        let mut files: Vec<_> = fs::read_dir(dir.path())
             .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().contains(TMP_MARKER))
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
             .collect();
-        assert!(leftovers.is_empty());
-
-        fs::write(suffixed(&proof, ".vk_hash.bin"), b"other").unwrap();
-        assert!(!manifest_matches(&proof));
+        files.sort();
+        assert_eq!(files, ["10-1.bin", "10-1.bin.public_inputs.bin", "10-1.bin.vk_hash.bin"]);
     }
 
     #[test]
     fn republication_replaces_the_previous_set() {
         let dir = tempfile::tempdir().unwrap();
         let proof = dir.path().join("1.bin");
-        publish_artifacts(&proof, b"old", &[(".public_inputs.bin", b"old")], "watchtower 1")
-            .unwrap();
-        publish_artifacts(&proof, b"new", &[(".public_inputs.bin", b"new")], "watchtower 1")
-            .unwrap();
+        publish_artifacts(&proof, b"old", &[(".public_inputs.bin", b"old")]).unwrap();
+        publish_artifacts(&proof, b"new", &[(".public_inputs.bin", b"new")]).unwrap();
         assert_eq!(fs::read(&proof).unwrap(), b"new");
-        assert!(manifest_matches(&proof));
+        assert_eq!(fs::read(suffixed(&proof, ".public_inputs.bin")).unwrap(), b"new");
     }
 
     #[test]
-    fn interrupted_publication_has_no_manifest() {
+    fn invalid_sidecar_does_not_replace_proof() {
         let dir = tempfile::tempdir().unwrap();
         let proof = dir.path().join("1.bin");
-        // A legacy or interrupted proof file without a manifest.
-        fs::write(&proof, b"partial").unwrap();
-        assert!(!suffixed(&proof, MANIFEST_SUFFIX).exists());
-        // An invalid sidecar fails before the proof file or manifest are replaced.
-        assert!(publish_artifacts(&proof, b"proof", &[("", b"x")], "operator 1").is_err());
-        assert_eq!(fs::read(&proof).unwrap(), b"partial");
-        assert!(!suffixed(&proof, MANIFEST_SUFFIX).exists());
+        fs::write(&proof, b"old").unwrap();
+        assert!(publish_artifacts(&proof, b"proof", &[("", b"x")]).is_err());
+        assert_eq!(fs::read(&proof).unwrap(), b"old");
     }
 
     #[test]

@@ -605,7 +605,6 @@ impl ProofBuilder for OperatorProofBuilder {
                 (".vk_hash.bin", vk_hash.as_bytes()),
                 (".zkm_version.bin", proof.zkm_version.as_bytes()),
             ],
-            &format!("{} {}", Self::name(), output),
         )?;
         Ok((public_value_hex, proof_size))
     }

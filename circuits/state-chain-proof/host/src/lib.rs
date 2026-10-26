@@ -437,7 +437,6 @@ impl ProofBuilder for StateChainProofBuilder {
                 (".vk_hash.bin", vk_hash.as_bytes()),
                 (".zkm_version.bin", proof.zkm_version.as_bytes()),
             ],
-            &format!("{} {}", Self::name(), output_proof),
         )?;
 
         tracing::info!("Generate proof successfully, proof: {:?}", proof);
