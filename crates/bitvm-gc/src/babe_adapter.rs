@@ -261,7 +261,7 @@ pub fn expand_compact_soldering_proof_payload(
     Ok((payload.opened, finalized, expand_compact_soldering_data(payload.soldering)?))
 }
 
-/// Derives finalized circuit indices using the real BABE/CAC Fiat-Shamir selection.
+/// Randomly selects `m_cc` distinct finalized circuit indices for the cut-and-choose.
 pub fn derive_finalized_indices(package: &CACSetupPackage, m_cc: usize) -> Result<Vec<usize>> {
     let n_cc = package.commits.len();
     if m_cc == 0 || m_cc > n_cc {
@@ -595,6 +595,12 @@ fn recover_a_valid_finalized_messages(
         bail!("BABE prover state has no finalized instances");
     }
 
+    if challenge_witness.witness.input_labels.len() != GC_INPUT_WIRES {
+        bail!(
+            "challenge witness has {} input labels; expected {GC_INPUT_WIRES}",
+            challenge_witness.witness.input_labels.len()
+        );
+    }
     let base_input_labels: Vec<S> =
         challenge_witness.witness.input_labels.iter().map(|&b| S(b)).collect();
     let pi1_full_labels = base_input_labels[..2 * N_PADDED].to_vec();

@@ -2135,6 +2135,18 @@ async fn handle_cut_circuits_verifier(
         );
         return Ok(());
     }
+    // Reject a malformed cut before the expensive opening persists it: graph endorsement and
+    // challenge-assert both require exactly BABE_M_CC finalized instances.
+    if selected_circuit_indexes.len() != BABE_M_CC {
+        tracing::warn!(
+            instance_id = %instance_id,
+            graph_id = %graph_id,
+            selected = selected_circuit_indexes.len(),
+            expected = BABE_M_CC,
+            "Ignore CutCircuits with an invalid number of selected circuits"
+        );
+        return Ok(());
+    }
 
     if let Some(soldering_proof_ready) = verifier_state.soldering_proof_ready.clone() {
         if soldering_proof_ready.candidate_index != candidate_index {
