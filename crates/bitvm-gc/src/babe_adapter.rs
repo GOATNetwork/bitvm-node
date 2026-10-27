@@ -6,8 +6,8 @@ use std::path::PathBuf;
 
 use crate::types::BitvmGcCircuitData;
 use anyhow::{Result, bail};
+use ark_bn254::Bn254;
 use ark_bn254::g1::G1Affine;
-use ark_bn254::{Bn254, Fr};
 use ark_groth16::Proof as Groth16Proof;
 use ark_groth16::VerifyingKey as Groth16VerifyingKey;
 use ark_serialize::CanonicalSerialize;
@@ -49,6 +49,9 @@ use verifiable_circuit_babe::soldering::SolderingProof as RealSolderingProof;
 pub use verifiable_circuit_babe::transactions::ChallengeAssertWitnessRaw;
 pub use verifiable_circuit_babe::transactions::TxAssertWitness;
 use verifiable_circuit_babe::utils::pi1_xd_to_wots96_msg;
+pub use verifiable_circuit_babe::utils::{
+    DYNAMIC_SLOTS, NUM_PUBLIC_INPUTS, STATIC_SLOTS, StaticInputs, ziren_static_inputs,
+};
 use verifiable_circuit_babe::verifier::BABEVerifier;
 
 /// Number of Wots96 digit signatures expected by the GOAT GC-V2 connector.
@@ -181,7 +184,7 @@ pub fn build_setup_package(n_cc: usize) -> Result<CACSetupPackage> {
 pub fn build_real_setup_package(
     n_cc: usize,
     vk: &Groth16VerifyingKey<Bn254>,
-    static_inputs: Fr,
+    static_inputs: StaticInputs,
 ) -> Result<(CACSetupPackage, BabeVerifierPrivateState)> {
     if n_cc == 0 {
         bail!("n_cc must be greater than zero");
@@ -207,7 +210,7 @@ pub fn open_real_setup_and_solder(
     package: &CACSetupPackage,
     finalized_indices: &[usize],
     vk: &Groth16VerifyingKey<Bn254>,
-    static_inputs: Fr,
+    static_inputs: StaticInputs,
 ) -> Result<SetupAndSolderingData> {
     ensure_real_gc_assets_configured()?;
     if private_state.statement_digest != statement_digest(vk, static_inputs)? {
@@ -235,7 +238,7 @@ pub fn verify_real_setup(
     soldering: &SolderingData,
     vk: &Groth16VerifyingKey<Bn254>,
     claimed_finalized_indices: &[usize],
-    static_public_inputs: Fr,
+    static_public_inputs: StaticInputs,
 ) -> Result<()> {
     let bundle = BabeBundle {
         opened: opened.to_vec(),
@@ -277,7 +280,7 @@ pub fn expand_compact_soldering_proof_payload(
     Ok((payload.opened, finalized, expand_compact_soldering_data(payload.soldering)?))
 }
 
-/// Derives finalized circuit indices using the real BABE/CAC Fiat-Shamir selection.
+/// Randomly selects `m_cc` distinct finalized circuit indices for the cut-and-choose.
 pub fn derive_finalized_indices(package: &CACSetupPackage, m_cc: usize) -> Result<Vec<usize>> {
     let n_cc = package.commits.len();
     if m_cc == 0 || m_cc > n_cc {
@@ -411,9 +414,9 @@ pub fn recover_operator_proof_from_assert_witness(
 pub fn verify_operator_assert_proof(
     assert_witness: &TxAssertWitness,
     vk: &Groth16VerifyingKey<Bn254>,
-    static_input: Fr,
+    static_input: StaticInputs,
 ) -> bool {
-    assert_witness.verify_groth16_proof(vk, &[static_input])
+    assert_witness.verify_groth16_proof(vk, &static_input)
 }
 
 /// Builds a placeholder verifier challenge witness from an assert witness.
@@ -443,7 +446,7 @@ pub fn build_real_challenge_assert_witness(
     package: &CACSetupPackage,
     finalized_indices: &[usize],
     vk: &Groth16VerifyingKey<Bn254>,
-    static_inputs: Fr,
+    static_inputs: StaticInputs,
     assert_witness: &TxAssertWitness,
     verifier_index: usize,
 ) -> Result<BabeChallengeAssertWitness> {
@@ -535,11 +538,13 @@ fn ensure_real_gc_assets_configured() -> Result<()> {
 
 pub(crate) fn statement_digest(
     vk: &Groth16VerifyingKey<Bn254>,
-    static_inputs: Fr,
+    static_inputs: StaticInputs,
 ) -> Result<[u8; 32]> {
     let mut bytes = Vec::new();
     vk.serialize_compressed(&mut bytes)?;
-    static_inputs.serialize_compressed(&mut bytes)?;
+    for input in &static_inputs {
+        input.serialize_compressed(&mut bytes)?;
+    }
     Ok(hash32(&bytes))
 }
 
@@ -547,7 +552,7 @@ fn restore_real_verifier(
     state: &BabeVerifierPrivateState,
     package: &CACSetupPackage,
     vk: &Groth16VerifyingKey<Bn254>,
-    static_inputs: Fr,
+    static_inputs: StaticInputs,
 ) -> Result<BABEVerifier> {
     BABEVerifier::from_state(&state.instance_seeds, package, vk, static_inputs)
         .ok_or_else(|| anyhow::anyhow!("Cannot restore real verifier"))
@@ -625,6 +630,12 @@ fn recover_a_valid_finalized_messages(
         bail!("BABE prover state has no finalized instances");
     }
 
+    if challenge_witness.witness.input_labels.len() != GC_INPUT_WIRES {
+        bail!(
+            "challenge witness has {} input labels; expected {GC_INPUT_WIRES}",
+            challenge_witness.witness.input_labels.len()
+        );
+    }
     let base_input_labels: Vec<S> =
         challenge_witness.witness.input_labels.iter().map(|&b| S(b)).collect();
     let pi1_full_labels = base_input_labels[..2 * N_PADDED].to_vec();

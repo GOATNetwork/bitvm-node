@@ -23,8 +23,9 @@ async fn main() {
         args.start,
         args.batch_size,
         &args.block_headers,
-        args.force_fetch,
+        args.force_fetch || args.prefer_local_headers_on_init,
         args.bitcoin_network,
+        args.prefer_local_headers_on_init && args.is_genesis_batch(),
     )
     .await
     .unwrap();

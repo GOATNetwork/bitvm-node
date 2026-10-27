@@ -2,7 +2,10 @@
 //! metrics counts. Used by proof-builder-rpc (the node itself does not read these tables).
 
 use super::{StorageProcessor, get_current_timestamp_secs};
-use crate::{LongRunningTaskProof, MetricsStateCount, OperatorProof, WatchtowerProof};
+use crate::{
+    LongRunningTaskProof, MetricsStateCount, OnDemandProofCompletion, OnDemandProofTable,
+    OperatorProof, WatchtowerProof,
+};
 use sqlx::types::Uuid;
 
 impl StorageProcessor<'_> {
@@ -597,5 +600,79 @@ impl StorageProcessor<'_> {
             .execute(self.conn())
             .await?;
         Ok(res.rows_affected())
+    }
+}
+
+impl StorageProcessor<'_> {
+    /// Finishes an on-demand proof task only while it is still `New`.
+    ///
+    /// A timeout request may mark the task `Failed` while its proof is queued or
+    /// running; that state wins and this update affects no row.
+    pub async fn complete_on_demand_proof_if_new(
+        &mut self,
+        table: OnDemandProofTable,
+        id: i64,
+        completion: &OnDemandProofCompletion,
+    ) -> anyhow::Result<u64> {
+        let sql = format!(
+            "UPDATE {}
+             SET path_to_proof = ?,
+                 public_value_hex = ?,
+                 proof_size = ?,
+                 cycles = ?,
+                 proof_state = ?,
+                 total_time_to_proof = ?,
+                 proving_time = ?,
+                 zkm_version = ?,
+                 updated_at = ?
+             WHERE id = ? AND proof_state = ?",
+            table.table_name()
+        );
+        let res = sqlx::query(&sql)
+            .bind(&completion.path_to_proof)
+            .bind(&completion.public_value_hex)
+            .bind(completion.proof_size)
+            .bind(completion.cycles)
+            .bind(completion.proof_state)
+            .bind(completion.total_time_to_proof)
+            .bind(completion.proving_time)
+            .bind(&completion.zkm_version)
+            .bind(get_current_timestamp_secs())
+            .bind(id)
+            .bind(crate::ProofState::New.to_i64())
+            .execute(self.conn())
+            .await?;
+        Ok(res.rows_affected())
+    }
+
+    /// Returns the current proof state of an on-demand proof task.
+    pub async fn get_on_demand_proof_state(
+        &mut self,
+        table: OnDemandProofTable,
+        id: i64,
+    ) -> anyhow::Result<Option<i64>> {
+        let sql = format!("SELECT proof_state FROM {} WHERE id = ?", table.table_name());
+        let state = sqlx::query_scalar::<_, i64>(&sql).bind(id).fetch_optional(self.conn()).await?;
+        Ok(state)
+    }
+
+    /// Counts unfinished (`New` or `Proving`) tasks of one proof chain starting at or after
+    /// `from_block`.
+    pub async fn count_pending_long_running_task_proofs(
+        &mut self,
+        chain_name: &str,
+        from_block: i64,
+    ) -> anyhow::Result<i64> {
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM long_running_task_proof
+             WHERE chain_name = ? AND block_start >= ? AND proof_state IN (?, ?)",
+        )
+        .bind(chain_name)
+        .bind(from_block)
+        .bind(crate::ProofState::New.to_i64())
+        .bind(crate::ProofState::Proving.to_i64())
+        .fetch_one(self.conn())
+        .await?;
+        Ok(count)
     }
 }

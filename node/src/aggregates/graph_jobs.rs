@@ -1382,6 +1382,12 @@ async fn verifier_solder(deps: &JobDeps, graph_id: Uuid, params: &[u8]) -> Resul
     let operator_peer = PeerId::from_bytes(&verifier_state.operator_peer_id)
         .context("decode operator peer id saved from InitGraph")?
         .to_string();
+    if selected_circuit_indexes.len() != BABE_M_CC {
+        return invalid(format!(
+            "invalid CutCircuits selection: expected {BABE_M_CC}, got {}",
+            selected_circuit_indexes.len()
+        ));
+    }
     let soldering_proof_ready = if let Some(ready) = verifier_state.soldering_proof_ready.clone() {
         if ready.candidate_index != candidate_index {
             return invalid(format!(

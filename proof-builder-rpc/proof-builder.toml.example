@@ -6,6 +6,9 @@ start = 116000
 #start = 1000
 block_headers = "../circuits/data/header-chain/block_headers.bin"
 force_fetch = true 
+# Reuse local headers only when init_input = true and start = 0; fetch missing headers.
+# Also checks 0-<batch_size>.bin.blocks beside block_headers when the cache is incomplete.
+prefer_local_headers_on_init = false
 
 batch_size = 10 
 input_proof = "../circuits/data/header-chain/0-116000.bin"

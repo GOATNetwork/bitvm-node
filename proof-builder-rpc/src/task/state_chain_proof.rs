@@ -1,6 +1,10 @@
+use crate::prover::{Cancelled, ProverRuntime};
 use crate::task::ProofState::{Failed, New, Proven, Proving};
 use crate::task::fetch_latest_long_running_task_by_state;
-use crate::task::{create_long_running_task, update_long_running_task};
+use crate::task::{
+    TaskOptions, create_long_running_task, failure_outcome, settle_chain_failure,
+    update_long_running_task,
+};
 use crate::{ProofBuilderConfig, task::fetch_latest_long_running_task};
 use proof_builder::{ProofBuilder, ProofRequest};
 use state_chain_proof::{StateChainProofBuilder, fetch_state_chain};
@@ -11,11 +15,33 @@ use tokio_util::sync::CancellationToken;
 
 use crate::api::metrics_service::{ApiMetricsState, STATE_CHAIN_PROOF};
 
+/// Whether the prover already has `max_pending` unproved batches waiting.
+async fn state_chain_backlog_full(local_db: &LocalDB, max_pending: i64) -> anyhow::Result<bool> {
+    if max_pending <= 0 {
+        return Ok(false);
+    }
+    let latest_proven = fetch_latest_long_running_task_by_state(
+        local_db,
+        StateChainProofBuilder::name(),
+        Proven.to_i64(),
+    )
+    .await?;
+    // Unfinished rows before the latest proven batch are history, not backlog.
+    let from = latest_proven.map_or(0, |task| task.block_end);
+    let pending = local_db
+        .acquire()
+        .await?
+        .count_pending_long_running_task_proofs(&StateChainProofBuilder::name(), from)
+        .await?;
+    Ok(pending >= max_pending)
+}
+
 #[tracing::instrument(level = "info", skip(local_db, cancellation_token))]
 async fn spawn_state_chain_ctx_builder(
     args: state_chain_proof::Args,
     local_db: LocalDB,
     init_interval: u64,
+    max_pending: i64,
     cancellation_token: CancellationToken,
 ) -> anyhow::Result<()> {
     let mut args = args;
@@ -23,6 +49,10 @@ async fn spawn_state_chain_ctx_builder(
     loop {
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(interval)) => {
+                if state_chain_backlog_full(&local_db, max_pending).await? {
+                    tracing::debug!("ctx builder: {max_pending} batches await the prover");
+                    continue;
+                }
                 let next_task = fetch_latest_long_running_task(
                     &local_db,
                     StateChainProofBuilder::name()
@@ -84,8 +114,15 @@ async fn spawn_state_chain_ctx_builder(
 
                 let snap_path = std::path::Path::new(&args.input_proof).parent().unwrap().to_str().unwrap();
                 tracing::info!("fetch snap_path: {snap_path:?}");
-                std::fs::write(format!("{}/{}.args", snap_path, args.start), serde_json::to_string(&args)?)?;
-                std::fs::write(format!("{}/{}.ctx", snap_path, args.start), serde_json::to_string(&ctx)?)?;
+                // Snapshots are complete before the batch row that makes the prover read them.
+                proof_builder::artifacts::atomic_write(
+                    format!("{}/{}.args", snap_path, args.start),
+                    serde_json::to_string(&args)?.as_bytes(),
+                )?;
+                proof_builder::artifacts::atomic_write(
+                    format!("{}/{}.ctx", snap_path, args.start),
+                    serde_json::to_string(&ctx)?.as_bytes(),
+                )?;
 
                 let affected = match create_long_running_task(
                     &local_db,
@@ -117,8 +154,9 @@ async fn spawn_state_chain_ctx_builder(
     }
 }
 
-#[tracing::instrument(level = "info", skip(local_db, metrics_state, cancellation_token))]
+#[tracing::instrument(level = "info", skip(runtime, local_db, metrics_state, cancellation_token))]
 async fn spawn_state_chain_prover(
+    runtime: ProverRuntime,
     start_index: u64,
     batch_size: u64,
     input_proof: String,
@@ -127,7 +165,7 @@ async fn spawn_state_chain_prover(
     interval: u64,
     cancellation_token: CancellationToken,
 ) -> anyhow::Result<()> {
-    let builder = StateChainProofBuilder::new();
+    let builder = runtime.builder(StateChainProofBuilder::with_client).await?;
 
     let mut start_index = start_index;
     loop {
@@ -187,40 +225,47 @@ async fn spawn_state_chain_prover(
                 tracing::info!("Updated long running task to proving state, affected rows: {affteced}");
 
                 let attempt_start = tokio::time::Instant::now();
-                let attempt: anyhow::Result<u64> = async {
-                    let (input, proof, cycles, proving_time) = builder.build_proof(&ctx)?;
-                    let zkm_version = proof.zkm_version.clone();
-                    let (public_value_hex, proof_size) =
-                        builder.save_proof(&ctx, &input, cycles, proof)?;
-                    update_long_running_task(
-                        &local_db,
-                        start_index as i64,
-                        batch_size as i64,
-                        args.output_proof.clone(),
-                        public_value_hex,
-                        proof_size as i64,
-                        cycles,
-                        Proven,
-                        StateChainProofBuilder::name(),
-                        proving_time as i64,
-                        zkm_version,
-                    )
-                    .await
-                }
-                .await;
-                let outcome = if matches!(&attempt, Ok(affected) if *affected > 0) {
-                    "success"
-                } else {
-                    "failed"
+                let unit = {
+                    let (runtime, local_db, builder) = (runtime.clone(), local_db.clone(), builder.clone());
+                    let output_proof = args.output_proof.clone();
+                    async move {
+                        let proved = match runtime.prove_and_save(builder, ctx).await {
+                            Ok(proved) => proved,
+                            Err(error) => return Ok(Err(error)),
+                        };
+                        let affected = update_long_running_task(
+                            &local_db,
+                            start_index as i64,
+                            batch_size as i64,
+                            output_proof,
+                            proved.public_value_hex,
+                            proved.proof_size as i64,
+                            proved.cycles,
+                            Proven,
+                            StateChainProofBuilder::name(),
+                            proved.proving_time as i64,
+                            proved.zkm_version,
+                        )
+                        .await?;
+                        Ok::<_, anyhow::Error>(Ok(affected))
+                    }
                 };
-                metrics_state.record_attempt(STATE_CHAIN_PROOF, outcome, attempt_start.elapsed());
-                let affected = match attempt {
-                    Ok(affected) => affected,
-                    Err(error) => {
+                let affected = match runtime.run(unit).await {
+                    Err(Cancelled) => continue,
+                    Ok(Err(error)) => {
+                        metrics_state.record_attempt(STATE_CHAIN_PROOF, "failed", attempt_start.elapsed());
                         tracing::error!("State chain proof attempt failed: {error}");
                         continue;
                     }
+                    Ok(Ok(Err(error))) => {
+                        metrics_state.record_attempt(STATE_CHAIN_PROOF, failure_outcome(&error), attempt_start.elapsed());
+                        settle_chain_failure(&runtime, error, &StateChainProofBuilder::name())?;
+                        continue;
+                    }
+                    Ok(Ok(Ok(affected))) => affected,
                 };
+                let outcome = if affected > 0 { "success" } else { "failed" };
+                metrics_state.record_attempt(STATE_CHAIN_PROOF, outcome, attempt_start.elapsed());
                 tracing::info!("Updated long running task to proven state, affected rows: {affected}");
                 start_index += batch_size;
             }
@@ -231,8 +276,9 @@ async fn spawn_state_chain_prover(
     }
 }
 
-#[tracing::instrument(level = "info", skip(local_db, metrics_state, cancellation_token))]
+#[tracing::instrument(level = "info", skip(options, local_db, metrics_state, cancellation_token))]
 pub(crate) fn spawn_state_chain_proof_task(
+    options: TaskOptions,
     args: state_chain_proof::Args,
     local_db: LocalDB,
     metrics_state: ApiMetricsState,
@@ -247,6 +293,7 @@ pub(crate) fn spawn_state_chain_proof_task(
             args.clone(),
             local_db.clone(),
             interval + 1,
+            options.state_chain_max_pending_batches,
             cancellation_token.clone(),
         ));
 
@@ -292,6 +339,7 @@ pub(crate) fn spawn_state_chain_proof_task(
 
         let input_proof = args.input_proof.clone();
         let prover = tokio::spawn(spawn_state_chain_prover(
+            options.runtime.clone(),
             args.start,
             args.batch_size,
             input_proof,

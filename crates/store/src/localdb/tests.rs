@@ -404,12 +404,13 @@ async fn test_proof_builder_tables_are_migrated() {
     let db = setup_db().await;
     let mut s = db.acquire().await.unwrap();
 
-    let seed = s
-        .find_latest_long_running_task_proof_by_name("header-chain".to_string())
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!((seed.block_start, seed.block_end), (0, 116000));
+    // Ziren 2.0 removes the bundled v1 header proof. The table must still exist.
+    assert!(
+        s.find_latest_long_running_task_proof_by_name("header-chain".to_string())
+            .await
+            .unwrap()
+            .is_none()
+    );
 
     let (instance_id, graph_id) = (Uuid::new_v4(), Uuid::new_v4());
     let proof = OperatorProof {
@@ -427,4 +428,131 @@ async fn test_proof_builder_tables_are_migrated() {
         .unwrap();
     assert_eq!(stored.execution_layer_block_number, 7);
     assert!(s.proof_metrics_state_counts().await.is_ok());
+}
+
+use crate::{LongRunningTaskProof, OnDemandProofCompletion, OnDemandProofTable, WatchtowerProof};
+fn on_demand_completion() -> OnDemandProofCompletion {
+    OnDemandProofCompletion {
+        path_to_proof: "proofs/1.bin".to_string(),
+        public_value_hex: "00".to_string(),
+        proof_size: 1,
+        cycles: 2,
+        proof_state: crate::ProofState::Proven.to_i64(),
+        total_time_to_proof: 3,
+        proving_time: 4,
+        zkm_version: "v2".to_string(),
+    }
+}
+
+async fn new_operator_proof(s: &mut StorageProcessor<'_>) -> OperatorProof {
+    let proof = OperatorProof {
+        instance_id: Uuid::new_v4(),
+        graph_id: Uuid::new_v4(),
+        proof_state: crate::ProofState::New.to_i64(),
+        ..Default::default()
+    };
+    assert_eq!(s.create_operator_proof(&proof).await.unwrap(), 1);
+    s.find_next_operator_proof().await.unwrap().unwrap()
+}
+
+#[tokio::test]
+async fn test_complete_on_demand_proof_only_while_new() {
+    let db = setup_db().await;
+    let mut s = db.acquire().await.unwrap();
+    let task = new_operator_proof(&mut s).await;
+    let table = OnDemandProofTable::Operator;
+
+    let completion = on_demand_completion();
+    assert_eq!(s.complete_on_demand_proof_if_new(table, task.id, &completion).await.unwrap(), 1);
+    assert_eq!(
+        s.get_on_demand_proof_state(table, task.id).await.unwrap(),
+        Some(crate::ProofState::Proven.to_i64())
+    );
+    // A finished task is never rewritten, including by a later timeout.
+    assert_eq!(s.complete_on_demand_proof_if_new(table, task.id, &completion).await.unwrap(), 0);
+    let timed_out = s
+        .update_operator_proof_state_with_instance_graph(
+            &task.instance_id,
+            &task.graph_id,
+            crate::ProofState::New.to_i64(),
+            crate::ProofState::Failed.to_i64(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(timed_out, 0);
+    assert_eq!(s.get_on_demand_proof_state(table, i64::MAX).await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn test_timed_out_on_demand_proof_is_not_completed() {
+    let db = setup_db().await;
+    let mut s = db.acquire().await.unwrap();
+    let task = new_operator_proof(&mut s).await;
+    s.update_operator_proof_state_with_instance_graph(
+        &task.instance_id,
+        &task.graph_id,
+        crate::ProofState::New.to_i64(),
+        crate::ProofState::Failed.to_i64(),
+    )
+    .await
+    .unwrap();
+
+    let table = OnDemandProofTable::Operator;
+    let completion = on_demand_completion();
+    assert_eq!(s.complete_on_demand_proof_if_new(table, task.id, &completion).await.unwrap(), 0);
+    assert_eq!(
+        s.get_on_demand_proof_state(table, task.id).await.unwrap(),
+        Some(crate::ProofState::Failed.to_i64())
+    );
+
+    let watchtower = WatchtowerProof {
+        instance_id: Uuid::new_v4(),
+        graph_id: Uuid::new_v4(),
+        public_key: "pk".to_string(),
+        proof_state: crate::ProofState::New.to_i64(),
+        ..Default::default()
+    };
+    s.create_watchtower_proof(&watchtower).await.unwrap();
+    let watchtower_task = s.find_next_watchtower_proof().await.unwrap().unwrap();
+    s.update_watchtower_proof_state_with_instance_graph_pubkey(
+        &watchtower.instance_id,
+        &watchtower.graph_id,
+        "pk",
+        crate::ProofState::New.to_i64(),
+        crate::ProofState::Failed.to_i64(),
+    )
+    .await
+    .unwrap();
+    let table = OnDemandProofTable::Watchtower;
+    assert_eq!(
+        s.complete_on_demand_proof_if_new(table, watchtower_task.id, &completion).await.unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn test_count_pending_long_running_task_proofs() {
+    let db = setup_db().await;
+    let mut s = db.acquire().await.unwrap();
+    let chain = "state-chain".to_string();
+    for (start, state) in [
+        (5, crate::ProofState::New),
+        (10, crate::ProofState::Proven),
+        (20, crate::ProofState::New),
+        (30, crate::ProofState::Proving),
+        (40, crate::ProofState::Failed),
+    ] {
+        s.create_long_running_task_proof(&LongRunningTaskProof {
+            block_start: start,
+            block_end: start + 10,
+            chain_name: chain.clone(),
+            proof_state: state.to_i64(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    }
+    assert_eq!(s.count_pending_long_running_task_proofs(&chain, 20).await.unwrap(), 2);
+    assert_eq!(s.count_pending_long_running_task_proofs(&chain, 0).await.unwrap(), 3);
+    assert_eq!(s.count_pending_long_running_task_proofs("header-chain", 0).await.unwrap(), 0);
 }

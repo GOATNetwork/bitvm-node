@@ -5,6 +5,7 @@ esplora_url = "http://127.0.0.1:13002"
 start = 0
 block_headers = "../circuits/data/header-chain/block_headers.bin"
 force_fetch = true 
+prefer_local_headers_on_init = false
 
 batch_size = 1 
 input_proof = "../circuits/data/header-chain/0-10.bin"

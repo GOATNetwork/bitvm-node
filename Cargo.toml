@@ -14,11 +14,11 @@ members = [
     "crates/node-macros",
     "crates/client",
     "crates/util",
-    "crates/header-chain",
-    "crates/commit-chain",
-    "crates/state-chain",
-    "crates/bitcoin-light-client-circuit",
-    "crates/verifier",
+    "circuits/crates/header-chain",
+    "circuits/crates/commit-chain",
+    "circuits/crates/state-chain",
+    "circuits/crates/bitcoin-light-client-circuit",
+    "circuits/crates/verifier",
     "circuits/header-chain-proof/host",
     "circuits/commit-chain-proof/host",
     "circuits/state-chain-proof/host",
@@ -89,17 +89,20 @@ uuid = { version = "1.7", features = ["v4", "serde"] }
 zeroize = "1.8.1"
 
 bincode = "1.3.3"
-zkm-build = { git = "https://github.com/ProjectZKM/Ziren", tag = "v1.2.7" }
-zkm-core-executor = { git = "https://github.com/ProjectZKM/Ziren", tag = "v1.2.7" }
-zkm-prover = { git = "https://github.com/ProjectZKM/Ziren", tag = "v1.2.7" }
-zkm-sdk = { git = "https://github.com/ProjectZKM/Ziren", tag = "v1.2.7" }
-zkm-verifier = { git = "https://github.com/ProjectZKM/Ziren", tag = "v1.2.7" }
-zkm-primitives = { git = "https://github.com/ProjectZKM/Ziren", tag = "v1.2.7" }
-zkm-zkvm = { git = "https://github.com/ProjectZKM/Ziren", tag = "v1.2.7", features = ["verify"] }
-zkm-recursion-core = { git = "https://github.com/ProjectZKM/Ziren", tag = "v1.2.7" }
-zkm-stark = { git = "https://github.com/ProjectZKM/Ziren", tag = "v1.2.7" }
-p3-bn254-fr = { git = "https://github.com/ProjectZKM/Plonky3" }
-p3-field = { git = "https://github.com/ProjectZKM/Plonky3" }
+# Ziren
+zkm-build = { git = "https://github.com/ProjectZKM/Ziren" }
+zkm-core-executor = { git = "https://github.com/ProjectZKM/Ziren" }
+zkm-prover = { git = "https://github.com/ProjectZKM/Ziren" }
+zkm-sdk = { git = "https://github.com/ProjectZKM/Ziren" }
+zkm-cuda = { git = "https://github.com/ProjectZKM/Ziren" }
+zkm-verifier = { git = "https://github.com/ProjectZKM/Ziren" }
+zkm-primitives = { git = "https://github.com/ProjectZKM/Ziren" }
+zkm-zkvm = { git = "https://github.com/ProjectZKM/Ziren", features = ["verify"] }
+zkm-recursion-core = { git = "https://github.com/ProjectZKM/Ziren" }
+zkm-pcs = { git = "https://github.com/ProjectZKM/Ziren" }
+# Must match Ziren's own Plonky3 spec exactly, or the field types differ from Ziren's.
+p3-bn254-fr = { git = "https://github.com/ProjectZKM/Plonky3", rev = "4dd0d47a8176503fbaa7293c9f0e3b20004e16b2", package = "p3-bn254" }
+p3-field = { git = "https://github.com/ProjectZKM/Plonky3", rev = "4dd0d47a8176503fbaa7293c9f0e3b20004e16b2" }
 
 #zkm-build = { path = "../Ziren/crates/build" }
 #zkm-core-executor = { path = "../Ziren/crates/core/executor" }
@@ -108,9 +111,9 @@ p3-field = { git = "https://github.com/ProjectZKM/Plonky3" }
 #zkm-verifier = { path = "../Ziren/crates/verifier" }
 
 bitvm-lib = { package = "bitvm-gc", path = "crates/bitvm-gc" }
-verifiable-circuit-babe = { git = "https://github.com/GOATNetwork/bitvm-gc", branch = "feat/goat-bitvm3", features = ["aes"] }
-garbled-snark-verifier = { git = "https://github.com/GOATNetwork/bitvm-gc", branch = "feat/goat-bitvm3", features = ["_aes"] }
-soldering-host = { git = "https://github.com/GOATNetwork/bitvm-gc", branch = "feat/goat-bitvm3", features = ["aes"] }
+verifiable-circuit-babe = { git = "https://github.com/GOATNetwork/bitvm-gc", features = ["aes"] }
+garbled-snark-verifier = { git = "https://github.com/GOATNetwork/bitvm-gc", features = ["_aes"] }
+soldering-host = { git = "https://github.com/GOATNetwork/bitvm-gc", features = ["aes"] }
 
 #verifiable-circuit-babe = { path = "../bitvm-gc/verifiable-circuit-babe"}
 #garbled-snark-verifier = { path = "../bitvm-gc/garbled-snark-verifier"}
@@ -119,14 +122,14 @@ store = { path = "crates/store" }
 engine = { path = "crates/engine" }
 util = { path = "crates/util" }
 client = { path = "crates/client" }
-bitcoin-light-client-circuit = { path = "crates/bitcoin-light-client-circuit" }
-header-chain = { path = "crates/header-chain" }
+bitcoin-light-client-circuit = { path = "circuits/crates/bitcoin-light-client-circuit" }
+header-chain = { path = "circuits/crates/header-chain" }
 header-chain-proof = { path = "circuits/header-chain-proof/host" }
-commit-chain = { path = "crates/commit-chain" }
+commit-chain = { path = "circuits/crates/commit-chain" }
 commit-chain-proof = { path = "circuits/commit-chain-proof/host" }
 cbft-rpc = { path = "crates/cbft-rpc" }
-state-chain = { path = "crates/state-chain" }
-verifier = { path = "crates/verifier" }
+state-chain = { path = "circuits/crates/state-chain" }
+verifier = { path = "circuits/crates/verifier" }
 state-chain-proof = { path = "circuits/state-chain-proof/host" }
 operator-proof = { path = "circuits/operator-proof/host" }
 watchtower-proof = { path = "circuits/watchtower-proof/host" }
@@ -154,10 +157,10 @@ alloy-consensus = { git = "https://github.com/ziren-patches/alloy", branch = "pa
 # workspace
 
 # Reth
-guest-executor = { git = "https://github.com/ProjectZKM/reth-processor", branch = "feat/slot-state-check" }
-host-executor = { git = "https://github.com/ProjectZKM/reth-processor", branch = "feat/slot-state-check", features = ["execution-witness"] }
-primitives = { git = "https://github.com/ProjectZKM/reth-processor", branch = "feat/slot-state-check" }
-provider = { git = "https://github.com/ProjectZKM/reth-processor", branch = "feat/slot-state-check" }
+guest-executor = { git = "https://github.com/ProjectZKM/reth-processor" }
+host-executor = { git = "https://github.com/ProjectZKM/reth-processor", features = ["execution-witness"] }
+primitives = { git = "https://github.com/ProjectZKM/reth-processor" }
+provider = { git = "https://github.com/ProjectZKM/reth-processor" }
 
 reth-chainspec = { git = "https://github.com/ziren-patches/reth", branch = "patch-1.9.3", default-features = false }
 

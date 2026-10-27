@@ -42,9 +42,6 @@ jobs:
       - name: Build binarys
         run: export BITCOIN_NETWORK=regtest && source ~/.zkm-toolchain/env && cd proof-builder-rpc && cargo build --release
 
-      - name: Generate certs
-        run: cd circuits/tool && ./certgen.sh
-
       - name: Extract version from Cargo.toml
         id: version
         run: |

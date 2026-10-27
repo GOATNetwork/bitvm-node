@@ -2,7 +2,7 @@
 //!
 //! Serves the exact HTTP routes and JSON the bitvm-noded Operator and Watchtower call, returning
 //! proof data the node accepts. It performs *no* real proving: the operator proof is the repo's
-//! real Groth16 fixture with its 96 public-value bytes re-patched to match the request (so the
+//! structurally valid Groth16 mock with 96 public-value bytes patched to match the request (so the
 //! node's `convert_ark_imm_wrap_vk` decoding, vk-hash, version and constant checks all pass), and
 //! the watchtower proof is dummy bytes of the exact lengths the node validates.
 //!
@@ -19,8 +19,8 @@
 //! - `MOCK_PROOF_WATCHTOWER_DELAY_SECS` override for watchtower proofs
 //! - `MOCK_PROOF_RESPONSE_LATENCY_MS`   optional artificial per-response latency (default 0; keep small)
 //! - `GENESIS_SEQUENCER_COMMIT_TXID`    REQUIRED for operator proofs (same value as the nodes)
-//! - `MOCK_PROOF_OPERATOR_VK`           operator proof vk-hash string (default = fixture vk)
-//! - `MOCK_PROOF_OPERATOR_ZKM_VERSION`  operator proof Ziren version (default = fixture version)
+//! - `MOCK_PROOF_OPERATOR_VK`           operator proof vk-hash string (default = localnet program vk)
+//! - `MOCK_PROOF_OPERATOR_ZKM_VERSION`  operator proof Ziren version (default = SDK circuit version)
 //! - `MOCK_PROOF_WATCHTOWER_VK`         watchtower proof vk-hash string (default documented value)
 //! - `MOCK_PROOF_WATCHTOWER_ZKM_VERSION`watchtower proof Ziren version (default "v1.2.7")
 
@@ -42,10 +42,27 @@ use proof_builder::{
 };
 use zkm_sdk::{ZKMProofWithPublicValues, ZKMPublicValues};
 
-/// Real Groth16 operator-proof fixture (bincode `ZKMProofWithPublicValues`, 1498 bytes). Only its
-/// 96 public-value bytes are re-patched per request; all curve points stay valid.
-const OPERATOR_PROOF_FIXTURE: &[u8] = include_bytes!("../../testdata/test-operator-proof.bin");
-/// vk-hash string matching the fixture (see the `assert_ready_extracts_blake3_xd_from_operator_proof` test).
+/// Structurally valid curve points from the former localnet fixture. This is not a valid
+/// proof of the patched public values; mock-gc deliberately bypasses the pairing verdict.
+const MOCK_OPERATOR_ENCODED_PROOF: &str = "2c88102ff14026ed35c76229319008d52e8bac2cef9d6812ae73769f4b9987d52f44e70c6a42cf43142978af0aaf407cb725a8138c02cdcf7f8326967fd6d6c616e39d0cd24351eed4ca6419720f80d63d23d949b306ac950838474a25d95eef2f671368683c3ac9d59f438b3f796189c2881c62331905f1b0c66bfa5391865f1add2ca47995b8a0c63d07e8b2c2eebdc60d82f04b916008f52498d23bacdb54096a4f7725cc8956ec3b99e9397354e0ffd69162904d9d09c4d2dd28965fb1c82b92022ac1d18d7a368705eef8b1ede50f33f3e37137f9ff620fdb7ec71ead742d47f4bdc501dab4c3449f8f6d400cd9d9372b50ebb5b12dd32cc6fad30395a0";
+
+fn mock_operator_template() -> ZKMProofWithPublicValues {
+    use sha2::{Digest, Sha256};
+    let vk_hash: [u8; 32] = Sha256::digest(&*zkm_verifier::IMM_GROTH16_VK_BYTES).into();
+    let groth16 = serde_json::from_value(serde_json::json!({
+        "public_inputs": ["", "", ""],
+        "encoded_proof": MOCK_OPERATOR_ENCODED_PROOF,
+        "raw_proof": "",
+        "groth16_vkey_hash": vk_hash,
+    }))
+    .expect("mock Groth16 proof structure");
+    ZKMProofWithPublicValues {
+        proof: zkm_sdk::ZKMProof::Groth16(groth16),
+        public_values: ZKMPublicValues::new(),
+        zkm_version: zkm_sdk::ZKM_CIRCUIT_VERSION.to_string(),
+    }
+}
+/// Default localnet operator program identity; override it to match the node configuration.
 const DEFAULT_OPERATOR_VK: &str =
     "0x00ba1ff974eb6e5890f238f8a11c1aeff2d5f4a68a860274bcb602c3c5c681b7";
 /// A valid 66-char vk-hash string for the watchtower proof (only the length/format is checked).
@@ -300,8 +317,7 @@ async fn handle_root() -> &'static str {
 }
 
 fn build_state() -> AppState {
-    let operator_template: ZKMProofWithPublicValues = bincode::deserialize(OPERATOR_PROOF_FIXTURE)
-        .expect("embedded operator proof fixture must deserialize");
+    let operator_template = mock_operator_template();
     let operator_zkm_version = std::env::var("MOCK_PROOF_OPERATOR_ZKM_VERSION")
         .unwrap_or_else(|_| operator_template.zkm_version.clone());
     let operator_vk =
@@ -376,14 +392,13 @@ mod tests {
     use super::*;
 
     fn test_state() -> AppState {
-        let operator_template: ZKMProofWithPublicValues =
-            bincode::deserialize(OPERATOR_PROOF_FIXTURE).unwrap();
+        let operator_template = mock_operator_template();
         AppState {
             seen: Mutex::new(HashMap::new()),
             failed_watchtower: Mutex::new(HashSet::new()),
             operator_template,
             operator_vk: DEFAULT_OPERATOR_VK.to_string(),
-            operator_zkm_version: "v1.2.5".to_string(),
+            operator_zkm_version: zkm_sdk::ZKM_CIRCUIT_VERSION.to_string(),
             watchtower_vk: DEFAULT_WATCHTOWER_VK.to_string(),
             watchtower_zkm_version: "v1.2.7".to_string(),
             genesis_txid_internal: Some([7u8; 32]),
@@ -426,6 +441,16 @@ mod tests {
         // public_values[32..64] is the operator constant computed from the request fields.
         let expected = build_operator_public_values(&state, &req).unwrap();
         assert_eq!(proof.public_values.as_slice(), &expected);
+        let part_vk = zkm_verifier::Groth16Verifier::try_get_part_stark_vk(&proof.zkm_version)
+            .expect("bundled partial STARK key");
+        let converted = zkm_verifier::convert_ark_imm_wrap_vk(
+            &proof,
+            &data.vk,
+            &zkm_verifier::IMM_GROTH16_VK_BYTES,
+            part_vk,
+        )
+        .expect("mock proof must pass the node's curve-point and public-input conversion");
+        assert_eq!(converted.public_inputs.len(), bitvm_lib::babe_adapter::NUM_PUBLIC_INPUTS);
     }
 
     #[test]

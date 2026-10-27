@@ -21,6 +21,8 @@
 //! verdict shared by convention with the mock proof builder. This is fine for a functional
 //! testnet and useless as a security test.
 
+use crate::babe_adapter::StaticInputs;
+
 use std::collections::HashSet;
 
 use anyhow::{Result, anyhow, bail};
@@ -144,7 +146,7 @@ fn mock_commit_from_seed(seed: Seed) -> CACInstanceCommit {
     }
 }
 
-fn serialize_static_input(static_inputs: Fr) -> Result<Vec<u8>> {
+fn serialize_static_input(static_inputs: StaticInputs) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     static_inputs.serialize_compressed(&mut bytes)?;
     Ok(bytes)
@@ -169,7 +171,7 @@ fn message_bit(msg: &[u8; 96], wire: usize) -> usize {
 pub fn build_real_setup_package(
     n_cc: usize,
     vk: &Groth16VerifyingKey<Bn254>,
-    static_inputs: Fr,
+    static_inputs: StaticInputs,
 ) -> Result<(CACSetupPackage, BabeVerifierPrivateState)> {
     if n_cc == 0 {
         bail!("n_cc must be greater than zero");
@@ -193,7 +195,7 @@ pub fn open_real_setup_and_solder(
     package: &CACSetupPackage,
     finalized_indices: &[usize],
     vk: &Groth16VerifyingKey<Bn254>,
-    static_inputs: Fr,
+    static_inputs: StaticInputs,
 ) -> Result<SetupAndSolderingData> {
     if private_state.statement_digest != statement_digest(vk, static_inputs)? {
         bail!("BABE setup statement does not match persisted verifier state");
@@ -254,7 +256,7 @@ pub fn verify_real_setup(
     soldering: &SolderingData,
     _vk: &Groth16VerifyingKey<Bn254>,
     claimed_finalized_indices: &[usize],
-    static_public_inputs: Fr,
+    static_public_inputs: StaticInputs,
 ) -> Result<()> {
     verify_finalized_indices_in_bundle(
         package,
@@ -371,14 +373,14 @@ pub fn recover_real_wrongly_challenged_witness(
 pub fn verify_operator_assert_proof(
     assert_witness: &TxAssertWitness,
     vk: &Groth16VerifyingKey<Bn254>,
-    static_input: Fr,
+    static_input: StaticInputs,
 ) -> bool {
     if assert_witness.try_recover_pi1_xd().is_none() || assert_witness.recover_pi2_pi3().is_none() {
         return false;
     }
     match verdict() {
         Verdict::AlwaysInvalid => false,
-        Verdict::Real => assert_witness.verify_groth16_proof(vk, &[static_input]),
+        Verdict::Real => assert_witness.verify_groth16_proof(vk, &static_input),
         Verdict::AlwaysValid => true,
     }
 }
@@ -438,7 +440,7 @@ mod tests {
 
     struct Fixture {
         vk: Groth16VerifyingKey<Bn254>,
-        static_input: Fr,
+        static_input: StaticInputs,
         package: CACSetupPackage,
         private_state: BabeVerifierPrivateState,
         finalized_indices: Vec<usize>,
@@ -449,7 +451,7 @@ mod tests {
 
     fn build_fixture() -> Fixture {
         let vk = test_vk();
-        let static_input = Fr::from(2024u64);
+        let static_input = [Fr::from(2024u64); crate::babe_adapter::STATIC_SLOTS.len()];
         let (package, private_state) =
             build_real_setup_package(TEST_N_CC, &vk, static_input).expect("setup package");
         let finalized_indices =
@@ -526,7 +528,7 @@ mod tests {
             &f.soldering,
             &f.vk,
             &f.finalized_indices,
-            f.static_input + Fr::from(1u64),
+            f.static_input.map(|input| input + Fr::from(1u64)),
         );
         assert!(wrong.is_err(), "a mismatched statement must be rejected");
 
