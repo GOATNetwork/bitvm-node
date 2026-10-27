@@ -1,7 +1,10 @@
 use crate::ProofBuilderConfig;
-use crate::task::{ProofState, fetch_on_demand_task, update_watchtower_task};
+use crate::prover::ProverRuntime;
+use crate::task::{OnDemandJob, OnDemandOutcome, fetch_on_demand_task, prove_on_demand};
 use proof_builder::{ProofBuilder, ProofRequest};
+use std::collections::HashMap;
 use std::time::Duration;
+use store::OnDemandProofTable;
 use store::localdb::LocalDB;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -10,8 +13,9 @@ use watchtower_proof::{WatchtowerProofBuilder, fetch_target_block};
 
 use crate::api::metrics_service::{ApiMetricsState, WATCHTOWER_PROOF};
 
-#[tracing::instrument(level = "info", skip(local_db, metrics_state, cancellation_token))]
+#[tracing::instrument(level = "info", skip(runtime, local_db, metrics_state, cancellation_token))]
 pub(crate) fn spawn_watchtower_proof_task(
+    runtime: ProverRuntime,
     args: watchtower_proof::Args,
     local_db: LocalDB,
     metrics_state: ApiMetricsState,
@@ -28,7 +32,9 @@ pub(crate) fn spawn_watchtower_proof_task(
             }
         }
 
-        let builder = WatchtowerProofBuilder::new();
+        let builder = runtime.builder(WatchtowerProofBuilder::with_client).await?;
+        // Consecutive failed attempts per task, reset when a task finishes.
+        let mut attempts = HashMap::new();
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(interval)) => {
@@ -84,34 +90,20 @@ pub(crate) fn spawn_watchtower_proof_task(
                             block_pos,
                             latest_sequencer_commit_tx,
                     };
-                    let proving_start = tokio::time::Instant::now();
-                    let (cycles, proving_time, public_value_hex, proof_size, proof_state, zkm_version) = match builder.build_proof(&ctx) {
-                        Ok((input, proof, cycles, proving_time)) => {
-                            let zkm_version = proof.zkm_version.clone();
-                            let (public_value_hex, proof_size, proof_state) = match builder.save_proof(&ctx, &input, cycles, proof) {
-                                Ok((pvh, pf)) => (pvh, pf, ProofState::Proven),
-                                Err(e) => {
-                                    tracing::error!("Generate watchtower proof, error: {e:?}");
-                                    ("".to_string(), 0, ProofState::Failed)
-                                }
-                            };
-                            (cycles, proving_time, public_value_hex, proof_size, proof_state, zkm_version)
-                        },
-                        Err(err) => {
-                            tracing::error!("Build proof error: {err}");
-                            tokio::time::sleep(Duration::from_secs(5)).await;
-                            (0u64, 0.0, "".to_string(), 0usize, ProofState::Failed, "".to_string())
-                        }
+                    let job = OnDemandJob {
+                        table: OnDemandProofTable::Watchtower,
+                        task_index,
+                        output: args.output.clone(),
+                        builder: builder.clone(),
+                        ctx,
                     };
-                    let proving_duration = proving_start.elapsed().as_secs_f32() * 1000.0;
-                    let succeeded = matches!(proof_state, ProofState::Proven);
-                    let update_result = update_watchtower_task(&local_db, task_index, args.output.clone(), public_value_hex, proof_size as i64, cycles, proof_state, proving_duration as i64, proving_time as i64, zkm_version).await;
-                    let persisted =
-                        matches!(&update_result, Ok(affected) if *affected > 0);
-                    let outcome = if succeeded && persisted { "success" } else { "failed" };
-                    metrics_state.record_attempt(WATCHTOWER_PROOF, outcome, proving_start.elapsed());
-                    let affected = update_result?;
-                    tracing::info!("update watchtower task: {args:?}, cycles: {cycles}, index: {}, affected row: {affected}", task_index);
+                    let outcome =
+                        prove_on_demand(&runtime, &local_db, job, &mut attempts, &metrics_state, WATCHTOWER_PROOF)
+                            .await?;
+                    tracing::info!("watchtower task {task_index}: {outcome:?}");
+                    if outcome == OnDemandOutcome::Deferred {
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    }
                     args = ProofBuilderConfig::run_next(args, WatchtowerProofBuilder::name())?;
                 }
                 _ = cancellation_token.cancelled() => {

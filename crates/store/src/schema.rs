@@ -882,6 +882,35 @@ impl ProofState {
     }
 }
 
+/// An on-demand proof table whose rows the proof builder completes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OnDemandProofTable {
+    Operator,
+    Watchtower,
+}
+
+impl OnDemandProofTable {
+    pub fn table_name(self) -> &'static str {
+        match self {
+            Self::Operator => "operator_proof",
+            Self::Watchtower => "watchtower_proof",
+        }
+    }
+}
+
+/// The result columns written when an on-demand proof task finishes.
+#[derive(Clone, Debug, Default)]
+pub struct OnDemandProofCompletion {
+    pub path_to_proof: String,
+    pub public_value_hex: String,
+    pub proof_size: i64,
+    pub cycles: i64,
+    pub proof_state: i64,
+    pub total_time_to_proof: i64,
+    pub proving_time: i64,
+    pub zkm_version: String,
+}
+
 #[derive(Clone, FromRow, Debug, Serialize, Deserialize, Default)]
 pub struct WatchtowerProof {
     pub id: i64,

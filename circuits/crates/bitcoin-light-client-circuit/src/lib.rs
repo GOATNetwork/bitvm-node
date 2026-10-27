@@ -33,10 +33,10 @@ pub const VK_HASH_SIZE: usize = 66;
 pub const TOTAL_WORK_SIZE: usize = 32;
 pub const CONSENSUS_BLOCK_HEIGHT_SIZE: usize = 4;
 
-// 0xc3d8382a8efed79d564f8ec6da4dd00a4e77572d1e02f5f81dda441a36fdc9d8
+// 0x4dc626c63149074f261a81b2719491482d112e2564e1f68b948237f679a1f3fc
 pub const ROOT_COMMIT_PROGRAM_ID: verifier::ProgramId = [
-    195, 216, 56, 42, 142, 254, 215, 157, 86, 79, 142, 198, 218, 77, 208, 10, 78, 119, 87, 45, 30,
-    2, 245, 248, 29, 218, 68, 26, 54, 253, 201, 216,
+    77, 198, 38, 198, 49, 73, 7, 79, 38, 26, 129, 178, 113, 148, 145, 72, 45, 17, 46, 37, 100, 225,
+    246, 139, 148, 130, 55, 246, 121, 161, 243, 252,
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -726,10 +726,10 @@ mod tests {
     use super::*;
 
     use bitcoin::Transaction;
-    const PROOF: &[u8] = include_bytes!("../../../circuits/data/watchtower/output3.bin.proof.bin");
+    const PROOF: &[u8] = include_bytes!("../../../data/watchtower/output3.bin.proof.bin");
     const PUBLIC_INPUTS: &[u8] =
-        include_bytes!("../../../circuits/data/watchtower/output3.bin.public_inputs.bin");
-    const VK_HASH: &str = include_str!("../../../circuits/data/watchtower/output3.bin.vk_hash.bin");
+        include_bytes!("../../../data/watchtower/output3.bin.public_inputs.bin");
+    const VK_HASH: &str = include_str!("../../../data/watchtower/output3.bin.vk_hash.bin");
     const ZKM_VERSION: &str = "v1.2.4";
 
     #[test]

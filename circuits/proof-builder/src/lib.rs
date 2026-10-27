@@ -5,12 +5,14 @@ use header_chain::CircuitBlockHeader;
 use serde::{Deserialize, Serialize};
 use state_chain::CircuitStateBlock;
 use std::fs;
+use std::sync::Arc;
 use strum::{Display, EnumString};
 use thiserror::Error;
 use zkm_sdk::{HashableKey, ProverClient, ZKM_CIRCUIT_VERSION, ZKMProofWithPublicValues};
-use zkm_sdk::{ZKMProvingKey, ZKMVerifyingKey};
+use zkm_sdk::{Prover, ZKMProofKind, ZKMProvingKey, ZKMStdin, ZKMVerifyingKey};
 
 pub mod api_auth;
+pub mod artifacts;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ProofRequest {
@@ -111,6 +113,85 @@ pub trait ProofBuilder {
 
 pub trait LongRunning {
     fn rotate(&self) -> Self;
+}
+
+/// A failed prover call, carrying what it takes to execute the same guest input on the CPU.
+///
+/// Prover errors do not say whether the input or the prover failed: a GPU transport error
+/// and a guest that rejects its input both surface as the same RPC failure. Executing the
+/// guest tells them apart.
+pub struct ProverCallError {
+    error: anyhow::Error,
+    client: Arc<ProverClient>,
+    elf: Vec<u8>,
+    stdin: ZKMStdin,
+}
+
+impl ProverCallError {
+    /// Returns a check that executes the guest on the CPU. An error means the guest rejects
+    /// the input, so proving it again cannot succeed.
+    pub fn guest_check(&self) -> impl FnOnce() -> Result<()> + Send + 'static {
+        let (client, elf, stdin) = (self.client.clone(), self.elf.clone(), self.stdin.clone());
+        move || client.execute(&elf, &stdin).run().map(|_| ())
+    }
+}
+
+impl std::fmt::Display for ProverCallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "prover call failed: {:#}", self.error)
+    }
+}
+
+impl std::fmt::Debug for ProverCallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProverCallError").field("error", &self.error).finish_non_exhaustive()
+    }
+}
+
+impl std::error::Error for ProverCallError {}
+
+/// Proves `stdin` and returns the proof, its cycles, and its execution time in
+/// milliseconds: the prover's own measurement when it reports one (the GPU server's
+/// `prove_ms`), otherwise the wall time of the prove call. Transfers and the CPU
+/// Groth16 wrap are excluded from the GPU measurement.
+///
+/// A failing or panicking prover call returns a [`ProverCallError`].
+pub fn prove_timed(
+    client: &Arc<ProverClient>,
+    pk: &ZKMProvingKey,
+    stdin: &ZKMStdin,
+    kind: ZKMProofKind,
+    elf_id: Option<String>,
+) -> Result<(ZKMProofWithPublicValues, u64, f32)> {
+    // Discard a measurement left by an earlier call on this client.
+    let _ = client.take_prove_ms();
+    let started = std::time::Instant::now();
+    let call = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.prove_with_cycles(pk, stdin, kind, elf_id)
+    }));
+    let error = match call {
+        Ok(Ok((proof, cycles))) => {
+            let wall_ms = started.elapsed().as_secs_f32() * 1000.0;
+            let prove_ms = client.take_prove_ms().map_or(wall_ms, |ms| ms as f32);
+            return Ok((proof, cycles, prove_ms));
+        }
+        Ok(Err(error)) => error,
+        Err(panic) => {
+            let message = panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic.downcast_ref::<&str>().copied())
+                .unwrap_or("unknown panic");
+            anyhow::anyhow!("prover panicked: {message}")
+        }
+    };
+    Err(ProverCallError {
+        error,
+        client: client.clone(),
+        elf: pk.elf.clone(),
+        stdin: stdin.clone(),
+    }
+    .into())
 }
 
 #[derive(Debug, Default)]

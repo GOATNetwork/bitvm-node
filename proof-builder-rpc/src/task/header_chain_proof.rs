@@ -8,10 +8,14 @@ use tracing::info;
 
 use crate::api::metrics_service::{ApiMetricsState, HEADER_CHAIN_PROOF};
 use crate::config::ProofBuilderConfig;
-use crate::task::{create_long_running_task, fetch_latest_long_running_task};
+use crate::prover::{Cancelled, ProverRuntime};
+use crate::task::{
+    create_long_running_task, failure_outcome, fetch_latest_long_running_task, settle_chain_failure,
+};
 
-#[tracing::instrument(level = "info", skip(local_db, metrics_state, cancellation_token))]
+#[tracing::instrument(level = "info", skip(runtime, local_db, metrics_state, cancellation_token))]
 pub(crate) fn spawn_header_chain_proof_task(
+    runtime: ProverRuntime,
     args: header_chain_proof::Args,
     local_db: LocalDB,
     metrics_state: ApiMetricsState,
@@ -28,13 +32,7 @@ pub(crate) fn spawn_header_chain_proof_task(
                 anyhow::bail!("Header chain proof generate task cancelled");
             }
         }
-        assert_eq!(
-            args.batch_size, 1,
-            "Header chain proof batch size must be 1, current batch size: {}",
-            args.batch_size
-        );
-
-        let builder = HeaderChainProofBuilder::new();
+        let builder = runtime.builder(HeaderChainProofBuilder::with_client).await?;
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(large_interval)) => {
@@ -42,6 +40,7 @@ pub(crate) fn spawn_header_chain_proof_task(
                     if let Some(next_task) = next_task {
                         info!("Header chain's next task: {next_task:?}");
                         args.start = next_task.block_end as usize;
+                        args.batch_size = 1;
                         args.input_proof = next_task.path_to_proof.unwrap();
                         args.output_proof = format!(
                             "{}/{}-{}.bin",
@@ -51,14 +50,20 @@ pub(crate) fn spawn_header_chain_proof_task(
                         );
                         args.init_input = false;
                     }
+                    anyhow::ensure!(
+                        args.batch_size > 0 && (args.batch_size == 1 || args.is_genesis_batch()),
+                        "Header chain proof batch size must be positive and must be 1 after Genesis, current batch size: {}",
+                        args.batch_size
+                    );
                     info!("Header chain proof generate task: generate proof, args: {args:?}");
                     let total_block_headers = match fetch_header_chain(
                         &args.esplora_url,
                         args.start,
                         args.batch_size,
                         &args.block_headers,
-                        args.force_fetch,
+                        args.force_fetch || args.prefer_local_headers_on_init,
                         args.bitcoin_network,
+                        args.prefer_local_headers_on_init && args.is_genesis_batch(),
                     ).await {
                         Ok(data) => data,
                         Err(err) => {
@@ -78,59 +83,50 @@ pub(crate) fn spawn_header_chain_proof_task(
                            batch_size: args.batch_size,
                            total_block_headers,
                     };
-                    let proving_start = tokio::time::Instant::now();
-                    let (input, proof, cycles, proving_time) = match builder.build_proof(&ctx) {
-                        Ok(data) => data,
-                        Err(error) => {
-                            metrics_state.record_attempt(
-                                HEADER_CHAIN_PROOF,
-                                "failed",
-                                proving_start.elapsed(),
-                            );
-                            tracing::error!("Build proof error: {error}");
-                            continue;
+                    let started = tokio::time::Instant::now();
+                    let unit = {
+                        let (runtime, local_db, builder) = (runtime.clone(), local_db.clone(), builder.clone());
+                        let (start, batch_size) = (args.start as i64, args.batch_size as i64);
+                        let output_proof = args.output_proof.clone();
+                        async move {
+                            let proved = match runtime.prove_and_save(builder, ctx).await {
+                                Ok(proved) => proved,
+                                Err(error) => return Ok(Err(error)),
+                            };
+                            let affected = create_long_running_task(
+                                &local_db,
+                                start,
+                                batch_size,
+                                output_proof,
+                                proved.public_value_hex,
+                                proved.proof_size as i64,
+                                proved.cycles,
+                                HeaderChainProofBuilder::name(),
+                                started.elapsed().as_millis() as i64,
+                                proved.proving_time as i64,
+                                store::ProofState::Proven,
+                                proved.zkm_version,
+                            )
+                            .await?;
+                            Ok::<_, anyhow::Error>(Ok(affected))
                         }
                     };
-                    let proving_duration = proving_start.elapsed().as_secs_f32() * 1000.0;
-                    let zkm_version = proof.zkm_version.clone();
-                    let (public_value_hex, proof_size) =
-                        match builder.save_proof(&ctx, &input, cycles, proof) {
-                            Ok(data) => data,
-                            Err(error) => {
-                                metrics_state.record_attempt(
-                                    HEADER_CHAIN_PROOF,
-                                    "failed",
-                                    proving_start.elapsed(),
-                                );
-                                return Err(error);
-                            }
-                        };
-                    let persist_result = create_long_running_task(
-                        &local_db,
-                        args.start as i64,
-                        args.batch_size as i64,
-                        args.output_proof.clone(),
-                        public_value_hex,
-                        proof_size as i64,
-                        cycles,
-                        HeaderChainProofBuilder::name(),
-                        proving_duration as i64,
-                        proving_time as i64,
-                        store::ProofState::Proven,
-                        zkm_version,
-                    )
-                    .await;
-                    let outcome = if matches!(&persist_result, Ok(affected) if *affected > 0) {
-                        "success"
-                    } else {
-                        "failed"
-                    };
-                    metrics_state.record_attempt(
-                        HEADER_CHAIN_PROOF,
-                        outcome,
-                        proving_start.elapsed(),
-                    );
-                    persist_result?;
+                    match runtime.run(unit).await {
+                        Err(Cancelled) => continue,
+                        Ok(Err(error)) => {
+                            metrics_state.record_attempt(HEADER_CHAIN_PROOF, "failed", started.elapsed());
+                            return Err(error);
+                        }
+                        Ok(Ok(Err(error))) => {
+                            metrics_state.record_attempt(HEADER_CHAIN_PROOF, failure_outcome(&error), started.elapsed());
+                            settle_chain_failure(&runtime, error, &HeaderChainProofBuilder::name())?;
+                            continue;
+                        }
+                        Ok(Ok(Ok(affected))) => {
+                            let outcome = if affected > 0 { "success" } else { "failed" };
+                            metrics_state.record_attempt(HEADER_CHAIN_PROOF, outcome, started.elapsed());
+                        }
+                    }
                     args = ProofBuilderConfig::run_next(args, HeaderChainProofBuilder::name())?;
                 }
                 _ = cancellation_token.cancelled() => {

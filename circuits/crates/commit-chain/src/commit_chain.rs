@@ -579,7 +579,7 @@ mod tests {
     #[test]
     fn test_apply_commit() {
         // let commit_info: Vec<CircuitCommit> = serde_json::from_slice(include_bytes!(
-        //     "../../../circuits/data/commit-chain/0-1.bin.commits"
+        //     "../../../data/commit-chain/0-1.bin.commits"
         // ))
         // .unwrap();
         //
@@ -590,7 +590,7 @@ mod tests {
         // assert_eq!(commit_info[0].commit_txn.compute_txid(), chain_state.commit_txn.compute_txid());
         //
         // let commit_info2: Vec<CircuitCommit> = serde_json::from_slice(include_bytes!(
-        //     "../../../circuits/data/commit-chain/1-1.bin.commits"
+        //     "../../../data/commit-chain/1-1.bin.commits"
         // ))
         // .unwrap();
         // chain_state.apply_commit(commit_info2.clone());

@@ -18,6 +18,12 @@ fn tagged_hash(tag: &[u8], parts: &[&[u8]]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+/// The partial STARK verifying key bundled for `zkm_version`, or an error for an unknown version.
+fn bundled_part_stark_vk(zkm_version: &str) -> Result<&'static [u8], String> {
+    Groth16Verifier::try_get_part_stark_vk(zkm_version)
+        .ok_or_else(|| format!("no partial STARK verifying key is bundled for Ziren {zkm_version}"))
+}
+
 fn program_id_with_part_vk(zkm_vk_hash: &str, part_stark_vk: &[u8]) -> Result<ProgramId, String> {
     let vk_hash = decode_zkm_vkey_hash(zkm_vk_hash).map_err(|e| format!("{e:?}"))?;
     let part_vk_hash: [u8; 32] = Sha256::digest(part_stark_vk).into();
@@ -26,7 +32,7 @@ fn program_id_with_part_vk(zkm_vk_hash: &str, part_stark_vk: &[u8]) -> Result<Pr
 
 pub fn program_id(zkm_vk_hash: &[u8], zkm_version: &str) -> Result<ProgramId, String> {
     let zkm_vk_hash = String::from_utf8(zkm_vk_hash.to_vec()).map_err(|e| e.to_string())?;
-    program_id_with_part_vk(&zkm_vk_hash, Groth16Verifier::get_part_stark_vk(zkm_version))
+    program_id_with_part_vk(&zkm_vk_hash, bundled_part_stark_vk(zkm_version)?)
 }
 
 pub fn initial_history(program_type: ProgramType) -> [u8; 32] {
@@ -98,7 +104,7 @@ pub fn verify_groth16_proof(
 ) -> Result<ProgramId, String> {
     let groth16_vk = *IMM_GROTH16_VK_BYTES;
     let zkm_vk_hash = String::from_utf8(zkm_vk_hash.to_vec()).map_err(|e| e.to_string())?;
-    let part_stark_vk = Groth16Verifier::get_part_stark_vk(zkm_version);
+    let part_stark_vk = bundled_part_stark_vk(zkm_version)?;
 
     Groth16Verifier::verify_by_imm_groth16_vk(
         proof,
@@ -115,6 +121,36 @@ pub fn verify_groth16_proof(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pins the Groth16 statement to Ziren `62acdd5c` (circuit version v2.0.0). The Ziren dependency
+    /// has no tag or rev, so a `cargo update` could otherwise move the wrap vk or the recursion vk
+    /// root without a reviewable diff. Update these only together with a deliberate Ziren upgrade.
+    #[test]
+    fn ziren_wrap_vk_and_vk_root_are_pinned() {
+        let imm_vk_hash: [u8; 32] = Sha256::digest(*IMM_GROTH16_VK_BYTES).into();
+        assert_eq!(
+            imm_vk_hash,
+            [
+                0xba, 0xad, 0x5b, 0x23, 0x1f, 0x3f, 0x25, 0x84, 0x35, 0x31, 0x96, 0xd8, 0xfe, 0xb7,
+                0xfd, 0xd6, 0x0c, 0x49, 0x35, 0x6e, 0x8d, 0xd6, 0x04, 0x20, 0x6b, 0xf0, 0x18, 0xcf,
+                0x19, 0xe2, 0xce, 0x0e,
+            ]
+        );
+        assert_eq!(
+            *zkm_verifier::VK_ROOT_BYTES,
+            [
+                0x00, 0x32, 0x6c, 0xc6, 0xf1, 0xf6, 0x4b, 0xa2, 0x26, 0x66, 0x0f, 0x3c, 0x89, 0x64,
+                0x2d, 0x0e, 0xf2, 0x9c, 0x40, 0xf1, 0x75, 0xac, 0xb2, 0x1c, 0x21, 0xbe, 0x9a, 0xb9,
+                0x0e, 0x32, 0x24, 0x6e,
+            ]
+        );
+    }
+
+    #[test]
+    fn unknown_ziren_version_is_an_error() {
+        assert!(program_id(b"0x00", "v0.0.0-unknown").is_err());
+        assert!(verify_groth16_proof(&[], &[], b"0x00", "v0.0.0-unknown").is_err());
+    }
 
     #[test]
     fn program_history_root_binds_header_then_state() {

@@ -36,7 +36,7 @@ fn real_setup_restores_private_state_and_verifies_soldering_proof() {
         &mut rng,
     )
     .expect("groth16 setup");
-    let static_public_inputs = a * b;
+    let static_public_inputs = [a * b, b];
     let _dynamic_public_inputs = a * a;
 
     let (package, private_state) =

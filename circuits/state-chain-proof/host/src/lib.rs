@@ -17,7 +17,7 @@ use state_chain::*;
 use std::sync::Arc;
 use url::Url;
 use zkm_sdk::{
-    HashableKey, Prover, ProverClient, ZKM_CIRCUIT_VERSION, ZKMProofKind, ZKMProofWithPublicValues,
+    HashableKey, ProverClient, ZKM_CIRCUIT_VERSION, ZKMProofKind, ZKMProofWithPublicValues,
     ZKMStdin, include_elf,
 };
 
@@ -27,7 +27,7 @@ use util::hex_parse;
 static ELF_ID: OnceLock<String> = OnceLock::new();
 
 /// A program that aggregates the proofs of the simple program.
-const STATE_CHAIN: &[u8] = include_elf!("guest");
+pub const STATE_CHAIN: &[u8] = include_elf!("state-chain-guest");
 
 use std::fs;
 
@@ -287,7 +287,7 @@ pub async fn fetch_state_chain(
 }
 
 pub struct StateChainProofBuilder {
-    client: ProverClient,
+    client: Arc<ProverClient>,
     proving_key: zkm_sdk::ZKMProvingKey,
     verifying_key: zkm_sdk::ZKMVerifyingKey,
 }
@@ -295,7 +295,11 @@ pub struct StateChainProofBuilder {
 impl StateChainProofBuilder {
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
-        let client = ProverClient::new();
+        Self::with_client(Arc::new(ProverClient::new()))
+    }
+
+    /// Sets the program up on a prover client that other builders may share.
+    pub fn with_client(client: Arc<ProverClient>) -> Self {
         let (proving_key, verifying_key) = client.setup(STATE_CHAIN);
         Self { client, proving_key, verifying_key }
     }
@@ -391,15 +395,13 @@ impl ProofBuilder for StateChainProofBuilder {
                 };
                 tracing::info!("elf id: {:?}", elf_id);
 
-                let proving_start = tokio::time::Instant::now();
-                let (proof, cycles) = self.client.prove_with_cycles(
+                proof_builder::prove_timed(
+                    &self.client,
                     &self.proving_key,
                     &stdin,
                     ZKMProofKind::Groth16,
                     elf_id,
-                )?;
-                let proving_duration = proving_start.elapsed().as_secs_f32() * 1000.0;
-                Ok((proof, cycles, proving_duration))
+                )
             },
         )?;
         tracing::info!("State chain proof cycles: {}", cycles);
@@ -422,16 +424,20 @@ impl ProofBuilder for StateChainProofBuilder {
         let ProofRequest::StateChainProofRequest { output_proof, .. } = ctx else {
             anyhow::bail!("Invalid state chain inputs");
         };
-        std::fs::write(output_proof, proof.bytes())?;
-        let public_value_hex = hex::encode(proof.public_values.to_vec());
-        let proof_size = proof.bytes().len();
-        let zkm_version = proof.zkm_version.clone();
-        std::fs::write(
-            format!("{}.public_inputs.bin", output_proof),
-            proof.public_values.to_vec(),
+        let proof_bytes = proof.bytes()?;
+        let proof_size = proof_bytes.len();
+        let public_values = proof.public_values.to_vec();
+        let public_value_hex = hex::encode(&public_values);
+        let vk_hash = self.verifying_key.bytes32();
+        proof_builder::artifacts::publish_artifacts(
+            output_proof,
+            &proof_bytes,
+            &[
+                (".public_inputs.bin", public_values.as_slice()),
+                (".vk_hash.bin", vk_hash.as_bytes()),
+                (".zkm_version.bin", proof.zkm_version.as_bytes()),
+            ],
         )?;
-        std::fs::write(format!("{}.vk_hash.bin", output_proof), self.verifying_key.bytes32())?;
-        std::fs::write(format!("{}.zkm_version.bin", output_proof), zkm_version)?;
 
         tracing::info!("Generate proof successfully, proof: {:?}", proof);
         Ok((public_value_hex, proof_size))

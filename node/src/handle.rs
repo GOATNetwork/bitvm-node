@@ -6477,7 +6477,7 @@ async fn handle_assert_sent_verifier(
         .map_err(|e| anyhow!("failed to extract operator assert witness: {e}"))?;
     let vk = crate::vk::get_vk().await.context("load Groth16 verifying key for operator assert")?;
     let static_input = derive_operator_static_input()?;
-    if pubin_consistent && assert_witness.verify_groth16_proof(&vk, &[static_input]) {
+    if pubin_consistent && assert_witness.verify_groth16_proof(&vk, &static_input) {
         tracing::info!(
             "Skip ChallengeAssert for {instance_id}:{graph_id}: operator assert proof is valid"
         );
