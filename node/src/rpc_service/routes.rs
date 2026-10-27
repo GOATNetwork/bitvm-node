@@ -4,6 +4,8 @@ pub(crate) mod v1 {
     pub const NODES_BASE: &str = "/v1/nodes";
     pub const NODES_BY_ID: &str = "/v1/nodes/{:id}";
     pub const NODES_OVERVIEW: &str = "/v1/nodes/overview";
+    /// Liveness / readiness of this node, served from memory.
+    pub const HEALTH: &str = "/v1/health";
 
     pub const INSTANCES_BASE: &str = "/v1/instances";
     pub const INSTANCES_SETTINGS: &str = "/v1/instances/settings";
@@ -30,20 +32,14 @@ pub(crate) mod v1 {
     pub const DEBUG_STATUS: &str = "/v1/debug/status";
     // TODO(auth): Restrict debug endpoints before exposing the RPC outside trusted operators.
     #[cfg(feature = "rpc-debug-endpoints")]
-    pub const DEBUG_GRAPH_MESSAGES: &str = "/v1/debug/graphs/{:id}/messages";
+    pub const DEBUG_ENGINE: &str = "/v1/debug/engine";
     // TODO(auth): Restrict debug endpoints before exposing the RPC outside trusted operators.
     #[cfg(feature = "rpc-debug-endpoints")]
-    pub const DEBUG_INSTANCE_MESSAGES: &str = "/v1/debug/instances/{:id}/messages";
-    // TODO(auth): Restrict debug endpoints before exposing the RPC outside trusted operators.
-    #[cfg(feature = "rpc-debug-endpoints")]
-    pub const DEBUG_MESSAGE_DETAILS: &str = "/v1/debug/messages/{:id}";
+    pub const DEBUG_ENGINE_CLEAR_POISON: &str = "/v1/debug/engine/clear-poison";
     // pub const PROOFS_BASE: &str = "/v1/proofs";
     pub const PROOFS_CHAIN_PROOFS_DESC: &str = "/v1/proofs/chain_proofs_desc";
     pub const NODES_WATCHTOWER_BASE: &str = "/v1/proofs/watchtower_proofs";
-    #[allow(dead_code)]
     pub const NODES_OPERATOR_BASE: &str = "/v1/proofs/operator_proofs";
     pub const PROOFS_OPERATOR_PROOF_DESC: &str = "/v1/proofs/operator_proofs_desc";
     pub const PROOFS_WATCHTOWER_PROOF_TIMEOUT: &str = "/v1/proofs/watchtower_proofs_timeout";
-    #[allow(dead_code)]
-    pub const PROOFS_OPERATOR_PROOF_TIMEOUT: &str = "/v1/proofs/operator_proofs_timeout";
 }

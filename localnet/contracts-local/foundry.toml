@@ -1,0 +1,23 @@
+# Local-only additions on top of the upstream contracts (git submodule ../contracts): the GatewayLocal
+# test faucet, the two mocks and the deploy script. Built by tools/forge.sh inside the foundry container
+# with the localnet directory as the project root (so the upstream library artifacts resolve) and this
+# file as FOUNDRY_CONFIG; out/cache/broadcast are redirected to $LOCALNET_DATA/forge. Paths are relative
+# to localnet/.
+[profile.default]
+src = 'contracts-local/src'
+script = 'contracts-local/script'
+test = 'contracts-local/test'
+libs = []
+solc_version = '0.8.28'
+optimizer = true
+optimizer_runs = 100
+via_ir = true
+remappings = [
+  'bitvm-l2/=contracts/src/',
+  'forge-std/=contracts/lib/forge-std/src/',
+  '@openzeppelin/contracts/=contracts/lib/openzeppelin-contracts-upgradeable/lib/openzeppelin-contracts/contracts/',
+  '@openzeppelin/contracts-upgradeable/=contracts/lib/openzeppelin-contracts-upgradeable/contracts/',
+]
+
+[lint]
+lint_on_build = false

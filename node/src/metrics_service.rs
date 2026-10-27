@@ -1,9 +1,11 @@
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use crate::rpc_service::{AppState, current_time_secs};
+use crate::clock::current_time_secs;
+use crate::rpc_service::AppState;
 use alloy::primitives::U256;
 use axum::extract::{MatchedPath, Request, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -15,7 +17,7 @@ use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::metrics::histogram::{Histogram, exponential_buckets};
-use store::{GraphStatus, InstanceBridgeInStatus, MessageState, SwapEscrowStatus};
+use store::{GraphStatus, InstanceBridgeInStatus, SwapEscrowStatus};
 use tokio::time::Instant;
 
 const METRICS_CONTENT_TYPE: &str = "application/openmetrics-text;charset=utf-8;version=1.0.0";
@@ -32,6 +34,23 @@ pub fn set_node_metrics_state(metrics_state: MetricsState) {
 
 pub fn node_metrics_state() -> Option<&'static MetricsState> {
     NODE_METRICS_STATE.get()
+}
+
+/// Backend availability hooks for code that only has the process-wide handle.
+pub fn record_backend_ok(backend: &'static str) {
+    if let Some(state) = node_metrics_state() {
+        state.record_backend_call(backend, true, None);
+    }
+}
+
+pub fn record_backend_failure(
+    backend: &'static str,
+    operation: &'static str,
+    error: &dyn std::fmt::Display,
+) {
+    if let Some(state) = node_metrics_state() {
+        state.backend_probe_failed(backend, operation, error);
+    }
 }
 
 /// Creates a duration histogram using the shared HTTP and task latency buckets.
@@ -79,6 +98,11 @@ struct EventWatchStateLabels {
     state: String,
 }
 
+#[derive(Debug, Clone, Hash, PartialEq, Eq, prometheus_client::encoding::EncodeLabelSet)]
+struct ReasonLabels {
+    reason: String,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EventWatchState {
     Healthy,
@@ -106,6 +130,59 @@ struct ReadinessState {
     event_watcher_ready: AtomicBool,
 }
 
+/// Readiness bits as served by `/v1/health`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ReadinessSnapshot {
+    pub ready: bool,
+    pub startup: bool,
+    pub database: bool,
+    pub backend: bool,
+    pub event_watcher: bool,
+}
+
+/// The backends whose availability is tracked as one signal each.
+pub const BACKENDS: [&str; 4] = ["btc", "goat", "graph", "proof"];
+/// The backends the node needs to be ready: probed continuously, unlike the
+/// proof builder, which is only called while a proof is being fetched.
+const READINESS_BACKENDS: [&str; 3] = ["btc", "goat", "graph"];
+/// Consecutive failed calls before a backend is declared unavailable.
+const BACKEND_UNAVAILABLE_AFTER_FAILURES: u32 = 2;
+/// Seconds without any failed call before an unavailable backend counts as
+/// recovered, so a flaky backend yields one outage instead of a transition per call.
+const BACKEND_RECOVERY_QUIET_SECS: i64 = 30;
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq, prometheus_client::encoding::EncodeLabelSet)]
+struct BackendLabels {
+    backend: String,
+}
+
+#[derive(Debug, Default)]
+struct BackendHealth {
+    consecutive_failures: u32,
+    failed_calls: u64,
+    unavailable_since: Option<i64>,
+    last_failure_at: Option<i64>,
+    last_error: Option<String>,
+}
+
+/// One backend's availability as served by `/v1/health`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BackendHealthSnapshot {
+    pub backend: &'static str,
+    pub up: bool,
+    pub unavailable_since: Option<i64>,
+    pub consecutive_failures: u32,
+    pub last_error: Option<String>,
+}
+
+/// Event watcher state as served by `/v1/health`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EventWatchSnapshot {
+    pub state: &'static str,
+    pub lag_blocks: i64,
+    pub last_success_timestamp: i64,
+}
+
 #[derive(Debug, Clone, Hash, PartialEq, Eq, prometheus_client::encoding::EncodeLabelSet)]
 struct InstanceLabels {
     flow: String,
@@ -129,10 +206,6 @@ pub struct MetricsState {
     message_dispatch_total: Family<MessageDispatchLabels, Counter>,
     instances: Family<InstanceLabels, Gauge>,
     graphs: Family<StatusLabels, Gauge>,
-    messages: Family<StatusLabels, Gauge>,
-    oldest_pending_message_age_seconds: Gauge,
-    p2p_inbox_messages: Family<StatusLabels, Gauge>,
-    oldest_pending_p2p_inbox_age_seconds: Gauge,
     ready: Gauge,
     db_busy_retries_total: Counter,
     db_errors_total: Counter,
@@ -143,7 +216,6 @@ pub struct MetricsState {
     fee_wallet_balance_sats: Gauge,
     fee_wallet_spendable_utxos: Gauge,
     graph_validation_total: Family<OutcomeLabels, Counter>,
-    message_retry_total: Counter,
     p2p_publish_total: Family<OutcomeLabels, Counter>,
     p2p_receive_total: Family<OutcomeLabels, Counter>,
     p2p_oversized_messages_total: Counter,
@@ -158,6 +230,7 @@ pub struct MetricsState {
     pegin_graph_setup_total: Family<OutcomeLabels, Counter>,
     pegin_confirm_total: Family<OutcomeLabels, Counter>,
     pegin_post_total: Family<OutcomeLabels, Counter>,
+    instance_alerts_total: Family<ReasonLabels, Counter>,
     pegout_disprove_total: Counter,
     withdraw_finalize_total: Family<OutcomeLabels, Counter>,
     goat_gas_balance_wei: Gauge,
@@ -165,6 +238,13 @@ pub struct MetricsState {
     soldering_payload_io_total: Family<OutcomeLabels, Counter>,
     btc_tx_broadcast_total: Family<OutcomeLabels, Counter>,
     event_watch_lag_blocks: Gauge,
+    backend_up: Family<BackendLabels, Gauge>,
+    backend_unavailable_since_seconds: Family<BackendLabels, Gauge>,
+    backend_health: Arc<Mutex<HashMap<&'static str, BackendHealth>>>,
+    /// No readiness backend is currently declared unavailable.
+    backends_available: Arc<AtomicBool>,
+    event_watch_state_current: Arc<AtomicU8>,
+    started_at: Instant,
     readiness: Arc<ReadinessState>,
     peg_btc_decimals: Arc<AtomicU8>,
 }
@@ -191,11 +271,15 @@ impl MetricsState {
         let message_dispatch_total = Family::default();
         let instances = Family::default();
         let graphs = Family::default();
-        let messages = Family::default();
-        let oldest_pending_message_age_seconds = Gauge::default();
-        let p2p_inbox_messages = Family::default();
-        let oldest_pending_p2p_inbox_age_seconds = Gauge::default();
         let ready = Gauge::default();
+        let backend_up: Family<BackendLabels, Gauge> = Family::default();
+        let backend_unavailable_since_seconds: Family<BackendLabels, Gauge> = Family::default();
+        for backend in BACKENDS {
+            backend_up.get_or_create(&BackendLabels { backend: backend.to_owned() }).set(1);
+            backend_unavailable_since_seconds
+                .get_or_create(&BackendLabels { backend: backend.to_owned() })
+                .set(0);
+        }
         let db_busy_retries_total = Counter::default();
         let db_errors_total = Counter::default();
         let pegin_oldest_active_age_seconds = Gauge::default();
@@ -205,7 +289,6 @@ impl MetricsState {
         let fee_wallet_balance_sats = Gauge::default();
         let fee_wallet_spendable_utxos = Gauge::default();
         let graph_validation_total = Family::default();
-        let message_retry_total = Counter::default();
         let p2p_publish_total = Family::default();
         let p2p_receive_total = Family::default();
         let p2p_oversized_messages_total = Counter::default();
@@ -225,6 +308,7 @@ impl MetricsState {
         let pegin_graph_setup_total = Family::default();
         let pegin_confirm_total = Family::default();
         let pegin_post_total = Family::default();
+        let instance_alerts_total = Family::default();
         let pegout_disprove_total = Counter::default();
         let withdraw_finalize_total = Family::default();
         let goat_gas_balance_wei = Gauge::default();
@@ -269,7 +353,7 @@ impl MetricsState {
             );
             registry.register(
                 "bitvm_node_message_dispatch",
-                "Total number of protocol message dispatches",
+                "Total number of control message dispatches (NodeInfo, GraphSetupAck)",
                 message_dispatch_total.clone(),
             );
             registry.register(
@@ -278,26 +362,6 @@ impl MetricsState {
                 instances.clone(),
             );
             registry.register("bitvm_node_graphs", "Number of graphs by status", graphs.clone());
-            registry.register(
-                "bitvm_node_messages",
-                "Number of queued messages by state",
-                messages.clone(),
-            );
-            registry.register(
-                "bitvm_node_oldest_pending_message_age_seconds",
-                "Age in seconds of the oldest pending message",
-                oldest_pending_message_age_seconds.clone(),
-            );
-            registry.register(
-                "bitvm_node_p2p_inbox_messages",
-                "Number of durable P2P inbox messages by state",
-                p2p_inbox_messages.clone(),
-            );
-            registry.register(
-                "bitvm_node_oldest_pending_p2p_inbox_age_seconds",
-                "Age in seconds of the oldest pending durable P2P inbox message",
-                oldest_pending_p2p_inbox_age_seconds.clone(),
-            );
             registry.register(
                 "bitvm_node_ready",
                 "Whether the node is ready to process work",
@@ -349,11 +413,6 @@ impl MetricsState {
                 graph_validation_total.clone(),
             );
             registry.register(
-                "bitvm_node_message_retry",
-                "Total deferred protocol messages",
-                message_retry_total.clone(),
-            );
-            registry.register(
                 "bitvm_node_p2p_publish",
                 "Total P2P message publish outcomes",
                 p2p_publish_total.clone(),
@@ -389,6 +448,16 @@ impl MetricsState {
                 goat_backend_last_success_timestamp_seconds.clone(),
             );
             registry.register(
+                "bitvm_node_backend_up",
+                "Whether the backend answered its latest calls (0 after consecutive failures)",
+                backend_up.clone(),
+            );
+            registry.register(
+                "bitvm_node_backend_unavailable_since_seconds",
+                "Unix timestamp since when the backend has been unavailable (0 when up)",
+                backend_unavailable_since_seconds.clone(),
+            );
+            registry.register(
                 "bitvm_node_spv_lag_blocks",
                 "BTC tip minus Goat SPV height",
                 spv_lag_blocks.clone(),
@@ -422,6 +491,11 @@ impl MetricsState {
                 "bitvm_node_pegin_post",
                 "Total postPeginData outcomes",
                 pegin_post_total.clone(),
+            );
+            registry.register(
+                "bitvm_node_instance_alerts",
+                "Total bridge-in instance conditions that need manual handling, by reason",
+                instance_alerts_total.clone(),
             );
             registry.register(
                 "bitvm_node_pegout_disprove",
@@ -471,10 +545,6 @@ impl MetricsState {
             message_dispatch_total,
             instances,
             graphs,
-            messages,
-            oldest_pending_message_age_seconds,
-            p2p_inbox_messages,
-            oldest_pending_p2p_inbox_age_seconds,
             ready,
             db_busy_retries_total,
             db_errors_total,
@@ -485,7 +555,6 @@ impl MetricsState {
             fee_wallet_balance_sats,
             fee_wallet_spendable_utxos,
             graph_validation_total,
-            message_retry_total,
             p2p_publish_total,
             p2p_receive_total,
             p2p_oversized_messages_total,
@@ -500,6 +569,7 @@ impl MetricsState {
             pegin_graph_setup_total,
             pegin_confirm_total,
             pegin_post_total,
+            instance_alerts_total,
             pegout_disprove_total,
             withdraw_finalize_total,
             goat_gas_balance_wei,
@@ -507,9 +577,168 @@ impl MetricsState {
             soldering_payload_io_total,
             btc_tx_broadcast_total,
             event_watch_lag_blocks,
+            backend_up,
+            backend_unavailable_since_seconds,
+            backend_health: Arc::new(Mutex::new(HashMap::new())),
+            backends_available: Arc::new(AtomicBool::new(true)),
+            event_watch_state_current: Arc::new(AtomicU8::new(0)),
+            started_at: Instant::now(),
             readiness,
             peg_btc_decimals,
         }
+    }
+
+    /// Records one call to a backend and logs only the transitions: one WARN
+    /// when it becomes unavailable, one INFO when it answers again.
+    pub fn record_backend_call(&self, backend: &'static str, success: bool, error: Option<&str>) {
+        self.record_backend_call_at(backend, success, error, current_time_secs());
+    }
+
+    fn record_backend_call_at(
+        &self,
+        backend: &'static str,
+        success: bool,
+        error: Option<&str>,
+        now: i64,
+    ) {
+        let labels = BackendLabels { backend: backend.to_owned() };
+        let mut health =
+            self.backend_health.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = health.entry(backend).or_default();
+        if success {
+            entry.consecutive_failures = 0;
+            let quiet_for = entry.last_failure_at.map_or(i64::MAX, |at| now.saturating_sub(at));
+            if entry.unavailable_since.is_some() && quiet_for >= BACKEND_RECOVERY_QUIET_SECS {
+                let since = entry.unavailable_since.take().unwrap_or(now);
+                tracing::info!(
+                    event = "backend_availability",
+                    backend,
+                    outcome = "recovered",
+                    downtime_secs = now.saturating_sub(since),
+                    failed_calls = entry.failed_calls,
+                    "backend answers again"
+                );
+                self.backend_up.get_or_create(&labels).set(1);
+                self.backend_unavailable_since_seconds.get_or_create(&labels).set(0);
+                entry.failed_calls = 0;
+                entry.last_error = None;
+            }
+        } else {
+            entry.consecutive_failures += 1;
+            entry.failed_calls += 1;
+            entry.last_failure_at = Some(now);
+            entry.last_error = error.map(str::to_owned);
+            if entry.unavailable_since.is_none()
+                && entry.consecutive_failures >= BACKEND_UNAVAILABLE_AFTER_FAILURES
+            {
+                entry.unavailable_since = Some(now);
+                tracing::warn!(
+                    event = "backend_availability",
+                    backend,
+                    outcome = "unavailable",
+                    consecutive_failures = entry.consecutive_failures,
+                    error = error.unwrap_or("unknown"),
+                    "backend unavailable; further failures are logged at debug until it recovers"
+                );
+                self.backend_up.get_or_create(&labels).set(0);
+                self.backend_unavailable_since_seconds.get_or_create(&labels).set(now);
+            }
+        }
+        let available = READINESS_BACKENDS
+            .iter()
+            .all(|name| health.get(name).is_none_or(|h| h.unavailable_since.is_none()));
+        drop(health);
+        self.backends_available.store(available, Ordering::Relaxed);
+        self.refresh_ready();
+    }
+
+    /// Whether the backend is currently declared unavailable.
+    pub fn backend_unavailable(&self, backend: &str) -> bool {
+        self.backend_health
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(backend)
+            .is_some_and(|health| health.unavailable_since.is_some())
+    }
+
+    /// Records a failed backend call: WARN while the backend still counts as
+    /// up, debug once it is known to be unavailable.
+    pub fn backend_probe_failed(
+        &self,
+        backend: &'static str,
+        operation: &'static str,
+        error: &dyn std::fmt::Display,
+    ) {
+        let known_down = self.backend_unavailable(backend);
+        match backend {
+            "btc" => self
+                .btc_backend_requests_total
+                .get_or_create(&OutcomeLabels { outcome: outcome(false) })
+                .inc(),
+            "goat" => self
+                .goat_backend_requests_total
+                .get_or_create(&OutcomeLabels { outcome: outcome(false) })
+                .inc(),
+            _ => 0,
+        };
+        let message = error.to_string();
+        self.record_backend_call(backend, false, Some(&message));
+        if known_down {
+            tracing::debug!(event = "metrics_backend_probe", backend, operation, error = %message, "backend probe failed (backend already unavailable)");
+        } else {
+            tracing::warn!(event = "metrics_backend_probe", backend, operation, error = %message, "backend probe failed");
+        }
+    }
+
+    pub fn backend_health_snapshot(&self) -> Vec<BackendHealthSnapshot> {
+        let health = self.backend_health.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        BACKENDS
+            .iter()
+            .map(|backend| {
+                let entry = health.get(backend);
+                BackendHealthSnapshot {
+                    backend,
+                    up: entry.is_none_or(|h| h.unavailable_since.is_none()),
+                    unavailable_since: entry.and_then(|h| h.unavailable_since),
+                    consecutive_failures: entry.map_or(0, |h| h.consecutive_failures),
+                    last_error: entry.and_then(|h| h.last_error.clone()),
+                }
+            })
+            .collect()
+    }
+
+    pub fn readiness_snapshot(&self) -> ReadinessSnapshot {
+        let startup = self.readiness.startup_ready.load(Ordering::Relaxed);
+        let database = self.readiness.database_ready.load(Ordering::Relaxed);
+        // The periodic probe (every 6th tick) and the per-call availability
+        // states both have to agree that the backends answer.
+        let backend = self.readiness.backend_ready.load(Ordering::Relaxed)
+            && self.backends_available.load(Ordering::Relaxed);
+        let event_watcher = self.readiness.event_watcher_ready.load(Ordering::Relaxed);
+        ReadinessSnapshot {
+            ready: startup && database && backend && event_watcher,
+            startup,
+            database,
+            backend,
+            event_watcher,
+        }
+    }
+
+    pub fn event_watch_snapshot(&self) -> EventWatchSnapshot {
+        let index = usize::from(self.event_watch_state_current.load(Ordering::Relaxed));
+        EventWatchSnapshot {
+            state: EventWatchState::ALL.get(index).map_or("unknown", |state| state.as_str()),
+            lag_blocks: self.event_watch_lag_blocks.get(),
+            last_success_timestamp: self.event_watch_last_success_timestamp_seconds.get(),
+        }
+    }
+
+    pub fn spv_lag_blocks(&self) -> i64 {
+        self.spv_lag_blocks.get()
+    }
+
+    pub fn uptime_secs(&self) -> u64 {
+        self.started_at.elapsed().as_secs()
     }
 
     /// Records a task outcome and duration, updating its success timestamp when applicable.
@@ -565,6 +794,9 @@ impl MetricsState {
                 .set(i64::from(candidate == state));
         }
 
+        let index =
+            EventWatchState::ALL.iter().position(|candidate| *candidate == state).unwrap_or(0);
+        self.event_watch_state_current.store(index as u8, Ordering::Relaxed);
         let healthy = state == EventWatchState::Healthy;
         self.readiness.event_watcher_ready.store(healthy, Ordering::Relaxed);
         self.event_watch_ready.set(i64::from(healthy));
@@ -572,11 +804,7 @@ impl MetricsState {
     }
 
     fn refresh_ready(&self) {
-        let ready = self.readiness.startup_ready.load(Ordering::Relaxed)
-            && self.readiness.database_ready.load(Ordering::Relaxed)
-            && self.readiness.backend_ready.load(Ordering::Relaxed)
-            && self.readiness.event_watcher_ready.load(Ordering::Relaxed);
-        self.ready.set(i64::from(ready));
+        self.ready.set(i64::from(self.readiness_snapshot().ready));
     }
 
     pub fn record_db_error(&self, error: &anyhow::Error) {
@@ -593,10 +821,6 @@ impl MetricsState {
         self.graph_validation_total
             .get_or_create(&OutcomeLabels { outcome: outcome(success) })
             .inc();
-    }
-
-    pub fn record_message_retry(&self) {
-        self.message_retry_total.inc();
     }
 
     pub fn record_p2p_publish(&self, success: bool) {
@@ -618,6 +842,7 @@ impl MetricsState {
         if success {
             self.btc_backend_last_success_timestamp_seconds.set(current_time_secs());
         }
+        self.record_backend_call("btc", success, None);
     }
 
     pub fn record_goat_backend_probe(&self, success: bool) {
@@ -627,6 +852,7 @@ impl MetricsState {
         if success {
             self.goat_backend_last_success_timestamp_seconds.set(current_time_secs());
         }
+        self.record_backend_call("goat", success, None);
     }
 
     pub fn set_peg_btc_decimals(&self, decimals: u8) {
@@ -645,6 +871,11 @@ impl MetricsState {
 
     pub fn record_pegin_post(&self, success: bool) {
         self.pegin_post_total.get_or_create(&OutcomeLabels { outcome: outcome(success) }).inc();
+    }
+
+    /// Record an instance alert, such as a late confirmation, rejected post or failed key deletion.
+    pub fn record_instance_alert(&self, reason: &str) {
+        self.instance_alerts_total.get_or_create(&ReasonLabels { reason: reason.to_owned() }).inc();
     }
 
     pub fn record_pegout_disprove(&self) {
@@ -699,11 +930,6 @@ impl MetricsState {
     fn apply_database_metrics(&self, counts: &[store::MetricsStateCount]) {
         self.instances.clear();
         self.graphs.clear();
-        self.messages.clear();
-        self.oldest_pending_message_age_seconds.set(0);
-        self.p2p_inbox_messages.clear();
-        self.oldest_pending_p2p_inbox_age_seconds.set(0);
-        let now = current_time_secs();
 
         for count in counts {
             match count.category.as_str() {
@@ -722,32 +948,6 @@ impl MetricsState {
                 "graph" => {
                     let status = known_status::<GraphStatus>(&count.state);
                     self.graphs.get_or_create(&StatusLabels { status }).inc_by(count.count);
-                }
-                "message" => {
-                    let status = known_status::<MessageState>(&count.state);
-                    self.messages
-                        .get_or_create(&StatusLabels { status: status.clone() })
-                        .inc_by(count.count);
-                    if status == "Pending" {
-                        self.oldest_pending_message_age_seconds.set(
-                            count
-                                .oldest_created_at
-                                .map_or(0, |created_at| now.saturating_sub(created_at).max(0)),
-                        );
-                    }
-                }
-                "p2p_inbox" => {
-                    let status = known_status::<MessageState>(&count.state);
-                    self.p2p_inbox_messages
-                        .get_or_create(&StatusLabels { status: status.clone() })
-                        .inc_by(count.count);
-                    if status == "Pending" {
-                        self.oldest_pending_p2p_inbox_age_seconds.set(
-                            count
-                                .oldest_created_at
-                                .map_or(0, |created_at| now.saturating_sub(created_at).max(0)),
-                        );
-                    }
                 }
                 _ => {}
             }
@@ -907,8 +1107,8 @@ mod tests {
                 last_success_at: None,
             },
             store::MetricsStateCount {
-                category: "p2p_inbox".to_string(),
-                state: "Pending".to_string(),
+                category: "instance".to_string(),
+                state: "Presigned".to_string(),
                 count: 4,
                 oldest_created_at: Some(current_time_secs() - 30),
                 last_success_at: None,
@@ -923,8 +1123,7 @@ mod tests {
         assert!(!output.contains("bitvm_node_graphs{status=\"OperatorPresigned\"}"));
         assert!(!output.contains("unexpected-id-like-value"));
         assert!(!output.contains("another-unexpected-value"));
-        assert!(output.contains("bitvm_node_p2p_inbox_messages{status=\"Pending\"} 4"));
-        assert!(output.contains("bitvm_node_oldest_pending_p2p_inbox_age_seconds 30"));
+        assert!(output.contains("bitvm_node_instances{flow=\"bridge_in\",status=\"Presigned\"} 4"));
     }
 
     #[test]
@@ -932,7 +1131,7 @@ mod tests {
         let state = MetricsState::new(Arc::new(Mutex::new(Registry::default())));
         state.record_task_run("maintenance", "success", Duration::from_millis(25));
         state.record_task_run("history_sync", "failed", Duration::from_millis(5));
-        state.record_message_dispatch("Tick", "success");
+        state.record_message_dispatch("RequestNodeInfo", "success");
 
         let output = encoded(&state);
         assert!(
@@ -940,7 +1139,7 @@ mod tests {
                 .contains("bitvm_node_task_runs_total{task=\"maintenance\",outcome=\"success\"} 1")
         );
         assert!(output.contains(
-            "bitvm_node_message_dispatch_total{message_type=\"Tick\",outcome=\"success\"} 1"
+            "bitvm_node_message_dispatch_total{message_type=\"RequestNodeInfo\",outcome=\"success\"} 1"
         ));
         assert!(
             !output
@@ -984,5 +1183,52 @@ mod tests {
         assert!(output.contains("bitvm_node_event_watch_state{state=\"healthy\"} 0"));
         assert!(output.contains("bitvm_node_event_watch_state{state=\"syncing\"} 0"));
         assert!(output.contains("bitvm_node_event_watch_state{state=\"failed\"} 1"));
+    }
+
+    #[test]
+    fn backend_availability_transitions_after_consecutive_failures() {
+        let state = MetricsState::new(Arc::new(Mutex::new(Registry::default())));
+        state.record_backend_call_at("goat", false, Some("timeout"), 1_000);
+        assert!(!state.backend_unavailable("goat"), "one failure is not an outage");
+        state.record_backend_call_at("goat", false, Some("timeout"), 1_005);
+        assert!(state.backend_unavailable("goat"));
+        let snapshot = state.backend_health_snapshot();
+        let goat = snapshot.iter().find(|b| b.backend == "goat").unwrap();
+        assert!(!goat.up);
+        assert_eq!(goat.unavailable_since, Some(1_005));
+        assert_eq!(goat.last_error.as_deref(), Some("timeout"));
+        // a success right after a failure is a flap, not a recovery
+        state.record_backend_call_at("goat", true, None, 1_010);
+        assert!(state.backend_unavailable("goat"));
+        state.record_backend_call_at("goat", false, Some("502"), 1_015);
+        // recovered once no call failed for the quiet window
+        state.record_backend_call_at("goat", true, None, 1_015 + BACKEND_RECOVERY_QUIET_SECS);
+        assert!(!state.backend_unavailable("goat"));
+        let goat =
+            state.backend_health_snapshot().into_iter().find(|b| b.backend == "goat").unwrap();
+        assert!(goat.up && goat.unavailable_since.is_none() && goat.consecutive_failures == 0);
+        assert!(goat.last_error.is_none());
+        // a single failure after recovery keeps it up
+        state.record_backend_call_at("goat", false, None, 2_000);
+        assert!(!state.backend_unavailable("goat"));
+    }
+
+    #[test]
+    fn readiness_follows_backend_availability() {
+        let state = MetricsState::new(Arc::new(Mutex::new(Registry::default())));
+        state.mark_startup_ready();
+        state.mark_database_ready(true);
+        state.mark_backend_ready(true);
+        state.set_event_watch_state(EventWatchState::Healthy);
+        assert!(state.readiness_snapshot().ready);
+        state.record_backend_call_at("graph", false, Some("down"), 100);
+        state.record_backend_call_at("graph", false, Some("down"), 105);
+        assert!(!state.readiness_snapshot().ready, "an unavailable subgraph is not ready");
+        assert!(encoded(&state).contains("bitvm_node_ready 0"));
+        // the proof builder is informational only
+        state.record_backend_call_at("graph", true, None, 200);
+        state.record_backend_call_at("proof", false, Some("down"), 200);
+        state.record_backend_call_at("proof", false, Some("down"), 205);
+        assert!(state.readiness_snapshot().ready);
     }
 }

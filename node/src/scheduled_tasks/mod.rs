@@ -1,40 +1,35 @@
 mod babe_setup_state_cleanup_task;
-mod event_watch_task;
-pub mod graph_maintenance_tasks;
-pub mod instance_maintenance_tasks;
+mod event_watch;
 mod node_maintenance_tasks;
 mod sequencer_set_hash_monitor_task;
 mod spv_maintenance_tasks;
+mod swap_maintenance_tasks;
 
+use crate::aggregates::graph_scan::{abandon_unfinished_setups, scan_graphs_on_chain};
+use crate::aggregates::instance_scan::{
+    pegin_request_monitor, scan_answer_windows, scan_instances_on_bitcoin,
+};
 use crate::env::{
     actor_runs_babe_setup_state_cleanup, get_maintenance_run_timeout_secs, get_network,
     get_node_goat_address, get_node_pubkey, is_enable_babe_setup_state_cleanup,
     is_enable_update_spv_contract, is_relayer,
 };
 use crate::metrics_service::MetricsState;
-use crate::rpc_service::current_time_secs;
 use crate::scheduled_tasks::babe_setup_state_cleanup_task::babe_setup_state_cleanup_monitor;
-use crate::scheduled_tasks::graph_maintenance_tasks::{
-    detect_init_withdraw_call, detect_kickoff, detect_take1_or_challenge, process_graph_challenge,
-};
-use crate::scheduled_tasks::instance_maintenance_tasks::{
-    instance_answers_monitor, instance_btc_tx_monitor, instance_committee_key_cleanup_monitor,
-    instance_expiration_monitor, instance_window_expiration_monitor,
-    pegin_confirm_recovery_monitor, swap_escrow_timeout_monitor,
-};
 use crate::scheduled_tasks::node_maintenance_tasks::node_available_pbtc_update_monitor;
 use crate::scheduled_tasks::spv_maintenance_tasks::spv_header_hash_update;
+use crate::scheduled_tasks::swap_maintenance_tasks::swap_escrow_timeout_monitor;
 use crate::utils::node_p2wsh_address;
 use bitvm_lib::actors::Actor;
 use client::btc_chain::BTCClient;
 use client::goat_chain::GOATClient;
-pub use event_watch_task::{is_processing_gateway_history_events, run_watch_event_task};
+use engine::EngineHandle;
+pub use event_watch::{is_processing_gateway_history_events, run_watch_event_task};
 pub use sequencer_set_hash_monitor_task::run_sequencer_set_hash_monitor_task;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use store::Graph;
-use store::localdb::{LocalDB, StorageProcessor};
+use store::localdb::LocalDB;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -57,15 +52,14 @@ async fn refresh_alert_health(
             Some(height)
         }
         Err(error) => {
-            metrics_state.record_btc_backend_probe(false);
-            warn!(event = "metrics_backend_probe", backend = "btc", error = %error, "BTC backend health probe failed");
+            metrics_state.backend_probe_failed("btc", "get_height", &error);
             None
         }
     };
     let goat_height_healthy = goat_height.is_ok();
-    metrics_state.record_goat_backend_probe(goat_height_healthy);
-    if let Err(error) = goat_height {
-        warn!(event = "metrics_backend_probe", backend = "goat", operation = "get_latest_block_number", error = %error, "Goat backend health probe failed");
+    match &goat_height {
+        Ok(_) => metrics_state.record_goat_backend_probe(true),
+        Err(error) => metrics_state.backend_probe_failed("goat", "get_latest_block_number", error),
     }
     let goat_spv_height = match goat_spv_height {
         Ok(height) => {
@@ -73,8 +67,7 @@ async fn refresh_alert_health(
             Some(height)
         }
         Err(error) => {
-            metrics_state.record_goat_backend_probe(false);
-            warn!(event = "metrics_backend_probe", backend = "goat", operation = "btc_spv_latest_height", error = %error, "Goat SPV health probe failed");
+            metrics_state.backend_probe_failed("goat", "btc_spv_latest_height", &error);
             None
         }
     };
@@ -84,8 +77,7 @@ async fn refresh_alert_health(
             metrics_state.set_peg_btc_decimals(decimals);
         }
         Err(error) => {
-            metrics_state.record_goat_backend_probe(false);
-            warn!(event = "metrics_backend_probe", backend = "goat", operation = "peg_btc_decimals", error = %error, "failed to load pegBTC decimals");
+            metrics_state.backend_probe_failed("goat", "peg_btc_decimals", &error);
         }
     }
     metrics_state.apply_chain_health(btc_height, goat_spv_height);
@@ -105,8 +97,7 @@ async fn refresh_alert_health(
                     );
                 }
                 Err(error) => {
-                    metrics_state.record_btc_backend_probe(false);
-                    warn!(event = "metrics_backend_probe", backend = "btc", operation = "get_address_utxo", error = %error, "BTC fee wallet probe failed");
+                    metrics_state.backend_probe_failed("btc", "get_address_utxo", &error);
                 }
             }
         }
@@ -122,8 +113,7 @@ async fn refresh_alert_health(
                 metrics_state.apply_goat_gas_balance(balance);
             }
             Err(error) => {
-                metrics_state.record_goat_backend_probe(false);
-                warn!(event = "metrics_backend_probe", backend = "goat", operation = "native_balance", error = %error, "Goat gas balance probe failed");
+                metrics_state.backend_probe_failed("goat", "native_balance", &error);
             }
         }
     }
@@ -148,40 +138,12 @@ async fn refresh_alert_health(
                 metrics_state.apply_required_stake(sufficient);
             }
             Err(error) => {
-                metrics_state.record_goat_backend_probe(false);
-                warn!(event = "metrics_backend_probe", backend = "goat", operation = "required_stake", error = %error, "required stake probe failed");
+                metrics_state.backend_probe_failed("goat", "required_stake", &error);
             }
         }
     } else {
         metrics_state.apply_required_stake(true);
     }
-}
-
-/// Return every graph in the requested status. Time-sensitive flows must not
-/// let a lower-index graph hide another graph owned by the same operator.
-pub(super) async fn fetch_all_graphs_by_status<'a>(
-    storage_processor: &mut StorageProcessor<'a>,
-    graph_status: &str,
-) -> anyhow::Result<Vec<Graph>> {
-    storage_processor.find_graphs_by_status_group_by_operator(graph_status).await
-}
-
-/// Return the lowest-index graph for each operator in the requested status.
-/// This is only suitable as the entry point for a chain-aware scan.
-pub(super) async fn fetch_first_graph_per_operator_by_status<'a>(
-    storage_processor: &mut StorageProcessor<'a>,
-    graph_status: &str,
-) -> anyhow::Result<Vec<Graph>> {
-    let graphs_ori = fetch_all_graphs_by_status(storage_processor, graph_status).await?;
-    let mut graphs: Vec<Graph> = vec![];
-    let mut pre_operator_pubkey = "".to_string();
-    for graph in graphs_ori {
-        if graph.operator_pubkey != pre_operator_pubkey {
-            pre_operator_pubkey = graph.operator_pubkey.clone();
-            graphs.push(graph);
-        }
-    }
-    Ok(graphs)
 }
 
 async fn run_maintenance_subtask<T>(
@@ -221,6 +183,9 @@ async fn run_maintenance_subtask<T>(
 enum MaintenanceRunOutcome {
     Completed,
     DeferredHistorySync,
+    /// The history-sync check itself failed (Goat read): protocol work is
+    /// deferred to the next tick, not reported as a tick error.
+    DeferredHistorySyncUnknown,
 }
 
 async fn run(
@@ -229,6 +194,7 @@ async fn run(
     btc_client: Arc<BTCClient>,
     goat_client: Arc<GOATClient>,
     metrics_state: &MetricsState,
+    engine: &EngineHandle,
 ) -> anyhow::Result<MaintenanceRunOutcome> {
     let btc_client = btc_client.as_ref();
     let goat_client = goat_client.as_ref();
@@ -260,7 +226,23 @@ async fn run(
         .await;
     }
 
-    if is_processing_gateway_history_events(local_db, goat_client).await? {
+    let history_sync_in_progress = match is_processing_gateway_history_events(local_db, goat_client)
+        .await
+    {
+        Ok(in_progress) => in_progress,
+        Err(error) => {
+            warn!(
+                event = "maintenance_subtask_result",
+                task = "gateway_history_sync",
+                outcome = "failed",
+                error_class = "maintenance",
+                error = %error,
+                "could not check the gateway history sync; protocol work deferred to the next tick"
+            );
+            return Ok(MaintenanceRunOutcome::DeferredHistorySyncUnknown);
+        }
+    };
+    if history_sync_in_progress {
         info!(
             event = "maintenance_subtask_result",
             task = "gateway_history_sync",
@@ -272,40 +254,24 @@ async fn run(
         return Ok(MaintenanceRunOutcome::DeferredHistorySync);
     }
 
+    // New peg-in requests become instance rows and `pegin_request` events.
     run_maintenance_subtask(
         metrics_state,
-        "instance_answers_monitor",
-        instance_answers_monitor(local_db, btc_client, goat_client),
+        "pegin_request_monitor",
+        pegin_request_monitor(local_db, btc_client, goat_client, engine),
+    )
+    .await;
+    // Chain facts for the Instance aggregate; the apply decides every status.
+    run_maintenance_subtask(
+        metrics_state,
+        "instance_answer_window_scan",
+        scan_answer_windows(local_db, goat_client, engine),
     )
     .await;
     run_maintenance_subtask(
         metrics_state,
-        "instance_window_expiration_monitor",
-        instance_window_expiration_monitor(local_db, goat_client),
-    )
-    .await;
-    run_maintenance_subtask(
-        metrics_state,
-        "instance_expiration_monitor",
-        instance_expiration_monitor(local_db, btc_client),
-    )
-    .await;
-    run_maintenance_subtask(
-        metrics_state,
-        "instance_btc_tx_monitor",
-        instance_btc_tx_monitor(local_db, btc_client),
-    )
-    .await;
-    run_maintenance_subtask(
-        metrics_state,
-        "pegin_confirm_recovery_monitor",
-        pegin_confirm_recovery_monitor(local_db, btc_client, &actor),
-    )
-    .await;
-    run_maintenance_subtask(
-        metrics_state,
-        "instance_committee_key_cleanup_monitor",
-        instance_committee_key_cleanup_monitor(local_db, btc_client),
+        "instance_btc_scan",
+        scan_instances_on_bitcoin(local_db, btc_client, engine, &actor),
     )
     .await;
     run_maintenance_subtask(
@@ -314,29 +280,32 @@ async fn run(
         swap_escrow_timeout_monitor(local_db),
     )
     .await;
+    // Rejected and stale unregistered network events leave the inbox quota.
     run_maintenance_subtask(
         metrics_state,
-        "detect_init_withdraw_call",
-        detect_init_withdraw_call(local_db),
+        "inbox_quota_purge",
+        crate::p2p_admission::purge_stale_network_events(local_db),
     )
     .await;
-    run_maintenance_subtask(metrics_state, "detect_kickoff", detect_kickoff(local_db, btc_client))
+    // Chain facts for the Graph aggregate's peg-out phases.
+    run_maintenance_subtask(
+        metrics_state,
+        "graph_chain_scan",
+        scan_graphs_on_chain(local_db, btc_client, goat_client, engine),
+    )
+    .await;
+    if actor == Actor::Operator {
+        run_maintenance_subtask(
+            metrics_state,
+            "graph_setup_abandon_scan",
+            abandon_unfinished_setups(local_db, btc_client, engine),
+        )
         .await;
-    run_maintenance_subtask(
-        metrics_state,
-        "detect_take1_or_challenge",
-        detect_take1_or_challenge(local_db, btc_client),
-    )
-    .await;
-    run_maintenance_subtask(
-        metrics_state,
-        "process_graph_challenge",
-        process_graph_challenge(local_db, btc_client),
-    )
-    .await;
+    }
     Ok(MaintenanceRunOutcome::Completed)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_maintenance_tasks(
     actor: Actor,
     local_db: LocalDB,
@@ -345,6 +314,7 @@ pub async fn run_maintenance_tasks(
     interval: u64,
     cancellation_token: CancellationToken,
     metrics_state: MetricsState,
+    engine: EngineHandle,
 ) -> anyhow::Result<String> {
     let mut tick: u64 = 0;
     let maintenance_run_timeout = Duration::from_secs(get_maintenance_run_timeout_secs());
@@ -369,6 +339,7 @@ pub async fn run_maintenance_tasks(
                         btc_client.clone(),
                         goat_client.clone(),
                         &metrics_state,
+                        &engine,
                     ),
                 ).await {
                     Ok(Ok(MaintenanceRunOutcome::Completed)) => {
@@ -388,6 +359,17 @@ pub async fn run_maintenance_tasks(
                             tick,
                             outcome = "deferred",
                             reason = "history_sync_in_progress",
+                            elapsed_ms = tick_start.elapsed().as_millis() as u64,
+                            "maintenance protocol work was deferred"
+                        );
+                    }
+                    Ok(Ok(MaintenanceRunOutcome::DeferredHistorySyncUnknown)) => {
+                        metrics_state.record_task_run("maintenance", "failed", tick_start.elapsed());
+                        warn!(
+                            event = "maintenance_tick_result",
+                            tick,
+                            outcome = "deferred",
+                            reason = "history_sync_check_failed",
                             elapsed_ms = tick_start.elapsed().as_millis() as u64,
                             "maintenance protocol work was deferred"
                         );
@@ -436,40 +418,6 @@ pub async fn run_maintenance_tasks(
                             warn!(event = "metrics_alert_health", "alert health probe timed out");
                         }
                     });
-                    let queue_started_at = Instant::now();
-                    match local_db.acquire().await {
-                        Ok(mut storage) => match storage
-                            .get_message_queue_stats(&actor.to_string(), current_time_secs())
-                            .await
-                        {
-                            Ok(stats) => info!(
-                                event = "message_queue_snapshot",
-                                role = %actor,
-                                pending_ready = stats.pending_ready,
-                                pending_locked = stats.pending_locked,
-                                failed = stats.failed,
-                                oldest_pending_at = ?stats.oldest_pending_at,
-                                elapsed_ms = queue_started_at.elapsed().as_millis() as u64,
-                                "local message queue snapshot"
-                            ),
-                            Err(error) => error!(
-                                event = "db_operation_result",
-                                operation = "get_message_queue_stats",
-                                outcome = "failed",
-                                elapsed_ms = queue_started_at.elapsed().as_millis() as u64,
-                                error = %error,
-                                "failed to collect local message queue snapshot"
-                            ),
-                        },
-                        Err(error) => error!(
-                            event = "db_operation_result",
-                            operation = "acquire_db_for_message_queue_snapshot",
-                            outcome = "failed",
-                            elapsed_ms = queue_started_at.elapsed().as_millis() as u64,
-                            error = %error,
-                            "failed to acquire local database for message queue snapshot"
-                        ),
-                    }
                 }
             }
             _ = cancellation_token.cancelled() => {

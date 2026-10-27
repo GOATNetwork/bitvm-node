@@ -1,6 +1,6 @@
 use super::utils::{deserialize_u256, serialize_u256};
+use crate::clock::current_time_secs;
 use crate::rpc_service::bitvm::{StatusExtra, StatusUserAction};
-use crate::rpc_service::current_time_secs;
 use alloy::primitives::U256;
 use client::btc_chain::BTCClient;
 use serde::{Deserialize, Serialize};

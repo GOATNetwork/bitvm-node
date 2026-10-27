@@ -81,6 +81,11 @@ on the same host. The business RPC listener does not serve metrics, so
 expose the dedicated listener through a private network, proxy, or access-control
 layer instead of binding it directly to a public interface.
 
+For liveness and readiness probes use `GET /v1/health` on `--rpc-addr`: it only pings the local
+database and otherwise answers from memory, `200` while the node is ready and `503` (with the same JSON body naming
+the failing component or backend) otherwise. A node whose GOAT RPC is unreachable at start-up retries
+for about a minute before exiting, so a supervisor restart during a short outage does not crash-loop.
+
 The provided Docker Compose deployment enables the listener on port `9108`
 inside each container and publishes it only on the host loopback interface:
 

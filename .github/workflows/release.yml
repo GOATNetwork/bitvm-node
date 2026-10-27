@@ -80,7 +80,6 @@ jobs:
             "target/release/send-rbf"
             "target/release/pegin-request"
             "target/release/pegout"
-            "target/release/update-db"
           )
 
           if [ "${{ runner.os }}" = "Linux" ]; then

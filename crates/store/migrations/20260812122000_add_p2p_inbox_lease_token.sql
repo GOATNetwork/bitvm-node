@@ -1,2 +1,0 @@
-ALTER TABLE p2p_inbox
-    ADD COLUMN lease_token TEXT NOT NULL DEFAULT '';

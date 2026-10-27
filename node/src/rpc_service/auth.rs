@@ -1,6 +1,7 @@
+use crate::clock::current_time_secs;
 use crate::env::get_bitvm_key;
+use crate::rpc_service::AppState;
 use crate::rpc_service::response::ErrorResponse;
-use crate::rpc_service::{AppState, current_time_secs};
 use axum::Json;
 use axum::body::{Body, to_bytes};
 use axum::extract::{Request, State};

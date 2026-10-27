@@ -1,0 +1,124 @@
+type BridgeIn @entity(immutable: true) {
+  id: Bytes!
+  depositorAddress: Bytes! # address
+  instanceId: Bytes! # bytes16
+  peginAmountSats: BigInt! # uint64
+  feeAmountSats: BigInt! # uint64
+  blockNumber: BigInt!
+  blockTimestamp: BigInt!
+  transactionHash: Bytes!
+}
+
+type BridgeInRequest @entity(immutable: true) {
+  id: Bytes!
+  instanceId: Bytes! # bytes16
+  depositorAddress: Bytes! # address
+  peginAmountSats: BigInt! # uint64
+  txnFees: [BigInt!]! # uint64[3]
+  userInputs: [Bytes!]! # tuple[]
+  userXonlyPubkey: Bytes! # bytes32
+  userChangeAddress: String! # string
+  userRefundAddress: String! # string
+  blockNumber: BigInt!
+  blockTimestamp: BigInt!
+  transactionHash: Bytes!
+}
+
+type CancelWithdraw @entity(immutable: true) {
+  id: Bytes!
+  instanceId: Bytes! # bytes16
+  graphId: Bytes! # bytes16
+  triggerAddress: Bytes! # address
+  blockNumber: BigInt!
+  blockTimestamp: BigInt!
+  transactionHash: Bytes!
+}
+
+type CommitteeResponse @entity(immutable: true) {
+  id: Bytes!
+  instanceId: Bytes! # bytes16
+  committeeAddress: Bytes! # address
+  committeePubkey: Bytes! # bytes
+  blockNumber: BigInt!
+  blockTimestamp: BigInt!
+  transactionHash: Bytes!
+}
+
+type InitWithdraw @entity(immutable: true) {
+  id: Bytes!
+  instanceId: Bytes! # bytes16
+  graphId: Bytes! # bytes16
+  operatorAddress: Bytes! # address
+  withdrawAmountSats: BigInt! # uint64
+  blockNumber: BigInt!
+  blockTimestamp: BigInt!
+  transactionHash: Bytes!
+}
+
+type Initialized @entity(immutable: true) {
+  id: Bytes!
+  version: BigInt! # uint64
+  blockNumber: BigInt!
+  blockTimestamp: BigInt!
+  transactionHash: Bytes!
+}
+
+type PostGraphData @entity(immutable: true) {
+  id: Bytes!
+  instanceId: Bytes! # bytes16
+  graphId: Bytes! # bytes16
+  blockNumber: BigInt!
+  blockTimestamp: BigInt!
+  transactionHash: Bytes!
+}
+
+type ProceedWithdraw @entity(immutable: true) {
+  id: Bytes!
+  instanceId: Bytes! # bytes16
+  graphId: Bytes! # bytes16
+  kickoffTxid: Bytes! # bytes32
+  blockNumber: BigInt!
+  blockTimestamp: BigInt!
+  transactionHash: Bytes!
+}
+
+type WithdrawDisproved @entity(immutable: true) {
+  id: Bytes!
+  instanceId: Bytes! # bytes16
+  graphId: Bytes! # bytes16
+  disproveTxType: Int! # uint8
+  txnIndex: BigInt! # uint256
+  challengeStartTxid: Bytes! # bytes32
+  challengeFinishTxid: Bytes! # bytes32
+  challengerAddress: Bytes! # address
+  disproverAddress: Bytes! # address
+  challengerRewardAmount: BigInt! # uint256
+  disproverRewardAmount: BigInt! # uint256
+  blockNumber: BigInt!
+  blockTimestamp: BigInt!
+  transactionHash: Bytes!
+}
+
+type WithdrawHappyPath @entity(immutable: true) {
+  id: Bytes!
+  instanceId: Bytes! # bytes16
+  graphId: Bytes! # bytes16
+  take1Txid: Bytes! # bytes32
+  operatorAddress: Bytes! # address
+  rewardAmountSats: BigInt! # uint64
+  blockNumber: BigInt!
+  blockTimestamp: BigInt!
+  transactionHash: Bytes!
+}
+
+type WithdrawUnhappyPath @entity(immutable: true) {
+  id: Bytes!
+  instanceId: Bytes! # bytes16
+  graphId: Bytes! # bytes16
+  take2Txid: Bytes! # bytes32
+  operatorAddress: Bytes! # address
+  rewardAmountSats: BigInt! # uint64
+  blockNumber: BigInt!
+  blockTimestamp: BigInt!
+  transactionHash: Bytes!
+}

@@ -1,5 +1,6 @@
 pub mod behaviour;
 pub mod connection_gate;
+pub mod get_graph;
 pub mod publisher;
 pub mod swarm;
 

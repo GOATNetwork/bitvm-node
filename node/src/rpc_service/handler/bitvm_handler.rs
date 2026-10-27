@@ -1,8 +1,8 @@
+#[cfg(feature = "rpc-debug-endpoints")]
+use crate::aggregates::graph_pegout_jobs::broadcast_verifier_challenge_assert_tx;
 use crate::env::{
     GraphBtcTxName, get_goat_gateway_contract_from_env, get_node_goat_address, get_node_pubkey,
 };
-#[cfg(feature = "rpc-debug-endpoints")]
-use crate::handle::broadcast_verifier_challenge_assert_tx;
 use crate::rpc_service::AppState;
 use crate::rpc_service::bitvm::*;
 use crate::rpc_service::node::ALIVE_TIME_JUDGE_THRESHOLD;
@@ -308,7 +308,7 @@ pub async fn get_instance(
 
         ok_response(InstanceGetResponse { instance_wrap })
     } else {
-        tracing::info!("instance_id {} has no record in database", instance_id);
+        tracing::debug!("instance_id {} has no record in database", instance_id);
         ok_response(InstanceGetResponse { instance_wrap: None })
     }
 }
@@ -481,7 +481,7 @@ pub async fn get_graph(
 
         ok_response(graph_extended)
     } else {
-        tracing::warn!("graph:{} is not record in db", graph_id);
+        tracing::debug!("graph:{} is not record in db", graph_id);
         ok_response(GraphExtended::default())
     }
 }
@@ -875,7 +875,7 @@ pub async fn get_graph_tx(
             btc_tx_data: BtcTxData { raw_data, progresses, fail_reason },
         })
     } else {
-        tracing::warn!("graph:{} is not record in db", graph_id);
+        tracing::debug!("graph:{} is not record in db", graph_id);
         Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
@@ -1176,7 +1176,6 @@ pub async fn get_unsigned_pegin_txn(
             InstanceBridgeInStatus::CommitteesAnswered.to_string(),
             InstanceBridgeInStatus::UserBroadcastPeginPrepare.to_string(),
             InstanceBridgeInStatus::Presigned.to_string(),
-            InstanceBridgeInStatus::PresignedFailed.to_string(),
             InstanceBridgeInStatus::Timeout.to_string(),
         ]
         .contains(&instance.status)

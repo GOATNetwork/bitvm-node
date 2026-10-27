@@ -1,3 +1,4 @@
+use crate::timeout_config::{DEFAULT_HTTP_CONNECT_TIMEOUT_SECS, get_http_request_timeout_secs};
 use anyhow::anyhow;
 use esplora_client::Error;
 use reqwest::{Client, Response};
@@ -5,10 +6,12 @@ use std::time::Duration;
 
 const DEFAULT_MAX_RETRIES: usize = 6;
 const BASE_BACKOFF_MILLIS: Duration = Duration::from_millis(256);
-const RETRYABLE_ERROR_CODES: [u16; 3] = [
+const RETRYABLE_ERROR_CODES: [u16; 5] = [
     429, // TOO_MANY_REQUESTS
     500, // INTERNAL_SERVER_ERROR
+    502, // BAD_GATEWAY (a proxy in front of the upstream)
     503, // SERVICE_UNAVAILABLE
+    504, // GATEWAY_TIMEOUT
 ];
 
 pub struct HttpAsyncClient {
@@ -17,8 +20,21 @@ pub struct HttpAsyncClient {
 }
 
 impl HttpAsyncClient {
+    /// A client with a connect timeout and a whole-request timeout
+    /// (`HTTP_REQUEST_TIMEOUT_SECS`), so a hung upstream fails the call instead
+    /// of parking the caller forever.
     pub fn new(max_retries: Option<usize>) -> Self {
-        Self { client: Client::new(), max_retries: max_retries.unwrap_or(DEFAULT_MAX_RETRIES) }
+        let client = Client::builder()
+            .connect_timeout(Duration::from_secs(DEFAULT_HTTP_CONNECT_TIMEOUT_SECS))
+            .timeout(Duration::from_secs(get_http_request_timeout_secs()))
+            .build()
+            .unwrap_or_else(|err| {
+                tracing::warn!(
+                    "failed to build the HTTP client with timeouts: {err}; using the default client"
+                );
+                Client::new()
+            });
+        Self { client, max_retries: max_retries.unwrap_or(DEFAULT_MAX_RETRIES) }
     }
 
     pub async fn get_response_json<T: serde::de::DeserializeOwned>(

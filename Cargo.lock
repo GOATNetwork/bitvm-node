@@ -3012,6 +3012,7 @@ dependencies = [
  "tracing",
  "uuid",
  "verifiable-circuit-babe",
+ "zkm-sdk",
 ]
 
 [[package]]
@@ -3041,6 +3042,7 @@ dependencies = [
  "client",
  "commit-chain",
  "dotenv",
+ "engine",
  "esplora-client",
  "futures",
  "goat",
@@ -4582,6 +4584,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "75030f3c4f45dafd7586dd6780965a8c7e8e285a5ecb86713e63a79c5b2766f3"
 dependencies = [
  "cfg-if",
+]
+
+[[package]]
+name = "engine"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "futures",
+ "hex",
+ "prometheus-client",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "store",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -6486,6 +6508,7 @@ dependencies = [
  "libp2p-ping",
  "libp2p-quic",
  "libp2p-relay",
+ "libp2p-request-response",
  "libp2p-swarm",
  "libp2p-tcp",
  "libp2p-upnp",

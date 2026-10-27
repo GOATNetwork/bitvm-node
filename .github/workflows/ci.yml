@@ -15,6 +15,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  ZKM_TOOLCHAIN_VERSION: '20260917'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -61,6 +62,7 @@ jobs:
           java -jar "$JAR" -config GraphLifecycleFixed.cfg GraphLifecycle.tla
           java -jar "$JAR" -config GraphLifecycleFineGrainedFixed.cfg GraphLifecycleFineGrainedFixed.tla
           java -jar "$JAR" -config InstancePresignedFixed.cfg InstancePresigned.tla
+          java -jar "$JAR" -config InstanceLifecycle.cfg InstanceLifecycle.tla
           java -jar "$JAR" -config Take2DisproveRace.cfg Take2DisproveRace.tla
           java -jar "$JAR" -config MultiActorRace.cfg MultiActorRace.tla
           java -jar "$JAR" -config InstanceBridgeOutRaceFixed.cfg InstanceBridgeOutRace.tla
@@ -141,10 +143,21 @@ jobs:
         timeout-minutes: 30
         with:
           profile: minimal
-          toolchain: nightly-2025-12-11
+          toolchain: nightly-2026-09-17
           override: true
           components: clippy
-      - run: curl --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/ProjectZKM/toolchain/refs/heads/main/setup.sh | sh
+      - name: Install Ziren toolchain
+        run: |
+          set -euo pipefail
+          installer="$RUNNER_TEMP/zkmup"
+          curl --proto '=https' --tlsv1.2 -fsSL --retry 3 \
+            https://raw.githubusercontent.com/ProjectZKM/toolchain/582f7927cac0668883a86cbd02fbc18b500b1b6f/zkmup \
+            -o "$installer"
+          sh "$installer" install -v "$ZKM_TOOLCHAIN_VERSION"
+          SHELL=/bin/true sh "$installer" setup -v "$ZKM_TOOLCHAIN_VERSION"
+          source "$HOME/.zkm-toolchain/env"
+          rustc --version
+          cargo --version
       - name: Install Dependencies
         run: sudo apt update && sudo apt install protobuf-compiler
       - run: |
@@ -154,14 +167,20 @@ jobs:
     name: Cargo Test
     needs: tla-plus
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        toolchain:
-          - nightly-2025-12-11
     steps:
       - uses: actions/checkout@v5
       - name: Install Ziren toolchain
-        run: curl --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/ProjectZKM/toolchain/refs/heads/main/setup.sh | sh
+        run: |
+          set -euo pipefail
+          installer="$RUNNER_TEMP/zkmup"
+          curl --proto '=https' --tlsv1.2 -fsSL --retry 3 \
+            https://raw.githubusercontent.com/ProjectZKM/toolchain/582f7927cac0668883a86cbd02fbc18b500b1b6f/zkmup \
+            -o "$installer"
+          sh "$installer" install -v "$ZKM_TOOLCHAIN_VERSION"
+          SHELL=/bin/true sh "$installer" setup -v "$ZKM_TOOLCHAIN_VERSION"
+          source "$HOME/.zkm-toolchain/env"
+          rustc --version
+          cargo --version
       - name: Install Dependencies
         run: sudo apt update && sudo apt install protobuf-compiler
       - name: Launch the Regtest

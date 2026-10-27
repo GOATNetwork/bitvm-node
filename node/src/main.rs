@@ -21,13 +21,14 @@ use bitvm_noded::utils::{
     self, generate_local_key, save_local_info, set_node_external_socket_addr_env,
 };
 use bitvm_noded::{
-    rpc_service, run_maintenance_tasks, run_sequencer_set_hash_monitor_task, run_watch_event_task,
+    engine_bridge, rpc_service, run_maintenance_tasks, run_sequencer_set_hash_monitor_task,
+    run_watch_event_task,
 };
 
 use anyhow::Result;
-use bitvm_noded::action::{load_persisted_peer_bindings, reclaim_stale_queue_claims};
 use bitvm_noded::metrics_service::{MetricsState, set_node_metrics_state};
 use bitvm_noded::middleware::swarm::{BitvmNetworkManager, BitvmSwarmConfig};
+use bitvm_noded::p2p_admission::load_persisted_peer_bindings;
 use bitvm_noded::p2p_msg_handler::BitvmNodeProcessor;
 use client::http_client::async_client::HttpAsyncClient;
 use futures::future;
@@ -196,24 +197,44 @@ async fn main() -> Result<(), Box<dyn Error>> {
         version = env!("CARGO_PKG_VERSION"),
     );
     let _node_span_guard = node_span.enter();
-    let local_db = store::create_local_db(&opt.db_path).await;
-    // Claims left by a previous process are provably abandoned: charge and
-    // release them before any dispatcher can wait on their leases.
-    let (reclaimed_local, reclaimed_inbox) = reclaim_stale_queue_claims(&local_db).await?;
-    if reclaimed_local + reclaimed_inbox > 0 {
-        tracing::warn!(
-            event = "message_queue_startup",
-            outcome = "claims_reclaimed",
-            reclaimed_local,
-            reclaimed_inbox,
-            "reclaimed queue claims left behind by a previous process"
-        );
-    }
+    let local_db =
+        store::create_local_db_with_busy_timeout(&opt.db_path, engine_bridge::db_busy_timeout())
+            .await;
+    // The execution engine's metrics must be registered before the registry is shared.
+    let engine_metrics = engine_bridge::register_engine_metrics(&mut metric_registry);
     let metric_registry = Arc::new(Mutex::new(metric_registry));
     let metrics_state = MetricsState::new(metric_registry);
     set_node_metrics_state(metrics_state.clone());
     let goat_client =
         Arc::new(GOATClient::new(env::goat_config_from_env().await, env::get_goat_network()));
+    let btc_client = Arc::new(BTCClient::new(get_network(), get_btc_url_from_env().as_deref()));
+    let http_client = Arc::new(HttpAsyncClient::new(None));
+    let soldering_builder = if actor_needs_soldering_builder(&actor) {
+        // Under `mock-gc` the builder is a free unit struct, so a configurable delay stands in for
+        // the Ziren soldering-guest setup the real builder performs here.
+        #[cfg(feature = "mock-gc")]
+        bitvm_noded::mock_gc::simulate(bitvm_noded::mock_gc::GcOp::BuilderInit).await;
+        Some(Arc::new(BabeBundleBuilder::new()))
+    } else {
+        None
+    };
+    // The execution engine owns the migrated aggregates (Instance and Graph).
+    let (engine, engine_acks) = engine_bridge::build_engine(
+        bitvm_network_manager.publisher(),
+        engine_metrics,
+        engine_bridge::EngineDeps {
+            actor: actor.clone(),
+            local_peer: peer_id_string.clone(),
+            local_db: local_db.clone(),
+            btc_client: btc_client.clone(),
+            goat_client: goat_client.clone(),
+            http_client: http_client.clone(),
+            soldering_builder: soldering_builder.clone(),
+            metrics_state: metrics_state.clone(),
+        },
+    );
+    let engine_handle = engine.handle();
+    engine_bridge::install_engine_handle(engine_handle.clone());
     // Restore persisted operator bindings into the admission registry.
     match load_persisted_peer_bindings(&local_db, &goat_client).await {
         Ok(loaded) if loaded > 0 => tracing::info!(
@@ -232,15 +253,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
     let handler = BitvmNodeProcessor {
         local_db: local_db.clone(),
-        btc_client: Arc::new(BTCClient::new(get_network(), get_btc_url_from_env().as_deref())),
         goat_client,
-        http_client: Arc::new(HttpAsyncClient::new(None)),
-        soldering_builder: actor_needs_soldering_builder(&actor)
-            .then(|| Arc::new(BabeBundleBuilder::new())),
         metrics_state: metrics_state.clone(),
         shutdown_token: cancellation_token.clone(),
         worker: Default::default(),
     };
+    handler.start(bitvm_network_manager.publisher());
 
     tracing::info!(
         event = "service_started",
@@ -252,6 +270,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         rpc_addr = %opt.rpc_addr,
         metrics_addr = opt.metrics_addr.as_deref().unwrap_or("disabled"),
         min_required_verifier,
+        btc_chain_url = get_btc_url_from_env().unwrap_or_default(),
+        goat_chain_url = %env::get_goat_url_from_env(),
+        gateway_graph_url = env::get_goat_gateway_the_graph_urls_from_env(),
+        btc_request_timeout_secs = client::timeout_config::get_btc_request_timeout_secs(),
+        goat_rpc_timeout_secs = client::timeout_config::get_goat_rpc_timeout_secs(),
+        http_request_timeout_secs = client::timeout_config::get_http_request_timeout_secs(),
+        maintenance_interval_secs = env::REGULAR_TASK_INTERVAL_SECOND,
         "node initialization completed"
     );
 
@@ -277,6 +302,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         actor.clone(),
         peer_id_string.clone(),
         metrics_state.clone(),
+        Some(engine_handle.clone()),
     )
     .await?;
 
@@ -415,6 +441,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let cancel_token_clone = cancellation_token.clone();
     let maintenance_task_span = node_span.clone();
     let maintenance_metrics = metrics_state.clone();
+    let maintenance_engine = engine_handle.clone();
     task_handles.push(tokio::spawn(
         async move {
             let goat_client =
@@ -429,6 +456,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 10,
                 cancel_token_clone,
                 maintenance_metrics,
+                maintenance_engine,
             )
             .await
             {
@@ -450,6 +478,57 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .instrument(maintenance_task_span),
     ));
     task_names.push("maintenance");
+
+    {
+        let acks = engine_acks;
+        let cancel_token_clone = cancellation_token.clone();
+        let engine_task_span = node_span.clone();
+        task_handles.push(tokio::spawn(
+            async move {
+                match engine.run(cancel_token_clone).await {
+                    Ok(()) => Ok("engine stopped".to_string()),
+                    Err(error) => {
+                        tracing::error!(
+                            event = "core_task_wrapper_error",
+                            service = "bitvm-noded",
+                            task = "engine",
+                            outcome = "failed",
+                            error_class = "engine",
+                            error = %error,
+                            "execution engine exited with an error"
+                        );
+                        Err("engine_error".to_string())
+                    }
+                }
+            }
+            .instrument(engine_task_span),
+        ));
+        task_names.push("engine");
+
+        let cancel_token_clone = cancellation_token.clone();
+        let ack_task_span = node_span.clone();
+        let ack_publisher = bitvm_network_manager.publisher();
+        task_handles.push(tokio::spawn(
+            async move {
+                engine_bridge::run_ack_forwarder(acks, ack_publisher, cancel_token_clone)
+                    .await
+                    .map_err(|error| {
+                        tracing::error!(
+                            event = "core_task_wrapper_error",
+                            service = "bitvm-noded",
+                            task = "engine_ack",
+                            outcome = "failed",
+                            error_class = "engine",
+                            error = %error,
+                            "engine ACK forwarder exited with an error"
+                        );
+                        "engine_ack_error".to_string()
+                    })
+            }
+            .instrument(ack_task_span),
+        ));
+        task_names.push("engine_ack");
+    }
 
     let swarm_actor = actor.clone();
     let cancel_token_clone = cancellation_token.clone();
