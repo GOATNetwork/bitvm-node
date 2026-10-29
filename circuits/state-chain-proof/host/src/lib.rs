@@ -8,18 +8,17 @@ use alloy_provider::{
 use anyhow::Context;
 use bitcoin_light_client_circuit::EthClientExecutorInput;
 use cbft_rpc::{
-    fetch_cbft_tx_data, fetch_cbft_validator_info, fetch_cosmos_block, get_cosmos_block_height_at,
+    HttpClient, fetch_cbft_tx_data, fetch_cbft_validator_info, fetch_cosmos_block,
+    get_cosmos_block_height_at,
 };
+use futures_util::{StreamExt, TryStreamExt, stream};
 use host_executor::EthHostExecutor;
 use primitives::genesis::Genesis;
 use proof_builder::ProofRequest;
 use proof_builder::{LongRunning, ProofBuilder};
 use reth_chainspec::ChainSpec;
 use state_chain::*;
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::Arc,
-};
+use std::{collections::BTreeSet, sync::Arc};
 use url::Url;
 use zkm_sdk::{
     HashableKey, ProverClient, ZKM_CIRCUIT_VERSION, ZKMProofKind, ZKMProofWithPublicValues,
@@ -74,6 +73,11 @@ pub struct Args {
     #[clap(long, env, default_value_t = 0)]
     pub start: u64,
 
+    /// Maximum number of GOAT blocks fetched concurrently.
+    #[clap(long, env, default_value_t = default_fetch_concurrency())]
+    #[serde(default = "default_fetch_concurrency")]
+    pub fetch_concurrency: usize,
+
     // Print-only mode skips runtime inputs but keeps them required otherwise.
     #[clap(
         long,
@@ -83,6 +87,10 @@ pub struct Args {
         default_value_if("print_program_id", "true", Some(""))
     )]
     pub l2_contract_addresses: String,
+}
+
+fn default_fetch_concurrency() -> usize {
+    16
 }
 
 impl LongRunning for Args {
@@ -193,53 +201,43 @@ fn collect_receipt_withdrawals(
 }
 
 async fn fetch_withdrawal_events(
-    execution_layer_rpc: &str,
+    provider: &RootProvider<Ethereum>,
     l2_contract_addresses: &[Address],
-    start: u64,
-    batch_size: u64,
-) -> anyhow::Result<BTreeMap<u64, BlockWithdrawals>> {
-    let provider = RootProvider::<Ethereum>::new_http(Url::parse(execution_layer_rpc)?);
-    let end = start.checked_add(batch_size).context("state-chain block range overflows")?;
-    let mut batches = BTreeMap::new();
-    for height in start..end {
-        // EthGetBlock normalizes a missing transaction list into empty hashes.
-        // Read the typed RPC response directly so missing data remains distinguishable.
-        let block = provider
-            .client()
-            .request::<_, Option<RpcBlock>>(
-                "eth_getBlockByNumber",
-                (format!("0x{height:x}"), false),
-            )
-            .await
-            .map_err(|error| input_not_ready(format!("get block {height}: {error}")))?
-            .ok_or_else(|| input_not_ready(format!("block {height} is missing")))?;
-        if block.header.number != height {
-            return Err(input_not_ready(format!("wrong block number returned for {height}")));
-        }
-        if block.transactions.is_uncle() {
-            return Err(input_not_ready(format!("block {height} has no transaction list")));
-        }
-        let block_hash = block.header.hash;
-        let mut withdrawals = Vec::new();
-        for (index, txid) in block.transactions.hashes().enumerate() {
-            let receipt = provider
-                .get_transaction_receipt(txid)
-                .await
-                .map_err(|error| input_not_ready(format!("get receipt {txid}: {error}")))?
-                .ok_or_else(|| input_not_ready(format!("receipt {txid} is missing")))?;
-            collect_receipt_withdrawals(
-                &receipt,
-                l2_contract_addresses,
-                height,
-                block_hash,
-                txid,
-                index as u64,
-                &mut withdrawals,
-            )?;
-        }
-        batches.insert(height, BlockWithdrawals { block_hash, withdrawals });
+    height: u64,
+) -> anyhow::Result<BlockWithdrawals> {
+    // EthGetBlock normalizes a missing transaction list into empty hashes.
+    // Read the typed RPC response directly so missing data remains distinguishable.
+    let block = provider
+        .client()
+        .request::<_, Option<RpcBlock>>("eth_getBlockByNumber", (format!("0x{height:x}"), false))
+        .await
+        .map_err(|error| input_not_ready(format!("get block {height}: {error}")))?
+        .ok_or_else(|| input_not_ready(format!("block {height} is missing")))?;
+    if block.header.number != height {
+        return Err(input_not_ready(format!("wrong block number returned for {height}")));
     }
-    Ok(batches)
+    if block.transactions.is_uncle() {
+        return Err(input_not_ready(format!("block {height} has no transaction list")));
+    }
+    let block_hash = block.header.hash;
+    let mut withdrawals = Vec::new();
+    for (index, txid) in block.transactions.hashes().enumerate() {
+        let receipt = provider
+            .get_transaction_receipt(txid)
+            .await
+            .map_err(|error| input_not_ready(format!("get receipt {txid}: {error}")))?
+            .ok_or_else(|| input_not_ready(format!("receipt {txid} is missing")))?;
+        collect_receipt_withdrawals(
+            &receipt,
+            l2_contract_addresses,
+            height,
+            block_hash,
+            txid,
+            index as u64,
+            &mut withdrawals,
+        )?;
+    }
+    Ok(BlockWithdrawals { block_hash, withdrawals })
 }
 
 fn check_execution_block(
@@ -258,13 +256,10 @@ fn check_execution_block(
 
 // https://github.com/ProjectZKM/reth-processor/blob/stateless/crates/executor/host/tests/integration.rs#L69
 async fn fetch_exection_layer_block(
-    execution_layer_rpc: &str,
+    provider: &RootProvider<Ethereum>,
     execution_layer_block_number: u64,
     genesis: &Genesis,
 ) -> anyhow::Result<EthClientExecutorInput> {
-    // Setup the provider.
-    let rpc_url = Url::parse(execution_layer_rpc)?;
-    let provider = RootProvider::<Ethereum>::new_http(rpc_url);
     //let rpc_db = RpcDb::new(provider.clone(), provider.clone(), execution_layer_block_number - 1);
     let chain_spec: Arc<ChainSpec> = Arc::new(genesis.try_into().unwrap());
     let custom_beneficiary = None;
@@ -273,8 +268,8 @@ async fn fetch_exection_layer_block(
     let client_input = host_executor
         .execute(
             execution_layer_block_number,
-            &provider,
-            &provider,
+            provider,
+            provider,
             genesis.clone(),
             custom_beneficiary,
             false,
@@ -283,6 +278,60 @@ async fn fetch_exection_layer_block(
     Ok(client_input)
 }
 
+/// Fetch execution and consensus inputs for GOAT block `i` and match them to its receipts.
+async fn fetch_state_block(
+    provider: &RootProvider<Ethereum>,
+    cosmos: &HttpClient,
+    genesis: &Genesis,
+    withdrawal_block: BlockWithdrawals,
+    i: u64,
+    retry_after: u64,
+) -> anyhow::Result<CircuitStateBlock> {
+    let evm_block = fetch_exection_layer_block(provider, i, genesis).await.map_err(|e| {
+        tracing::error!("fetch_exection_layer_block: {e:?}");
+        proof_builder::ProofError::InputNotReady(retry_after)
+    })?;
+
+    check_execution_block(
+        i,
+        withdrawal_block.block_hash,
+        evm_block.current_block.header.number,
+        evm_block.current_block.header.hash_slow(),
+    )?;
+    let parent_beacon_block_root = evm_block
+        .current_block
+        .header
+        .parent_beacon_block_root
+        .ok_or_else(|| input_not_ready(format!("block {i} has no parent beacon block root")))?;
+    let parent_cosmos_block_height = get_cosmos_block_height_at(cosmos, *parent_beacon_block_root)
+        .await
+        .map_err(|error| input_not_ready(format!("get parent cosmos block for {i}: {error}")))?;
+
+    let (_, cl_block_number) =
+        fetch_cbft_validator_info(cosmos, i, parent_cosmos_block_height, 1000).await.map_err(
+            |e| {
+                tracing::error!("fetch_cbft_validator_info: {e:?}");
+                proof_builder::ProofError::InputNotReady(retry_after)
+            },
+        )?;
+    let cosmos_txns = fetch_cbft_tx_data(cosmos, cl_block_number).await.map_err(|e| {
+        tracing::error!("fetch_cbft_tx_data: {e:?}");
+        proof_builder::ProofError::InputNotReady(retry_after)
+    })?;
+    let cosmos_block = fetch_cosmos_block(cosmos, cl_block_number).await.map_err(|e| {
+        tracing::error!("fetch_cosmos_block: {e:?}");
+        proof_builder::ProofError::InputNotReady(retry_after)
+    })?;
+
+    tracing::info!("block: {i}, cl_block_number: {cl_block_number}, txns: {}", cosmos_txns.len());
+
+    let withdrawals = withdrawal_block.withdrawals;
+    let cosmos_block = serde_json::to_vec(&cosmos_block)?;
+    tracing::info!("[push] block: {}, withdrawals: {:?}", i, withdrawals);
+    Ok(CircuitStateBlock { cosmos_txns, cosmos_block, evm_block, withdrawals })
+}
+
+/// Fetches GOAT blocks `start..start + batch_size`, `concurrency` blocks at a time, in block order.
 #[allow(clippy::too_many_arguments)]
 pub async fn fetch_state_chain(
     l2_contract_addresses: &str,
@@ -292,73 +341,39 @@ pub async fn fetch_state_chain(
     blocks_file: &str,
     genesis: &str,
     cosmos_rpc_url: &str,
+    concurrency: usize,
 ) -> anyhow::Result<Vec<CircuitStateBlock>> {
     let l2_contract_addresses = parse_gateway_addresses(l2_contract_addresses)?;
     anyhow::ensure!(start > 0, "Don't get genesis block from the consensus layer");
     anyhow::ensure!(batch_size > 0, "batch_size must be positive");
     let end = start.checked_add(batch_size).context("state-chain block range overflows")?;
     let genesis = if genesis == "goattest" { Genesis::GoatTestnet } else { Genesis::GOAT };
-    let mut blocks = Vec::new();
-    // fetch graph_block_numbers and graph_ids between in goat block(start, start + batch_size)
-    let withdrawal_events =
-        fetch_withdrawal_events(execution_layer_rpc, &l2_contract_addresses, start, batch_size)
-            .await?;
+    // One client per layer for the whole batch, so blocks reuse their connections.
+    let provider = RootProvider::<Ethereum>::new_http(Url::parse(execution_layer_rpc)?);
+    let cosmos = HttpClient::new(cosmos_rpc_url)
+        .map_err(|e| anyhow::anyhow!("Invalid cosmos rpc url {cosmos_rpc_url}: {e:?}"))?;
+    let concurrency = concurrency.max(1);
+    let fetch_start = std::time::Instant::now();
 
-    for i in start..end {
-        let evm_block =
-            fetch_exection_layer_block(execution_layer_rpc, i, &genesis).await.map_err(|e| {
-                tracing::error!("fetch_exection_layer_block: {e:?}");
-                proof_builder::ProofError::InputNotReady((batch_size + start - i) * 3)
-            })?;
-
-        let withdrawal_block = withdrawal_events
-            .get(&i)
-            .ok_or_else(|| input_not_ready(format!("withdrawal block {i} is missing")))?;
-        check_execution_block(
-            i,
-            withdrawal_block.block_hash,
-            evm_block.current_block.header.number,
-            evm_block.current_block.header.hash_slow(),
-        )?;
-        let parent_beacon_block_root =
-            evm_block.current_block.header.parent_beacon_block_root.ok_or_else(|| {
-                input_not_ready(format!("block {i} has no parent beacon block root"))
-            })?;
-        let parent_cosmos_block_height =
-            get_cosmos_block_height_at(cosmos_rpc_url, *parent_beacon_block_root).await.map_err(
-                |error| input_not_ready(format!("get parent cosmos block for {i}: {error}")),
-            )?;
-
-        let (_, cl_block_number) =
-            fetch_cbft_validator_info(cosmos_rpc_url, i, parent_cosmos_block_height, 1000)
-                .await
-                .map_err(|e| {
-                    tracing::error!("fetch_cbft_validator_info: {e:?}");
-                    // GOAT's block time is 3 seconds
-                    proof_builder::ProofError::InputNotReady((batch_size + start - i) * 3)
-                })?;
-        let cosmos_txns =
-            fetch_cbft_tx_data(cosmos_rpc_url, cl_block_number).await.map_err(|e| {
-                tracing::error!("fetch_cbft_tx_data: {e:?}");
-                proof_builder::ProofError::InputNotReady((batch_size + start - i) * 3)
-            })?;
-        let cosmos_block =
-            fetch_cosmos_block(cosmos_rpc_url, cl_block_number).await.map_err(|e| {
-                tracing::error!("fetch_cosmos_block: {e:?}");
-                proof_builder::ProofError::InputNotReady((batch_size + start - i) * 3)
-            })?;
-
-        tracing::info!(
-            "block: {i}, cl_block_number: {cl_block_number}, txns: {}",
-            cosmos_txns.len()
-        );
-
-        let withdrawals = withdrawal_block.withdrawals.clone();
-
-        let cosmos_block = serde_json::to_vec(&cosmos_block)?;
-        tracing::info!("[push] block: {}, withdrawals: {:?}", i, withdrawals);
-        blocks.push(CircuitStateBlock { cosmos_txns, cosmos_block, evm_block, withdrawals });
-    }
+    // Validate the batch's receipts before starting execution witness requests.
+    let withdrawals: Vec<BlockWithdrawals> = stream::iter(start..end)
+        .map(|height| fetch_withdrawal_events(&provider, &l2_contract_addresses, height))
+        .buffered(concurrency)
+        .try_collect()
+        .await?;
+    let blocks: Vec<CircuitStateBlock> = stream::iter((start..end).zip(withdrawals))
+        .map(|(i, withdrawal_block)| {
+            // GOAT's block time is 3 seconds.
+            let retry_after = (end - i).saturating_mul(3);
+            fetch_state_block(&provider, &cosmos, &genesis, withdrawal_block, i, retry_after)
+        })
+        .buffered(concurrency)
+        .try_collect()
+        .await?;
+    tracing::info!(
+        "fetched blocks {start}..{end}, {concurrency} at a time, in {:?}",
+        fetch_start.elapsed()
+    );
     let block_bytes = serde_json::to_vec(&blocks)?;
     std::fs::write(blocks_file, block_bytes)?;
     Ok(blocks)
@@ -636,8 +651,9 @@ mod tests {
             ("eth_getTransactionReceipt", json!({"result": receipt(tx2, 1, true, vec![log(2, gateway(1), tx2, 1), log(1, gateway(1), tx2, 1), log(3, gateway(2), tx2, 1)])})),
             ("eth_getTransactionReceipt", json!({"result": receipt(tx3, 2, false, vec![log(99, gateway(1), tx3, 2)])})),
         ]).await;
-        let result = fetch_withdrawal_events(&url, &[gateway(1), gateway(2)], 10, 1).await.unwrap();
-        let batch = &result[&10];
+        let provider = RootProvider::<Ethereum>::new_http(Url::parse(&url).unwrap());
+        let batch =
+            fetch_withdrawal_events(&provider, &[gateway(1), gateway(2)], 10).await.unwrap();
         assert_eq!(batch.block_hash, hash(10));
         assert_eq!(
             batch.withdrawals,
@@ -660,7 +676,8 @@ mod tests {
                 ("eth_getTransactionReceipt", json!({"result": receipt(hash(1), 0, true, vec![log(1, gateway(1), hash(1), 0)])})),
                 ("eth_getTransactionReceipt", response),
             ]).await;
-            assert_retry(&fetch_withdrawal_events(&url, &[gateway(1)], 10, 1).await.unwrap_err());
+            let provider = RootProvider::<Ethereum>::new_http(Url::parse(&url).unwrap());
+            assert_retry(&fetch_withdrawal_events(&provider, &[gateway(1)], 10).await.unwrap_err());
             finish(server).await;
         }
     }
@@ -687,6 +704,7 @@ mod tests {
                 file.to_str().unwrap(),
                 "goattest",
                 "http://127.0.0.1:1",
+                1,
             )
             .await
             .unwrap_err();
@@ -701,7 +719,8 @@ mod tests {
         let mut value = block(10, vec![hash(1)]);
         value.as_object_mut().unwrap().remove("transactions");
         let (url, server) = rpc(vec![("eth_getBlockByNumber", json!({"result": value}))]).await;
-        assert_retry(&fetch_withdrawal_events(&url, &[gateway(1)], 10, 1).await.unwrap_err());
+        let provider = RootProvider::<Ethereum>::new_http(Url::parse(&url).unwrap());
+        assert_retry(&fetch_withdrawal_events(&provider, &[gateway(1)], 10).await.unwrap_err());
         finish(server).await;
     }
 
@@ -790,6 +809,77 @@ mod tests {
             format!("{},", gateway(1)),
         ] {
             assert!(parse_gateway_addresses(&invalid).is_err(), "{invalid}");
+        }
+    }
+
+    /// A block as JSON, minus what changes between fetches of the same block: the cosmos node
+    /// that served the light block (behind a load balancer), and the order of the bytecodes,
+    /// which come from a hash map and which the guest looks up by hash.
+    fn comparable(block: &CircuitStateBlock) -> Value {
+        let mut light_block: Value = serde_json::from_slice(&block.cosmos_block).unwrap();
+        light_block.as_object_mut().unwrap().remove("provider");
+        let mut evm_block = serde_json::to_value(&block.evm_block).unwrap();
+        evm_block["bytecodes"].as_array_mut().unwrap().sort_by_key(|code| code.to_string());
+        serde_json::json!({
+            "cosmos_txns": block.cosmos_txns,
+            "light_block": light_block,
+            "evm_block": evm_block,
+            "withdrawals": block.withdrawals,
+        })
+    }
+
+    /// The JSON paths at which two values differ.
+    fn differing_paths(a: &Value, b: &Value, path: String) -> Vec<String> {
+        match (a, b) {
+            (Value::Object(x), Value::Object(y)) => {
+                let keys: std::collections::BTreeSet<&String> = x.keys().chain(y.keys()).collect();
+                keys.into_iter()
+                    .flat_map(|k| {
+                        let missing = Value::Null;
+                        let (x, y) = (x.get(k).unwrap_or(&missing), y.get(k).unwrap_or(&missing));
+                        differing_paths(x, y, format!("{path}.{k}"))
+                    })
+                    .collect()
+            }
+            (Value::Array(x), Value::Array(y)) if x.len() == y.len() => (0..x.len())
+                .flat_map(|i| differing_paths(&x[i], &y[i], format!("{path}[{i}]")))
+                .collect(),
+            _ if a != b => vec![path],
+            _ => vec![],
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires public GOAT testnet3 RPC"]
+    async fn concurrent_fetch_matches_sequential() {
+        let execution_layer_rpc = std::env::var("EXECUTION_LAYER_RPC")
+            .unwrap_or("https://rpc-legacy.testnet3.goat.network".to_string());
+        let cosmos_rpc_url = std::env::var("COSMOS_RPC_URL")
+            .unwrap_or("https://rpc.testnet3.goat.network/goat-rpc".to_string());
+        let (start, batch_size) = (17781200, 6);
+        let blocks_file = std::env::temp_dir().join("state-chain-fetch-test.blocks");
+        let fetch = |concurrency| {
+            fetch_state_chain(
+                "0x0c7821F1C72181a2C710Eaa91d81120d7e009e41,0x60a5b099eE011018DD064F9eBD50d381C37b5e8b",
+                start,
+                batch_size,
+                &execution_layer_rpc,
+                blocks_file.to_str().unwrap(),
+                "goattest",
+                &cosmos_rpc_url,
+                concurrency,
+            )
+        };
+
+        let sequential = fetch(1).await.unwrap();
+        let concurrent = fetch(4).await.unwrap();
+
+        let numbers: Vec<u64> =
+            concurrent.iter().map(|b| b.evm_block.current_block.header.number).collect();
+        assert_eq!(numbers, (start..start + batch_size).collect::<Vec<_>>());
+        for (number, (s, c)) in numbers.iter().zip(sequential.iter().zip(&concurrent)) {
+            let paths = differing_paths(&comparable(s), &comparable(c), String::new());
+            assert!(paths.is_empty(), "block {number} differs at {}", paths.join(", "));
         }
     }
 }

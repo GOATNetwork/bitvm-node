@@ -87,6 +87,7 @@ async fn spawn_state_chain_ctx_builder(
                     &args.blocks,
                     &args.goat_network,
                     &args.cosmos_rpc_url,
+                    args.fetch_concurrency,
                 ).await {
                     Ok(d) => d,
                     Err(e) => {

@@ -34,6 +34,8 @@ l2_contract_addresses = "0x294306b29b7A25EAe079fd874131B350bbA0b16c"
 #start = 9511050
 start = 10579883
 batch_size = 40
+## blocks fetched at once (default 16)
+#fetch_concurrency = 16
 execution_layer_rpc = "https://rpc-legacy.testnet3.goat.network"
 blocks = "../circuits/data/state-chain/state.blocks"
 ## input_proof is optional when init_input=true
