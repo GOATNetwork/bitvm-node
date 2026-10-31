@@ -13,6 +13,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  ZKM_TOOLCHAIN_VERSION: '20260917'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -141,13 +142,14 @@ jobs:
           pass       | GraphLifecycleFixed.cfg            | GraphLifecycle.tla                 | Finding 1 fix - atomic guard closes Graph.status race
           pass       | GraphLifecycleFineGrainedFixed.cfg | GraphLifecycleFineGrainedFixed.tla | Finding 1b fix - single-statement atomic CAS
           pass       | InstancePresignedFixed.cfg         | InstancePresigned.tla              | Finding 2 fix - Instance.status regression guarded
+          pass       | InstanceLifecycle.cfg              | InstanceLifecycle.tla              | baseline instance lifecycle is sound
           pass       | Take2DisproveRace.cfg              | Take2DisproveRace.tla              | Finding 4 - Take2 vs Disprove margin holds (real shipped values)
           pass       | MultiActorRace.cfg                 | MultiActorRace.tla                 | Finding 5/10 - 1-of-N watchtower/verifier + operator_commit margin
           pass       | InstanceBridgeOutRaceFixed.cfg     | InstanceBridgeOutRace.tla          | Finding 6 fix - terminal-status guard closes resurrection
           pass       | MessageStateRaceFixed.cfg          | MessageStateRace.tla               | Finding 7 fix - terminal-guarded resurrect
           pass       | Take1ChallengeRaceFixed.cfg        | Take1ChallengeRace.tla             | Finding 9 fix - connector_a margin check added
           pass       | VerifierKickoffFailOpenFixed.cfg   | VerifierKickoffFailOpen.tla        | Issue #429 fix design - defer/retry mirrors committee
-          pass       | KickoffScanCoverageFixed.cfg       | KickoffScanCoverage.tla            | Issue #431 fix - root-only chain walk, uncapped depth (current code)
+          pass       | KickoffScanCoverageFixed.cfg       | KickoffScanCoverage.tla            | Issue #431 fix - every graph reached, no depth cap (graph_scan round-robin since #476)
           historical | GraphLifecycle.cfg                 | GraphLifecycle.tla                 | Finding 1: Graph.status race (fixed 991faaa)
           historical | GraphLifecycleFineGrained.cfg      | GraphLifecycleFineGrained.tla      | Finding 1b: naive guard still unsafe (fixed 991faaa)
           historical | InstancePresignedBug.cfg           | InstancePresigned.tla              | Finding 2: Instance.status regression past Presigned (fixed 991faaa)
@@ -156,7 +158,7 @@ jobs:
           historical | Take1ChallengeRace.cfg             | Take1ChallengeRace.tla             | Finding 9: connector_a has no margin check (fixed 991faaa)
           historical | KickoffScanCoverage.cfg            | KickoffScanCoverage.tla            | Issue #431: detect_kickoff one-per-operator coverage gap (fixed by #451)
           historical | VerifierKickoffFailOpen.cfg        | VerifierKickoffFailOpen.tla        | Issue #429: verifier KickoffSent fail-open (SPV lag skipped Challenge, never retried) (fixed by #455)
-          historical | KickoffScanCoverageResidual.cfg    | KickoffScanCoverage.tla            | Issue #431 residual: root-only walk capped at 32 (fixed: the cap is removed, the scan runs as its own task)
+          historical | KickoffScanCoverageResidual.cfg    | KickoffScanCoverage.tla            | Issue #431 residual: root-only walk capped at 32 (fixed by #476: graph_scan visits every monitored graph)
           SPECS
           {
             echo
@@ -191,26 +193,43 @@ jobs:
         timeout-minutes: 30
         with:
           profile: minimal
-          toolchain: nightly-2025-12-11
+          toolchain: nightly-2026-09-17
           override: true
           components: clippy
-      - run: curl --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/ProjectZKM/toolchain/refs/heads/main/setup.sh | sh
+      - name: Install Ziren toolchain
+        run: |
+          set -euo pipefail
+          installer="$RUNNER_TEMP/zkmup"
+          curl --proto '=https' --tlsv1.2 -fsSL --retry 3 \
+            https://raw.githubusercontent.com/ProjectZKM/toolchain/582f7927cac0668883a86cbd02fbc18b500b1b6f/zkmup \
+            -o "$installer"
+          sh "$installer" install -v "$ZKM_TOOLCHAIN_VERSION"
+          SHELL=/bin/true sh "$installer" setup -v "$ZKM_TOOLCHAIN_VERSION"
+          source "$HOME/.zkm-toolchain/env"
+          rustc --version
+          cargo --version
       - name: Install Dependencies
         run: sudo apt update && sudo apt install protobuf-compiler
       - run: |
           source ~/.zkm-toolchain/env
-          cargo clippy --all-targets -- -D warnings
+          cargo clippy --all-targets --features rpc-debug-endpoints -- -D warnings
   test:
     name: Cargo Test
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        toolchain:
-          - nightly-2025-12-11
     steps:
       - uses: actions/checkout@v5
       - name: Install Ziren toolchain
-        run: curl --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/ProjectZKM/toolchain/refs/heads/main/setup.sh | sh
+        run: |
+          set -euo pipefail
+          installer="$RUNNER_TEMP/zkmup"
+          curl --proto '=https' --tlsv1.2 -fsSL --retry 3 \
+            https://raw.githubusercontent.com/ProjectZKM/toolchain/582f7927cac0668883a86cbd02fbc18b500b1b6f/zkmup \
+            -o "$installer"
+          sh "$installer" install -v "$ZKM_TOOLCHAIN_VERSION"
+          SHELL=/bin/true sh "$installer" setup -v "$ZKM_TOOLCHAIN_VERSION"
+          source "$HOME/.zkm-toolchain/env"
+          rustc --version
+          cargo --version
       - name: Install Dependencies
         run: sudo apt update && sudo apt install protobuf-compiler
       - name: Launch the Regtest
@@ -219,4 +238,4 @@ jobs:
         run: |
           set -e
           source ~/.zkm-toolchain/env
-          cargo test -r --all --all-targets
+          cargo test -r --all --all-targets --features rpc-debug-endpoints

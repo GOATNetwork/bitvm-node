@@ -22,10 +22,16 @@ ark-bn254 = { workspace = true }
 ark-groth16 = { workspace = true }
 ark-serialize = { workspace = true }
 ark-ff = { workspace = true }
+ark-ec = { workspace = true }
 verifiable-circuit-babe = { workspace = true }
 garbled-snark-verifier = { workspace = true }
 soldering-host = { workspace = true }
 rayon = { workspace = true }
+
+# Only needed by the compile-time `mock-gc` feature, to wrap the mocked soldered
+# output in a structurally-real `ZKMProofWithPublicValues` so the node's payload
+# plumbing (compact/expand, SolderingProof::output) keeps working unchanged.
+zkm-sdk = { workspace = true, optional = true }
 
 serde-big-array = { workspace = true }
 serde_json = { workspace = true }
@@ -46,3 +52,6 @@ tokio = { workspace = true, features = ["macros", "time"] }
 [features]
 default = []
 ci-tests = []
+# Replace the real BABE/GC/soldering machinery with deterministic, on-chain-valid
+# mocks. Localnet only. See node feature `mock-gc` which forwards to this one.
+mock-gc = ["dep:zkm-sdk"]

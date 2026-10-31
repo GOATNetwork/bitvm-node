@@ -166,6 +166,11 @@ pub struct Node {
     pub reward: String,
     pub service_fee_rate: f64,
     pub available_peg_btc: String,
+    /// Hex master-key signature authorizing this peer binding; empty when absent.
+    pub binding_sig: String,
+    /// When the binding was issued. Orders re-bindings so one key maps to a
+    /// single peer id at a time.
+    pub binding_issued_at: i64,
     pub updated_at: i64,
     pub created_at: i64,
 }
@@ -191,32 +196,57 @@ pub struct CommitteeSignatures {
     pub l2_sig: Vec<u8>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Display, EnumString)]
+/// Bridge-in lifecycle status.
+/// Failure states do not return to success; Timeout may transition to UserCanceled.
+/// Transitions are based on chain facts and block heights.
+#[derive(
+    Copy, Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq, Hash, Display, EnumString,
+)]
 pub enum InstanceBridgeInStatus {
     #[default]
-    UserIniting, // front has call contract, but node not get event
     UserInited, // from contract event request
     // committee won't answer if userRequest is invalid(e.g. insufficient fee)
     CommitteesAnswered,        // enough committee responsed & window expired
     UserBroadcastPeginPrepare, // user pegin prepare
     Presigned,                 // enough graphs completed committee pre-signing
-    PresignedFailed,           // required graph pre-signing did not finish in time
-    RelayerL1Broadcasted,      // PeginConfirm broadcast by relayer
+    RelayerL1Broadcasted,      // PeginConfirm confirmed on Bitcoin
     RelayerL2Minted,           // success
-    RelayerL2MintedFailed,
-    Timeout,                    // time to cancle bridgein
-    UserCanceled,               // user broadcast Pegin-cancel tx
+    /// Abandoned: `h >= prepare height + T0 + buffer` and Peg-In-Confirm is
+    /// neither confirmed nor visible in the mempool. Failure terminal; the
+    /// committee key is kept for manual handling.
+    Timeout,
+    UserCanceled,               // Peg-In-Cancel confirmed
     NoEnoughCommitteesAnswered, // no enough committee responsed & window expired
     UserDiscarded,              // pegin prepare tx input uxto been spent in other tx
+}
 
-    // for front end display
-    Initiated,  // UserInited
-    Verified,   // CommitteesAnswered
-    Submitted,  // UserBroadcastPeginPrepare
-    Failed,     // PresignedFailed, RelayerL2MintedFailed, NoEnoughCommitteesAnswered, UserDiscarded
-    Processing, // Presigned, RelayerL1Broadcasted
-    Success,    // RelayerL2Minted
-    Canceled,   // UserCanceled
+impl InstanceBridgeInStatus {
+    /// States that stop normal bridge-in progression.
+    pub const FAILED: [InstanceBridgeInStatus; 4] = [
+        InstanceBridgeInStatus::NoEnoughCommitteesAnswered,
+        InstanceBridgeInStatus::UserDiscarded,
+        InstanceBridgeInStatus::UserCanceled,
+        InstanceBridgeInStatus::Timeout,
+    ];
+
+    pub fn is_failed(self) -> bool {
+        Self::FAILED.contains(&self)
+    }
+
+    pub fn is_success(self) -> bool {
+        self == InstanceBridgeInStatus::RelayerL2Minted
+    }
+
+    /// Entering this failure state deletes the committee instance key in the
+    /// same transaction. `Timeout` keeps the key for manual handling.
+    pub fn deletes_key_on_entry(self) -> bool {
+        matches!(
+            self,
+            InstanceBridgeInStatus::NoEnoughCommitteesAnswered
+                | InstanceBridgeInStatus::UserDiscarded
+                | InstanceBridgeInStatus::UserCanceled
+        )
+    }
 }
 
 /// Lifecycle of a swap-based bridge-out escrow.
@@ -291,6 +321,9 @@ pub struct Instance {
     pub pegin_data_tx_hash: String,
     pub parameters: Option<String>,
     pub post_pegin_txhash: Option<String>,
+    /// The committee instance key envelope was deleted; a rebuilt projection must not
+    /// regenerate it.
+    pub key_deleted: bool,
     pub status_updated_at: i64,
     pub created_at: i64,
     pub updated_at: i64,
@@ -325,14 +358,6 @@ pub enum GraphStatus {
     Skipped,
     OperatorTake1,
     OperatorTake2,
-
-    /// frontend use only
-    Created,
-    Presigned,
-    L2Recorded,
-    OperatorKickOffing,
-    Challenging,
-    Disproving,
 }
 
 /// The evidence that authorizes a graph status transition.
@@ -477,8 +502,7 @@ impl GraphStatus {
                 OperatorTake1 => TAKE1,
                 OperatorTake2 | Disprove => TAKE2_OR_DISPROVE,
                 Skipped => SKIPPED,
-                OperatorPresigned | Created | Presigned | L2Recorded | OperatorKickOffing
-                | Challenging | Disproving => &[],
+                OperatorPresigned => &[],
             },
         }
     }
@@ -541,95 +565,6 @@ pub struct GraphBtcTxVoutMonitor {
     pub updated_at: i64,
 }
 
-#[derive(Clone, Debug, Display, EnumString)]
-pub enum MessageState {
-    Pending,
-    Processed,
-    Failed,
-    Expired,
-    Cancelled,
-}
-
-#[derive(Clone, FromRow, Debug, Serialize, Deserialize, Default)]
-pub struct Message {
-    pub message_id: String,
-    pub business_id: Uuid, // graph_id or instance_id
-    pub actor: String,
-    pub from_peer: String,
-    pub msg_type: String,
-    pub content: Vec<u8>,
-    pub state: String,
-    pub message_version: i64,
-    pub weight: i64,
-    pub lock_time_until: i64,
-    pub created_at: i64,
-}
-
-/// A durable copy of a message received from the P2P network.
-///
-/// Unlike `Message`, which is used for locally generated compensation work,
-/// this row retains the original sender and is consumed before dispatching the
-/// external message. Processed content is cleared, while failed content is
-/// retained for manual requeue and later TTL cleanup.
-#[derive(Clone, FromRow, Debug, Serialize, Deserialize, Default)]
-pub struct P2pInboxMessage {
-    pub message_id: String,
-    pub business_id: Option<Uuid>,
-    pub actor: String,
-    pub from_peer: String,
-    pub msg_type: String,
-    pub content: Vec<u8>,
-    pub content_size: i64,
-    pub state: String,
-    pub attempt_count: i64,
-    pub next_retry_at: i64,
-    pub lease_until: i64,
-    pub lease_token: String,
-    pub last_error: Option<String>,
-    pub created_at: i64,
-    pub updated_at: i64,
-}
-
-#[derive(Clone, FromRow, Debug, Serialize, Deserialize, Default)]
-pub struct P2pOutboxMessage {
-    pub message_id: String,
-    pub msg_type: String,
-    pub content: Vec<u8>,
-    pub state: String,
-    pub attempt_count: i64,
-    pub next_retry_at: i64,
-    pub lease_until: i64,
-    pub last_error: Option<String>,
-    pub retry_until: i64,
-    pub retry_interval_secs: i64,
-    pub ack_peer_id: String,
-    pub created_at: i64,
-}
-
-#[derive(Clone, Debug, FromRow)]
-pub struct MessageDebugOverview {
-    pub message_id: String,
-    pub actor: String,
-    pub msg_type: String,
-    pub state: String,
-    pub lock_time_until: i64,
-    pub created_at: i64,
-    pub updated_at: i64,
-    pub reason_count: i64,
-    pub last_reason_code: Option<String>,
-    pub last_reason_detail: Option<String>,
-    pub last_reason_seen_at: Option<i64>,
-}
-
-#[derive(Clone, Debug, FromRow)]
-pub struct MessageDebugReason {
-    pub reason_code: String,
-    pub reason_detail: String,
-    pub first_seen_at: i64,
-    pub last_seen_at: i64,
-    pub occurrences: i64,
-}
-
 #[derive(Clone, Debug, FromRow, PartialEq, Eq)]
 pub struct MetricsStateCount {
     pub category: String,
@@ -683,53 +618,6 @@ pub struct PendingGraphInit {
     pub graph_id: Uuid,
     pub updated_at: i64,
     pub created_at: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Display, EnumString)]
-pub enum MessageType {
-    None,
-    PeginRequest,
-    CreateGraph,
-    ConfirmInstance,
-    InitGraph,
-    GenCircuits,
-    CutCircuits,
-    SolderingProof,
-    VerifierGraphParamsEndorsement,
-    NonceGeneration,
-    AggNonceConsensus,
-    CommitteePresign,
-    GraphFinalize,
-    EndorseGraph,
-    PeginConfirmNonce,
-    PeginConfirmNonceConsensus,
-    PeginConfirmPartialSig,
-    PostReady,
-    KickoffReady,
-    KickoffSent,
-    PreKickoffSent,
-    ChallengeSent,
-    WatchtowerChallengeInitSent,
-    WatchtowerChallengeSent,
-    WatchtowerChallengeTimeout,
-    NackReady,
-    OperatorCommitPubinReady,
-    OperatorCommitPubinTimeout,
-    AssertReady,
-    AssertSent,
-    ChallengeAssertSent,
-    WronglyChallengeTimeout,
-    DisproveSent,
-    Take1Ready,
-    Take1Sent,
-    Take2Ready,
-    Take2Sent,
-    RequestNodeInfo,
-    ResponseNodeInfo,
-    SyncGraphRequest,
-    SyncGraph,
-    InstanceDiscarded,
-    Tick,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default, Display, EnumString)]
@@ -887,6 +775,35 @@ impl ProofState {
     }
 }
 
+/// An on-demand proof table whose rows the proof builder completes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OnDemandProofTable {
+    Operator,
+    Watchtower,
+}
+
+impl OnDemandProofTable {
+    pub fn table_name(self) -> &'static str {
+        match self {
+            Self::Operator => "operator_proof",
+            Self::Watchtower => "watchtower_proof",
+        }
+    }
+}
+
+/// The result columns written when an on-demand proof task finishes.
+#[derive(Clone, Debug, Default)]
+pub struct OnDemandProofCompletion {
+    pub path_to_proof: String,
+    pub public_value_hex: String,
+    pub proof_size: i64,
+    pub cycles: i64,
+    pub proof_state: i64,
+    pub total_time_to_proof: i64,
+    pub proving_time: i64,
+    pub zkm_version: String,
+}
+
 #[derive(Clone, FromRow, Debug, Serialize, Deserialize, Default)]
 pub struct WatchtowerProof {
     pub id: i64,
@@ -975,17 +892,16 @@ mod tests {
 
     #[test]
     fn test_graph_status_from_str() {
-        assert_eq!(GraphStatus::from_str("Created").unwrap(), GraphStatus::Created);
         assert_eq!(
             GraphStatus::from_str("OperatorPresigned").unwrap(),
             GraphStatus::OperatorPresigned
         );
+        assert!(GraphStatus::from_str("Created").is_err());
         assert!(GraphStatus::from_str("Invalid").is_err());
     }
 
     #[test]
     fn test_graph_status_display() {
-        assert_eq!(GraphStatus::Created.to_string(), "Created");
         assert_eq!(GraphStatus::OperatorPresigned.to_string(), "OperatorPresigned");
     }
 
@@ -996,13 +912,31 @@ mod tests {
             InstanceBridgeInStatus::RelayerL2Minted
         );
         assert!(InstanceBridgeInStatus::from_str("Invalid").is_err());
+        assert!(InstanceBridgeInStatus::from_str("PresignedFailed").is_err());
+        assert!(InstanceBridgeInStatus::from_str("RelayerL2MintedFailed").is_err());
     }
 
     #[test]
-    fn test_message_type_from_str() {
-        assert_eq!(MessageType::from_str("PeginRequest").unwrap(), MessageType::PeginRequest);
-        assert_eq!(MessageType::from_str("CreateGraph").unwrap(), MessageType::CreateGraph);
-        assert!(MessageType::from_str("Invalid").is_err());
+    fn test_bridge_in_failure_set() {
+        use InstanceBridgeInStatus::*;
+        for status in InstanceBridgeInStatus::FAILED {
+            assert!(status.is_failed());
+            assert!(!status.is_success());
+        }
+        assert!(RelayerL2Minted.is_success() && !RelayerL2Minted.is_failed());
+        for status in [
+            UserInited,
+            CommitteesAnswered,
+            UserBroadcastPeginPrepare,
+            Presigned,
+            RelayerL1Broadcasted,
+        ] {
+            assert!(!status.is_failed() && !status.is_success());
+        }
+        assert!(!Timeout.deletes_key_on_entry());
+        assert!(UserCanceled.deletes_key_on_entry());
+        assert!(UserDiscarded.deletes_key_on_entry());
+        assert!(NoEnoughCommitteesAnswered.deletes_key_on_entry());
     }
 
     #[test]

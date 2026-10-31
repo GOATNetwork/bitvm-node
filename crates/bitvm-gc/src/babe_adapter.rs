@@ -1,11 +1,13 @@
 use std::collections::HashSet;
+#[cfg(not(feature = "mock-gc"))]
 use std::panic::{AssertUnwindSafe, catch_unwind};
+#[cfg(not(feature = "mock-gc"))]
 use std::path::PathBuf;
 
 use crate::types::BitvmGcCircuitData;
 use anyhow::{Result, bail};
+use ark_bn254::Bn254;
 use ark_bn254::g1::G1Affine;
-use ark_bn254::{Bn254, Fr};
 use ark_groth16::Proof as Groth16Proof;
 use ark_groth16::VerifyingKey as Groth16VerifyingKey;
 use ark_serialize::CanonicalSerialize;
@@ -14,25 +16,42 @@ use goat::assert_scripts::{INPUT_WIRE_NUM, OperatorAssertSecretKey, WireHash, la
 use goat::wots::{Wots, Wots96};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+#[cfg(not(feature = "mock-gc"))]
 use soldering_host::BabeBundle;
+#[cfg(not(feature = "mock-gc"))]
 pub use soldering_host::BabeBundleBuilder;
+// Under `mock-gc`, the BABE builder, the four heavy setup/dispute entry points, and the operator
+// assert-proof verdict are replaced by the deterministic mocks in `crate::mock_gc`. Every other
+// helper here (label derivation, WOTS assert witness, compact/expand payload plumbing, the real
+// `build_real_challenge_assert_witness`) stays real in both builds.
+#[cfg(feature = "mock-gc")]
+pub use crate::mock_gc::{
+    BabeBundleBuilder, build_real_setup_package, open_real_setup_and_solder,
+    recover_real_wrongly_challenged_witness, verify_operator_assert_proof, verify_real_setup,
+};
 use verifiable_circuit_babe::babe::{
     GC_INPUT_WIRES, WitnessEncSetupCt,
     build_challenge_assert_witness as babe_build_challenge_assert_witness,
 };
 use verifiable_circuit_babe::cac::cac_finalize_indices;
 pub use verifiable_circuit_babe::cac::{CACSetupPackage, FinalizedInstanceData};
+#[cfg(not(feature = "mock-gc"))]
 use verifiable_circuit_babe::dre::N_PADDED;
 use verifiable_circuit_babe::gc::{SGC_PART1_CONSTANT_SIZE, SparseAdaptorTable};
 pub use verifiable_circuit_babe::instance::commit::CACInstanceCommit;
 pub use verifiable_circuit_babe::instance::secret::Seed;
+#[cfg(not(feature = "mock-gc"))]
 use verifiable_circuit_babe::prover::BABEProver;
-use verifiable_circuit_babe::soldering::{
-    SolderedLabelsData, SolderingData as RealSolderingData, SolderingProof as RealSolderingProof,
-};
+use verifiable_circuit_babe::soldering::SolderedLabelsData;
+#[cfg(not(feature = "mock-gc"))]
+use verifiable_circuit_babe::soldering::SolderingData as RealSolderingData;
+use verifiable_circuit_babe::soldering::SolderingProof as RealSolderingProof;
 pub use verifiable_circuit_babe::transactions::ChallengeAssertWitnessRaw;
 pub use verifiable_circuit_babe::transactions::TxAssertWitness;
 use verifiable_circuit_babe::utils::pi1_xd_to_wots96_msg;
+pub use verifiable_circuit_babe::utils::{
+    DYNAMIC_SLOTS, NUM_PUBLIC_INPUTS, STATIC_SLOTS, StaticInputs, ziren_static_inputs,
+};
 use verifiable_circuit_babe::verifier::BABEVerifier;
 
 /// Number of Wots96 digit signatures expected by the GOAT GC-V2 connector.
@@ -161,10 +180,11 @@ pub fn build_setup_package(n_cc: usize) -> Result<CACSetupPackage> {
 }
 
 /// Builds a real random BABE/CAC setup package bound to the supplied Groth16 statement.
+#[cfg(not(feature = "mock-gc"))]
 pub fn build_real_setup_package(
     n_cc: usize,
     vk: &Groth16VerifyingKey<Bn254>,
-    static_inputs: Fr,
+    static_inputs: StaticInputs,
 ) -> Result<(CACSetupPackage, BabeVerifierPrivateState)> {
     if n_cc == 0 {
         bail!("n_cc must be greater than zero");
@@ -183,13 +203,14 @@ pub fn build_real_setup_package(
 }
 
 /// Reconstructs the real Verifier instances and creates CAC opening/soldering output data.
+#[cfg(not(feature = "mock-gc"))]
 pub fn open_real_setup_and_solder(
     soldering_builder: &BabeBundleBuilder,
     private_state: &BabeVerifierPrivateState,
     package: &CACSetupPackage,
     finalized_indices: &[usize],
     vk: &Groth16VerifyingKey<Bn254>,
-    static_inputs: Fr,
+    static_inputs: StaticInputs,
 ) -> Result<SetupAndSolderingData> {
     ensure_real_gc_assets_configured()?;
     if private_state.statement_digest != statement_digest(vk, static_inputs)? {
@@ -207,6 +228,7 @@ pub fn open_real_setup_and_solder(
 }
 
 /// Verifies real CAC openings, commitments, and the native Ziren soldering proof.
+#[cfg(not(feature = "mock-gc"))]
 #[allow(clippy::too_many_arguments)]
 pub fn verify_real_setup(
     soldering_builder: &BabeBundleBuilder,
@@ -216,7 +238,7 @@ pub fn verify_real_setup(
     soldering: &SolderingData,
     vk: &Groth16VerifyingKey<Bn254>,
     claimed_finalized_indices: &[usize],
-    static_public_inputs: Fr,
+    static_public_inputs: StaticInputs,
 ) -> Result<()> {
     let bundle = BabeBundle {
         opened: opened.to_vec(),
@@ -258,7 +280,7 @@ pub fn expand_compact_soldering_proof_payload(
     Ok((payload.opened, finalized, expand_compact_soldering_data(payload.soldering)?))
 }
 
-/// Derives finalized circuit indices using the real BABE/CAC Fiat-Shamir selection.
+/// Randomly selects `m_cc` distinct finalized circuit indices for the cut-and-choose.
 pub fn derive_finalized_indices(package: &CACSetupPackage, m_cc: usize) -> Result<Vec<usize>> {
     let n_cc = package.commits.len();
     if m_cc == 0 || m_cc > n_cc {
@@ -386,6 +408,17 @@ pub fn recover_operator_proof_from_assert_witness(
     Ok(Groth16Proof { a: pi1, b: pi2, c: pi3 })
 }
 
+/// Verifies the operator's asserted Groth16 proof (the real BN254 pairing check). Under `mock-gc`
+/// this is replaced by a policy verdict (`crate::mock_gc::verify_operator_assert_proof`).
+#[cfg(not(feature = "mock-gc"))]
+pub fn verify_operator_assert_proof(
+    assert_witness: &TxAssertWitness,
+    vk: &Groth16VerifyingKey<Bn254>,
+    static_input: StaticInputs,
+) -> bool {
+    assert_witness.verify_groth16_proof(vk, &static_input)
+}
+
 /// Builds a placeholder verifier challenge witness from an assert witness.
 pub fn build_challenge_assert_witness(
     verifier_state: &BabeVerifierState,
@@ -413,7 +446,7 @@ pub fn build_real_challenge_assert_witness(
     package: &CACSetupPackage,
     finalized_indices: &[usize],
     vk: &Groth16VerifyingKey<Bn254>,
-    static_inputs: Fr,
+    static_inputs: StaticInputs,
     assert_witness: &TxAssertWitness,
     verifier_index: usize,
 ) -> Result<BabeChallengeAssertWitness> {
@@ -451,6 +484,7 @@ pub fn build_wrongly_challenged_witness(
 }
 
 /// Evaluates the native BABE garbled circuit and returns a finalized hashlock preimages.
+#[cfg(not(feature = "mock-gc"))]
 pub fn recover_real_wrongly_challenged_witness(
     prover_state: &BabeProverState,
     challenge_witness: &BabeChallengeAssertWitness,
@@ -479,6 +513,7 @@ pub fn build_wrongly_challenged_witness_from_preimages(
     Ok(BabeWronglyChallengedWitness { verifier_index: challenge_witness.verifier_index, final_msg })
 }
 
+#[cfg(not(feature = "mock-gc"))]
 fn ensure_real_gc_assets_configured() -> Result<()> {
     for name in [
         "FGC_GATES_PATH",
@@ -501,10 +536,15 @@ fn ensure_real_gc_assets_configured() -> Result<()> {
     Ok(())
 }
 
-fn statement_digest(vk: &Groth16VerifyingKey<Bn254>, static_inputs: Fr) -> Result<[u8; 32]> {
+pub(crate) fn statement_digest(
+    vk: &Groth16VerifyingKey<Bn254>,
+    static_inputs: StaticInputs,
+) -> Result<[u8; 32]> {
     let mut bytes = Vec::new();
     vk.serialize_compressed(&mut bytes)?;
-    static_inputs.serialize_compressed(&mut bytes)?;
+    for input in &static_inputs {
+        input.serialize_compressed(&mut bytes)?;
+    }
     Ok(hash32(&bytes))
 }
 
@@ -512,13 +552,13 @@ fn restore_real_verifier(
     state: &BabeVerifierPrivateState,
     package: &CACSetupPackage,
     vk: &Groth16VerifyingKey<Bn254>,
-    static_inputs: Fr,
+    static_inputs: StaticInputs,
 ) -> Result<BABEVerifier> {
     BABEVerifier::from_state(&state.instance_seeds, package, vk, static_inputs)
         .ok_or_else(|| anyhow::anyhow!("Cannot restore real verifier"))
 }
 
-fn validate_finalized_indices(
+pub(crate) fn validate_finalized_indices(
     package: &CACSetupPackage,
     finalized_indices: &[usize],
 ) -> Result<()> {
@@ -535,6 +575,7 @@ fn validate_finalized_indices(
     Ok(())
 }
 
+#[cfg(not(feature = "mock-gc"))]
 fn from_real_soldering(soldering: &RealSolderingData) -> Result<SolderingData> {
     let output = soldering.soldering_proof.output().map_err(anyhow::Error::msg)?;
     Ok(SolderingData {
@@ -565,6 +606,7 @@ fn expand_compact_soldering_data(soldering: CompactSolderingData) -> Result<Sold
     })
 }
 
+#[cfg(not(feature = "mock-gc"))]
 fn to_real_soldering(soldering: &SolderingData) -> Result<RealSolderingData> {
     if soldering.proof.is_empty() {
         bail!("soldering proof is empty");
@@ -575,6 +617,7 @@ fn to_real_soldering(soldering: &SolderingData) -> Result<RealSolderingData> {
     })
 }
 
+#[cfg(not(feature = "mock-gc"))]
 fn recover_a_valid_finalized_messages(
     prover_state: &BabeProverState,
     challenge_witness: &BabeChallengeAssertWitness,
@@ -587,6 +630,12 @@ fn recover_a_valid_finalized_messages(
         bail!("BABE prover state has no finalized instances");
     }
 
+    if challenge_witness.witness.input_labels.len() != GC_INPUT_WIRES {
+        bail!(
+            "challenge witness has {} input labels; expected {GC_INPUT_WIRES}",
+            challenge_witness.witness.input_labels.len()
+        );
+    }
     let base_input_labels: Vec<S> =
         challenge_witness.witness.input_labels.iter().map(|&b| S(b)).collect();
     let pi1_full_labels = base_input_labels[..2 * N_PADDED].to_vec();

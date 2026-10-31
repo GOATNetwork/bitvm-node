@@ -1,4 +1,6 @@
 use crate::middleware::behaviour::AllBehavioursEvent;
+use crate::middleware::get_graph::{GetGraphRequest, GetGraphResponse};
+use crate::middleware::publisher::PendingGraphRequests;
 use crate::middleware::{AllBehaviours, split_topic_name};
 use crate::{env, middleware};
 use anyhow::bail;
@@ -7,21 +9,24 @@ use bitvm_lib::actors::Actor;
 use futures::StreamExt;
 use libp2p::gossipsub::MessageId;
 use libp2p::multiaddr::Protocol;
+use libp2p::request_response;
+use libp2p::request_response::ResponseChannel;
 use libp2p::swarm::SwarmEvent;
+use libp2p::swarm::dial_opts::{DialOpts, PeerCondition};
 use libp2p::{Multiaddr, PeerId, Swarm, gossipsub, kad, noise, tcp, yamux};
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::registry::Registry;
 use std::collections::HashMap;
 
 use std::net::Ipv4Addr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::select;
 use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use zeroize::Zeroizing;
 
-pub struct BitvmSwarmWrapper(pub Swarm<AllBehaviours>);
+pub struct BitvmSwarmWrapper(pub Swarm<AllBehaviours>, Option<super::publisher::NetworkPublisher>);
 
 impl std::fmt::Debug for BitvmSwarmWrapper {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -31,7 +36,11 @@ impl std::fmt::Debug for BitvmSwarmWrapper {
 
 impl BitvmSwarmWrapper {
     pub fn new(swarm: Swarm<AllBehaviours>) -> Self {
-        Self(swarm)
+        Self(swarm, None)
+    }
+
+    pub fn publisher(&self) -> super::publisher::NetworkPublisher {
+        self.1.clone().expect("network manager owns the publish command receiver")
     }
 
     pub fn inner(&self) -> &Swarm<AllBehaviours> {
@@ -67,11 +76,16 @@ pub enum TickMessageType {
 
 #[allow(async_fn_in_trait)]
 pub trait P2pMessageHandler {
+    /// Handle received gossip and report one verdict for `id` and `propagation_source`.
+    /// `sequence_number` is signed by the author.
+    #[allow(clippy::too_many_arguments)]
     async fn recv_and_dispatch(
         &self,
         swarm: &mut BitvmSwarmWrapper,
         actor: Actor,
         from_peer_id: PeerId,
+        propagation_source: PeerId,
+        sequence_number: Option<u64>,
         id: MessageId,
         message: &[u8],
     ) -> anyhow::Result<()>;
@@ -90,6 +104,23 @@ pub trait P2pMessageHandler {
         actor: Actor,
         topic: &str,
     ) -> anyhow::Result<()>;
+
+    async fn graceful_shutdown(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Take a direct `GetGraph` request off the network loop: admit it and
+    /// answer later through `publisher`, or hand the channel back for an
+    /// immediate refusal. The default refuses.
+    fn serve_graph_request(
+        &self,
+        _peer: PeerId,
+        _request: GetGraphRequest,
+        channel: ResponseChannel<GetGraphResponse>,
+        _publisher: super::publisher::NetworkPublisher,
+    ) -> Option<ResponseChannel<GetGraphResponse>> {
+        Some(channel)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -102,12 +133,25 @@ pub struct BitvmSwarmConfig {
     pub regular_task_interval: u64,
 }
 
+/// A bootnode whose last connection closed is re-dialled after this delay, then
+/// every `BOOTNODE_REDIAL_RETRY` until it is connected again: libp2p does not
+/// reconnect on its own and the periodic Kademlia bootstrap only runs every
+/// five minutes.
+const BOOTNODE_REDIAL_DELAY: Duration = Duration::from_secs(5);
+const BOOTNODE_REDIAL_RETRY: Duration = Duration::from_secs(20);
+const BOOTNODE_REDIAL_TICK: Duration = Duration::from_secs(5);
+
 pub struct BitvmNetworkManager {
     config: BitvmSwarmConfig,
     peer_id: PeerId,
     swarm: BitvmSwarmWrapper,
     connected_peers: Gauge,
     required_topics_healthy: Gauge,
+    publish_commands: tokio::sync::mpsc::Receiver<super::publisher::PublishCommand>,
+    pending_graph_requests: PendingGraphRequests,
+    bootnodes: Vec<(PeerId, Multiaddr)>,
+    /// Disconnected bootnodes and when to dial them next.
+    bootnode_redials: HashMap<PeerId, Instant>,
 }
 impl BitvmNetworkManager {
     pub fn new(
@@ -141,21 +185,64 @@ impl BitvmNetworkManager {
             .build();
 
         debug!("bootnodes: {:?}", config.bootnodes);
+        let mut bootnodes = Vec::with_capacity(config.bootnodes.len());
         for peer in &config.bootnodes {
             let (peer_id, multi_addr) = parse_boot_node_str(peer)?;
-            swarm.behaviour_mut().kademlia.add_address(&peer_id, multi_addr);
+            swarm.behaviour_mut().kademlia.add_address(&peer_id, multi_addr.clone());
+            bootnodes.push((peer_id, multi_addr));
         }
+        let (publisher, publish_commands) = super::publisher::channel();
         Ok(BitvmNetworkManager {
             config,
-            swarm: BitvmSwarmWrapper::new(swarm),
+            swarm: BitvmSwarmWrapper(swarm, Some(publisher)),
             peer_id: key_pair.public().to_peer_id(),
             connected_peers,
             required_topics_healthy,
+            publish_commands,
+            pending_graph_requests: PendingGraphRequests::new(),
+            bootnodes,
+            bootnode_redials: HashMap::new(),
         })
+    }
+
+    fn is_bootnode(&self, peer_id: &PeerId) -> bool {
+        self.bootnodes.iter().any(|(id, _)| id == peer_id)
+    }
+
+    /// Dials every bootnode whose redial is due and still disconnected.
+    fn redial_bootnodes(&mut self) {
+        let now = Instant::now();
+        for (peer_id, address) in self.bootnodes.clone() {
+            if self.swarm.is_connected(&peer_id) {
+                self.bootnode_redials.remove(&peer_id);
+                continue;
+            }
+            if self.bootnode_redials.get(&peer_id).is_none_or(|due| *due > now) {
+                continue;
+            }
+            let opts = DialOpts::peer_id(peer_id)
+                .addresses(vec![address])
+                .condition(PeerCondition::Disconnected)
+                .build();
+            match self.swarm.dial(opts) {
+                Ok(()) => info!(
+                    event = "p2p_bootnode_redial",
+                    peer_id = %peer_id,
+                    "re-dialling a disconnected bootnode"
+                ),
+                Err(error) => debug!(%peer_id, %error, "bootnode redial not started"),
+            }
+            self.bootnode_redials.insert(peer_id, now + BOOTNODE_REDIAL_RETRY);
+        }
     }
 
     pub fn get_peer_id_string(&self) -> String {
         self.peer_id.to_string()
+    }
+
+    /// Bounded publisher handle for tasks that send through the swarm.
+    pub fn publisher(&self) -> super::publisher::NetworkPublisher {
+        self.swarm.publisher()
     }
 
     fn refresh_required_topics_health(&self, actor: &Actor) {
@@ -189,15 +276,27 @@ impl BitvmNetworkManager {
             .collect::<HashMap<String, _>>();
         self.refresh_required_topics_health(&actor);
 
+        // P2P listen interface is configurable (default 0.0.0.0 = unchanged behaviour). Setting
+        // P2P_LISTEN_IP=127.0.0.1 keeps the p2p port bound to loopback only (required when the node
+        // runs on a shared host); in that case we must NOT skip the loopback NewListenAddr below,
+        // otherwise the swarm task hangs forever waiting for a non-loopback listen address.
+        let listen_ip = std::env::var("P2P_LISTEN_IP")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| "0.0.0.0".to_string());
+        let allow_loopback = matches!(listen_ip.as_str(), "127.0.0.1" | "localhost");
         if self.config.p2p_port > 0 {
-            self.swarm.listen_on(format!("/ip4/0.0.0.0/tcp/{}", self.config.p2p_port).parse()?)?;
+            self.swarm
+                .listen_on(format!("/ip4/{}/tcp/{}", listen_ip, self.config.p2p_port).parse()?)?;
         } else {
-            self.swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
+            self.swarm.listen_on(format!("/ip4/{}/tcp/0", listen_ip).parse()?)?;
         }
 
         let address = loop {
             if let SwarmEvent::NewListenAddr { address, .. } = self.swarm.select_next_some().await {
-                if address.iter().any(|e| e == Protocol::Ip4(Ipv4Addr::LOCALHOST)) {
+                if !allow_loopback
+                    && address.iter().any(|e| e == Protocol::Ip4(Ipv4Addr::LOCALHOST))
+                {
                     debug!("Ignoring localhost address to make sure the example works in Firefox");
                     continue;
                 }
@@ -208,17 +307,36 @@ impl BitvmNetworkManager {
         info!("multi_addr: {}/p2p/{}", address.to_string(), self.peer_id.to_string());
         let mut heart_beat_interval = interval(Duration::from_secs(self.config.heartbeat_interval));
         let mut interval = interval(Duration::from_secs(self.config.regular_task_interval));
+        // Use Delay ticks and coalesced worker notifications.
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut redial_interval = tokio::time::interval(BOOTNODE_REDIAL_TICK);
+        redial_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             select! {
+                    Some(command) = self.publish_commands.recv() => {
+                        command.execute(&mut self.swarm, &mut self.pending_graph_requests);
+                    }
+                    _ = redial_interval.tick() => {
+                        if !self.bootnode_redials.is_empty() {
+                            self.redial_bootnodes();
+                        }
+                    }
                     _ = cancellation_token.cancelled() => {
                         info!("Swarm received shutdown signal");
+                        msg_handler.graceful_shutdown().await?;
                         return Ok("swarm_shutdown".to_string());
                     }
 
-                    _ticker = interval.tick() => {
+                    _ = interval.tick() => {
                         match msg_handler.handle_tick_message(&mut self.swarm, self.peer_id, actor.clone(), TickMessageType::RegularlyAction).await {
                                 Ok(_) => {}
-                                Err(e) => { tracing::error!("Fail to handle tick message {e:?}") }
+                                Err(e) => {
+                                    tracing::error!("Fail to handle tick message {e:?}");
+                                    if cancellation_token.is_cancelled() {
+                                        msg_handler.graceful_shutdown().await?;
+                                        return Err(e);
+                                    }
+                                }
                             }
                         self.refresh_required_topics_health(&actor);
 
@@ -244,7 +362,7 @@ impl BitvmNetworkManager {
                             let data_prefix = hex::encode(&message.data[..message.data.len().min(16)]);
                             let data_starts_with_goatbin = message.data.starts_with(b"GOATBIN1");
                             match msg_handler.recv_and_dispatch(&mut self.swarm, actor.clone(),
-                                source, id.clone(), &message.data).await {
+                                source, propagation_source, message.sequence_number, id.clone(), &message.data).await {
                                 Ok(_) => {},Err(e) => {
                                     tracing::error!(
                                         error = ?e,
@@ -255,7 +373,11 @@ impl BitvmNetworkManager {
                                         data_prefix,
                                         data_starts_with_goatbin,
                                         "Fail to handle p2p message"
-                                    )
+                                    );
+                                    if cancellation_token.is_cancelled() {
+                                        msg_handler.graceful_shutdown().await?;
+                                        return Err(e);
+                                    }
                             }
                         }
                         }
@@ -290,6 +412,32 @@ impl BitvmNetworkManager {
                         SwarmEvent::Behaviour(AllBehavioursEvent::Gossipsub(gossipsub::Event::Unsubscribed { peer_id, topic})) => {
                             debug!("unsubscribed: {:?}, {:?}", peer_id, topic);
                         }
+                        SwarmEvent::Behaviour(AllBehavioursEvent::GetGraph(request_response::Event::Message { peer, message, .. })) => {
+                            match message {
+                                request_response::Message::Request { request, channel, .. } => {
+                                    let publisher = self.swarm.publisher();
+                                    if let Some(channel) = msg_handler.serve_graph_request(peer, request, channel, publisher)
+                                        && self.swarm.behaviour_mut().get_graph.send_response(channel, GetGraphResponse::not_found()).is_err()
+                                    {
+                                        debug!(%peer, "GetGraph requester went away before the refusal");
+                                    }
+                                }
+                                request_response::Message::Response { request_id, response } => {
+                                    if let Some(reply) = self.pending_graph_requests.remove(&request_id) {
+                                        let _ = reply.send(Ok(response));
+                                    }
+                                }
+                            }
+                        }
+                        SwarmEvent::Behaviour(AllBehavioursEvent::GetGraph(request_response::Event::OutboundFailure { peer, request_id, error, .. })) => {
+                            if let Some(reply) = self.pending_graph_requests.remove(&request_id) {
+                                let _ = reply.send(Err(anyhow::anyhow!("GetGraph to {peer} failed: {error}")));
+                            }
+                        }
+                        SwarmEvent::Behaviour(AllBehavioursEvent::GetGraph(request_response::Event::InboundFailure { peer, error, .. })) => {
+                            debug!(%peer, %error, "GetGraph inbound request failed");
+                        }
+                        SwarmEvent::Behaviour(AllBehavioursEvent::GetGraph(request_response::Event::ResponseSent { .. })) => {}
                         SwarmEvent::Behaviour(AllBehavioursEvent::Kademlia(kad::Event::RoutingUpdated{ peer, addresses,..})) => {
                             debug!("routing updated: {:?}, addresses:{:?}", peer, addresses);
                         }
@@ -314,10 +462,17 @@ impl BitvmNetworkManager {
                         }
                         SwarmEvent::ConnectionEstablished {peer_id, connection_id, endpoint, .. } => {
                             self.connected_peers.set(self.swarm.connected_peers().count() as i64);
+                            if self.bootnode_redials.remove(&peer_id).is_some() {
+                                info!(event = "p2p_bootnode_connected", peer_id = %peer_id, "bootnode connection restored");
+                            }
                             debug!("connected to {peer_id}: {connection_id}, endpoint: {:?}", endpoint);
                         }
-                        SwarmEvent::ConnectionClosed {peer_id, connection_id, .. } => {
+                        SwarmEvent::ConnectionClosed {peer_id, connection_id, num_established, cause, .. } => {
                             self.connected_peers.set(self.swarm.connected_peers().count() as i64);
+                            if num_established == 0 && self.is_bootnode(&peer_id) {
+                                self.bootnode_redials.insert(peer_id, Instant::now() + BOOTNODE_REDIAL_DELAY);
+                                info!(event = "p2p_bootnode_disconnected", peer_id = %peer_id, cause = ?cause, "lost the last connection to a bootnode; redial scheduled");
+                            }
                             debug!("disconnected from {peer_id}: {connection_id}");
                         }
                         e => {

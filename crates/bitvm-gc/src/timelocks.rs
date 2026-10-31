@@ -37,8 +37,11 @@ pub const NODE_SIGNET_TIMELOCK_CONFIG: TimelockConfig = TimelockConfig {
     operator_commit: 18,
     connector_f: 24,
 };
+/// Regtest keeps `connector_z` (T0) wide on purpose: the peg-in pre-signing
+/// ceremony and the abandon buffer are measured in blocks, and a one-block T0
+/// would expire every localnet peg-in before the committee finishes signing.
 pub const NODE_REGTEST_TIMELOCK_CONFIG: TimelockConfig = TimelockConfig {
-    connector_z: 1,
+    connector_z: 60,
     connector_a: 2,
     prover_connector: 1,
     connector_d: 3,
@@ -95,7 +98,9 @@ impl ProtocolTimingBudget {
         self.action_window().saturating_add(self.watchtower_proof_blocks)
     }
 
-    const fn confirmed_action_window(self) -> u32 {
+    /// Blocks needed for already-broadcast evidence to confirm and settle:
+    /// evidence depth plus inclusion plus reorg safety.
+    pub const fn confirmed_action_window(self) -> u32 {
         self.evidence_confirmations
             .saturating_add(self.inclusion_blocks)
             .saturating_add(self.safety_blocks)
@@ -143,6 +148,28 @@ pub fn protocol_timing_budget(network: Network) -> ProtocolTimingBudget {
     }
 }
 
+/// Regtest's timing budget has no confirmation, inclusion, or safety blocks, so
+/// its `confirmed_action_window` is zero; the peg-in abandon buffer needs a
+/// non-zero floor there so a Peg-In-Confirm broadcast right before T0 still
+/// gets a few blocks to land before the instance is abandoned.
+pub const NODE_REGTEST_PEGIN_ABANDON_BUFFER_BLOCKS: u32 = 6;
+
+/// Default peg-in abandon buffer, in blocks after `Prepare height + connector_z` (T0).
+///
+/// Between T0 and the end of this buffer no node signs or broadcasts for the
+/// instance; it only follows the chain. Once the buffer has elapsed and the
+/// Peg-In-Confirm is neither confirmed nor visible in the mempool, the peg-in
+/// is abandoned (`Timeout`). Defaults to the network's `confirmed_action_window`
+/// (evidence + inclusion + safety), with a fixed floor on regtest.
+pub fn default_pegin_abandon_buffer_blocks(network: Network) -> u32 {
+    match network {
+        Network::Regtest => NODE_REGTEST_PEGIN_ABANDON_BUFFER_BLOCKS,
+        Network::Bitcoin | Network::Testnet | Network::Testnet4 | Network::Signet => {
+            protocol_timing_budget(network).confirmed_action_window()
+        }
+    }
+}
+
 pub fn validate_timelock_config(network: Network, config: &TimelockConfig) -> Result<()> {
     let budget = protocol_timing_budget(network);
     for (name, value) in [
@@ -155,6 +182,7 @@ pub fn validate_timelock_config(network: Network, config: &TimelockConfig) -> Re
         ("operator_commit", config.operator_commit),
         ("connector_f", config.connector_f),
     ] {
+        ensure_bip68_height_based_sequence(name, value)?;
         if value < budget.reaction_blocks {
             bail!(
                 "timelock_config.{name} must be at least {} reaction blocks, got {value}",
@@ -207,6 +235,17 @@ pub fn validate_timelock_config(network: Network, config: &TimelockConfig) -> Re
         budget.confirmed_action_window(),
     )?;
 
+    Ok(())
+}
+
+const BIP68_BLOCKS_MASK: u32 = 0x0000_ffff;
+
+fn ensure_bip68_height_based_sequence(name: &str, value: u32) -> Result<()> {
+    if value & !BIP68_BLOCKS_MASK != 0 {
+        bail!(
+            "timelock_config.{name} must use a BIP68 height-based sequence value, got {value:#010x}"
+        );
+    }
     Ok(())
 }
 
@@ -289,6 +328,41 @@ mod tests {
         ] {
             assert_eq!(default_timelock_config(network), config);
             validate_timelock_config(network, &config).unwrap();
+        }
+    }
+
+    #[test]
+    fn pegin_abandon_buffer_defaults_are_non_zero_confirmed_action_windows() {
+        for (network, expected) in [
+            (Network::Bitcoin, 18),
+            (Network::Testnet, 14),
+            (Network::Testnet4, 14),
+            (Network::Signet, 3),
+            (Network::Regtest, NODE_REGTEST_PEGIN_ABANDON_BUFFER_BLOCKS),
+        ] {
+            let buffer = default_pegin_abandon_buffer_blocks(network);
+            assert_eq!(buffer, expected, "{network:?}");
+            assert!(buffer > 0, "{network:?} abandon buffer must not be zero");
+            if network != Network::Regtest {
+                assert_eq!(buffer, protocol_timing_budget(network).confirmed_action_window());
+            }
+        }
+    }
+
+    #[test]
+    fn regtest_connector_z_leaves_room_for_presigning_and_abandon_buffer() {
+        let connector_z = default_connector_z_timelock_blocks(Network::Regtest);
+        assert_eq!(connector_z, 60);
+        assert!(connector_z > default_pegin_abandon_buffer_blocks(Network::Regtest));
+    }
+
+    #[test]
+    fn rejects_non_height_based_bip68_sequences() {
+        assert!(ensure_bip68_height_based_sequence("test", BIP68_BLOCKS_MASK).is_ok());
+
+        for invalid in [1 << 16, 1 << 22, 1 << 31] {
+            let error = ensure_bip68_height_based_sequence("test", invalid).unwrap_err();
+            assert!(error.to_string().contains("BIP68 height-based sequence"));
         }
     }
 }

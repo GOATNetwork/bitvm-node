@@ -1,0 +1,130 @@
+# Localnet infrastructure. Every name derives from COMPOSE_PROJECT, every port from PORT_BASE and all
+# data lives under LOCALNET_DATA/data, so two localnets can share one host. Always drive it through
+# scripts/*.sh (they export the variables from scripts/localnet.env and pass -p "$COMPOSE_PROJECT").
+# Ports bind 127.0.0.1 only; containers run as the invoking uid so the data dirs stay owned by you.
+
+x-user: &user "${LOCALNET_UID:-1000}:${LOCALNET_GID:-1000}"
+
+services:
+  bitcoind:
+    image: ${BITCOIND_IMAGE:-bitcoin/bitcoin:29}
+    container_name: ${COMPOSE_PROJECT:-bvlocal}-bitcoind
+    user: *user
+    entrypoint: ["bitcoind"]
+    command:
+      - -regtest=1
+      - -datadir=/bitcoin
+      - -server=1
+      - -txindex=1
+      - -acceptnonstdtxn=1
+      - -fallbackfee=0.0002
+      - -rpcbind=0.0.0.0
+      - -rpcallowip=0.0.0.0/0
+      - -rpcuser=bvlocal
+      - -rpcpassword=bvlocal
+      - -printtoconsole=1
+    ports:
+      - "127.0.0.1:${BTC_RPC_PORT:-22443}:18443"
+    volumes:
+      - ${LOCALNET_DATA:?}/data/bitcoin:/bitcoin
+    networks: [localnet]
+    restart: "no"
+
+  electrs:
+    image: ${ELECTRS_IMAGE:-mempool/electrs:latest}
+    container_name: ${COMPOSE_PROJECT:-bvlocal}-electrs
+    user: *user
+    entrypoint: ["electrs"]
+    command:
+      - --network=regtest
+      - --daemon-rpc-addr=bitcoind:18443
+      - --daemon-dir=/bitcoin
+      - --db-dir=/electrs
+      - --http-addr=0.0.0.0:3002
+      - --cookie=bvlocal:bvlocal
+      - --jsonrpc-import
+      - -v
+    ports:
+      - "127.0.0.1:${ESPLORA_PORT:-22002}:3002"
+    volumes:
+      - ${LOCALNET_DATA:?}/data/bitcoin:/bitcoin:ro
+      - ${LOCALNET_DATA:?}/data/electrs:/electrs
+    depends_on: [bitcoind]
+    networks: [localnet]
+    restart: "no"
+
+  anvil:
+    image: ${FOUNDRY_IMAGE:-ghcr.io/foundry-rs/foundry:stable}
+    container_name: ${COMPOSE_PROJECT:-bvlocal}-anvil
+    user: *user
+    entrypoint: ["anvil"]
+    command:
+      - --host=0.0.0.0
+      - --port=8545
+      - --chain-id=${ANVIL_CHAIN_ID:-48816}
+      - --block-time=${ANVIL_BLOCK_TIME:-2}
+      - --accounts=20
+      - --balance=1000000
+      - --state=/anvil/state.json
+      - --state-interval=30
+    ports:
+      - "127.0.0.1:${ANVIL_PORT:-22545}:8545"
+    volumes:
+      - ${LOCALNET_DATA:?}/data/anvil:/anvil
+    networks: [localnet]
+    restart: "no"
+
+  postgres:
+    image: ${POSTGRES_IMAGE:-postgres:16}
+    container_name: ${COMPOSE_PROJECT:-bvlocal}-postgres
+    user: *user
+    command: ["postgres", "-cshared_preload_libraries=pg_stat_statements", "-cmax_connections=200"]
+    environment:
+      POSTGRES_USER: graph-node
+      POSTGRES_PASSWORD: let-me-in
+      POSTGRES_DB: graph-node
+      PGDATA: /var/lib/postgresql/data/pgdata
+      POSTGRES_INITDB_ARGS: "-E UTF8 --locale=C"
+    volumes:
+      - ${LOCALNET_DATA:?}/data/postgres:/var/lib/postgresql/data
+    networks: [localnet]
+    restart: "no"
+
+  ipfs:
+    image: ${IPFS_IMAGE:-ipfs/kubo:v0.17.0}
+    container_name: ${COMPOSE_PROJECT:-bvlocal}-ipfs
+    user: *user
+    environment:
+      IPFS_PATH: /data/ipfs
+    ports:
+      - "127.0.0.1:${IPFS_PORT:-22501}:5001"
+    volumes:
+      - ${LOCALNET_DATA:?}/data/ipfs:/data/ipfs
+    networks: [localnet]
+    restart: "no"
+
+  graph-node:
+    image: ${GRAPH_NODE_IMAGE:-graphprotocol/graph-node:latest}
+    container_name: ${COMPOSE_PROJECT:-bvlocal}-graph-node
+    ports:
+      - "127.0.0.1:${GRAPH_QUERY_PORT:-22800}:8000"
+      - "127.0.0.1:${GRAPH_ADMIN_PORT:-22820}:8020"
+      - "127.0.0.1:${GRAPH_INDEX_PORT:-22830}:8030"
+      - "127.0.0.1:${GRAPH_METRICS_PORT:-22840}:8040"
+    depends_on: [postgres, ipfs, anvil]
+    environment:
+      postgres_host: postgres
+      postgres_user: graph-node
+      postgres_pass: let-me-in
+      postgres_db: graph-node
+      ipfs: "ipfs:5001"
+      ethereum: "goat-local:http://anvil:8545"
+      ETHEREUM_POLLING_INTERVAL: "1000"
+      GRAPH_LOG: info
+    networks: [localnet]
+    restart: "no"
+
+networks:
+  localnet:
+    name: ${COMPOSE_PROJECT:-bvlocal}-net
+    driver: bridge

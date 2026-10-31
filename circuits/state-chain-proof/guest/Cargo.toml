@@ -1,6 +1,5 @@
-[workspace]
 [package]
-name = "guest"
+name = "state-chain-guest"
 version = "1.1.0"
 edition = "2021"
 publish = false
@@ -8,10 +7,10 @@ publish = false
 [dependencies]
 bincode = "1.3.3"
 # workspace
-state-chain = { path = "../../../crates/state-chain" }
+state-chain = { path = "../../crates/state-chain" }
 
 # Ziren
-zkm-zkvm = { git = "https://github.com/ProjectZKM/Ziren", tag = "v1.2.7", features = ["verify"] }
+zkm-zkvm = { git = "https://github.com/ProjectZKM/Ziren", features = ["verify"] }
 #zkm-zkvm = { path = "../../../Ziren/crates/zkvm/entrypoint", features = ["verify"] }
 
 # Statically turns off logging
@@ -20,19 +19,6 @@ tracing = { version = "0.1", features = ["max_level_trace"] }
 alloy-primitives = { version = "1.0.0", default-features = false, features = ["sha3-keccak", "map-foldhash", "serde"] }
 sha2 = "0.10.9"
 
-
-[patch.crates-io]
-# Precompile patches
-sha2 = { git = "https://github.com/ziren-patches/RustCrypto-hashes", branch = "patch-sha2-0.10.9", package = "sha2" }
-bn = { git = "https://github.com/ziren-patches/bn", branch = "patch-0.6.0", package = "substrate-bn" }
-k256 = { git = "https://github.com/ziren-patches/elliptic-curves", branch = "patch-k256-0.13.4" }
-p256 = { git = "https://github.com/ziren-patches/elliptic-curves", branch = "patch-p256-0.13.2" }
-alloy-primitives-v1-0-0 = { git = "https://github.com/ziren-patches/core.git", package = "alloy-primitives", branch = "patch-alloy-primitives-1.0.0" }
-alloy-primitives-v1-1-0 = { git = "https://github.com/ziren-patches/core.git", package = "alloy-primitives", branch = "patch-alloy-primitives-1.1.0" }
-alloy-primitives-v1-1-2 = { git = "https://github.com/ziren-patches/core.git", package = "alloy-primitives", branch = "patch-alloy-primitives-1.1.2" }
-alloy-primitives-v1-4-1 = { git = "https://github.com/ziren-patches/core.git", package = "alloy-primitives", branch = "patch-alloy-primitives-1.4.1" }
-secp256k1-v0-29-1 = { git = "https://github.com/ziren-patches/rust-secp256k1", package = "secp256k1", branch = "patch-0.29.1" }
-#secp256k1-v0-30-0 = { git = "https://github.com/ziren-patches/rust-secp256k1", package = "secp256k1", branch = "patch-0.30.0" }
 
 [features]
 imm-wrap-vk = ["zkm-zkvm/imm-wrap-vk", "state-chain/imm-wrap-vk"]

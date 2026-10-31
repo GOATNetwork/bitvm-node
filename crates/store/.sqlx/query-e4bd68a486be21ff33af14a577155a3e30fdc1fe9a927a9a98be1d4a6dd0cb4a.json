@@ -57,12 +57,24 @@
         "name": "updated_at",
         "ordinal": 10,
         "type_info": "Integer"
+      },
+      {
+        "name": "binding_sig",
+        "ordinal": 11,
+        "type_info": "Text"
+      },
+      {
+        "name": "binding_issued_at",
+        "ordinal": 12,
+        "type_info": "Integer"
       }
     ],
     "parameters": {
       "Right": 1
     },
     "nullable": [
+      false,
+      false,
       false,
       false,
       false,

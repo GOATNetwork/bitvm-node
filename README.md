@@ -9,6 +9,8 @@ GOAT Network's BitVM bridge implementation. See [GOAT BitVM Whitepaper](https://
 - `proof-builder-rpc/`: RPC server for offloading proof generation to a separate process
 - `crates/`: Shared Rust crates for common types and utilities
 - `deployment`: Deployment scripts and documentation
+- `scripts/ops/`: Read-only operator helpers for a running node (health triage, log queries, instance / graph traces)
+- `localnet/`: clone-and-run mock testnet (five `mock-gc` nodes on regtest + anvil + graph-node) and the on-demand e2e suite, see [localnet/README.md](localnet/README.md); `make localnet-reset`, `make e2e-smoke`
 
 
 ## Formal verification (TLA+)
@@ -77,10 +79,10 @@ java -jar ~/.local/share/tlaplus/tla2tools.jar -config <Spec>.cfg <Spec>.tla
 | `Take1ChallengeRace.tla` | `Take1ChallengeRace.cfg` | **pre-fix code (historical)** | **fails, by design**: `connector_a` (Take1 vs. Challenge) had *no* margin check anywhere in `validate_timelock_config`; on Regtest the pre-fix shipped value gave a challenger exactly zero reaction margin - fixed in `991faaa` |
 | `Take1ChallengeRace.tla` | `Take1ChallengeRaceFixed.cfg` | fix design (**applied in `991faaa`**) | pass - the missing margin check (mirroring Finding 4's floor) was added, closing the gap |
 | `VerifierKickoffFailOpen.tla` | `VerifierKickoffFailOpen.cfg` | **pre-fix code (historical)** | **fails, by design**: issue #429 - the verifier consumed `KickoffSent` while GOAT SPV lagged the kickoff and never retried, so no Challenge was sent - fixed in #455 |
-| `VerifierKickoffFailOpen.tla` | `VerifierKickoffFailOpenFixed.cfg` | fix design (**applied in #455**) | pass - deferring the message until SPV catches up guarantees the Challenge fires before Take1 |
+| `VerifierKickoffFailOpen.tla` | `VerifierKickoffFailOpenFixed.cfg` | fix design (**applied in #455**) | pass - deferring the message until SPV catches up makes the Challenge fire before Take1, provided SPV catches up before `connector_a` expires (a fairness assumption of the model; a SPV lag longer than `connector_a` is not modeled) |
 | `KickoffScanCoverage.tla` | `KickoffScanCoverage.cfg` | **pre-fix code (historical)** | **fails, by design**: issue #431 - `detect_kickoff` watched only the lowest-nonce graph per operator, so a kickoff on a later graph was never observed - fixed in #451 |
-| `KickoffScanCoverage.tla` | `KickoffScanCoverageResidual.cfg` | **pre-fix code (historical)** | **fails, by design**: #451's chain walk was capped at 32 successors, so a kickoff deeper than that escaped a single round - fixed by removing the cap and running the scan as its own task |
-| `KickoffScanCoverage.tla` | `KickoffScanCoverageFixed.cfg` | fix design (**current code**) | pass - the uncapped walk from the root reaches every graph on the confirmed pre-kickoff chain |
+| `KickoffScanCoverage.tla` | `KickoffScanCoverageResidual.cfg` | **pre-fix code (historical)** | **fails, by design**: #451's chain walk was capped at 32 successors, so a kickoff deeper than that escaped a single round - fixed by #476, whose `scan_graphs_on_chain` visits every monitored graph |
+| `KickoffScanCoverage.tla` | `KickoffScanCoverageFixed.cfg` | fix design (**current code**) | pass - every graph on the confirmed pre-kickoff chain is reached, with no depth cap (since #476: a round-robin over all monitored graphs, `node/src/aggregates/graph_scan.rs`) |
 | `MultiActorRace.tla` | `MultiActorRace.cfg` | verification (no bug; still holds under real shipped values) | pass - also confirms `operator_commit`'s margin against the shared `ConnectorF` UTXO (the `OperatorCommitTimeoutTransaction` path, `ConnectorF` leaf 1's second spender) holds, closing a gap where only a scalar Rust check existed |
 
 Additional standalone tools available in the jar if needed: SANY (parser/type-checker)

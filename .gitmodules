@@ -1,0 +1,3 @@
+[submodule "localnet/contracts"]
+	path = localnet/contracts
+	url = https://github.com/KSlashh/bitvm-L2-contracts.git

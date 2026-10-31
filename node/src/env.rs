@@ -1,5 +1,4 @@
-#![allow(dead_code)]
-use crate::action::NodeInfo;
+use crate::messages::NodeInfo;
 use alloy::primitives::Address as EvmAddress;
 use alloy::primitives::Address;
 use alloy::providers::{Provider, ProviderBuilder};
@@ -8,16 +7,20 @@ use base64::Engine;
 use bitcoin::{Network, PublicKey, key::Keypair};
 use bitvm_lib::actors::Actor;
 use bitvm_lib::keys::NodeMasterKey;
-use bitvm_lib::timelocks::{default_connector_z_timelock_blocks, estimated_block_interval_secs};
+use bitvm_lib::timelocks::{
+    default_connector_z_timelock_blocks, default_pegin_abandon_buffer_blocks,
+};
 use client::goat_chain::utils::{
     get_committee_management_contract, get_gateway_relay_contracts, is_validate_committee,
 };
 use client::goat_chain::{GoatInitConfig, GoatNetwork};
+use client::timeout_config::get_goat_rpc_timeout_secs;
 use libp2p::PeerId;
 use reqwest::Url;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::time::SystemTime;
 use strum::{Display, EnumString};
 use tracing::{info, warn};
 use util::hex_parse;
@@ -58,19 +61,13 @@ pub const ENV_BITVM_SECRET: &str = "BITVM_SECRET";
 pub const ENV_PEER_KEY: &str = "PEER_KEY";
 pub const ENV_PROOF_SEVER_URL: &str = "PROOF_SEVER_URL";
 pub const ENV_ACTOR: &str = "ACTOR";
-pub const ENV_IPFS_ENDPOINT: &str = "IPFS_ENDPOINT";
 pub const ENV_COMMITTEE_NUM: &str = "COMMITTEE_NUM";
 pub const ENV_MIN_REQUIRED_VERIFIER: &str = "MIN_REQUIRED_VERIFIER";
 pub const ENV_VERIFIER_CANDIDATE_BACKUP_COUNT: &str = "VERIFIER_CANDIDATE_BACKUP_COUNT";
 pub const ENV_VERIFIER_CANDIDATE_COLLECTION_WINDOW_SECS: &str =
     "VERIFIER_CANDIDATE_COLLECTION_WINDOW_SECS";
-pub const ENV_P2P_GRAPH_SETUP_RETRY_INTERVAL_SECS: &str = "P2P_GRAPH_SETUP_RETRY_INTERVAL_SECS";
-pub const ENV_P2P_GRAPH_SETUP_RETRY_WINDOW_SECS: &str = "P2P_GRAPH_SETUP_RETRY_WINDOW_SECS";
 pub const ENV_EXTERNAL_SOCKET_ADDR: &str = "EXTERNAL_SOCKET_ADDR";
 pub const COMMITTEE_INSTANCE_KEYS_DIR: &str = "cache/committee-instance-keys/";
-pub const SCRIPT_CACHE_FILE_NAME: &str = "cache/partial_script.bin";
-pub const ASSERT_COMMITS_CACHE_DIR: &str = "cache/assert_commits_cache/";
-pub const IPFS_GRAPH_CACHE_DIR: &str = "cache/graph_cache/";
 pub const DUST_AMOUNT: u64 = goat::transactions::base::DUST_AMOUNT;
 pub const MAX_CUSTOM_INPUTS: usize = 100;
 
@@ -78,8 +75,6 @@ pub const DEFAULT_CONFIRMATION_TARGET: u16 = 1;
 pub const DEFAULT_MIN_REQUIRED_VERIFIER: usize = 1;
 pub const DEFAULT_VERIFIER_CANDIDATE_BACKUP_COUNT: usize = 2;
 pub const DEFAULT_VERIFIER_CANDIDATE_COLLECTION_WINDOW_SECS: i64 = 15;
-pub const DEFAULT_P2P_GRAPH_SETUP_RETRY_INTERVAL_SECS: i64 = 10;
-pub const DEFAULT_P2P_GRAPH_SETUP_RETRY_WINDOW_SECS: i64 = 180;
 
 pub const ENV_BITCOIN_NETWORK: &str = "BITCOIN_NETWORK";
 pub const ENV_GOAT_NETWORK: &str = "GOAT_NETWORK";
@@ -90,61 +85,42 @@ pub const ENV_OPERATOR_VK_HASH: &str = "OPERATOR_VK_HASH";
 pub const ENV_OPERATOR_ZKM_VERSION: &str = "OPERATOR_ZKM_VERSION";
 pub const DEFAULT_WATCHTOWER_PROOF_WAIT_SECS: usize = 60;
 pub const DEFAULT_OPERATOR_PROOF_WAIT_SECS: usize = 60;
+// Only read by the real `get_babe_gc_asset_paths`; unused under `mock-gc`.
+#[cfg(not(feature = "mock-gc"))]
 pub const ENV_FGC_GATES_PATH: &str = "FGC_GATES_PATH";
+#[cfg(not(feature = "mock-gc"))]
 pub const ENV_FGC_OUT_INDICES_PATH: &str = "FGC_OUT_INDICES_PATH";
+#[cfg(not(feature = "mock-gc"))]
 pub const ENV_SGC_GATES_PATH: &str = "SGC_GATES_PATH";
+#[cfg(not(feature = "mock-gc"))]
 pub const ENV_SGC_OUT_INDICES_PATH: &str = "SGC_OUT_INDICES_PATH";
+#[cfg(not(feature = "mock-gc"))]
 pub const ENV_FGC_COMPACT_GATES_PATH: &str = "FGC_COMPACT_GATES_PATH";
+#[cfg(not(feature = "mock-gc"))]
 pub const ENV_FGC_COMPACT_OUT_INDICES_PATH: &str = "FGC_COMPACT_OUT_INDICES_PATH";
+#[cfg(not(feature = "mock-gc"))]
 pub const ENV_SGC_COMPACT_GATES_PATH: &str = "SGC_COMPACT_GATES_PATH";
+#[cfg(not(feature = "mock-gc"))]
 pub const ENV_SGC_COMPACT_OUT_INDICES_PATH: &str = "SGC_COMPACT_OUT_INDICES_PATH";
 pub const ENV_BABE_SETUP_STATE_DIR: &str = "BABE_SETUP_STATE_DIR";
 pub const ENV_SOLDERING_PROOF_PAYLOAD_STORE_PATH: &str = "SOLDERING_PROOF_PAYLOAD_STORE_PATH";
 
-pub const ENV_ALWAYS_CHALLENGE: &str = "ALWAYS_CHALLENGE";
 pub const ENV_GENESIS_SEQUENCER_COMMIT_TXID: &str = "GENESIS_SEQUENCER_COMMIT_TXID";
 pub const ENV_SEQUENCER_SET_MONITOR_START_COSMOS_BLOCK: &str =
     "SEQUENCER_SET_MONITOR_START_COSMOS_BLOCK";
 pub const ENV_COSMOS_RPC_URL: &str = "COSMOS_RPC_URL";
 pub const DEFAULT_COSMOS_RPC_URL: &str = "https://rpc.testnet3.goat.network/goat-rpc";
 
-// fee estimate
-// TODO: more precise fee estimation
-pub const CHEKSIG_P2WSH_INPUT_VBYTES: u64 = 100;
-pub const CHEKSIG_P2TR_INPUT_VBYTES: u64 = 100;
+// Conservative fee-reserve estimates, not exact serialized transaction sizes.
+pub const CHECKSIG_P2WSH_INPUT_VBYTES_ESTIMATE: u64 = 100;
 pub const P2WSH_OUTPUT_VBYTES: u64 = 50;
-pub const P2TR_OUTPUT_VBYTES: u64 = 50;
-pub const P2A_OUTPUT_VBYTES: u64 = 50;
 pub const PRE_KICKOFF_BASE_VBYTES: u64 = 300;
-pub const PEGIN_BASE_VBYTES: u64 = 300;
-pub const CHALLENGE_BASE_VBYTES: u64 = 300;
 pub const ANCHOR_CHILD_BASE_VBYTES: u64 = 200;
 
 // reduce costs to facilitate testing
-pub const MIN_SATKE_AMOUNT: u64 = 4_000_000; // 0.04 BTC
-pub const MIN_CHALLENGE_AMOUNT: u64 = 1_000_000; // 0.01 BTC
-pub const STAKE_RATE: u64 = 0; // 0%
-pub const CHALLENGE_RATE: u64 = 0; // 0%
-
-pub const RATE_MULTIPLIER: u64 = 10000;
-
-const COMMITTEE_MEMBER_NUMBER: usize = 2;
-
-pub const MESSAGE_BROADCAST_MAX_TIMES: i64 = 3;
-pub const MESSAGE_RESEND_INTERVAL_SECOND: i64 = 60 * 5;
-pub const MESSAGE_EXPIRE_TIME: i64 = 3600 * 24 * 15; // 15 days for test
-
-pub const MESSAGE_SAVE_INTERVAL_SECOND: i64 = 3600 * 24 * 3;
-
-pub const GRAPH_OPERATOR_DATA_UPLOAD_TIME_EXPIRED: i64 = 3600 * 48;
-
-pub const SYNC_GRAPH_INTERVAL: u64 = 3;
-pub const SYNC_GRAPH_MAX_WAIT_SECS: u64 = 30;
 
 // use to judge load history event thread is dead
 pub const LOAD_HISTORY_EVENT_NO_WOKING_MAX_SECS: i64 = 600;
-
-pub const GATEWAY_RATE_MULTIPLIER: u64 = 10000;
 
 pub const HEARTBEAT_INTERVAL_SECOND: u64 = 60 * 5;
 pub const REGULAR_TASK_INTERVAL_SECOND: u64 = 20;
@@ -153,10 +129,31 @@ pub const ENV_INSTANCE_MAINTENANCE_BATCH_SIZE: &str = "INSTANCE_MAINTENANCE_BATC
 pub const DEFAULT_INSTANCE_MAINTENANCE_BATCH_SIZE: u32 = 50;
 pub const ENV_MAINTENANCE_RUN_TIMEOUT_SECS: &str = "MAINTENANCE_RUN_TIMEOUT_SECS";
 pub const DEFAULT_MAINTENANCE_RUN_TIMEOUT_SECS: u64 = 60;
-pub const ENV_P2P_INBOX_BATCH_SIZE: &str = "P2P_INBOX_BATCH_SIZE";
-pub const DEFAULT_P2P_INBOX_BATCH_SIZE: i64 = 16;
-pub const ENV_P2P_OUTBOX_BATCH_SIZE: &str = "P2P_OUTBOX_BATCH_SIZE";
-pub const DEFAULT_P2P_OUTBOX_BATCH_SIZE: i64 = 16;
+/// Maximum decoded JSON gossip size.
+pub const ENV_P2P_MAX_JSON_MESSAGE_BYTES: &str = "P2P_MAX_JSON_MESSAGE_BYTES";
+pub const DEFAULT_P2P_MAX_JSON_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
+/// Ceiling on the payload bytes queued in the durable P2P inbox. The per-class
+/// and per-sender quotas are derived from it, see `p2p_admission::InboundLimits`.
+pub const ENV_P2P_INBOX_MAX_QUEUED_BYTES: &str = "P2P_INBOX_MAX_QUEUED_BYTES";
+pub const DEFAULT_P2P_INBOX_MAX_QUEUED_BYTES: i64 = 2 * 1024 * 1024 * 1024;
+/// Ceilings on libp2p connections. Inbound only: outgoing dials stay unlimited.
+/// Keep the inbound ceiling well below the process file descriptor limit.
+pub const ENV_P2P_MAX_INCOMING_CONNECTIONS: &str = "P2P_MAX_INCOMING_CONNECTIONS";
+pub const DEFAULT_P2P_MAX_INCOMING_CONNECTIONS: u32 = 512;
+/// Inbound slots, out of `P2P_MAX_INCOMING_CONNECTIONS`, only registered peers
+/// may take.
+pub const ENV_P2P_INBOUND_REGISTERED_RESERVE: &str = "P2P_INBOUND_REGISTERED_RESERVE";
+pub const DEFAULT_P2P_INBOUND_REGISTERED_RESERVE: u32 = 128;
+/// Comma-separated peer IDs eligible for reserved inbound capacity.
+/// Does not grant registration, message quota or ban exemption.
+pub const ENV_P2P_RESERVED_PEERS: &str = "P2P_RESERVED_PEERS";
+/// Comma-separated `<peer id>=<operator master public key>` bindings.
+/// Stake is verified on chain at startup.
+pub const ENV_P2P_TRUSTED_OPERATOR_BINDINGS: &str = "P2P_TRUSTED_OPERATOR_BINDINGS";
+pub const ENV_P2P_MAX_PENDING_INCOMING_CONNECTIONS: &str = "P2P_MAX_PENDING_INCOMING_CONNECTIONS";
+pub const DEFAULT_P2P_MAX_PENDING_INCOMING_CONNECTIONS: u32 = 128;
+pub const ENV_P2P_MAX_CONNECTIONS_PER_PEER: &str = "P2P_MAX_CONNECTIONS_PER_PEER";
+pub const DEFAULT_P2P_MAX_CONNECTIONS_PER_PEER: u32 = 4;
 pub const ENV_ENABLE_COMMITTEE_INSTANCE_KEY_DELETE: &str = "ENABLE_COMMITTEE_INSTANCE_KEY_DELETE";
 pub const DEFAULT_ENABLE_COMMITTEE_INSTANCE_KEY_DELETE: bool = false;
 pub const ENV_COMMITTEE_INSTANCE_KEY_DELETE_TIMELOCK_BLOCKS: &str =
@@ -179,10 +176,27 @@ pub fn get_network() -> Network {
     }
 }
 
-pub fn get_instance_presigned_time_expired_secs() -> i64 {
-    let network = get_network();
-    let connector_z_blocks = default_connector_z_timelock_blocks(network) as i64;
-    estimated_block_interval_secs(network) * connector_z_blocks * 2 / 3
+pub const ENV_PEGIN_ABANDON_BUFFER_BLOCKS: &str = "PEGIN_ABANDON_BUFFER_BLOCKS";
+pub const ENV_OPERATOR_GRAPH_START_CUTOFF_BLOCKS: &str = "OPERATOR_GRAPH_START_CUTOFF_BLOCKS";
+
+/// `B`, the peg-in abandon buffer in blocks after `Prepare height + T0`. Defaults to the
+/// network's confirmed-action window.
+pub fn get_pegin_abandon_buffer_blocks() -> i64 {
+    std::env::var(ENV_PEGIN_ABANDON_BUFFER_BLOCKS)
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .map(|blocks| blocks.clamp(1, 100_000))
+        .unwrap_or_else(|| i64::from(default_pegin_abandon_buffer_blocks(get_network())))
+}
+
+/// Local operator policy: no new graph for an instance once the tip is past
+/// `Prepare height + cutoff`. Defaults to two thirds of `T0`.
+pub fn get_operator_graph_start_cutoff_blocks() -> i64 {
+    std::env::var(ENV_OPERATOR_GRAPH_START_CUTOFF_BLOCKS)
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .map(|blocks| blocks.clamp(0, 100_000))
+        .unwrap_or_else(|| i64::from(default_connector_z_timelock_blocks(get_network())) * 2 / 3)
 }
 
 pub fn get_goat_network() -> GoatNetwork {
@@ -353,6 +367,20 @@ pub fn get_local_node_info() -> NodeInfo {
         addr_op
     };
     let socket_addr = std::env::var(ENV_EXTERNAL_SOCKET_ADDR).unwrap_or("".to_string());
+    // Sign this node's peer ID binding with its master key.
+    let issued_at = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or_default();
+    let binding_sig = match get_bitvm_key() {
+        Ok(keypair) => {
+            crate::messages::sign_node_info_binding(&peer_key, &pubkey_str, issued_at, &keypair)
+        }
+        Err(error) => {
+            tracing::error!("failed to sign node info binding: {error}");
+            String::new()
+        }
+    };
     NodeInfo {
         peer_id: peer_key,
         actor: actor.to_string(),
@@ -362,10 +390,9 @@ pub fn get_local_node_info() -> NodeInfo {
         node_name: get_node_name(),
         service_fee_rate: get_operator_node_service_fee_rate(),
         available_peg_btc: "0".to_string(),
+        binding_sig,
+        binding_issued_at: issued_at,
     }
-}
-pub fn get_committee_member_num() -> usize {
-    COMMITTEE_MEMBER_NUMBER
 }
 
 #[derive(Clone, Copy, Display, EnumString)]
@@ -470,6 +497,44 @@ pub fn get_goat_swap_the_graph_urls_from_env() -> String {
         .unwrap_or("https://graph.goat.network/subgraphs/name/bitvm_escrow_manager_dev".to_string())
 }
 
+const GOAT_BOOT_RETRY_ATTEMPTS: u32 = 12;
+const GOAT_BOOT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Retries a Goat read the node needs to boot, so a restart during a Goat
+/// outage waits for the RPC (about a minute) instead of dying at once.
+async fn retry_at_boot<T, E, F, Fut>(what: &str, rpc_url: &Url, mut call: F) -> Result<T, String>
+where
+    E: std::fmt::Display,
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
+    // The boot provider has no request timeout of its own: bound every call
+    // so a peer that accepts the connection but never answers still retries.
+    let timeout = std::time::Duration::from_secs(get_goat_rpc_timeout_secs());
+    let mut attempt = 1;
+    loop {
+        let error = match tokio::time::timeout(timeout, call()).await {
+            Ok(Ok(value)) => return Ok(value),
+            Ok(Err(error)) => error.to_string(),
+            Err(_) => format!("timed out after {} s", timeout.as_secs()),
+        };
+        if attempt >= GOAT_BOOT_RETRY_ATTEMPTS {
+            return Err(error);
+        }
+        warn!(
+            event = "goat_boot_retry",
+            what,
+            attempt,
+            max_attempts = GOAT_BOOT_RETRY_ATTEMPTS,
+            rpc_url = %rpc_url,
+            error = %error,
+            "Goat RPC unavailable at boot; retrying"
+        );
+        tokio::time::sleep(GOAT_BOOT_RETRY_DELAY).await;
+        attempt += 1;
+    }
+}
+
 pub async fn goat_config_from_env() -> GoatInitConfig {
     let rpc_url = get_goat_url_from_env();
     let private_key = std::env::var(ENV_GOAT_PRIVATE_KEY).ok();
@@ -482,11 +547,13 @@ pub async fn goat_config_from_env() -> GoatInitConfig {
         peg_btc_address,
     ) = {
         let provider = ProviderBuilder::new().connect_http(rpc_url.clone());
-        let chain_id = provider
-            .get_chain_id()
+        let chain_id = retry_at_boot("eth_chainId", &rpc_url, || provider.get_chain_id())
             .await
-            .unwrap_or_else(|_| panic!("cannot get chain_id from {rpc_url}"))
-            as u32;
+            .unwrap_or_else(|error| {
+                panic!(
+                    "cannot get chain_id from {rpc_url} after {GOAT_BOOT_RETRY_ATTEMPTS} attempts: {error}"
+                )
+            }) as u32;
 
         let (
             committee_management_address,
@@ -495,9 +562,13 @@ pub async fn goat_config_from_env() -> GoatInitConfig {
             peg_btc_address,
         ) = if let Some(gateway_address) = gateway_address {
             let (committee_management_address, stake_management_address, btc_spv_address, peg_btc_address) =
-                    get_gateway_relay_contracts(&provider, gateway_address).await.expect(
-                        "fail to get committee, stake management, btc spv, peg btc contract online addresses",
-                    );
+                retry_at_boot("gateway relay contracts", &rpc_url, || {
+                    get_gateway_relay_contracts(&provider, gateway_address)
+                })
+                .await
+                .expect(
+                    "fail to get committee, stake management, btc spv, peg btc contract online addresses",
+                );
             (
                 Some(committee_management_address),
                 Some(stake_management_address),
@@ -613,22 +684,6 @@ pub fn get_verifier_candidate_collection_window_secs() -> i64 {
         .unwrap_or(DEFAULT_VERIFIER_CANDIDATE_COLLECTION_WINDOW_SECS)
 }
 
-pub fn get_p2p_graph_setup_retry_interval_secs() -> i64 {
-    std::env::var(ENV_P2P_GRAPH_SETUP_RETRY_INTERVAL_SECS)
-        .ok()
-        .and_then(|value| value.parse::<i64>().ok())
-        .map(|value| value.clamp(1, 300))
-        .unwrap_or(DEFAULT_P2P_GRAPH_SETUP_RETRY_INTERVAL_SECS)
-}
-
-pub fn get_p2p_graph_setup_retry_window_secs() -> i64 {
-    std::env::var(ENV_P2P_GRAPH_SETUP_RETRY_WINDOW_SECS)
-        .ok()
-        .and_then(|value| value.parse::<i64>().ok())
-        .map(|value| value.clamp(10, 3600))
-        .unwrap_or(DEFAULT_P2P_GRAPH_SETUP_RETRY_WINDOW_SECS)
-}
-
 pub fn get_soldering_proof_payload_store_path() -> anyhow::Result<String> {
     let value = std::env::var(ENV_SOLDERING_PROOF_PAYLOAD_STORE_PATH)
         .map_err(|_| anyhow::anyhow!("{ENV_SOLDERING_PROOF_PAYLOAD_STORE_PATH} needs to be set"))?;
@@ -639,8 +694,16 @@ pub fn get_soldering_proof_payload_store_path() -> anyhow::Result<String> {
     Ok(value.to_string())
 }
 
+pub const fn actor_needs_soldering_builder(actor: &Actor) -> bool {
+    matches!(actor, Actor::Verifier | Actor::Operator)
+}
+
+pub const fn actor_runs_babe_setup_state_cleanup(actor: &Actor) -> bool {
+    actor_needs_soldering_builder(actor)
+}
+
 pub fn validate_soldering_proof_payload_store_config(actor: &Actor) -> anyhow::Result<()> {
-    if matches!(actor, Actor::Verifier | Actor::Operator | Actor::All) {
+    if actor_needs_soldering_builder(actor) {
         get_soldering_proof_payload_store_path()
             .map(|_| ())
             .map_err(|err| anyhow::anyhow!("{err}; required for actor {actor}"))
@@ -671,6 +734,23 @@ pub struct BabeGcAssetPaths {
     pub sgc_compact_out_indices: PathBuf,
 }
 
+/// Under `mock-gc` the 3.3 GB GC gate files are never loaded, so this returns empty paths and
+/// requires no env vars. The two callers (`handle.rs` InitGraph / CutCircuits) discard the value.
+#[cfg(feature = "mock-gc")]
+pub fn get_babe_gc_asset_paths() -> anyhow::Result<BabeGcAssetPaths> {
+    Ok(BabeGcAssetPaths {
+        fgc_gates: PathBuf::new(),
+        fgc_out_indices: PathBuf::new(),
+        sgc_gates: PathBuf::new(),
+        sgc_out_indices: PathBuf::new(),
+        fgc_compact_gates: PathBuf::new(),
+        fgc_compact_out_indices: PathBuf::new(),
+        sgc_compact_gates: PathBuf::new(),
+        sgc_compact_out_indices: PathBuf::new(),
+    })
+}
+
+#[cfg(not(feature = "mock-gc"))]
 pub fn get_babe_gc_asset_paths() -> anyhow::Result<BabeGcAssetPaths> {
     fn read_path(name: &str) -> anyhow::Result<PathBuf> {
         let path =
@@ -708,32 +788,107 @@ pub fn get_maintenance_run_timeout_secs() -> u64 {
         .unwrap_or(DEFAULT_MAINTENANCE_RUN_TIMEOUT_SECS)
 }
 
-pub fn get_p2p_inbox_batch_size() -> i64 {
-    std::env::var(ENV_P2P_INBOX_BATCH_SIZE)
+pub fn get_p2p_max_json_message_bytes() -> usize {
+    std::env::var(ENV_P2P_MAX_JSON_MESSAGE_BYTES)
         .ok()
-        .and_then(|value| value.parse::<i64>().ok())
-        .map(|size| size.clamp(1, 128))
-        .unwrap_or(DEFAULT_P2P_INBOX_BATCH_SIZE)
+        .and_then(|value| value.parse::<usize>().ok())
+        .map(|size| {
+            size.clamp(64 * 1024, crate::middleware::behaviour::MAX_GOSSIPSUB_TRANSMIT_SIZE)
+        })
+        .unwrap_or(DEFAULT_P2P_MAX_JSON_MESSAGE_BYTES)
 }
 
-pub fn get_p2p_outbox_batch_size() -> i64 {
-    std::env::var(ENV_P2P_OUTBOX_BATCH_SIZE)
+fn p2p_connection_limit(name: &str, default: u32) -> u32 {
+    std::env::var(name)
         .ok()
-        .and_then(|value| value.parse::<i64>().ok())
-        .map(|size| size.clamp(1, 128))
-        .unwrap_or(DEFAULT_P2P_OUTBOX_BATCH_SIZE)
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|limit| *limit > 0)
+        .unwrap_or(default)
 }
 
+pub fn get_p2p_max_incoming() -> u32 {
+    p2p_connection_limit(ENV_P2P_MAX_INCOMING_CONNECTIONS, DEFAULT_P2P_MAX_INCOMING_CONNECTIONS)
+}
+
+pub fn get_p2p_inbound_registered_reserve() -> u32 {
+    p2p_connection_limit(ENV_P2P_INBOUND_REGISTERED_RESERVE, DEFAULT_P2P_INBOUND_REGISTERED_RESERVE)
+}
+
+pub fn get_p2p_reserved_peers() -> std::collections::HashSet<libp2p::PeerId> {
+    parse_reserved_peers(&std::env::var(ENV_P2P_RESERVED_PEERS).unwrap_or_default())
+}
+
+pub fn parse_reserved_peers(value: &str) -> std::collections::HashSet<libp2p::PeerId> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .filter_map(|entry| {
+            let parsed = libp2p::PeerId::from_str(entry).ok();
+            if parsed.is_none() {
+                tracing::error!("ignoring malformed {ENV_P2P_RESERVED_PEERS} entry {entry:?}");
+            }
+            parsed
+        })
+        .collect()
+}
+
+/// Parse `P2P_TRUSTED_OPERATOR_BINDINGS`. A malformed entry is reported and
+/// skipped: a typo must not stop the node, nor silently trust something else.
+pub fn get_p2p_trusted_operator_bindings() -> Vec<(libp2p::PeerId, [u8; 32])> {
+    parse_trusted_operator_bindings(
+        &std::env::var(ENV_P2P_TRUSTED_OPERATOR_BINDINGS).unwrap_or_default(),
+    )
+}
+
+pub fn parse_trusted_operator_bindings(value: &str) -> Vec<(libp2p::PeerId, [u8; 32])> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .filter_map(|entry| {
+            let parsed = entry.split_once('=').and_then(|(peer_id, pubkey)| {
+                let peer_id = libp2p::PeerId::from_str(peer_id.trim()).ok()?;
+                let pubkey = PublicKey::from_str(pubkey.trim()).ok()?;
+                Some((peer_id, bitcoin::XOnlyPublicKey::from(pubkey).serialize()))
+            });
+            if parsed.is_none() {
+                tracing::error!(
+                    "ignoring malformed {ENV_P2P_TRUSTED_OPERATOR_BINDINGS} entry {entry:?}; \
+                     expected <peer id>=<public key>"
+                );
+            }
+            parsed
+        })
+        .collect()
+}
+
+pub fn get_p2p_max_pending_incoming() -> u32 {
+    p2p_connection_limit(
+        ENV_P2P_MAX_PENDING_INCOMING_CONNECTIONS,
+        DEFAULT_P2P_MAX_PENDING_INCOMING_CONNECTIONS,
+    )
+}
+
+pub fn get_p2p_max_per_peer() -> u32 {
+    p2p_connection_limit(ENV_P2P_MAX_CONNECTIONS_PER_PEER, DEFAULT_P2P_MAX_CONNECTIONS_PER_PEER)
+}
+
+pub fn get_p2p_inbox_max_bytes() -> i64 {
+    std::env::var(ENV_P2P_INBOX_MAX_QUEUED_BYTES)
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .map(|size| size.max(256 * 1024 * 1024))
+        .unwrap_or(DEFAULT_P2P_INBOX_MAX_QUEUED_BYTES)
+}
+
+/// Enable committee key deletion on terminal failure except Timeout, or 32 blocks
+/// after Confirm confirmation. Disabled deletion leaves key_deleted false.
 pub fn is_enable_committee_instance_key_delete() -> bool {
-    // TODO: enable this feature when ready
-    tracing::warn!(
-        "Committee key delete not activated, ignore ENV_ENABLE_COMMITTEE_INSTANCE_KEY_DELETE"
-    );
-    false
-    // std::env::var(ENV_ENABLE_COMMITTEE_INSTANCE_KEY_DELETE)
-    //     .ok()
-    //     .map(|value| value.eq_ignore_ascii_case("true"))
-    //     .unwrap_or(DEFAULT_ENABLE_COMMITTEE_INSTANCE_KEY_DELETE)
+    std::env::var(ENV_ENABLE_COMMITTEE_INSTANCE_KEY_DELETE)
+        .ok()
+        .map(|value| value.eq_ignore_ascii_case("true"))
+        .unwrap_or(DEFAULT_ENABLE_COMMITTEE_INSTANCE_KEY_DELETE)
 }
 
 pub fn get_committee_instance_key_delete_timelock_blocks() -> i64 {
@@ -744,11 +899,44 @@ pub fn get_committee_instance_key_delete_timelock_blocks() -> i64 {
         .unwrap_or(DEFAULT_COMMITTEE_INSTANCE_KEY_DELETE_TIMELOCK_BLOCKS)
 }
 
-pub fn should_always_challenge() -> bool {
-    match std::env::var(ENV_ALWAYS_CHALLENGE) {
-        Ok(val) => val.to_lowercase() == "true",
-        Err(_) => false,
+pub const ENV_ENGINE_WORKER_COUNT: &str = "ENGINE_WORKER_COUNT";
+pub const ENV_ENGINE_CPU_POOL_SLOTS: &str = "ENGINE_CPU_POOL_SLOTS";
+pub const ENV_ENGINE_PEGOUT_POOL_SLOTS: &str = "ENGINE_PEGOUT_POOL_SLOTS";
+pub const ENV_ENGINE_NETWORK_POOL_SLOTS: &str = "ENGINE_NETWORK_POOL_SLOTS";
+pub const ENV_ENGINE_APPLY_TIMEOUT_SECS: &str = "ENGINE_APPLY_TIMEOUT_SECS";
+pub const ENV_ENGINE_RECHECK_INTERVAL_SECS: &str = "ENGINE_RECHECK_INTERVAL_SECS";
+
+fn engine_setting<T: FromStr + PartialOrd>(name: &str, default: T, min: T, max: T) -> T {
+    match std::env::var(name).ok().and_then(|value| value.parse::<T>().ok()) {
+        Some(value) if value < min => min,
+        Some(value) if value > max => max,
+        Some(value) => value,
+        None => default,
     }
+}
+
+pub fn get_engine_worker_count(default: usize) -> usize {
+    engine_setting(ENV_ENGINE_WORKER_COUNT, default, 1, 64)
+}
+
+pub fn get_engine_cpu_pool_slots(default: usize) -> usize {
+    engine_setting(ENV_ENGINE_CPU_POOL_SLOTS, default, 1, 64)
+}
+
+pub fn get_engine_pegout_pool_slots(default: usize) -> usize {
+    engine_setting(ENV_ENGINE_PEGOUT_POOL_SLOTS, default, 1, 64)
+}
+
+pub fn get_engine_network_pool_slots(default: usize) -> usize {
+    engine_setting(ENV_ENGINE_NETWORK_POOL_SLOTS, default, 1, 256)
+}
+
+pub fn get_engine_apply_timeout_secs(default: u64) -> u64 {
+    engine_setting(ENV_ENGINE_APPLY_TIMEOUT_SECS, default, 1, 3600)
+}
+
+pub fn get_engine_recheck_interval_secs(default: u64) -> u64 {
+    engine_setting(ENV_ENGINE_RECHECK_INTERVAL_SECS, default, 1, 3600)
 }
 
 pub fn get_genesis_sequencer_commit_id() -> [u8; 32] {
@@ -772,7 +960,7 @@ mod tests {
 
         assert!(validate_soldering_proof_payload_store_config(&Actor::Verifier).is_err());
         assert!(validate_soldering_proof_payload_store_config(&Actor::Operator).is_err());
-        assert!(validate_soldering_proof_payload_store_config(&Actor::All).is_err());
+        assert!(validate_soldering_proof_payload_store_config(&Actor::All).is_ok());
         assert!(validate_soldering_proof_payload_store_config(&Actor::Committee).is_ok());
         assert!(validate_soldering_proof_payload_store_config(&Actor::Watchtower).is_ok());
         assert!(validate_soldering_proof_payload_store_config(&Actor::Publisher).is_ok());

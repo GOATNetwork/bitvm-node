@@ -1,0 +1,2113 @@
+[
+  {
+    "type": "constructor",
+    "inputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "answerPeginRequest",
+    "inputs": [
+      {
+        "name": "instanceId",
+        "type": "bytes16",
+        "internalType": "bytes16"
+      },
+      {
+        "name": "committeePubkey",
+        "type": "bytes",
+        "internalType": "bytes"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "bitcoinSPV",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "address",
+        "internalType": "contract IBitcoinSPV"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "cancelWithdrawTimelock",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "committeeCancelWithdraw",
+    "inputs": [
+      {
+        "name": "graphId",
+        "type": "bytes16",
+        "internalType": "bytes16"
+      },
+      {
+        "name": "nonce",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "committeeSigs",
+        "type": "bytes[]",
+        "internalType": "bytes[]"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "committeeManagement",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "address",
+        "internalType": "contract ICommitteeManagement"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "finishWithdrawDisproved",
+    "inputs": [
+      {
+        "name": "graphId",
+        "type": "bytes16",
+        "internalType": "bytes16"
+      },
+      {
+        "name": "disproveTxType",
+        "type": "uint8",
+        "internalType": "enum IGateway.DisproveTxType"
+      },
+      {
+        "name": "txnIndex",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "rawChallengeStartTx",
+        "type": "tuple",
+        "internalType": "struct BitvmTxParser.BitcoinTx",
+        "components": [
+          {
+            "name": "version",
+            "type": "bytes4",
+            "internalType": "bytes4"
+          },
+          {
+            "name": "inputVector",
+            "type": "bytes",
+            "internalType": "bytes"
+          },
+          {
+            "name": "outputVector",
+            "type": "bytes",
+            "internalType": "bytes"
+          },
+          {
+            "name": "locktime",
+            "type": "bytes4",
+            "internalType": "bytes4"
+          }
+        ]
+      },
+      {
+        "name": "challengeStartTxProof",
+        "type": "tuple",
+        "internalType": "struct MerkleProof.BitcoinTxProof",
+        "components": [
+          {
+            "name": "rawHeader",
+            "type": "bytes",
+            "internalType": "bytes"
+          },
+          {
+            "name": "height",
+            "type": "uint256",
+            "internalType": "uint256"
+          },
+          {
+            "name": "proof",
+            "type": "bytes32[]",
+            "internalType": "bytes32[]"
+          },
+          {
+            "name": "index",
+            "type": "uint256",
+            "internalType": "uint256"
+          }
+        ]
+      },
+      {
+        "name": "rawChallengeFinishTx",
+        "type": "tuple",
+        "internalType": "struct BitvmTxParser.BitcoinTx",
+        "components": [
+          {
+            "name": "version",
+            "type": "bytes4",
+            "internalType": "bytes4"
+          },
+          {
+            "name": "inputVector",
+            "type": "bytes",
+            "internalType": "bytes"
+          },
+          {
+            "name": "outputVector",
+            "type": "bytes",
+            "internalType": "bytes"
+          },
+          {
+            "name": "locktime",
+            "type": "bytes4",
+            "internalType": "bytes4"
+          }
+        ]
+      },
+      {
+        "name": "challengeFinishTxProof",
+        "type": "tuple",
+        "internalType": "struct MerkleProof.BitcoinTxProof",
+        "components": [
+          {
+            "name": "rawHeader",
+            "type": "bytes",
+            "internalType": "bytes"
+          },
+          {
+            "name": "height",
+            "type": "uint256",
+            "internalType": "uint256"
+          },
+          {
+            "name": "proof",
+            "type": "bytes32[]",
+            "internalType": "bytes32[]"
+          },
+          {
+            "name": "index",
+            "type": "uint256",
+            "internalType": "uint256"
+          }
+        ]
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "finishWithdrawHappyPath",
+    "inputs": [
+      {
+        "name": "graphId",
+        "type": "bytes16",
+        "internalType": "bytes16"
+      },
+      {
+        "name": "rawTake1Tx",
+        "type": "tuple",
+        "internalType": "struct BitvmTxParser.BitcoinTx",
+        "components": [
+          {
+            "name": "version",
+            "type": "bytes4",
+            "internalType": "bytes4"
+          },
+          {
+            "name": "inputVector",
+            "type": "bytes",
+            "internalType": "bytes"
+          },
+          {
+            "name": "outputVector",
+            "type": "bytes",
+            "internalType": "bytes"
+          },
+          {
+            "name": "locktime",
+            "type": "bytes4",
+            "internalType": "bytes4"
+          }
+        ]
+      },
+      {
+        "name": "take1Proof",
+        "type": "tuple",
+        "internalType": "struct MerkleProof.BitcoinTxProof",
+        "components": [
+          {
+            "name": "rawHeader",
+            "type": "bytes",
+            "internalType": "bytes"
+          },
+          {
+            "name": "height",
+            "type": "uint256",
+            "internalType": "uint256"
+          },
+          {
+            "name": "proof",
+            "type": "bytes32[]",
+            "internalType": "bytes32[]"
+          },
+          {
+            "name": "index",
+            "type": "uint256",
+            "internalType": "uint256"
+          }
+        ]
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "finishWithdrawUnhappyPath",
+    "inputs": [
+      {
+        "name": "graphId",
+        "type": "bytes16",
+        "internalType": "bytes16"
+      },
+      {
+        "name": "rawTake2Tx",
+        "type": "tuple",
+        "internalType": "struct BitvmTxParser.BitcoinTx",
+        "components": [
+          {
+            "name": "version",
+            "type": "bytes4",
+            "internalType": "bytes4"
+          },
+          {
+            "name": "inputVector",
+            "type": "bytes",
+            "internalType": "bytes"
+          },
+          {
+            "name": "outputVector",
+            "type": "bytes",
+            "internalType": "bytes"
+          },
+          {
+            "name": "locktime",
+            "type": "bytes4",
+            "internalType": "bytes4"
+          }
+        ]
+      },
+      {
+        "name": "take2Proof",
+        "type": "tuple",
+        "internalType": "struct MerkleProof.BitcoinTxProof",
+        "components": [
+          {
+            "name": "rawHeader",
+            "type": "bytes",
+            "internalType": "bytes"
+          },
+          {
+            "name": "height",
+            "type": "uint256",
+            "internalType": "uint256"
+          },
+          {
+            "name": "proof",
+            "type": "bytes32[]",
+            "internalType": "bytes32[]"
+          },
+          {
+            "name": "index",
+            "type": "uint256",
+            "internalType": "uint256"
+          }
+        ]
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "getCancelWithdrawDigestNonced",
+    "inputs": [
+      {
+        "name": "graphId",
+        "type": "bytes16",
+        "internalType": "bytes16"
+      },
+      {
+        "name": "nonce",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "getCommitteeAddresses",
+    "inputs": [
+      {
+        "name": "instanceId",
+        "type": "bytes16",
+        "internalType": "bytes16"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "committeeAddresses",
+        "type": "address[]",
+        "internalType": "address[]"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "getCommitteePubkeys",
+    "inputs": [
+      {
+        "name": "instanceId",
+        "type": "bytes16",
+        "internalType": "bytes16"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "committeePubkeys",
+        "type": "bytes[]",
+        "internalType": "bytes[]"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "getCommitteePubkeysUnsafe",
+    "inputs": [
+      {
+        "name": "instanceId",
+        "type": "bytes16",
+        "internalType": "bytes16"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "committeePubkeys",
+        "type": "bytes[]",
+        "internalType": "bytes[]"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "getGraphData",
+    "inputs": [
+      {
+        "name": "graphId",
+        "type": "bytes16",
+        "internalType": "bytes16"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "tuple",
+        "internalType": "struct IGateway.GraphData",
+        "components": [
+          {
+            "name": "operatorPubkeyPrefix",
+            "type": "bytes1",
+            "internalType": "bytes1"
+          },
+          {
+            "name": "operatorPubkey",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "peginTxid",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "kickoffTxid",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "take1Txid",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "take2Txid",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "watchtowerChallengeInitTxid",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "proverAssertTxid",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "disproveTxids",
+            "type": "bytes32[]",
+            "internalType": "bytes32[]"
+          },
+          {
+            "name": "watchtowerChallengeTimeoutTxids",
+            "type": "bytes32[]",
+            "internalType": "bytes32[]"
+          },
+          {
+            "name": "operatorChallengeNackTxids",
+            "type": "bytes32[]",
+            "internalType": "bytes32[]"
+          },
+          {
+            "name": "operatorCommitTimeoutTxid",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          }
+        ]
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "getGraphIdsByInstanceId",
+    "inputs": [
+      {
+        "name": "instanceId",
+        "type": "bytes16",
+        "internalType": "bytes16"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "bytes16[]",
+        "internalType": "bytes16[]"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "getPeginData",
+    "inputs": [
+      {
+        "name": "instanceId",
+        "type": "bytes16",
+        "internalType": "bytes16"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "tuple",
+        "internalType": "struct IGateway.PeginData",
+        "components": [
+          {
+            "name": "status",
+            "type": "uint8",
+            "internalType": "enum IGateway.PeginStatus"
+          },
+          {
+            "name": "instanceId",
+            "type": "bytes16",
+            "internalType": "bytes16"
+          },
+          {
+            "name": "depositorAddress",
+            "type": "address",
+            "internalType": "address"
+          },
+          {
+            "name": "peginAmountSats",
+            "type": "uint64",
+            "internalType": "uint64"
+          },
+          {
+            "name": "txnFees",
+            "type": "uint64[3]",
+            "internalType": "uint64[3]"
+          },
+          {
+            "name": "userInputs",
+            "type": "tuple[]",
+            "internalType": "struct IGateway.Utxo[]",
+            "components": [
+              {
+                "name": "txid",
+                "type": "bytes32",
+                "internalType": "bytes32"
+              },
+              {
+                "name": "vout",
+                "type": "uint32",
+                "internalType": "uint32"
+              },
+              {
+                "name": "amountSats",
+                "type": "uint64",
+                "internalType": "uint64"
+              }
+            ]
+          },
+          {
+            "name": "userXonlyPubkey",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "userChangeAddress",
+            "type": "string",
+            "internalType": "string"
+          },
+          {
+            "name": "userRefundAddress",
+            "type": "string",
+            "internalType": "string"
+          },
+          {
+            "name": "peginTxid",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "createdAt",
+            "type": "uint256",
+            "internalType": "uint256"
+          },
+          {
+            "name": "committeeAddresses",
+            "type": "address[]",
+            "internalType": "address[]"
+          },
+          {
+            "name": "committeePubkeys",
+            "type": "bytes[]",
+            "internalType": "bytes[]"
+          }
+        ]
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "getPostGraphDigest",
+    "inputs": [
+      {
+        "name": "instanceId",
+        "type": "bytes16",
+        "internalType": "bytes16"
+      },
+      {
+        "name": "graphId",
+        "type": "bytes16",
+        "internalType": "bytes16"
+      },
+      {
+        "name": "graphData",
+        "type": "tuple",
+        "internalType": "struct IGateway.GraphData",
+        "components": [
+          {
+            "name": "operatorPubkeyPrefix",
+            "type": "bytes1",
+            "internalType": "bytes1"
+          },
+          {
+            "name": "operatorPubkey",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "peginTxid",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "kickoffTxid",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "take1Txid",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "take2Txid",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "watchtowerChallengeInitTxid",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "proverAssertTxid",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "disproveTxids",
+            "type": "bytes32[]",
+            "internalType": "bytes32[]"
+          },
+          {
+            "name": "watchtowerChallengeTimeoutTxids",
+            "type": "bytes32[]",
+            "internalType": "bytes32[]"
+          },
+          {
+            "name": "operatorChallengeNackTxids",
+            "type": "bytes32[]",
+            "internalType": "bytes32[]"
+          },
+          {
+            "name": "operatorCommitTimeoutTxid",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          }
+        ]
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "getPostPeginDigest",
+    "inputs": [
+      {
+        "name": "instanceId",
+        "type": "bytes16",
+        "internalType": "bytes16"
+      },
+      {
+        "name": "peginTxid",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "getUnlockStakeDigestNonced",
+    "inputs": [
+      {
+        "name": "operator",
+        "type": "address",
+        "internalType": "address"
+      },
+      {
+        "name": "amount",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "nonce",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "graphDataMap",
+    "inputs": [
+      {
+        "name": "graphId",
+        "type": "bytes16",
+        "internalType": "bytes16"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "operatorPubkeyPrefix",
+        "type": "bytes1",
+        "internalType": "bytes1"
+      },
+      {
+        "name": "operatorPubkey",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      },
+      {
+        "name": "peginTxid",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      },
+      {
+        "name": "kickoffTxid",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      },
+      {
+        "name": "take1Txid",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      },
+      {
+        "name": "take2Txid",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      },
+      {
+        "name": "watchtowerChallengeInitTxid",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      },
+      {
+        "name": "proverAssertTxid",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      },
+      {
+        "name": "operatorCommitTimeoutTxid",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "initWithdraw",
+    "inputs": [
+      {
+        "name": "instanceId",
+        "type": "bytes16",
+        "internalType": "bytes16"
+      },
+      {
+        "name": "graphId",
+        "type": "bytes16",
+        "internalType": "bytes16"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "initialize",
+    "inputs": [
+      {
+        "name": "_pegBTC",
+        "type": "address",
+        "internalType": "contract IPegBTC"
+      },
+      {
+        "name": "_bitcoinSPV",
+        "type": "address",
+        "internalType": "contract IBitcoinSPV"
+      },
+      {
+        "name": "_committeeManagement",
+        "type": "address",
+        "internalType": "contract ICommitteeManagement"
+      },
+      {
+        "name": "_stakeManagement",
+        "type": "address",
+        "internalType": "contract IStakeManagement"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "instanceIdToGraphIds",
+    "inputs": [
+      {
+        "name": "instanceId",
+        "type": "bytes16",
+        "internalType": "bytes16"
+      },
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "graphIds",
+        "type": "bytes16",
+        "internalType": "bytes16"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "instanceIds",
+    "inputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "bytes16",
+        "internalType": "bytes16"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "minChallengeAmountSats",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint64",
+        "internalType": "uint64"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "minChallengerReward",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "minDisproverReward",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "minOperatorRewardSats",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint64",
+        "internalType": "uint64"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "minPeginFeeSats",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint64",
+        "internalType": "uint64"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "minSlashAmount",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "minStakeAmount",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "operatorRewardRate",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint64",
+        "internalType": "uint64"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "pegBTC",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "address",
+        "internalType": "contract IPegBTC"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "peginDataMap",
+    "inputs": [
+      {
+        "name": "instanceId",
+        "type": "bytes16",
+        "internalType": "bytes16"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "status",
+        "type": "uint8",
+        "internalType": "enum IGateway.PeginStatus"
+      },
+      {
+        "name": "instanceId",
+        "type": "bytes16",
+        "internalType": "bytes16"
+      },
+      {
+        "name": "depositorAddress",
+        "type": "address",
+        "internalType": "address"
+      },
+      {
+        "name": "peginAmountSats",
+        "type": "uint64",
+        "internalType": "uint64"
+      },
+      {
+        "name": "userXonlyPubkey",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      },
+      {
+        "name": "userChangeAddress",
+        "type": "string",
+        "internalType": "string"
+      },
+      {
+        "name": "userRefundAddress",
+        "type": "string",
+        "internalType": "string"
+      },
+      {
+        "name": "peginTxid",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      },
+      {
+        "name": "createdAt",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "peginFeeRate",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint64",
+        "internalType": "uint64"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "postGraphData",
+    "inputs": [
+      {
+        "name": "instanceId",
+        "type": "bytes16",
+        "internalType": "bytes16"
+      },
+      {
+        "name": "graphId",
+        "type": "bytes16",
+        "internalType": "bytes16"
+      },
+      {
+        "name": "graphData",
+        "type": "tuple",
+        "internalType": "struct IGateway.GraphData",
+        "components": [
+          {
+            "name": "operatorPubkeyPrefix",
+            "type": "bytes1",
+            "internalType": "bytes1"
+          },
+          {
+            "name": "operatorPubkey",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "peginTxid",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "kickoffTxid",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "take1Txid",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "take2Txid",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "watchtowerChallengeInitTxid",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "proverAssertTxid",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "disproveTxids",
+            "type": "bytes32[]",
+            "internalType": "bytes32[]"
+          },
+          {
+            "name": "watchtowerChallengeTimeoutTxids",
+            "type": "bytes32[]",
+            "internalType": "bytes32[]"
+          },
+          {
+            "name": "operatorChallengeNackTxids",
+            "type": "bytes32[]",
+            "internalType": "bytes32[]"
+          },
+          {
+            "name": "operatorCommitTimeoutTxid",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          }
+        ]
+      },
+      {
+        "name": "committeeSigs",
+        "type": "bytes[]",
+        "internalType": "bytes[]"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "postPeginData",
+    "inputs": [
+      {
+        "name": "instanceId",
+        "type": "bytes16",
+        "internalType": "bytes16"
+      },
+      {
+        "name": "rawPeginTx",
+        "type": "tuple",
+        "internalType": "struct BitvmTxParser.BitcoinTx",
+        "components": [
+          {
+            "name": "version",
+            "type": "bytes4",
+            "internalType": "bytes4"
+          },
+          {
+            "name": "inputVector",
+            "type": "bytes",
+            "internalType": "bytes"
+          },
+          {
+            "name": "outputVector",
+            "type": "bytes",
+            "internalType": "bytes"
+          },
+          {
+            "name": "locktime",
+            "type": "bytes4",
+            "internalType": "bytes4"
+          }
+        ]
+      },
+      {
+        "name": "peginProof",
+        "type": "tuple",
+        "internalType": "struct MerkleProof.BitcoinTxProof",
+        "components": [
+          {
+            "name": "rawHeader",
+            "type": "bytes",
+            "internalType": "bytes"
+          },
+          {
+            "name": "height",
+            "type": "uint256",
+            "internalType": "uint256"
+          },
+          {
+            "name": "proof",
+            "type": "bytes32[]",
+            "internalType": "bytes32[]"
+          },
+          {
+            "name": "index",
+            "type": "uint256",
+            "internalType": "uint256"
+          }
+        ]
+      },
+      {
+        "name": "committeeSigs",
+        "type": "bytes[]",
+        "internalType": "bytes[]"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "postPeginRequest",
+    "inputs": [
+      {
+        "name": "instanceId",
+        "type": "bytes16",
+        "internalType": "bytes16"
+      },
+      {
+        "name": "peginAmountSats",
+        "type": "uint64",
+        "internalType": "uint64"
+      },
+      {
+        "name": "txnFees",
+        "type": "uint64[3]",
+        "internalType": "uint64[3]"
+      },
+      {
+        "name": "receiverAddress",
+        "type": "address",
+        "internalType": "address"
+      },
+      {
+        "name": "userInputs",
+        "type": "tuple[]",
+        "internalType": "struct IGateway.Utxo[]",
+        "components": [
+          {
+            "name": "txid",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "vout",
+            "type": "uint32",
+            "internalType": "uint32"
+          },
+          {
+            "name": "amountSats",
+            "type": "uint64",
+            "internalType": "uint64"
+          }
+        ]
+      },
+      {
+        "name": "userXonlyPubkey",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      },
+      {
+        "name": "userChangeAddress",
+        "type": "string",
+        "internalType": "string"
+      },
+      {
+        "name": "userRefundAddress",
+        "type": "string",
+        "internalType": "string"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "payable"
+  },
+  {
+    "type": "function",
+    "name": "proceedWithdraw",
+    "inputs": [
+      {
+        "name": "graphId",
+        "type": "bytes16",
+        "internalType": "bytes16"
+      },
+      {
+        "name": "rawKickoffTx",
+        "type": "tuple",
+        "internalType": "struct BitvmTxParser.BitcoinTx",
+        "components": [
+          {
+            "name": "version",
+            "type": "bytes4",
+            "internalType": "bytes4"
+          },
+          {
+            "name": "inputVector",
+            "type": "bytes",
+            "internalType": "bytes"
+          },
+          {
+            "name": "outputVector",
+            "type": "bytes",
+            "internalType": "bytes"
+          },
+          {
+            "name": "locktime",
+            "type": "bytes4",
+            "internalType": "bytes4"
+          }
+        ]
+      },
+      {
+        "name": "kickoffProof",
+        "type": "tuple",
+        "internalType": "struct MerkleProof.BitcoinTxProof",
+        "components": [
+          {
+            "name": "rawHeader",
+            "type": "bytes",
+            "internalType": "bytes"
+          },
+          {
+            "name": "height",
+            "type": "uint256",
+            "internalType": "uint256"
+          },
+          {
+            "name": "proof",
+            "type": "bytes32[]",
+            "internalType": "bytes32[]"
+          },
+          {
+            "name": "index",
+            "type": "uint256",
+            "internalType": "uint256"
+          }
+        ]
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "responseWindowBlocks",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "stakeManagement",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "address",
+        "internalType": "contract IStakeManagement"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "unlockOperatorStake",
+    "inputs": [
+      {
+        "name": "operator",
+        "type": "address",
+        "internalType": "address"
+      },
+      {
+        "name": "amount",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "nonce",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "committeeSigs",
+        "type": "bytes[]",
+        "internalType": "bytes[]"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "verifyCommitteeSignatures",
+    "inputs": [
+      {
+        "name": "msgHash",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      },
+      {
+        "name": "signatures",
+        "type": "bytes[]",
+        "internalType": "bytes[]"
+      },
+      {
+        "name": "members",
+        "type": "address[]",
+        "internalType": "address[]"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "bool",
+        "internalType": "bool"
+      }
+    ],
+    "stateMutability": "pure"
+  },
+  {
+    "type": "function",
+    "name": "withdrawDataMap",
+    "inputs": [
+      {
+        "name": "graphId",
+        "type": "bytes16",
+        "internalType": "bytes16"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "status",
+        "type": "uint8",
+        "internalType": "enum IGateway.WithdrawStatus"
+      },
+      {
+        "name": "peginTxid",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      },
+      {
+        "name": "operatorAddress",
+        "type": "address",
+        "internalType": "address"
+      },
+      {
+        "name": "instanceId",
+        "type": "bytes16",
+        "internalType": "bytes16"
+      },
+      {
+        "name": "lockAmount",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "btcBlockHeightAtWithdraw",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "event",
+    "name": "BridgeIn",
+    "inputs": [
+      {
+        "name": "depositorAddress",
+        "type": "address",
+        "indexed": true,
+        "internalType": "address"
+      },
+      {
+        "name": "instanceId",
+        "type": "bytes16",
+        "indexed": true,
+        "internalType": "bytes16"
+      },
+      {
+        "name": "peginAmountSats",
+        "type": "uint64",
+        "indexed": true,
+        "internalType": "uint64"
+      },
+      {
+        "name": "feeAmountSats",
+        "type": "uint64",
+        "indexed": false,
+        "internalType": "uint64"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
+    "name": "BridgeInRequest",
+    "inputs": [
+      {
+        "name": "instanceId",
+        "type": "bytes16",
+        "indexed": true,
+        "internalType": "bytes16"
+      },
+      {
+        "name": "depositorAddress",
+        "type": "address",
+        "indexed": true,
+        "internalType": "address"
+      },
+      {
+        "name": "peginAmountSats",
+        "type": "uint64",
+        "indexed": false,
+        "internalType": "uint64"
+      },
+      {
+        "name": "txnFees",
+        "type": "uint64[3]",
+        "indexed": false,
+        "internalType": "uint64[3]"
+      },
+      {
+        "name": "userInputs",
+        "type": "tuple[]",
+        "indexed": false,
+        "internalType": "struct IGateway.Utxo[]",
+        "components": [
+          {
+            "name": "txid",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "vout",
+            "type": "uint32",
+            "internalType": "uint32"
+          },
+          {
+            "name": "amountSats",
+            "type": "uint64",
+            "internalType": "uint64"
+          }
+        ]
+      },
+      {
+        "name": "userXonlyPubkey",
+        "type": "bytes32",
+        "indexed": false,
+        "internalType": "bytes32"
+      },
+      {
+        "name": "userChangeAddress",
+        "type": "string",
+        "indexed": false,
+        "internalType": "string"
+      },
+      {
+        "name": "userRefundAddress",
+        "type": "string",
+        "indexed": false,
+        "internalType": "string"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
+    "name": "CancelWithdraw",
+    "inputs": [
+      {
+        "name": "instanceId",
+        "type": "bytes16",
+        "indexed": true,
+        "internalType": "bytes16"
+      },
+      {
+        "name": "graphId",
+        "type": "bytes16",
+        "indexed": true,
+        "internalType": "bytes16"
+      },
+      {
+        "name": "triggerAddress",
+        "type": "address",
+        "indexed": true,
+        "internalType": "address"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
+    "name": "CommitteeResponse",
+    "inputs": [
+      {
+        "name": "instanceId",
+        "type": "bytes16",
+        "indexed": true,
+        "internalType": "bytes16"
+      },
+      {
+        "name": "committeeAddress",
+        "type": "address",
+        "indexed": true,
+        "internalType": "address"
+      },
+      {
+        "name": "committeePubkey",
+        "type": "bytes",
+        "indexed": false,
+        "internalType": "bytes"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
+    "name": "InitWithdraw",
+    "inputs": [
+      {
+        "name": "instanceId",
+        "type": "bytes16",
+        "indexed": true,
+        "internalType": "bytes16"
+      },
+      {
+        "name": "graphId",
+        "type": "bytes16",
+        "indexed": true,
+        "internalType": "bytes16"
+      },
+      {
+        "name": "operatorAddress",
+        "type": "address",
+        "indexed": true,
+        "internalType": "address"
+      },
+      {
+        "name": "withdrawAmountSats",
+        "type": "uint64",
+        "indexed": false,
+        "internalType": "uint64"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
+    "name": "Initialized",
+    "inputs": [
+      {
+        "name": "version",
+        "type": "uint64",
+        "indexed": false,
+        "internalType": "uint64"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
+    "name": "PostGraphData",
+    "inputs": [
+      {
+        "name": "instanceId",
+        "type": "bytes16",
+        "indexed": true,
+        "internalType": "bytes16"
+      },
+      {
+        "name": "graphId",
+        "type": "bytes16",
+        "indexed": true,
+        "internalType": "bytes16"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
+    "name": "ProceedWithdraw",
+    "inputs": [
+      {
+        "name": "instanceId",
+        "type": "bytes16",
+        "indexed": true,
+        "internalType": "bytes16"
+      },
+      {
+        "name": "graphId",
+        "type": "bytes16",
+        "indexed": true,
+        "internalType": "bytes16"
+      },
+      {
+        "name": "kickoffTxid",
+        "type": "bytes32",
+        "indexed": false,
+        "internalType": "bytes32"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
+    "name": "WithdrawDisproved",
+    "inputs": [
+      {
+        "name": "instanceId",
+        "type": "bytes16",
+        "indexed": true,
+        "internalType": "bytes16"
+      },
+      {
+        "name": "graphId",
+        "type": "bytes16",
+        "indexed": true,
+        "internalType": "bytes16"
+      },
+      {
+        "name": "disproveTxType",
+        "type": "uint8",
+        "indexed": false,
+        "internalType": "enum IGateway.DisproveTxType"
+      },
+      {
+        "name": "txnIndex",
+        "type": "uint256",
+        "indexed": false,
+        "internalType": "uint256"
+      },
+      {
+        "name": "challengeStartTxid",
+        "type": "bytes32",
+        "indexed": false,
+        "internalType": "bytes32"
+      },
+      {
+        "name": "challengeFinishTxid",
+        "type": "bytes32",
+        "indexed": false,
+        "internalType": "bytes32"
+      },
+      {
+        "name": "challengerAddress",
+        "type": "address",
+        "indexed": false,
+        "internalType": "address"
+      },
+      {
+        "name": "disproverAddress",
+        "type": "address",
+        "indexed": false,
+        "internalType": "address"
+      },
+      {
+        "name": "challengerRewardAmount",
+        "type": "uint256",
+        "indexed": false,
+        "internalType": "uint256"
+      },
+      {
+        "name": "disproverRewardAmount",
+        "type": "uint256",
+        "indexed": false,
+        "internalType": "uint256"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
+    "name": "WithdrawHappyPath",
+    "inputs": [
+      {
+        "name": "instanceId",
+        "type": "bytes16",
+        "indexed": true,
+        "internalType": "bytes16"
+      },
+      {
+        "name": "graphId",
+        "type": "bytes16",
+        "indexed": true,
+        "internalType": "bytes16"
+      },
+      {
+        "name": "take1Txid",
+        "type": "bytes32",
+        "indexed": false,
+        "internalType": "bytes32"
+      },
+      {
+        "name": "operatorAddress",
+        "type": "address",
+        "indexed": true,
+        "internalType": "address"
+      },
+      {
+        "name": "rewardAmountSats",
+        "type": "uint64",
+        "indexed": false,
+        "internalType": "uint64"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
+    "name": "WithdrawUnhappyPath",
+    "inputs": [
+      {
+        "name": "instanceId",
+        "type": "bytes16",
+        "indexed": true,
+        "internalType": "bytes16"
+      },
+      {
+        "name": "graphId",
+        "type": "bytes16",
+        "indexed": true,
+        "internalType": "bytes16"
+      },
+      {
+        "name": "take2Txid",
+        "type": "bytes32",
+        "indexed": false,
+        "internalType": "bytes32"
+      },
+      {
+        "name": "operatorAddress",
+        "type": "address",
+        "indexed": true,
+        "internalType": "address"
+      },
+      {
+        "name": "rewardAmountSats",
+        "type": "uint64",
+        "indexed": false,
+        "internalType": "uint64"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "error",
+    "name": "AlreadyDisproved",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "DisproveInvalidHeader",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "ECDSAInvalidSignature",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "ECDSAInvalidSignatureLength",
+    "inputs": [
+      {
+        "name": "length",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ]
+  },
+  {
+    "type": "error",
+    "name": "ECDSAInvalidSignatureS",
+    "inputs": [
+      {
+        "name": "s",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ]
+  },
+  {
+    "type": "error",
+    "name": "ERC20TransferFailed",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "FeeTooHigh",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "GraphAlreadyPosted",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "GraphPeginTxidMismatch",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "IndexOutOfRange",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "InstanceMismatch",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "InstanceUsed",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "InvalidHeader",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "InvalidInitialization",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "InvalidPubkeyLen",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "InvalidPubkeyParity",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "InvalidSignatures",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "KickoffHeightLow",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "MerkleVerifyFail",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "NotCommittee",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "NotEnoughCommittee",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "NotInitializing",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "NotOperator",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "NotPending",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "NotWithdrawable",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "OperatorNotRegistered",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "PeginAmountMismatch",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "StakeInsufficient",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "TimelockNotExpired",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "TxidMismatch",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "UnknownDisproveType",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "UnsupportedChainId",
+    "inputs": [
+      {
+        "name": "chainId",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ]
+  },
+  {
+    "type": "error",
+    "name": "WindowExpired",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "WindowNotExpired",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "WithdrawStatusInvalid",
+    "inputs": []
+  }
+]

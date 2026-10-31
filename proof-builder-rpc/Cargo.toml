@@ -9,6 +9,8 @@ path = "src/main.rs"
 
 [dependencies]
 zkm-sdk = { workspace = true }
+zkm-cuda = { workspace = true }
+zkm-primitives = { workspace = true }
 clap = { workspace = true }
 futures = { workspace = true }
 dotenv = { workspace = true }
@@ -16,7 +18,7 @@ anyhow = { workspace = true }
 async-trait = { workspace = true }
 store = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
-tokio-util.workspace = true
+tokio-util = { workspace = true, features = ["rt"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 serde = { workspace = true, default-features = false, features = ["derive"] }
@@ -29,6 +31,9 @@ secp256k1 = { workspace = true }
 strum = { workspace = true }
 serde_json = { workspace = true }
 alloy-primitives = { workspace = true }
+reqwest = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 # proofs
 proof-builder = { workspace = true }
@@ -45,6 +50,17 @@ bitcoin-light-client-circuit.workspace = true
 #config
 toml.workspace = true
 tower-http = { version = "0.6.2", features = ["cors", "trace"] }
+
+[features]
+# Test builds only: `PROOF_BUILDER_FAULT=after-publish` exits after a proof is published
+# and before its database commit.
+fault-injection = []
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

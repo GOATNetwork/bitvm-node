@@ -38,6 +38,16 @@ proof-builder-rpc/*.ckpt
 node/tla/states/
 
 local_docs/
+local_scripts/
 scripts/testnet/
 scripts/devnet/
 *.DS_Store
+# localnet state (default LOCALNET_DATA) and build artifacts of its tooling
+localnet/.local/
+localnet/subgraph/gateway/node_modules/
+localnet/subgraph/gateway/build/
+localnet/subgraph/gateway/generated/
+localnet/contracts-local/out/
+localnet/contracts-local/cache/
+localnet/contracts-local/broadcast/
+localnet/tools/__pycache__/

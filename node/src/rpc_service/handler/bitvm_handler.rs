@@ -1,8 +1,8 @@
+#[cfg(feature = "rpc-debug-endpoints")]
+use crate::aggregates::graph_pegout_jobs::broadcast_verifier_challenge_assert_tx;
 use crate::env::{
     GraphBtcTxName, get_goat_gateway_contract_from_env, get_node_goat_address, get_node_pubkey,
 };
-#[cfg(feature = "rpc-debug-endpoints")]
-use crate::handle::broadcast_verifier_challenge_assert_tx;
 use crate::rpc_service::AppState;
 use crate::rpc_service::bitvm::*;
 use crate::rpc_service::node::ALIVE_TIME_JUDGE_THRESHOLD;
@@ -10,9 +10,11 @@ use crate::rpc_service::response::{
     ApiErrorExt, ApiResult, ErrorResponse, error_response, ok_response,
 };
 use crate::rpc_service::validation::InputValidator;
+#[cfg(feature = "rpc-debug-endpoints")]
+use crate::utils::send_challenge_tx;
 use crate::utils::{
     gen_instance_parameters_local, get_bridge_out_global_stats, load_validated_graph_definition,
-    obsolete_graph, send_challenge_tx,
+    obsolete_graph,
 };
 use alloy::primitives::U256;
 use axum::Json;
@@ -306,7 +308,7 @@ pub async fn get_instance(
 
         ok_response(InstanceGetResponse { instance_wrap })
     } else {
-        tracing::info!("instance_id {} has no record in database", instance_id);
+        tracing::debug!("instance_id {} has no record in database", instance_id);
         ok_response(InstanceGetResponse { instance_wrap: None })
     }
 }
@@ -479,7 +481,7 @@ pub async fn get_graph(
 
         ok_response(graph_extended)
     } else {
-        tracing::warn!("graph:{} is not record in db", graph_id);
+        tracing::debug!("graph:{} is not record in db", graph_id);
         ok_response(GraphExtended::default())
     }
 }
@@ -873,7 +875,7 @@ pub async fn get_graph_tx(
             btc_tx_data: BtcTxData { raw_data, progresses, fail_reason },
         })
     } else {
-        tracing::warn!("graph:{} is not record in db", graph_id);
+        tracing::debug!("graph:{} is not record in db", graph_id);
         Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
@@ -1174,7 +1176,6 @@ pub async fn get_unsigned_pegin_txn(
             InstanceBridgeInStatus::CommitteesAnswered.to_string(),
             InstanceBridgeInStatus::UserBroadcastPeginPrepare.to_string(),
             InstanceBridgeInStatus::Presigned.to_string(),
-            InstanceBridgeInStatus::PresignedFailed.to_string(),
             InstanceBridgeInStatus::Timeout.to_string(),
         ]
         .contains(&instance.status)
@@ -1211,6 +1212,7 @@ pub async fn get_unsigned_pegin_txn(
 ///
 /// - `200 OK`: Challenge transaction broadcasted successfully, returns txid
 /// - `500 Internal Server Error`: Graph not found or broadcast failed
+#[cfg(feature = "rpc-debug-endpoints")]
 #[axum::debug_handler]
 pub async fn send_challenge(
     Path(graph_id): Path<String>,
@@ -1625,15 +1627,6 @@ pub async fn pegout(
                             "PEGOUT_ERROR".to_string(),
                             format!(
                                 "graph {} not ready: previous graph {} is in active pegout status {}",
-                                graph.graph_id, previous_graph.graph_id, previous_graph.status
-                            ),
-                        );
-                    }
-                    _ => {
-                        return error_response(
-                            "PEGOUT_ERROR".to_string(),
-                            format!(
-                                "graph {} not ready: previous graph {} has unexpected status {}",
                                 graph.graph_id, previous_graph.graph_id, previous_graph.status
                             ),
                         );

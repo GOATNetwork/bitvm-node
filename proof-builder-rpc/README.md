@@ -16,6 +16,26 @@ the database.
 
 Field descriptions for the configuration are available in the circuits documentation: [circuits README](../circuits/README.md).
 
+To reuse local Bitcoin headers for the first batch built from Genesis, set
+`prefer_local_headers_on_init = true` in `[header_chain]`, together with `init_input = true`
+and `start = 0`. The option defaults to `false` for existing configurations. Headers are read
+from `block_headers`, which contains consecutive 80-byte headers starting at height 0.
+If that working cache is missing or incomplete, the builder also checks
+`0-<batch_size>.bin.blocks` in the same directory. A sidecar containing more complete headers
+is copied into the working cache, up to the requested batch size; the source sidecar is unchanged.
+For example, a Genesis batch of 157450 headers can reuse `0-157450.bin.blocks` without changing
+the configured `block_headers` path. Logs identify both the sidecar source and working cache.
+Choose a distinct Genesis `output_proof`, such as `genesis-157450.bin`; the following batch is
+written to `157450-1.bin` in the same output directory.
+For `batch_size = 10000`, the first batch uses heights 0 through 9999. A complete local batch
+requires no Bitcoin RPC calls and leaves any later cached headers intact. If local files are absent
+or incomplete, only missing headers are fetched through Esplora; an incomplete trailing header
+is fetched again. This preference overrides `force_fetch` for the Genesis batch only.
+After the first proof succeeds, subsequent batches contain one block and use the existing
+fetching behaviour. Restarting with database progress also resumes with one block per batch.
+When this option is enabled, surplus cached headers are replaced as later batches are fetched,
+including when `force_fetch = false`.
+
 The four Operator/Watchtower task endpoints require signed requests and live GOAT contract
 authorization. Configure the read-only GOAT connection before startup:
 
@@ -51,6 +71,71 @@ HTTP method, route, timestamp, nonce, and canonical JSON body. Rust callers shou
 To enable multiple Gateways without interrupting proof polling, first upgrade Proof Builder with a
 single Gateway, then upgrade all Nodes to send `gateway_address`, and finally configure the
 comma-separated Gateway list.
+
+## Fleet app worker mode
+
+Proof Builder can run as a zkm-fleet integrated app worker. Fleet starts a dedicated Ziren GPU
+server for the app and launches `proof-builder-rpc` beside it. The
+worker proves directly against that loopback server instead of submitting through the SDK
+network prover and the Fleet gateway. The HTTP API and node configuration are unchanged.
+
+Fleet mode starts when Fleet supplies its worker environment. Any partial Fleet environment is a
+startup error. Without these variables the SDK network prover (`ZKM_PROVER=network`) is used as
+before, which is how operators fall back explicitly.
+
+| Variable | Source | Meaning |
+|---|---|---|
+| `FLEET_GPU_ENDPOINT` | Fleet | Loopback URL of the replica's GPU server |
+| `FLEET_APP_STORAGE_ROOT` | Fleet | Durable app storage (`proof_storage_root`) |
+| `FLEET_APP_ELF_ID` | Fleet | App id: the SHA-256 of the program bundle manifest |
+| `FLEET_APP_NAMESPACE`, `FLEET_APP_TENANT` | Fleet | App identity |
+| `FLEET_EXIT_WITH_PARENT` | Fleet | Exit with the Fleet actor (Linux `PR_SET_PDEATHSIG`) |
+| `PROOF_BUILDER_PROGRAMS_FILE` | worker env file | `programs.json` from the package |
+
+The app id covers all five guests. Each line is `<name> <ELF SHA-256>`, sorted by name
+(commit-chain, header-chain, operator, state-chain, watchtower), and the id is the SHA-256 of
+those lines. `proof-builder-rpc --print-programs` sets every program up on the CPU prover and
+prints the ELF digests, program IDs, verifying-key hashes, wrap mode and app id as JSON; package
+that output as `programs.json`. At startup the worker checks that the embedded programs, the
+programs file and `ZKM_IMM_WRAP_VK` match the Fleet app id. After each GPU setup it also checks
+the verifying key.
+
+Startup also requires the following:
+
+- The working directory (`worker_workdir`) and the sqlite database must be inside the storage
+  root, and the worker takes an exclusive lock on `<root>/proof-builder.lock`.
+- Use `<root>/run` as the working directory so that relative `../circuits/data/...` paths
+  resolve to `<root>/circuits/data/...`.
+- Groth16 wrapping runs on the worker's CPU. Pre-install the Groth16 circuit artifacts for the
+  Fleet execution user before enabling the app.
+
+Proving behaviour in Fleet mode:
+
+- The GPU server runs one proof at a time. Builder setup and every proving unit (prove, publish
+  and database commit) pass through a FIFO gate.
+- An operator or watchtower task stays `New` while it queues and proves. Its result is written
+  only while it is still `New`, so a timeout request that arrives in the meantime wins.
+- If the GPU server stops reporting ready, or a proof cannot be published, the task stays
+  pending and the worker exits. Fleet then restarts the GPU server and the worker.
+- Otherwise a failed prover call is replayed by executing its guest on the CPU. GPU RPC
+  errors do not distinguish transport failures from rejected inputs. If the guest executes,
+  the prover or its transport failed; the proof is retried in place and the failure does not
+  count as an attempt.
+- A proof that fails because the guest rejects its input, or because the result does not
+  verify, marks the task `Failed` after `--max-proof-attempts` consecutive failures
+  (default 2).
+- On SIGTERM or a task failure the worker starts no new proof. It waits up to
+  `--drain-timeout-secs` for the proof in progress to be published and committed, then exits.
+  A proof still running at the timeout does not delay the exit; it is retried after restart.
+  Keep that value below the service's `worker_stop_timeout_s`. Exit codes: 0 after a clean stop,
+  1 after a task failure or an abandoned proof, 101 after a panic.
+- Proofs and their sidecars are published through synced temporary files and atomic renames.
+  Sidecars are published before the proof file, and the database is updated after all files
+  and the directory are synced. Sidecars include the header chain's `.blocks`, which operator
+  and watchtower proofs read for SPV. State-chain `.args`/`.ctx` snapshots are written atomically
+  as well.
+- The state-chain context builder prepares at most `--state-chain-max-pending-batches`
+  unproved batches (default 2; 0 means unlimited).
 
 ## Metrics
 
