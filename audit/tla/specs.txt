@@ -1,0 +1,107 @@
+# TLA+ spec table, run by check.sh (`make tla`, CI job `tla-plus`).
+# One row per TLC run:  tier | config | spec | description
+#   pass       - fix or baseline design; must verify
+#   historical - bug fixed in the code; the frozen spec must still reproduce it
+#   live       - bug NOT fixed in the code; fails the run until fixed, then move to historical
+# See check.sh for how each tier is judged and README.md "Formal verification (TLA+)".
+
+# ---- round 1 (audit/TLAPlus-20260710.md) ------------------------------------------------------------
+pass       | GraphLifecycleCoreOnly.cfg                 | GraphLifecycle.tla                 | baseline chain-scan state machine is sound
+pass       | GraphLifecycleFixed.cfg                    | GraphLifecycle.tla                 | Finding 1 fix - atomic guard closes Graph.status race
+pass       | GraphLifecycleFineGrainedFixed.cfg         | GraphLifecycleFineGrainedFixed.tla | Finding 1b fix - single-statement atomic CAS
+pass       | InstancePresignedFixed.cfg                 | InstancePresigned.tla              | Finding 2 fix - Instance.status regression guarded
+pass       | InstanceLifecycle.cfg                      | InstanceLifecycle.tla              | baseline instance lifecycle is sound
+pass       | Take2DisproveRace.cfg                      | Take2DisproveRace.tla              | Finding 4 - Take2 vs Disprove margin holds (real shipped values)
+pass       | MultiActorRace.cfg                         | MultiActorRace.tla                 | Finding 5/10 - 1-of-N watchtower/verifier + operator_commit margin
+pass       | InstanceBridgeOutRaceFixed.cfg             | InstanceBridgeOutRace.tla          | Finding 6 fix - terminal-status guard closes resurrection
+pass       | MessageStateRaceFixed.cfg                  | MessageStateRace.tla               | Finding 7 fix - terminal-guarded resurrect
+pass       | Take1ChallengeRaceFixed.cfg                | Take1ChallengeRace.tla             | Finding 9 fix - connector_a margin check added
+historical | GraphLifecycle.cfg                         | GraphLifecycle.tla                 | Finding 1: Graph.status race (fixed 991faaa)
+historical | GraphLifecycleFineGrained.cfg              | GraphLifecycleFineGrained.tla      | Finding 1b: naive guard still unsafe (fixed 991faaa)
+historical | InstancePresignedBug.cfg                   | InstancePresigned.tla              | Finding 2: Instance.status regression past Presigned (fixed 991faaa)
+historical | InstanceBridgeOutRace.cfg                  | InstanceBridgeOutRace.tla          | Finding 6: InstanceBridgeOutStatus resurrection (fixed 991faaa)
+historical | MessageStateRace.cfg                       | MessageStateRace.tla               | Finding 7: MessageState resurrection (fixed 991faaa)
+historical | Take1ChallengeRace.cfg                     | Take1ChallengeRace.tla             | Finding 9: connector_a has no margin check (fixed 991faaa)
+
+# ---- issues #429 / #431 -----------------------------------------------------------------------------
+pass       | VerifierKickoffFailOpenFixed.cfg           | VerifierKickoffFailOpen.tla        | Issue #429 fix design - defer/retry mirrors committee (assumes SPV catches up; see ChallengeKickoffGate)
+pass       | KickoffScanCoverageFixed.cfg               | KickoffScanCoverage.tla            | Issue #431 fix - every graph reached, no depth cap (graph_scan round-robin since #476)
+historical | KickoffScanCoverage.cfg                    | KickoffScanCoverage.tla            | Issue #431: detect_kickoff one-per-operator coverage gap (fixed by #451)
+historical | VerifierKickoffFailOpen.cfg                | VerifierKickoffFailOpen.tla        | Issue #429: verifier KickoffSent fail-open (SPV lag skipped Challenge, never retried) (fixed by #455)
+historical | KickoffScanCoverageResidual.cfg            | KickoffScanCoverage.tla            | Issue #431 residual: root-only walk capped at 32 (fixed by #476: graph_scan visits every monitored graph)
+
+# ---- round 2: dispute defences (C1, C2) -------------------------------------------------------------
+live       | DisputeObligationsC1.cfg                   | DisputeObligations.tla             | C1: unresolved watchtower keeps all_resolved false -> no NACK, no Commit-Timeout, ChallengeAssert gated on connector-E -> Take-2 with invalid proof
+live       | DisputeObligationsC1LateCommit.cfg         | DisputeObligations.tla             | C1: ChallengeAssert gate alone - late commit-pubin, operator_commit + prover_connector >= connector_f -> Disprove loses to Take-2
+live       | DisputeObligationsC1NoPubin.cfg            | DisputeObligations.tla             | C1: Commit-Timeout gated on all_resolved + hashlock ACK without challenge -> Take-2 without commit-pubin
+live       | DisputeObligationsC2.cfg                   | DisputeObligations.tla             | C2: early Assert cancels every JOB_WATCHTOWER_CHALLENGE -> all watchtowers honest yet Take-2 with invalid proof
+live       | DisputeObligationsC2Silenced.cfg           | DisputeObligations.tla             | C2 alone (C1 fixed): early Assert still silences every honest watchtower
+pass       | DisputeObligationsFixed.cfg                | DisputeObligations.tla             | C1/C2 fix design - Commit-Timeout at operator_commit, NACK every unspent Ack, ungated ChallengeAssert, no cancel on Assert
+
+# ---- round 2: assert scripts and presigned tx policy (C3, C4, M3, M5) -------------------------------
+live       | AssertFrontRun.cfg                         | AssertFrontRun.tla                 | C3: VerifierConnector leaf 0 has no CHECKSIG - operator copies the ChallengeAssert witness, Disprove dies, Take2 follows
+live       | AssertFrontRunC4.cfg                       | AssertFrontRun.tla                 | C4: ConnectorC leaf 1 has no CHECKSIG - watcher redirects OperatorAssert, no ConnectorD, honest operator cannot settle
+live       | AssertFrontRunPiMalleable.cfg              | AssertFrontRun.tla                 | pi2/pi3 OP_2DROP malleability survives both CHECKSIG fixes - honest operator Disproved
+pass       | AssertFrontRunFixed.cfg                    | AssertFrontRun.tla                 | C3 fix design - n-of-n SIGHASH_ALL presig on VerifierAssert, Disprove always reachable
+pass       | AssertFrontRunC4Fixed.cfg                  | AssertFrontRun.tla                 | C3/C4 fix design - both CHECKSIGs + pi2/pi3 bound to signed data, valid and invalid proofs
+live       | DefenderTxPinning.cfg                      | DefenderTxPinning.tla              | M3: v2 + keyless P2A - absolute-fee pin keeps the defender tx unconfirmed until Take2
+pass       | DefenderTxPinningFixed.cfg                 | DefenderTxPinning.tla              | M3 fix design - v3/TRUC 1p1c, 1 kvB child cap, defender always evicts the pin
+live       | RoundPenalty.cfg                           | RoundPenalty.tla                   | M5: operator burns ForceSkipConn_{i+1}, late Kickoff_i escapes QuickChallenge/ForceSkip/CIK
+pass       | RoundPenaltyFixed.cfg                      | RoundPenalty.tla                   | M5 fix design - n-of-n ForceSkipConnector, late kickoff always QuickChallenged
+
+# ---- round 2: kickoff challenge gate (C5, C6, H4) ---------------------------------------------------
+live       | ChallengeKickoffGateC5.cfg                 | ChallengeKickoffGate.tla           | C5: late initWithdraw poisons proceedWithdraw (KickoffHeightLow); gate waits on Initialized forever, Take1 + manual cancel = double payment
+live       | ChallengeKickoffGateC6.cfg                 | ChallengeKickoffGate.tla           | C6: challenge_kickoff waits for GOAT SPV with no connector_a deadline; bounded SPV lag lets Take1 land unchallenged
+live       | ChallengeKickoffGateC6Testnet4.cfg         | ChallengeKickoffGate.tla           | C6 shipped: Testnet4 BTC_BLOCK_CONFIRMS 10 > connector_a 6, SPV can never cover the kickoff before Take1
+live       | ChallengeKickoffGateH4.cfg                 | ChallengeKickoffGate.tla           | H4: Goat history-sync stall skips the chain scan that queues challenge_kickoff; Take1 lands unchallenged
+pass       | ChallengeKickoffGateFixed.cfg              | ChallengeKickoffGate.tla           | C5/C6/H4 fix design - poisoned-Initialized + connector_a-deadline challenge, ungated scan, cancel guard
+
+# ---- round 2: Gateway withdraw lifecycle and committee multisig (H1, M1, C5, F4, econ) ---------------
+live       | GatewayWithdrawLifecycleH1.cfg             | GatewayWithdrawLifecycle.tla       | H1: finish_disproved gives up on withdraw None -> disproved operator never slashed
+live       | GatewayWithdrawLifecycleH1Node.cfg         | GatewayWithdrawLifecycle.tla       | H1: WithdrawDisproved of an un-initialised graph has instanceId 0, watcher drops it
+pass       | GatewayWithdrawLifecycleH1Fixed.cfg        | GatewayWithdrawLifecycle.tla       | H1 fix design - relay None + key event by graph
+live       | GatewayWithdrawLifecycleM1.cfg             | GatewayWithdrawLifecycle.tla       | M1: disprove of lock holder leaves pegin Locked forever (liveness)
+live       | GatewayWithdrawLifecycleM1Escrow.cfg       | GatewayWithdrawLifecycle.tla       | M1: disprove while Initialized strands the escrowed pegBTC
+pass       | GatewayWithdrawLifecycleM1Fixed.cfg        | GatewayWithdrawLifecycle.tla       | M1 fix design - disprove of lock holder reopens pegin + releases escrow
+live       | GatewayWithdrawLifecycleC5.cfg             | GatewayWithdrawLifecycle.tla       | C5: committeeCancelWithdraw after kickoff+Take1 refunds pegBTC (double payment)
+live       | GatewayWithdrawLifecycleC5Stale.cfg        | GatewayWithdrawLifecycle.tla       | C5: cancel digest not bound to attempt, old signature cancels a re-init
+pass       | GatewayWithdrawLifecycleC5Fixed.cfg        | GatewayWithdrawLifecycle.tla       | C5 fix design - cancel needs kickoff-impossible proof + attempt-bound digest
+live       | GatewayWithdrawLifecycleF4.cfg             | GatewayWithdrawLifecycle.tla       | F4: initWithdraw not restricted to the graph's operator
+pass       | GatewayWithdrawLifecycleF4Fixed.cfg        | GatewayWithdrawLifecycle.tla       | F4 fix design - initWithdraw only from the graph operator
+live       | GatewayWithdrawLifecycleEcon.cfg           | GatewayWithdrawLifecycle.tla       | Econ: one stake backs N graphs, rewards paid when slash is 0
+pass       | GatewayWithdrawLifecycleEconFixed.cfg      | GatewayWithdrawLifecycle.tla       | Econ fix design - per-graph stake reservation, rewards capped by slash
+pass       | GatewayWithdrawLifecycleAllFixed.cfg       | GatewayWithdrawLifecycle.tla       | all Gateway withdraw fixes together, safety + liveness
+live       | MultiSigReplay.cfg                         | MultiSigReplay.tla                 | updateOwners digest lacks contract/chain id, cross-deployment replay
+pass       | MultiSigReplayFixed.cfg                    | MultiSigReplay.tla                 | domain-separated updateOwners digest
+
+# ---- round 2: engine job persistence and capacity (H3, M4, H5) --------------------------------------
+live       | JobObligationPersistence.cfg               | JobObligationPersistence.tla       | H3: one panic Poisons a stable-id defence job; INSERT OR IGNORE never re-runs it
+live       | JobObligationPersistenceRejected.cfg       | JobObligationPersistence.tla       | H3: transient Goat revert classified Permanent ends peg-out job Done("rejected"), never re-run
+live       | JobObligationPersistenceReorg.cfg          | JobObligationPersistence.tla       | H3: Take1/Take2/Disprove/Skipped closed at 1 conf, never rescanned; 1-block reorg leaves false closure
+pass       | JobObligationPersistenceFixed.cfg          | JobObligationPersistence.tla       | H3 fix design - re-arm unbroadcast obligations per scan (generation in job id), close at depth > max reorg
+live       | PeginPostRetry.cfg                         | PeginPostRetry.tla                 | M4: post_pegin_data "cannot cover fee" retried forever, no alert, BTC locked with no mint
+pass       | PeginPostRetryFixed.cfg                    | PeginPostRetry.tla                 | M4 fix design - FeeTooHigh classified as rejection -> Failed -> PostPeginDataRejected alert
+live       | PegoutPoolCapacity.cfg                     | PegoutPoolCapacity.tla             | H5: 1 Pegout slot + 1 running job per graph; N*E > T2-Incl -> honest operator disproved (testnet4)
+live       | PegoutPoolCapacitySlotsOnly.cfg            | PegoutPoolCapacity.tla             | H5: raising pegout_pool_slots alone does not help (per-aggregate claim gate)
+pass       | PegoutPoolCapacityFixed.cfg                | PegoutPoolCapacity.tla             | H5 fix design - prover_connector >= Reaction + N*E_max + Incl validated per graph
+
+# ---- round 2: peg-in safety and liveness (H2, H6, M2, F1, F6, F7) -----------------------------------
+# PeginConfirmCancelReorg{GateOnly,PostWaitOnly}.cfg are insufficient fix designs (expected to fail);
+# they document why the fix needs a deep SPV, and are not part of this table.
+live       | PeginConfirmCancelReorg.cfg                | PeginConfirmCancelReorg.tla        | H6: Cancel reorgs out a 1-conf-minted Confirm (SPV lag 0, d=1) - unbacked mint
+live       | PeginConfirmCancelReorgNodeSpv.cfg         | PeginConfirmCancelReorg.tla        | H6: node SPV writer lag k=1 -> d=k+1 reorg still mints unbacked
+pass       | PeginConfirmCancelReorgFixed.cfg           | PeginConfirmCancelReorg.tla        | H6 fix design - SPV records only headers >= max-reorg deep
+live       | PeginTimeoutAgreement.cfg                  | PeginTimeoutAgreement.tla          | M2: per-node Timeout vs later-confirmed Confirm - nodes disagree
+live       | PeginTimeoutAgreementMint.cfg              | PeginTimeoutAgreement.tla          | M2: Timeout relayer never posts - confirmed Confirm never minted
+pass       | PeginTimeoutAgreementFixed.cfg             | PeginTimeoutAgreement.tla          | M2 fix design - confirmed Confirm reverts Timeout to RelayerL1Broadcasted
+pass       | PeginTimeoutAgreementRelayerPosts.cfg      | PeginTimeoutAgreement.tla          | M2 partial fix - relayer posts despite Timeout (mint live; agreement not)
+live       | CommitteeKeyDeletion.cfg                   | CommitteeKeyDeletion.tla           | H2: key deletion off by default - settled C0 sweepable
+live       | CommitteeKeyDeletionTimeout.cfg            | CommitteeKeyDeletion.tla           | H2: deletion on but never on Timeout - deposit/C0 sweepable
+pass       | CommitteeKeyDeletionFixed.cfg              | CommitteeKeyDeletion.tla           | H2 fix design - delete on by default, on every terminal state incl. Timeout
+live       | PeginRequestLivenessSpam.cfg               | PeginRequestLiveness.tla           | F1: free never-expiring spam delays Prepare detection past graph cutoff
+pass       | PeginRequestLivenessSpamFixed.cfg          | PeginRequestLiveness.tla           | F1 fix design - fee/min amount + CommitteesAnswered expiry bound live spam
+live       | PeginRequestLivenessBadKey.cfg             | PeginRequestLiveness.tla           | F6: one off-curve answer wedges the instance in CommitteesAnswered
+pass       | PeginRequestLivenessBadKeyFixed.cfg        | PeginRequestLiveness.tla           | F6 fix design - on-curve check on answers
+live       | PeginRequestLivenessNoHeight.cfg           | PeginRequestLiveness.tla           | F7 (latent, non-conforming backend): btc_height 0 - Timeout never fires
+live       | PeginRequestLivenessNoHeightGate.cfg       | PeginRequestLiveness.tla           | F7 (latent): btc_height 0 - T0 gate never closes, signature after T0
+pass       | PeginRequestLivenessNoHeightFixed.cfg      | PeginRequestLiveness.tla           | F7 fix design - confirmed Prepare needs a height
