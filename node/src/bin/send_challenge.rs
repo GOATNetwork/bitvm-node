@@ -19,9 +19,10 @@
 use anyhow::{Context, Result};
 use bitvm_noded::env::get_bitvm_key;
 use bitvm_noded::rpc_service::auth::{
-    AUTH_SIGNATURE_HEADER, AUTH_TIMESTAMP_HEADER, sign_request_auth,
+    AUTH_NONCE_HEADER, AUTH_SIGNATURE_HEADER, AUTH_TIMESTAMP_HEADER, sign_request_auth,
 };
 use clap::Parser;
+use http::Method;
 use serde::Deserialize;
 
 #[derive(Debug, Parser)]
@@ -50,19 +51,18 @@ struct SendChallengeResponse {
 async fn main() -> Result<()> {
     dotenv::dotenv().ok();
     let args = Args::parse();
-    let url = format!(
-        "{}/v1/graphs/{}/send-challenge",
-        args.rpc_url.trim_end_matches('/'),
-        args.graph_id
-    );
+    let request_target = format!("/v1/graphs/{}/send-challenge", args.graph_id);
+    let url = format!("{}{}", args.rpc_url.trim_end_matches('/'), request_target);
 
     let keypair = get_bitvm_key().context("failed to load BITVM_SECRET")?;
-    let (timestamp, signature) = sign_request_auth(&keypair);
+    let (timestamp, nonce, signature) =
+        sign_request_auth(&keypair, &Method::POST, &request_target, &[]);
 
     let client = reqwest::Client::new();
     let resp = client
         .post(&url)
         .header(AUTH_TIMESTAMP_HEADER, &timestamp)
+        .header(AUTH_NONCE_HEADER, &nonce)
         .header(AUTH_SIGNATURE_HEADER, &signature)
         .send()
         .await

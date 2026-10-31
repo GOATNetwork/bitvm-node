@@ -1,8 +1,10 @@
 use crate::committee::{
-    CommitteeNonceSignatures, CommitteePubNonces, CommitteeSecNonces, generate_nonce,
-    generate_nonce_from_seed,
+    CommitteeNonceSignatures, CommitteePubNonces, CommitteeSecNonces,
+    committee_presign_sighash_digest, generate_nonce, generate_nonce_from_seed,
+    pegin_confirm_sighash,
 };
 use crate::operator::{generate_assert_wots_key, generate_commit_pubin_wots_key};
+use crate::types::{BitvmGcGraph, BitvmGcInstanceParameters};
 use anyhow::{Context, bail};
 use bitcoin::{
     Network, PublicKey,
@@ -188,6 +190,22 @@ pub struct CommitteeInstanceKeyEnvelope {
 }
 
 pub struct CommitteeMasterKey(Keypair);
+
+struct CommitteeGraphNonceContext {
+    instance_id: Uuid,
+    graph_id: Uuid,
+    graph_parameters_hash: [u8; 32],
+    presign_sighash_digest: [u8; 32],
+    watchtower_num: usize,
+    verifier_num: usize,
+}
+
+struct CommitteeInstanceNonceContext {
+    instance_id: Uuid,
+    instance_parameters_hash: [u8; 32],
+    pegin_confirm_sighash: [u8; 32],
+}
+
 impl CommitteeMasterKey {
     pub fn new(inner: Keypair) -> Self {
         CommitteeMasterKey(inner)
@@ -340,40 +358,66 @@ impl CommitteeMasterKey {
 
     pub fn nonces_for_graph_job_with_keypair(
         &self,
-        instance_id: Uuid,
-        graph_id: Uuid,
-        graph_parameters_hash: [u8; 32],
-        watchtower_num: usize,
-        verifier_num: usize,
+        graph: &BitvmGcGraph,
+        signer_keypair: Keypair,
+    ) -> anyhow::Result<(CommitteePubNonces, CommitteeSecNonces, CommitteeNonceSignatures)> {
+        let context = CommitteeGraphNonceContext {
+            instance_id: graph.parameters.instance_parameters.instance_id,
+            graph_id: graph.parameters.graph_id,
+            graph_parameters_hash: graph.parameters.parameters_hash()?,
+            presign_sighash_digest: committee_presign_sighash_digest(graph)?,
+            watchtower_num: graph.parameters.watchtower_pubkeys.len(),
+            verifier_num: graph.parameters.gc_data.len(),
+        };
+        Ok(self.nonces_for_graph_context_with_keypair(context, signer_keypair))
+    }
+
+    fn nonces_for_graph_context_with_keypair(
+        &self,
+        context: CommitteeGraphNonceContext,
         signer_keypair: Keypair,
     ) -> (CommitteePubNonces, CommitteeSecNonces, CommitteeNonceSignatures) {
         let domain = [
-            b"committee_bitvm_graph_nonces_v2".to_vec(),
-            instance_id.as_bytes().to_vec(),
-            graph_id.as_bytes().to_vec(),
-            graph_parameters_hash.to_vec(),
+            b"committee_bitvm_graph_nonces_v3".to_vec(),
+            context.instance_id.as_bytes().to_vec(),
+            context.graph_id.as_bytes().to_vec(),
+            context.graph_parameters_hash.to_vec(),
+            context.presign_sighash_digest.to_vec(),
         ]
         .concat();
         let nonce_seed = derive_secret(&signer_keypair, &domain);
         generate_nonce_from_seed(
             nonce_seed,
-            graph_id.as_u128() as usize,
+            context.graph_id.as_u128() as usize,
             signer_keypair,
-            watchtower_num,
-            verifier_num,
+            context.watchtower_num,
+            context.verifier_num,
         )
     }
 
     pub fn nonce_for_instance_job_with_keypair(
         &self,
-        instance_id: Uuid,
-        instance_parameters_hash: [u8; 32],
+        instance_parameters: &BitvmGcInstanceParameters,
+        signer_keypair: Keypair,
+    ) -> anyhow::Result<(SecNonce, PubNonce, SchnorrSignature)> {
+        let context = CommitteeInstanceNonceContext {
+            instance_id: instance_parameters.instance_id,
+            instance_parameters_hash: instance_parameters.parameters_hash()?,
+            pegin_confirm_sighash: pegin_confirm_sighash(instance_parameters)?,
+        };
+        Ok(self.nonce_for_instance_context_with_keypair(context, signer_keypair))
+    }
+
+    fn nonce_for_instance_context_with_keypair(
+        &self,
+        context: CommitteeInstanceNonceContext,
         signer_keypair: Keypair,
     ) -> (SecNonce, PubNonce, SchnorrSignature) {
         let domain = [
-            b"committee_bitvm_instance_nonce_v2".to_vec(),
-            instance_id.as_bytes().to_vec(),
-            instance_parameters_hash.to_vec(),
+            b"committee_bitvm_instance_nonce_v3".to_vec(),
+            context.instance_id.as_bytes().to_vec(),
+            context.instance_parameters_hash.to_vec(),
+            context.pegin_confirm_sighash.to_vec(),
         ]
         .concat();
         let nonce_seed = derive_secret(&signer_keypair, &domain);

@@ -18,9 +18,9 @@ use crate::scheduled_tasks::graph_maintenance_tasks::{
     detect_init_withdraw_call, detect_kickoff, detect_take1_or_challenge, process_graph_challenge,
 };
 use crate::scheduled_tasks::instance_maintenance_tasks::{
-    instance_answers_monitor, instance_bridge_out_monitor, instance_btc_tx_monitor,
-    instance_committee_key_cleanup_monitor, instance_expiration_monitor,
-    instance_window_expiration_monitor, pegin_confirm_recovery_monitor,
+    instance_answers_monitor, instance_btc_tx_monitor, instance_committee_key_cleanup_monitor,
+    instance_expiration_monitor, instance_window_expiration_monitor,
+    pegin_confirm_recovery_monitor, swap_escrow_timeout_monitor,
 };
 use crate::scheduled_tasks::node_maintenance_tasks::node_available_pbtc_update_monitor;
 use crate::scheduled_tasks::spv_maintenance_tasks::spv_header_hash_update;
@@ -157,8 +157,9 @@ async fn refresh_alert_health(
     }
 }
 
-/// Return every graph in the requested status. Time-sensitive flows must not
-/// let a lower-index graph hide another graph owned by the same operator.
+/// Return every graph in the requested status, ordered by operator and
+/// kickoff index. Time-sensitive flows must not let a lower-index graph hide
+/// another graph owned by the same operator.
 pub(super) async fn fetch_all_graphs_by_status<'a>(
     storage_processor: &mut StorageProcessor<'a>,
     graph_status: &str,
@@ -312,8 +313,8 @@ async fn run(
     .await;
     run_maintenance_subtask(
         metrics_state,
-        "instance_bridge_out_monitor",
-        instance_bridge_out_monitor(local_db),
+        "swap_escrow_timeout_monitor",
+        swap_escrow_timeout_monitor(local_db),
     )
     .await;
     run_maintenance_subtask(
@@ -322,8 +323,8 @@ async fn run(
         detect_init_withdraw_call(local_db),
     )
     .await;
-    run_maintenance_subtask(metrics_state, "detect_kickoff", detect_kickoff(local_db, btc_client))
-        .await;
+    // detect_kickoff runs in its own task (run_kickoff_scan_task): its walks
+    // are unbounded and must not share this run's timeout budget.
     run_maintenance_subtask(
         metrics_state,
         "detect_take1_or_challenge",
@@ -337,6 +338,83 @@ async fn run(
     )
     .await;
     Ok(MaintenanceRunOutcome::Completed)
+}
+
+/// A kickoff scan round that takes longer than this is logged; the walk is
+/// unbounded by design, so this is a signal, not a cutoff.
+const KICKOFF_SCAN_SLOW_ROUND: Duration = Duration::from_secs(60);
+
+/// Independent kickoff scan loop. Each round is gated by the gateway history
+/// sync like the maintenance tick, records its own metrics, and is cancellable
+/// while scanning as well as while sleeping. A failed round is logged and the
+/// next round runs after `interval`.
+pub async fn run_kickoff_scan_task(
+    local_db: LocalDB,
+    btc_client: Arc<BTCClient>,
+    goat_client: Arc<GOATClient>,
+    interval: u64,
+    cancellation_token: CancellationToken,
+    metrics_state: MetricsState,
+) -> anyhow::Result<String> {
+    loop {
+        tokio::select! {
+            _ = kickoff_scan_round(&local_db, &btc_client, &goat_client, &metrics_state) => {}
+            _ = cancellation_token.cancelled() => break,
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(interval)) => {}
+            _ = cancellation_token.cancelled() => break,
+        }
+    }
+    info!(
+        event = "kickoff_scan_lifecycle",
+        outcome = "shutdown",
+        "kickoff scan received shutdown signal"
+    );
+    Ok("kickoff_scan_shutdown".to_string())
+}
+
+async fn kickoff_scan_round(
+    local_db: &LocalDB,
+    btc_client: &BTCClient,
+    goat_client: &GOATClient,
+    metrics_state: &MetricsState,
+) {
+    match is_processing_gateway_history_events(local_db, goat_client).await {
+        Ok(true) => {
+            info!(
+                event = "maintenance_subtask_result",
+                task = "detect_kickoff",
+                outcome = "deferred",
+                reason = "history_sync_in_progress",
+                "kickoff scan deferred while gateway history sync is active"
+            );
+            return;
+        }
+        Ok(false) => {}
+        Err(error) => {
+            warn!(
+                event = "maintenance_subtask_result",
+                task = "detect_kickoff",
+                outcome = "failed",
+                error = %error,
+                "kickoff scan could not check gateway history sync"
+            );
+            return;
+        }
+    }
+    let started_at = Instant::now();
+    run_maintenance_subtask(metrics_state, "detect_kickoff", detect_kickoff(local_db, btc_client))
+        .await;
+    let elapsed = started_at.elapsed();
+    if elapsed > KICKOFF_SCAN_SLOW_ROUND {
+        warn!(
+            event = "maintenance_subtask_result",
+            task = "detect_kickoff",
+            elapsed_ms = elapsed.as_millis() as u64,
+            "kickoff scan round is slow"
+        );
+    }
 }
 
 pub async fn run_maintenance_tasks(
@@ -496,14 +574,19 @@ pub fn get_goat_message_content_type(content: &GOATMessageContent) -> MessageTyp
         GOATMessageContent::GenCircuits(_) => MessageType::GenCircuits,
         GOATMessageContent::CutCircuits(_) => MessageType::CutCircuits,
         GOATMessageContent::SolderingProofReady(_) => MessageType::SolderingProof,
+        GOATMessageContent::GraphSetupAck(_) => MessageType::None,
         GOATMessageContent::VerifierGraphParamsEndorsement(_) => {
             MessageType::VerifierGraphParamsEndorsement
         }
         GOATMessageContent::NonceGeneration(_) => MessageType::NonceGeneration,
+        GOATMessageContent::AggNonceConsensus(_) => MessageType::AggNonceConsensus,
         GOATMessageContent::CommitteePresign(_) => MessageType::CommitteePresign,
         GOATMessageContent::GraphFinalize(_) => MessageType::GraphFinalize,
         GOATMessageContent::EndorseGraph(_) => MessageType::EndorseGraph,
         GOATMessageContent::PeginConfirmNonce(_) => MessageType::PeginConfirmNonce,
+        GOATMessageContent::PeginConfirmNonceConsensus(_) => {
+            MessageType::PeginConfirmNonceConsensus
+        }
         GOATMessageContent::PeginConfirmPartialSig(_) => MessageType::PeginConfirmPartialSig,
         GOATMessageContent::PostReady(_) => MessageType::PostReady,
         GOATMessageContent::KickoffReady(_) => MessageType::KickoffReady,

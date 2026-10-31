@@ -3,7 +3,7 @@
 
 Collects and summarizes:
 1) graph status counts
-2) instance status counts (bridge-in/out)
+2) instance status counts (bridge-in) and swap escrow status counts (bridge-out)
 3) node online or offline status
 4) overall service health verdict
 """
@@ -482,7 +482,7 @@ def summarize_once(
             "instance_wraps",
             timeout,
             page_size,
-            fixed_params={"is_bridge_in": "true"},
+            fixed_params={},
         )
         checks.extend(in_checks)
     except Exception as err:  # pylint: disable=broad-except
@@ -493,11 +493,11 @@ def summarize_once(
     try:
         instance_out_items, instance_out_total, out_checks = fetch_pages(
             base_url,
-            "/v1/instances",
-            "instance_wraps",
+            "/v1/swaps",
+            "swaps",
             timeout,
             page_size,
-            fixed_params={"is_bridge_in": "false"},
+            fixed_params={},
         )
         checks.extend(out_checks)
     except Exception as err:  # pylint: disable=broad-except
@@ -562,8 +562,8 @@ def summarize_once(
     instance_out_status_counts = count_by(
         instance_out_items,
         lambda x: (
-            (x.get("instance") or {}).get("status")
-            if isinstance(x, dict) and isinstance(x.get("instance"), dict)
+            (x.get("swap") or {}).get("status")
+            if isinstance(x, dict) and isinstance(x.get("swap"), dict)
             else "MISSING_INSTANCE"
         ),
     )

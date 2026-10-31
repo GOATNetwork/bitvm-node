@@ -25,6 +25,7 @@ pub use verifiable_circuit_babe::cac::{CACSetupPackage, FinalizedInstanceData};
 use verifiable_circuit_babe::dre::N_PADDED;
 use verifiable_circuit_babe::gc::{SGC_PART1_CONSTANT_SIZE, SparseAdaptorTable};
 pub use verifiable_circuit_babe::instance::commit::CACInstanceCommit;
+pub use verifiable_circuit_babe::instance::secret::Seed;
 use verifiable_circuit_babe::prover::BABEProver;
 use verifiable_circuit_babe::soldering::{
     SolderedLabelsData, SolderingData as RealSolderingData, SolderingProof as RealSolderingProof,
@@ -39,7 +40,7 @@ pub const WOTS_SIG_COUNT: usize = Wots96::TOTAL_DIGIT_LEN as usize;
 pub const BABE_N_CC: usize = 181;
 pub const BABE_M_CC: usize = 7;
 
-pub type OpenedInstanceSeeds = Vec<(usize, u64)>;
+pub type OpenedInstanceSeeds = Vec<(usize, Seed)>;
 pub type FinalizedInstances = Vec<FinalizedInstanceData>;
 pub type SetupAndSolderingData = (OpenedInstanceSeeds, FinalizedInstances, SolderingData);
 
@@ -65,7 +66,7 @@ pub struct SolderingData {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BabeVerifierPrivateState {
-    pub instance_seeds: Vec<u64>,
+    pub instance_seeds: Vec<Seed>,
     pub statement_digest: [u8; 32],
 }
 
@@ -210,7 +211,7 @@ pub fn open_real_setup_and_solder(
 pub fn verify_real_setup(
     soldering_builder: &BabeBundleBuilder,
     package: &CACSetupPackage,
-    opened: &[(usize, u64)],
+    opened: &[(usize, Seed)],
     finalized: &[FinalizedInstanceData],
     soldering: &SolderingData,
     vk: &Groth16VerifyingKey<Bn254>,
@@ -235,7 +236,7 @@ pub fn verify_real_setup(
 
 /// Removes setup-derived public fields from the Verifier-to-Operator soldering proof payload.
 pub fn compact_soldering_proof_payload(
-    opened: &[(usize, u64)],
+    opened: &[(usize, Seed)],
     finalized: &[FinalizedInstanceData],
     soldering: &SolderingData,
 ) -> Result<CompactSolderingProofPayload> {
@@ -291,7 +292,7 @@ pub fn open_and_solder(
 /// Validates placeholder opened, finalized, and soldering data consistency.
 pub fn verify_setup(
     package: &CACSetupPackage,
-    opened: &[(usize, u64)],
+    opened: &[(usize, Seed)],
     finalized: &[FinalizedInstanceData],
     soldering: &SolderingData,
 ) -> Result<()> {
@@ -623,8 +624,8 @@ fn recover_a_valid_finalized_messages(
     })
 }
 
-fn deterministic_seed(index: usize) -> u64 {
-    u64::from_le_bytes(hash32(&(index as u64).to_le_bytes())[0..8].try_into().expect("8 bytes"))
+fn deterministic_seed(index: usize) -> Seed {
+    hash32(&(index as u64).to_le_bytes())
 }
 
 fn hash20(data: &[u8]) -> [u8; 20] {

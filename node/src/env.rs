@@ -61,6 +61,11 @@ pub const ENV_ACTOR: &str = "ACTOR";
 pub const ENV_IPFS_ENDPOINT: &str = "IPFS_ENDPOINT";
 pub const ENV_COMMITTEE_NUM: &str = "COMMITTEE_NUM";
 pub const ENV_MIN_REQUIRED_VERIFIER: &str = "MIN_REQUIRED_VERIFIER";
+pub const ENV_VERIFIER_CANDIDATE_BACKUP_COUNT: &str = "VERIFIER_CANDIDATE_BACKUP_COUNT";
+pub const ENV_VERIFIER_CANDIDATE_COLLECTION_WINDOW_SECS: &str =
+    "VERIFIER_CANDIDATE_COLLECTION_WINDOW_SECS";
+pub const ENV_P2P_GRAPH_SETUP_RETRY_INTERVAL_SECS: &str = "P2P_GRAPH_SETUP_RETRY_INTERVAL_SECS";
+pub const ENV_P2P_GRAPH_SETUP_RETRY_WINDOW_SECS: &str = "P2P_GRAPH_SETUP_RETRY_WINDOW_SECS";
 pub const ENV_EXTERNAL_SOCKET_ADDR: &str = "EXTERNAL_SOCKET_ADDR";
 pub const COMMITTEE_INSTANCE_KEYS_DIR: &str = "cache/committee-instance-keys/";
 pub const SCRIPT_CACHE_FILE_NAME: &str = "cache/partial_script.bin";
@@ -71,6 +76,10 @@ pub const MAX_CUSTOM_INPUTS: usize = 100;
 
 pub const DEFAULT_CONFIRMATION_TARGET: u16 = 1;
 pub const DEFAULT_MIN_REQUIRED_VERIFIER: usize = 1;
+pub const DEFAULT_VERIFIER_CANDIDATE_BACKUP_COUNT: usize = 2;
+pub const DEFAULT_VERIFIER_CANDIDATE_COLLECTION_WINDOW_SECS: i64 = 15;
+pub const DEFAULT_P2P_GRAPH_SETUP_RETRY_INTERVAL_SECS: i64 = 10;
+pub const DEFAULT_P2P_GRAPH_SETUP_RETRY_WINDOW_SECS: i64 = 180;
 
 pub const ENV_BITCOIN_NETWORK: &str = "BITCOIN_NETWORK";
 pub const ENV_GOAT_NETWORK: &str = "GOAT_NETWORK";
@@ -587,6 +596,37 @@ pub fn get_min_required_verifier() -> anyhow::Result<usize> {
             anyhow::anyhow!("{ENV_MIN_REQUIRED_VERIFIER} must be a positive integer, got {value:?}")
         }),
     }
+}
+
+pub fn get_verifier_candidate_backup_count() -> usize {
+    std::env::var(ENV_VERIFIER_CANDIDATE_BACKUP_COUNT)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_VERIFIER_CANDIDATE_BACKUP_COUNT)
+}
+
+pub fn get_verifier_candidate_collection_window_secs() -> i64 {
+    std::env::var(ENV_VERIFIER_CANDIDATE_COLLECTION_WINDOW_SECS)
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .map(|value| value.clamp(1, 300))
+        .unwrap_or(DEFAULT_VERIFIER_CANDIDATE_COLLECTION_WINDOW_SECS)
+}
+
+pub fn get_p2p_graph_setup_retry_interval_secs() -> i64 {
+    std::env::var(ENV_P2P_GRAPH_SETUP_RETRY_INTERVAL_SECS)
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .map(|value| value.clamp(1, 300))
+        .unwrap_or(DEFAULT_P2P_GRAPH_SETUP_RETRY_INTERVAL_SECS)
+}
+
+pub fn get_p2p_graph_setup_retry_window_secs() -> i64 {
+    std::env::var(ENV_P2P_GRAPH_SETUP_RETRY_WINDOW_SECS)
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .map(|value| value.clamp(10, 3600))
+        .unwrap_or(DEFAULT_P2P_GRAPH_SETUP_RETRY_WINDOW_SECS)
 }
 
 pub fn get_soldering_proof_payload_store_path() -> anyhow::Result<String> {

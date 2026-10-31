@@ -171,11 +171,11 @@ fn verify_setup_accepts_valid_opening_and_rejects_invalid_shapes() {
     assert!(verify_setup(&package, &opened, &duplicate_finalized, &soldering).is_err());
 
     let mut overlapping_opened = opened.clone();
-    overlapping_opened.push((finalized[0].index, 0));
+    overlapping_opened.push((finalized[0].index, [0u8; 32]));
     assert!(verify_setup(&package, &overlapping_opened, &finalized, &soldering).is_err());
 
     let mut wrong_seed_opened = opened.clone();
-    wrong_seed_opened[0].1 ^= 1;
+    wrong_seed_opened[0].1[0] ^= 1;
     assert!(verify_setup(&package, &wrong_seed_opened, &finalized, &soldering).is_err());
 
     let mut mismatched_soldering = soldering.clone();

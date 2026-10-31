@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO swap_escrow (escrow_hash, network, status, offerer_addr, claimer_addr, btc_addr, token, amount, refund_deadline, escrow_data, init_tx_hash, init_tx_height, claim_tx_hash, claim_btc_txid, refund_tx_hash, status_updated_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(escrow_hash) DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 18
+    },
+    "nullable": []
+  },
+  "hash": "139b72c815d071e58c04a9dfdfabdebf0ee70d7238941466eb7dac759326facd"
+}

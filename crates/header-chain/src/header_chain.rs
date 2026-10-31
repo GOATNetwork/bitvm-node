@@ -3,6 +3,7 @@ use bincode::Options as BincodeOptions;
 use bitcoin::{
     BlockHash, CompactTarget, Network, TxMerkleNode,
     block::{Header, Version},
+    consensus::Params,
     hashes::Hash,
 };
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -99,10 +100,6 @@ pub const NETWORK_CONSTANTS: NetworkConstants = {
         _ => panic!("Unsupported network"),
     }
 };
-
-/// An epoch should be two weeks (represented as number of seconds)
-/// seconds/minute * minutes/hour * hours/day * 14 days
-const EXPECTED_EPOCH_TIMESPAN: u32 = 60 * 60 * 24 * 14;
 
 /// Number of blocks per epoch
 const BLOCKS_PER_EPOCH: u32 = 2016;
@@ -278,12 +275,12 @@ impl ChainState {
             }
 
             if !IS_REGTEST && self.block_height % BLOCKS_PER_EPOCH == BLOCKS_PER_EPOCH - 1 {
-                current_target_bytes = calculate_new_difficulty(
+                self.current_target_bits = calculate_new_difficulty(
                     self.epoch_start_time,
                     block_header.time,
                     self.current_target_bits,
                 );
-                self.current_target_bits = target_to_bits(&current_target_bytes);
+                current_target_bytes = bits_to_target(self.current_target_bits);
             }
         }
 
@@ -320,39 +317,18 @@ pub fn bits_to_target(bits: u32) -> [u8; 32] {
     target.to_be_bytes()
 }
 
-fn target_to_bits(target: &[u8; 32]) -> u32 {
-    let target_u256 = U256::from_be_slice(target);
-    let target_bits = target_u256.bits();
-    let size = (263 - target_bits) / 8;
-    let mut compact_target = [0u8; 4];
-    compact_target[0] = 33 - size as u8;
-    compact_target[1] = target[size - 1_usize];
-    compact_target[2] = target[size];
-    compact_target[3] = target[size + 1_usize];
-    u32::from_be_bytes(compact_target)
-}
-
 fn calculate_new_difficulty(
     epoch_start_time: u32,
     last_timestamp: u32,
     current_target: u32,
-) -> [u8; 32] {
-    let mut actual_timespan = last_timestamp - epoch_start_time;
-    if actual_timespan < EXPECTED_EPOCH_TIMESPAN / 4 {
-        actual_timespan = EXPECTED_EPOCH_TIMESPAN / 4;
-    } else if actual_timespan > EXPECTED_EPOCH_TIMESPAN * 4 {
-        actual_timespan = EXPECTED_EPOCH_TIMESPAN * 4;
-    }
-
-    let new_target_bytes = bits_to_target(current_target);
-    let mut new_target = U256::from_be_bytes(new_target_bytes)
-        .wrapping_mul(&U256::from(actual_timespan))
-        .wrapping_div(&U256::from(EXPECTED_EPOCH_TIMESPAN));
-
-    if new_target > NETWORK_CONSTANTS.max_target {
-        new_target = NETWORK_CONSTANTS.max_target;
-    }
-    new_target.to_be_bytes()
+) -> u32 {
+    let actual_timespan = last_timestamp.saturating_sub(epoch_start_time);
+    CompactTarget::from_next_work_required(
+        CompactTarget::from_consensus(current_target),
+        u64::from(actual_timespan),
+        Params::new(NETWORK),
+    )
+    .to_consensus()
 }
 
 fn check_hash_valid(hash: &[u8; 32], target_bytes: &[u8; 32]) {
@@ -1025,15 +1001,6 @@ mod tests {
     }
 
     #[test]
-    fn test_target_conversion() {
-        for (_, _, bits, _) in DIFFICULTY_ADJUSTMENTS {
-            let compact_target = bits_to_target(bits);
-            let nbits = target_to_bits(&compact_target);
-            assert_eq!(nbits, bits);
-        }
-    }
-
-    #[test]
     fn test_bits_to_target() {
         // https://learnmeabitcoin.com/explorer/block/00000000000000000002ebe388cb8fa0683fc34984cfc2d7d3b3f99bc0d51bfd
         let expected_target =
@@ -1041,19 +1008,25 @@ mod tests {
         let bits: u32 = 0x1702f128;
         let target = bits_to_target(bits);
         assert_eq!(target, expected_target);
-
-        let converted_bits = target_to_bits(&target);
-
-        assert_eq!(converted_bits, bits);
     }
 
     #[test]
     fn test_difficulty_adjustments() {
         for (start_time, end_time, start_target, end_target) in DIFFICULTY_ADJUSTMENTS {
-            let new_target_bytes = calculate_new_difficulty(start_time, end_time, start_target);
-            let bits = target_to_bits(&new_target_bytes);
-            assert_eq!(bits, end_target);
+            let new_target = calculate_new_difficulty(start_time, end_time, start_target);
+            assert_eq!(new_target, end_target);
         }
+    }
+
+    #[test]
+    fn test_difficulty_adjustment_handles_reversed_timestamps() {
+        let epoch_start_time = 1_700_002_000;
+        let current_target = 0x1d00ffff;
+        let expected = calculate_new_difficulty(epoch_start_time, epoch_start_time, current_target);
+
+        let actual = calculate_new_difficulty(epoch_start_time, 1_700_001_000, current_target);
+
+        assert_eq!(actual, expected);
     }
 
     #[test]

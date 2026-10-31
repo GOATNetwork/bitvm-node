@@ -69,9 +69,28 @@ Configure the `.env` file for the specific role and run the node.
 **Common Arguments:**
 
 - `--rpc-addr <ADDR>`: Address for the RPC server (default: `0.0.0.0:8080`)
+- `--metrics-addr <ADDR>`: Address for the dedicated Prometheus listener (disabled when omitted)
+- `--metrics-path <PATH>`: Path served by the metrics listener (default: `/metrics`)
 - `--db-path <PATH>`: Path to the SQLite database (default: `sqlite:/tmp/bitvm-node.db`)
 - `--p2p-port <PORT>`: Port for P2P communication (default: `0`)
 - `--bootnodes <MULTIADDR>`: Bootnodes to connect to 
+
+Bind metrics to a private interface and use a unique port for every node running
+on the same host. The business RPC listener does not serve metrics, so
+`GET /metrics` on `--rpc-addr` returns `404`. For remote Prometheus servers,
+expose the dedicated listener through a private network, proxy, or access-control
+layer instead of binding it directly to a public interface.
+
+The provided Docker Compose deployment enables the listener on port `9108`
+inside each container and publishes it only on the host loopback interface:
+
+| Service | Host metrics endpoint |
+|---------|-----------------------|
+| `committee_0` | `http://127.0.0.1:9900/metrics` |
+| `committee_1` | `http://127.0.0.1:9901/metrics` |
+| `verifier_0` | `http://127.0.0.1:9902/metrics` |
+| `operator_0` | `http://127.0.0.1:9903/metrics` |
+| `watchtower_0` | `http://127.0.0.1:9904/metrics` |
 
 ### Committee
 
@@ -113,6 +132,7 @@ GOAT_SWAP_EVENT_FILTER_FROM=9368978
 ```bash
 ./target/release/bitvm-noded \
   --rpc-addr 0.0.0.0:9100 \
+  --metrics-addr 127.0.0.1:9108 \
   --p2p-port 8443 \
   --db-path ./committee.db
 ```
@@ -148,6 +168,7 @@ BOOTNODES=... # empty if this is the first node
 ```bash
 ./target/release/bitvm-noded \
   --rpc-addr 0.0.0.0:9100 \
+  --metrics-addr 127.0.0.1:9108 \
   --p2p-port 8443 \
   --db-path ./operator.db
 ```
@@ -183,6 +204,7 @@ BOOTNODES=... # empty if this is the first node
 ```bash
 ./target/release/bitvm-noded \
   --rpc-addr 0.0.0.0:9100 \
+  --metrics-addr 127.0.0.1:9108 \
   --p2p-port 8443 \
   --db-path ./challenger.db
 ```
@@ -217,6 +239,7 @@ BOOTNODES=... # empty if this is the first node
 ```bash
 ./target/release/bitvm-noded \
   --rpc-addr 0.0.0.0:9100 \
+  --metrics-addr 127.0.0.1:9108 \
   --p2p-port 8443 \
   --db-path ./watchtower.db
 ```

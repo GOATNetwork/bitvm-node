@@ -2874,7 +2874,7 @@ dependencies = [
 [[package]]
 name = "bitcoin-script"
 version = "0.4.0"
-source = "git+https://github.com/BitVM/rust-bitcoin-script#01b4cb66cbf5b525079cabe006f9f99627da97cd"
+source = "git+https://github.com/BitVM/rust-bitcoin-script#124b561ed75ac3ec4c6ad99207d8dcdd3bc67180"
 dependencies = [
  "bitcoin",
  "script-macro",
@@ -5569,7 +5569,7 @@ dependencies = [
 [[package]]
 name = "garbled-snark-verifier"
 version = "0.1.0"
-source = "git+https://github.com/GOATNetwork/bitvm-gc?branch=feat%2Fgoat-bitvm3#65b523681ac5dc8f1464602f0e38803b9055ccf7"
+source = "git+https://github.com/GOATNetwork/bitvm-gc?branch=feat%2Fgoat-bitvm3#f8980142fe5b3f3a9d6adcb7014c2299484d5633"
 dependencies = [
  "aes",
  "ark-bn254",
@@ -11562,7 +11562,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 [[package]]
 name = "script-macro"
 version = "0.4.0"
-source = "git+https://github.com/BitVM/rust-bitcoin-script#01b4cb66cbf5b525079cabe006f9f99627da97cd"
+source = "git+https://github.com/BitVM/rust-bitcoin-script#124b561ed75ac3ec4c6ad99207d8dcdd3bc67180"
 dependencies = [
  "bitcoin",
  "proc-macro-error",
@@ -12195,7 +12195,7 @@ dependencies = [
 [[package]]
 name = "soldering-host"
 version = "1.1.0"
-source = "git+https://github.com/GOATNetwork/bitvm-gc?branch=feat%2Fgoat-bitvm3#65b523681ac5dc8f1464602f0e38803b9055ccf7"
+source = "git+https://github.com/GOATNetwork/bitvm-gc?branch=feat%2Fgoat-bitvm3#f8980142fe5b3f3a9d6adcb7014c2299484d5633"
 dependencies = [
  "ark-bn254",
  "ark-crypto-primitives",
@@ -13896,7 +13896,7 @@ dependencies = [
 [[package]]
 name = "verifiable-circuit-babe"
 version = "0.0.1"
-source = "git+https://github.com/GOATNetwork/bitvm-gc?branch=feat%2Fgoat-bitvm3#65b523681ac5dc8f1464602f0e38803b9055ccf7"
+source = "git+https://github.com/GOATNetwork/bitvm-gc?branch=feat%2Fgoat-bitvm3#f8980142fe5b3f3a9d6adcb7014c2299484d5633"
 dependencies = [
  "aes",
  "ark-bn254",

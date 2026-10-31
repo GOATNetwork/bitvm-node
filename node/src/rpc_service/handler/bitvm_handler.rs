@@ -1,51 +1,34 @@
 use crate::env::{
-    ENV_GOAT_GATEWAY_CONTRACT_ADDRESS, ENV_GOAT_SWAP_CONTRACT_ADDRESS, GraphBtcTxName,
-    get_goat_address_from_env, get_goat_gateway_contract_from_env, get_network,
-    get_node_goat_address, get_node_pubkey,
+    GraphBtcTxName, get_goat_gateway_contract_from_env, get_node_goat_address, get_node_pubkey,
 };
+#[cfg(feature = "rpc-debug-endpoints")]
 use crate::handle::broadcast_verifier_challenge_assert_tx;
-use crate::rpc_service::auth::verify_request_auth;
+use crate::rpc_service::AppState;
 use crate::rpc_service::bitvm::*;
 use crate::rpc_service::node::ALIVE_TIME_JUDGE_THRESHOLD;
 use crate::rpc_service::response::{
     ApiErrorExt, ApiResult, ErrorResponse, error_response, ok_response,
 };
 use crate::rpc_service::validation::InputValidator;
-use crate::rpc_service::{AppState, current_time_secs};
 use crate::utils::{
-    bridge_out_instance_id_from_escrow_hash, find_instances_by_escrow_hash,
     gen_instance_parameters_local, get_bridge_out_global_stats, load_validated_graph_definition,
     obsolete_graph, send_challenge_tx,
 };
-use alloy::primitives::{Address, U256};
+use alloy::primitives::U256;
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use bitcoin::consensus::encode::serialize_hex;
 use bitvm_lib::types::BitvmGcGraph;
 use client::goat_chain::{PeginStatus, WithdrawStatus};
 use goat::transactions::pre_signed::PreSignedTransaction;
-use http::{HeaderMap, StatusCode};
+use http::StatusCode;
 use std::collections::HashSet;
 use std::default::Default;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
-use store::localdb::{GraphQuery, InstanceQuery, InstanceUpdate, StorageProcessor};
-use store::{
-    GoatTxType, Graph, GraphStatus, Instance, InstanceBridgeInStatus, InstanceBridgeOutStatus,
-};
-use tokio::time::{Duration, sleep};
+use store::localdb::{GraphQuery, InstanceQuery, StorageProcessor};
+use store::{Graph, GraphStatus, InstanceBridgeInStatus};
 use tracing::{info, warn};
-use uuid::Uuid;
-
-fn bridge_out_retry_jitter_ms(attempt: u32) -> u64 {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.subsec_millis() as u64)
-        .unwrap_or(0);
-    let base = 5u64.saturating_mul(1u64 << attempt.min(4));
-    base + (now % 25)
-}
 
 fn graph_tx_index_error(
     tx_name: GraphBtcTxName,
@@ -94,390 +77,14 @@ pub async fn instance_settings(
     ok_response(InstanceSettingResponse { bridge_in_amount: BRIDGE_IN_AMOUNTS.to_vec() })
 }
 
-/// Prepare bridge-in request
-///
-/// Validates user-provided data against the allowed bridge-in options returned by
-/// [`instance_settings`](routes::v1::INSTANCES_SETTINGS). Clients should first call
-/// `instance_settings` to know the supported `bridge_in_amount` list and then submit a
-/// bridge-in request using one of those amounts.
-///
-/// This function creates or updates a bridge-in instance record with status `UserIniting`.
-/// The network configuration is read from the environment variable `ENV_BTC_NETWORK`, not
-/// from the request body.
-///
-/// # Request Body
-///
-/// - `instance_id`: UUID of the bridge-in request (must be a valid UUID format)
-/// - `contract_address`: GOAT chain contract address (gateway contract address). Must match
-///   the gateway contract address configured in environment variables.
-/// - `network`: Target Bitcoin network (e.g. `testnet3`, `mainnet`). Note: This field is
-///   present in the request but the actual network is determined from environment configuration.
-/// - `from_addr`: Funding Bitcoin address selected by the user (must be a valid BTC address)
-/// - `to_addr`: Destination address on GOAT chain that receives bridged assets (must be a valid GOAT address)
-/// - `bridge_request_tx_hash`: GOAT chain transaction hash referencing the bridge intent
-///
-/// # Validation
-///
-/// The function validates:
-/// - `contract_address` matches the configured gateway contract address
-/// - `from_addr` is a valid Bitcoin address
-/// - `to_addr` is a valid GOAT chain address
-/// - `instance_id` is a valid UUID format
-///
-/// # Returns
-///
-/// - `200 OK`: Request is valid and instance record created/updated successfully
-/// - `500 Internal Server Error`: Validation failed, contract address mismatch, or database error
-/// - Response body is an empty object `{}`
-///
-/// # Example
-///
-/// ```http
-/// PUT /v1/instances/bridge-in-request-tag
-/// {
-///   "instance_id": "123e4567-e89b-12d3-a456-426614174000",
-///   "contract_address": "0xabcdef1234567890abcdef1234567890abcdef12",
-///   "from_addr": "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx",
-///   "to_addr": "0x1234567890abcdef1234567890abcdef12345678",
-///   "bridge_request_tx_hash": "0xf6d6523a4344806aca5c66f23554bc574cb93634572f5e115cc630b3d8db3c6e"
-/// }
-/// ```
-///
-/// Response example:
-/// ```json
-/// {}
-/// ```
-#[axum::debug_handler]
-// TODO(auth): Add caller authorization or rate limiting before exposing this write endpoint publicly.
-pub async fn bridge_in_request_tag(
-    State(app_state): State<Arc<AppState>>,
-    Json(payload): Json<BridgeInPrepareRequest>,
-) -> ApiResult<BridgeInPrepareResponse> {
-    InputValidator::validate_btc_address(&payload.from_addr, None, "from_addr")?;
-    let to_addr = InputValidator::validate_goat_address(&payload.to_addr, "to_addr")?;
-    let instance_id = InputValidator::validate_uuid(&payload.instance_id, "instance_id")?;
-    let contract_address =
-        InputValidator::validate_goat_address(&payload.contract_address, "contract_address")?;
-    let gateway_contract: Address = get_goat_address_from_env(ENV_GOAT_GATEWAY_CONTRACT_ADDRESS)
-        .ok_or(anyhow::anyhow!("need to set swap contract address"))
-        .api_error("PUT_BRIDGE_IN_REQUEST_TAG_ERROR")?;
-    if contract_address != gateway_contract.to_string() {
-        return error_response(
-            format!(
-                "Invalid contract address: input: {contract_address}, expect:{gateway_contract}"
-            ),
-            format!(
-                "Invalid contract address: input: {contract_address}, expect:{gateway_contract}"
-            ),
-        );
-    }
-    let mut storage_process =
-        app_state.local_db.acquire().await.api_error("PUT_BRIDGE_IN_REQUEST_TAG_ERROR")?;
-    let current_time = current_time_secs();
-    if let Some(instance) = storage_process
-        .find_instance(&instance_id)
-        .await
-        .api_error("PUT_BRIDGE_IN_REQUEST_TAG_ERROR")?
-    {
-        let network = get_network().to_string();
-        let has_conflict = !instance.is_bridge_in
-            || (!instance.network.is_empty() && instance.network != network)
-            || (!instance.from_addr.is_empty() && instance.from_addr != payload.from_addr)
-            || (!instance.to_addr.is_empty() && instance.to_addr != to_addr);
-        if has_conflict {
-            return error_response(
-                "BRIDGE_IN_INSTANCE_ID_CONFLICT".to_string(),
-                format!("instance_id {instance_id} already exists with different request data"),
-            );
-        }
-        return ok_response(BridgeInPrepareResponse {});
-    }
-
-    let instance = Instance {
-        instance_id,
-        is_bridge_in: true,
-        network: get_network().to_string(),
-        from_addr: payload.from_addr,
-        to_addr,
-        input_utxos: "[]".to_string(),
-        status: InstanceBridgeInStatus::UserIniting.to_string(),
-        bridge_out_amount: "0".to_string(),
-        status_updated_at: current_time,
-        created_at: current_time,
-        updated_at: current_time,
-        ..Default::default()
-    };
-
-    storage_process
-        .upsert_instance(&instance)
-        .await
-        .api_error("PUT_BRIDGE_IN_REQUEST_TAG_ERROR")?;
-    ok_response(BridgeInPrepareResponse {})
-}
-
-/// Initialize bridge-out request
-///
-/// Validates user-provided bridge-out data and creates a bridge-out instance record. This is the first step
-/// in the bridge-out workflow, used to prepare bridging assets from L2 (GOAT) to L1 (Bitcoin). Clients should
-/// provide an escrow hash (`escrow_hash`) to associate with an escrow contract already created on the GOAT chain.
-///
-/// If an instance with the same `escrow_hash` already exists, the function updates the existing instance
-/// if it is in `Initialize` status. Otherwise, a new instance is created with an auto-generated UUID.
-/// The network configuration is read from the environment variable `ENV_BTC_NETWORK`.
-///
-/// # Request Body
-///
-/// - `contract_address`: GOAT chain contract address (swap contract address). Must match the swap contract
-///   address configured in environment variables.
-/// - `from_addr`: User's source address on the GOAT chain (must be a valid GOAT address)
-/// - `to_addr`: Bitcoin destination address that receives the bridged assets (must be a valid BTC address)
-/// - `escrow_hash`: Hash of the escrow contract on the GOAT chain (32-byte hex string), referencing the escrow
-///   transaction for the bridge intent. Used to identify existing instances.
-///
-/// # Validation
-///
-/// The function validates:
-/// - `contract_address` matches the configured swap contract address
-/// - `from_addr` is a valid GOAT chain address
-/// - `to_addr` is a valid Bitcoin address
-/// - `escrow_hash` is a valid 32-byte hex string
-///
-/// # Returns
-///
-/// - `200 OK`: Request is valid and instance record created/updated successfully
-/// - `500 Internal Server Error`: Validation failed, contract address mismatch, or database error
-/// - Response body is an empty object `{}`
-///
-/// # Use Case
-///
-/// Frontend applications use this endpoint to initiate the bridge-out flow, recording the user's intent to bridge
-/// from L2 to L1 into the system. The endpoint handles both new instance creation and updates to existing instances
-/// based on the escrow hash.
-///
-/// # Example
-///
-/// ```http
-/// PUT /v1/instances/bridge-out-init-tag
-/// {
-///   "contract_address": "0xabcdef1234567890abcdef1234567890abcdef12",
-///   "from_addr": "0x1234567890abcdef1234567890abcdef12345678",
-///   "to_addr": "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx",
-///   "escrow_hash": "0xf6d6523a4344806aca5c66f23554bc574cb93634572f5e115cc630b3d8db3c6e"
-/// }
-/// ```
-///
-/// Response example:
-/// ```json
-/// {}
-/// ```
-#[axum::debug_handler]
-// TODO(auth): Add caller authorization or rate limiting before exposing this write endpoint publicly.
-pub async fn bridge_out_init_tag(
-    State(app_state): State<Arc<AppState>>,
-    Json(payload): Json<BridgeOutInitTagRequest>,
-) -> ApiResult<BridgeOutInitTagResponse> {
-    const MAX_BRIDGE_OUT_INIT_RETRIES: u32 = 3;
-
-    let from_addr = InputValidator::validate_goat_address(&payload.from_addr, "from_addr")?;
-    InputValidator::validate_btc_address(&payload.to_addr, None, "network and to_addr")?;
-    let contract_address =
-        InputValidator::validate_goat_address(&payload.contract_address, "contract_address")?;
-    let swap_contract: Address = get_goat_address_from_env(ENV_GOAT_SWAP_CONTRACT_ADDRESS)
-        .ok_or(anyhow::anyhow!("need to set swap contract address"))
-        .api_error("PUT_BRIDGE_OUT_INIT_TAG_ERROR")?;
-    if contract_address != swap_contract.to_string() {
-        return error_response(
-            format!("Invalid contract address: input: {contract_address}, expect:{swap_contract}"),
-            format!("Invalid contract address: input: {contract_address}, expect:{swap_contract}"),
-        );
-    }
-    let escrow_hash = InputValidator::validate_hex(&payload.escrow_hash, true, 32, "escrow_hash")?;
-    let mut storage_process =
-        app_state.local_db.acquire().await.api_error("PUT_BRIDGE_OUT_INIT_TAG_ERROR")?;
-    let current_time = current_time_secs();
-
-    for attempt in 0..=MAX_BRIDGE_OUT_INIT_RETRIES {
-        if let Some(instance) = find_instances_by_escrow_hash(&mut storage_process, &escrow_hash)
-            .await
-            .api_error("PUT_BRIDGE_OUT_INIT_TAG_ERROR")?
-        {
-            let updated = storage_process
-                .update_instance(
-                    &InstanceUpdate::new_with_instance_id(instance.instance_id)
-                        .with_to_addr(payload.to_addr.clone())
-                        .with_only_if_status_in(vec![
-                            InstanceBridgeOutStatus::Initialize.to_string(),
-                        ])
-                        .with_only_if_is_bridge_in(false),
-                )
-                .await
-                .api_error("PUT_BRIDGE_OUT_INIT_TAG_ERROR")?;
-            if !updated {
-                warn!(
-                    "bridge_out_init_tag ignored for resolved instance {} with status {}",
-                    instance.instance_id, instance.status
-                );
-            }
-            return ok_response(BridgeOutInitTagResponse {});
-        }
-
-        let candidate_instance_id = bridge_out_instance_id_from_escrow_hash(&escrow_hash);
-        let mut instance = Instance {
-            instance_id: candidate_instance_id,
-            from_addr: from_addr.clone(),
-            network: get_network().to_string(),
-            input_utxos: "[]".to_string(),
-            escrow_hash: Some(escrow_hash.clone()),
-            status: InstanceBridgeOutStatus::Initialize.to_string(),
-            bridge_out_amount: "0".to_string(),
-            status_updated_at: current_time,
-            created_at: current_time,
-            ..Default::default()
-        };
-        instance.to_addr = payload.to_addr.clone();
-
-        match storage_process.insert_instance_if_absent(&instance).await {
-            Ok(true) => return ok_response(BridgeOutInitTagResponse {}),
-            Ok(false) => {
-                let Some(existing) = storage_process
-                    .find_instance(&candidate_instance_id)
-                    .await
-                    .api_error("PUT_BRIDGE_OUT_INIT_TAG_ERROR")?
-                else {
-                    if attempt < MAX_BRIDGE_OUT_INIT_RETRIES {
-                        sleep(Duration::from_millis(bridge_out_retry_jitter_ms(attempt))).await;
-                        continue;
-                    }
-                    return error_response(
-                        "BRIDGE_OUT_INSTANCE_ID_CONFLICT".to_string(),
-                        "bridge-out instance disappeared while being created".to_string(),
-                    );
-                };
-                let escrow_hash_matches = existing
-                    .escrow_hash
-                    .as_ref()
-                    .map(|hash| hash.eq_ignore_ascii_case(&escrow_hash))
-                    .unwrap_or(false);
-                if existing.is_bridge_in || !escrow_hash_matches {
-                    return error_response(
-                        "BRIDGE_OUT_INSTANCE_ID_CONFLICT".to_string(),
-                        "failed to allocate bridge-out instance_id for escrow_hash".to_string(),
-                    );
-                }
-
-                let updated = storage_process
-                    .update_instance(
-                        &InstanceUpdate::new_with_instance_id(existing.instance_id)
-                            .with_to_addr(payload.to_addr.clone())
-                            .with_only_if_status_in(vec![
-                                InstanceBridgeOutStatus::Initialize.to_string(),
-                            ])
-                            .with_only_if_is_bridge_in(false),
-                    )
-                    .await
-                    .api_error("PUT_BRIDGE_OUT_INIT_TAG_ERROR")?;
-                if !updated {
-                    warn!(
-                        "bridge_out_init_tag ignored for concurrently resolved instance {} with status {}",
-                        existing.instance_id, existing.status
-                    );
-                }
-                return ok_response(BridgeOutInitTagResponse {});
-            }
-            Err(err) => {
-                if attempt < MAX_BRIDGE_OUT_INIT_RETRIES {
-                    warn!(
-                        "bridge_out_init_tag insert failed at attempt {}, retrying: {}",
-                        attempt, err
-                    );
-                    sleep(Duration::from_millis(bridge_out_retry_jitter_ms(attempt))).await;
-                    continue;
-                }
-                return Err(err).api_error("PUT_BRIDGE_OUT_INIT_TAG_ERROR");
-            }
-        }
-    }
-
-    error_response(
-        "BRIDGE_OUT_INSTANCE_ID_CONFLICT".to_string(),
-        "failed to initialize bridge-out instance after retries".to_string(),
-    )
-}
-
-/// Get instance escrow data
-///
-/// Returns escrow hash information for a specified bridge instance. Escrow data is used in the bridge-out workflow,
-/// containing information about the escrow contract created on the GOAT chain. This endpoint allows clients to query
-/// the escrow hash associated with a specific instance for verification and tracking of bridge status.
-///
-/// # Path Parameters
-///
-/// - `instance_id`: UUID of the bridge instance to query
-///
-/// # Returns
-///
-/// - `200 OK`: Successfully returns escrow data information
-/// - `500 Internal Server Error`: Server internal error or database operation failed
-/// - Response includes instance ID, escrow hash (if present), and optional error information
-///
-/// # Use Case
-///
-/// Frontend applications use this endpoint to query the escrow hash for a bridge-out instance, to verify escrow
-/// contract status and track bridge progress.
-///
-/// # Example
-///
-/// ```http
-/// GET /v1/instances/123e4567-e89b-12d3-a456-426614174000/escrow-data
-/// ```
-///
-/// Response example:
-/// ```json
-/// {
-///   "instance_id": "123e4567-e89b-12d3-a456-426614174000",
-///   "escrow": "0xf6d6523a4344806aca5c66f23554bc574cb93634572f5e115cc630b3d8db3c6e",
-///   "error": null
-/// }
-/// ```
-#[axum::debug_handler]
-pub async fn get_instance_escrow_data(
-    State(app_state): State<Arc<AppState>>,
-    Path(instance_id): Path<String>,
-) -> ApiResult<EscrowDataResponse> {
-    let instance_id = InputValidator::validate_uuid(&instance_id, "instance_id")?;
-    let mut storage_process =
-        app_state.local_db.acquire().await.api_error("PUT_BRIDGE_OUT_INIT_TAG_ERROR")?;
-    match storage_process
-        .find_graph_goat_tx_record(
-            &instance_id,
-            &Uuid::nil(),
-            &GoatTxType::SwapInitialize.to_string(),
-        )
-        .await
-        .api_error("PUT_BRIDGE_OUT_INIT_TAG_ERROR")?
-    {
-        Some(tx_record) => ok_response(EscrowDataResponse {
-            instance_id: instance_id.to_string(),
-            escrow: tx_record.extra,
-            error: None,
-        }),
-        None => ok_response(EscrowDataResponse {
-            instance_id: instance_id.to_string(),
-            escrow: None,
-            error: Some("no escrow record in db".to_string()),
-        }),
-    }
-}
-
 /// Get instance list
 ///
-/// Returns a paginated list of bridge instances based on query parameters. Supports filtering by
-/// source address and bridge direction (bridge-in or bridge-out).
+/// Returns a paginated list of bridge-in instances based on query parameters. Supports filtering by
+/// source address.
 ///
 /// # Query Parameters
 ///
 /// - `from_addr`: Source address filter (optional) - filters instances by source Bitcoin address
-/// - `is_bridge_in`: Bridge direction filter (required) - true for bridge-in, false for bridge-out
 /// - `offset`: Pagination offset (default: 0) - number of items to skip
 /// - `limit`: Items per page (default: 10) - maximum number of items to return
 ///
@@ -494,7 +101,7 @@ pub async fn get_instance_escrow_data(
 /// # Example
 ///
 /// ```http
-/// GET /v1/instances?is_bridge_in=true&offset=0&limit=10
+/// GET /v1/instances?offset=0&limit=10
 /// ```
 ///
 /// Response example:
@@ -504,7 +111,6 @@ pub async fn get_instance_escrow_data(
 ///     {
 ///       "instance": {
 ///         "instance_id": "123e4567-e89b-12d3-a456-426614174000",
-///         "is_bridge_in": true,
 ///         "network": "testnet",
 ///         "from_addr": "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx",
 ///         "to_addr": "0x1234567890abcdef1234567890abcdef12345678",
@@ -524,9 +130,7 @@ pub async fn get_instance_escrow_data(
 ///         "committees_answers": {},
 ///         "pegin_data_tx_hash": "0x...",
 ///         "parameters": null,
-///         "escrow_hash": null,
 ///         "status_updated_at": 1699123456,
-///         "bridge_out_lock_time": 0,
 ///         "created_at": 1699123456,
 ///         "updated_at": 1699123456
 ///       },
@@ -564,19 +168,10 @@ pub async fn get_instances(
 
     let mut query = InstanceQuery::default();
     if let Some(from_addr) = params.from_addr {
-        // Validate from_addr format (if provided)
-        let from_addr = if params.is_bridge_in {
-            InputValidator::validate_btc_address(&from_addr, None, "bridge in from_addr")?;
-            from_addr
-        } else {
-            InputValidator::validate_goat_address(&from_addr, "Bridge out from_addr")?.to_string()
-        };
+        InputValidator::validate_btc_address(&from_addr, None, "bridge in from_addr")?;
         query = query.with_from_addr(from_addr);
     }
-    query = query
-        .with_pagination(offset, limit)
-        .with_order("created_at DESC".to_string())
-        .with_is_bridge_in(params.is_bridge_in);
+    query = query.with_pagination(offset, limit).with_order("created_at DESC".to_string());
 
     let (instances, total) =
         storage_process.find_instances(query).await.api_error("GET_INSTANCE_ERROR")?;
@@ -585,8 +180,6 @@ pub async fn get_instances(
         warn!("get_instances instance is empty: total {}", total);
         return ok_response(InstanceListResponse::default());
     }
-    let btc_current_height =
-        app_state.btc_client.get_height().await.api_error("GET_INSTANCE_ERROR")?;
     let response_window_blocks = app_state
         .goat_client
         .gateway_get_response_window_blocks()
@@ -596,7 +189,6 @@ pub async fn get_instances(
     for instance in instances {
         let item = InstanceExtended::convert_from_instance(
             &app_state.btc_client,
-            btc_current_height,
             response_window_blocks as i64,
             instance,
         )
@@ -640,7 +232,6 @@ pub async fn get_instances(
 ///   "instance_wrap": {
 ///     "instance": {
 ///       "instance_id": "123e4567-e89b-12d3-a456-426614174000",
-///       "is_bridge_in": true,
 ///       "network": "testnet",
 ///       "from_addr": "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx",
 ///       "to_addr": "0x1234567890abcdef1234567890abcdef12345678",
@@ -660,8 +251,6 @@ pub async fn get_instances(
 ///       "committees_answers": {},
 ///       "pegin_data_tx_hash": "0x...",
 ///       "parameters": null,
-///       "escrow_hash": null,
-///       "bridge_out_lock_time": 0,
 ///       "post_pegin_txhash": "0xf6d6523a4344806aca5c66f23554bc574cb93634572f5e115cc630b3d8db3c6e",
 ///       "status_updated_at": 1699123456,
 ///       "created_at": 1699123456,
@@ -699,8 +288,6 @@ pub async fn get_instance(
     if let Some(instance) =
         storage_process.find_instance(&instance_id_uuid).await.api_error("GET_INSTANCE_ERROR")?
     {
-        let btc_current_height =
-            app_state.btc_client.get_height().await.api_error("GET_INSTANCE_ERROR")?;
         let response_window_blocks = app_state
             .goat_client
             .gateway_get_response_window_blocks()
@@ -710,7 +297,6 @@ pub async fn get_instance(
         let instance_wrap = Some(
             InstanceExtended::convert_from_instance(
                 &app_state.btc_client,
-                btc_current_height,
                 response_window_blocks as i64,
                 instance,
             )
@@ -770,7 +356,7 @@ pub async fn get_instances_overview(
         app_state.local_db.acquire().await.api_error("INSTANCE_OVERVIEW_ERROR")?;
 
     let (bridge_in_sum, bridge_in_count) = storage_process
-        .get_sum_bridge_txn(true, &[InstanceBridgeInStatus::RelayerL2Minted.to_string()])
+        .get_sum_bridge_in_txn(&[InstanceBridgeInStatus::RelayerL2Minted.to_string()])
         .await
         .api_error("INSTANCE_OVERVIEW_ERROR")?;
 
@@ -1627,12 +1213,9 @@ pub async fn get_unsigned_pegin_txn(
 /// - `500 Internal Server Error`: Graph not found or broadcast failed
 #[axum::debug_handler]
 pub async fn send_challenge(
-    headers: HeaderMap,
     Path(graph_id): Path<String>,
     State(app_state): State<Arc<AppState>>,
 ) -> ApiResult<SendChallengeResponse> {
-    // TODO(auth): Replace shared node-key authentication with caller-scoped authorization.
-    verify_request_auth(&headers)?;
     let graph_id_uuid = InputValidator::validate_uuid(&graph_id, "graph_id")?;
 
     let mut storage_process =
@@ -1680,14 +1263,12 @@ pub async fn send_challenge(
 ///
 /// This is a test endpoint. Unlike the normal AssertSent verifier flow, it does
 /// not skip ChallengeAssert when the operator assert proof is valid.
+#[cfg(feature = "rpc-debug-endpoints")]
 #[axum::debug_handler]
 pub async fn send_verifier_challenge(
-    headers: HeaderMap,
     Path(graph_id): Path<String>,
     State(app_state): State<Arc<AppState>>,
 ) -> ApiResult<SendVerifierChallengeResponse> {
-    // TODO(auth): Replace shared node-key authentication with caller-scoped authorization.
-    verify_request_auth(&headers)?;
     let graph_id_uuid = InputValidator::validate_uuid(&graph_id, "graph_id")?;
 
     let mut storage_process =
@@ -1799,12 +1380,9 @@ fn sats_to_token_amount(amount_sats: u64, token_decimals: u8) -> U256 {
 /// - `500 Internal Server Error`: No eligible graph, L2 status invalid, or initWithdraw failed
 #[axum::debug_handler]
 pub async fn pegout(
-    headers: HeaderMap,
     State(app_state): State<Arc<AppState>>,
     Json(payload): Json<PegoutRequest>,
 ) -> ApiResult<PegoutResponse> {
-    // TODO(auth): Replace shared node-key authentication with caller-scoped authorization.
-    verify_request_auth(&headers)?;
     let operator_pubkey = get_node_pubkey().api_error("PEGOUT_ERROR")?.to_string();
     let operator_goat_addr = get_node_goat_address()
         .ok_or_else(|| {

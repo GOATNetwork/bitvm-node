@@ -33,6 +33,12 @@ pub const VK_HASH_SIZE: usize = 66;
 pub const TOTAL_WORK_SIZE: usize = 32;
 pub const CONSENSUS_BLOCK_HEIGHT_SIZE: usize = 4;
 
+// 0xc3d8382a8efed79d564f8ec6da4dd00a4e77572d1e02f5f81dda441a36fdc9d8
+pub const ROOT_COMMIT_PROGRAM_ID: verifier::ProgramId = [
+    195, 216, 56, 42, 142, 254, 215, 157, 86, 79, 142, 198, 218, 77, 208, 10, 78, 119, 87, 45, 30,
+    2, 245, 248, 29, 218, 68, 26, 54, 253, 201, 216,
+];
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WatchtowerPublicOutputs {
     pub total_work: [u8; TOTAL_WORK_SIZE],
@@ -74,6 +80,11 @@ fn checked_history_root(
 }
 
 /// Verifies that the latest Bitcoin commitment authorizes every supplied circuit proof.
+///
+/// `root_commit_program_id` is the pinned anchor; it is the only identity here that does not
+/// come from the proofs being checked, so it is asserted before anything reads the
+/// Commit-chain output. See [`ROOT_COMMIT_PROGRAM_ID`].
+#[allow(clippy::too_many_arguments)]
 fn verify_commitment_authorization(
     commit_chain_output: &CommitChainCircuitOutput,
     header_chain_output: &BlockHeaderCircuitOutput,
@@ -81,8 +92,13 @@ fn verify_commitment_authorization(
     header_program_id: verifier::ProgramId,
     state_program_id: verifier::ProgramId,
     commit_program_id: verifier::ProgramId,
+    root_commit_program_id: verifier::ProgramId,
     sequencer_set_hash: [u8; 32],
 ) -> AuthorizedProgramIds {
+    assert_eq!(
+        commit_program_id, root_commit_program_id,
+        "commit proof program id does not match the pinned root anchor"
+    );
     let authorized = commit_chain_output.chain_state.authorized_program_ids;
     authorized.validate().expect("invalid authorized ProgramIds");
     check_program_id(commit_program_id, commit_chain_output.self_program_id, authorized.commit);
@@ -215,6 +231,7 @@ pub fn watch_longest_chain(
             header_program_id,
             state_program_id,
             commit_program_id,
+            ROOT_COMMIT_PROGRAM_ID,
             sequencer_set_hash,
         );
     } else {
@@ -382,6 +399,7 @@ pub fn propose_longest_chain(
                 header_program_id,
                 state_program_id,
                 commit_program_id,
+                ROOT_COMMIT_PROGRAM_ID,
                 sequencer_set_hash,
             )
         } else {

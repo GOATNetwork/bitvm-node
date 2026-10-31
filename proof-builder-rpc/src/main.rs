@@ -27,6 +27,12 @@ struct Opts {
     #[arg(long, default_value = "0.0.0.0:7777")]
     pub rpc_addr: String,
 
+    /// Dedicated Prometheus metrics listener address.
+    ///
+    /// Unset disables metrics; the business RPC never serves them.
+    #[arg(long)]
+    pub metrics_addr: Option<String>,
+
     /// Local Sqlite database file path
     #[arg(long, env, default_value = "sqlite:/tmp/bitvm-node.db")]
     pub database_url: String,
@@ -44,28 +50,29 @@ async fn main() -> anyhow::Result<()> {
     println!("proof builder config: {:?}", cfg);
 
     let _ = tracing_subscriber::fmt().with_env_filter(EnvFilter::from_default_env()).try_init();
+    let metrics_listener = match opt.metrics_addr.as_deref() {
+        Some(metrics_addr) => Some(api::bind_metrics_listener(metrics_addr).await?),
+        None => None,
+    };
     let authorization_chains = goat_clients_from_env().await?;
     // Create cancellation token for graceful shutdown
     let cancellation_token = CancellationToken::new();
     info!("load db {}", opt.database_url);
     let local_db = store::create_local_db(&opt.database_url).await;
     let metrics_state = ApiMetricsState::new();
-    let local_db_clone1 = local_db.clone();
-    let api_metrics_state = metrics_state.clone();
+    let api_state =
+        api::ApiState::new(local_db.clone(), metrics_state.clone(), authorization_chains);
     let mut task_handles: Vec<JoinHandle<anyhow::Result<String, String>>> = vec![];
     let cancel_token_clone = cancellation_token.clone();
     let opt_rpc_addr = opt.rpc_addr.clone();
-    info!("start api server");
+    let rpc_api_state = api_state.clone();
+    info!(
+        rpc_addr = %opt.rpc_addr,
+        metrics_addr = opt.metrics_addr.as_deref().unwrap_or("disabled"),
+        "start api server"
+    );
     task_handles.push(tokio::spawn(async move {
-        match api::serve(
-            opt_rpc_addr,
-            local_db_clone1,
-            api_metrics_state,
-            authorization_chains,
-            cancel_token_clone,
-        )
-        .await
-        {
+        match api::serve_with_app_state(opt_rpc_addr, rpc_api_state, cancel_token_clone).await {
             Ok(tag) => Ok(tag),
             Err(e) => {
                 tracing::error!("RPC service error: {}", e);
@@ -73,6 +80,18 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }));
+    if let Some(listener) = metrics_listener {
+        let cancel_token_clone = cancellation_token.clone();
+        task_handles.push(tokio::spawn(async move {
+            match api::serve_metrics(listener, api_state, cancel_token_clone).await {
+                Ok(tag) => Ok(tag),
+                Err(e) => {
+                    tracing::error!("Metrics service error: {}", e);
+                    Err("metrics_error".to_string())
+                }
+            }
+        }));
+    }
     if is_start_generate_proof_tasks(&cfg) {
         info!("start generate proof tasks");
         let cancel_token_clone = cancellation_token.clone();

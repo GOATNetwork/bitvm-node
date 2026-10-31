@@ -120,11 +120,14 @@ pub fn check_el_block_from_payload(
     txs: &[Vec<u8>],
     actual_data_hash: &[u8; 32],
 ) {
-    if let Some(payload) = parse_cbft_tx_payload(&txs[0]) {
-        assert_eq!(payload.block_number, el_block_number);
-        assert_eq!(payload.block_hash, el_block_hash);
-        assert_eq!(payload.parent_hash, el_parent_block_hash);
-    }
+    // The payload is what binds this EVM block to the chain we are extending, so
+    // it must be present: a `Tx` encoded without a body decodes to `body: None`,
+    // which used to skip all three assertions and leave only the merkle root.
+    assert!(!txs.is_empty(), "cosmos block carries no txs");
+    let payload = parse_cbft_tx_payload(&txs[0]).expect("missing MsgNewEthBlock payload");
+    assert_eq!(payload.block_number, el_block_number);
+    assert_eq!(payload.block_hash, el_block_hash);
+    assert_eq!(payload.parent_hash, el_parent_block_hash);
     let computed_data_hash = merkle_root_from_base64_txns(txs);
     assert_eq!(*actual_data_hash, computed_data_hash);
 }

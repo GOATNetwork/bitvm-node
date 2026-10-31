@@ -707,7 +707,7 @@ flowchart TB
         IM1["instance_answers_monitor"]
         IM2["instance_window_expiration_monitor"]
         IM3["instance_btc_tx_monitor"]
-        IM4["instance_bridge_out_monitor"]
+        IM4["swap_escrow_timeout_monitor"]
         IM5["instance_committee_key_cleanup_monitor"]
     end
 
@@ -734,7 +734,7 @@ flowchart TB
 | `instance_answers_monitor` | 20s | Track committee responses |
 | `instance_window_expiration_monitor` | 20s | Handle response window timeouts |
 | `instance_btc_tx_monitor` | 20s | Track pegin/confirm/cancel BTC transaction confirmations |
-| `instance_bridge_out_monitor` | 20s | Track bridge-out deadlines and timeout transitions |
+| `swap_escrow_timeout_monitor` | 20s | Mark swap escrows past their refund deadline as timed out |
 | `instance_committee_key_cleanup_monitor` | 20s | Scan `cache/committee-instance-keys/` and delete expired key envelopes after configurable pegin-confirm timelock |
 | `spv_header_hash_update` | Periodic | Update SPV header hashes |
 
@@ -814,6 +814,7 @@ bitvm-noded key funding-address
 ```bash
 bitvm-noded \
   --rpc-addr 0.0.0.0:8080 \
+  --metrics-addr 127.0.0.1:9108 \
   --db-path ./node.db \
   --p2p-port 4001 \
   --bootnodes /ip4/x.x.x.x/tcp/4001/p2p/<peer_id>
@@ -833,7 +834,8 @@ Useful test calls:
 
 ```bash
 curl http://127.0.0.1:18080/v1/nodes/overview
-curl 'http://127.0.0.1:18080/v1/instances?is_bridge_in=true'
+curl http://127.0.0.1:18080/v1/instances
+curl http://127.0.0.1:18080/v1/swaps
 curl http://127.0.0.1:18080/v1/graphs
 ```
 
@@ -849,7 +851,8 @@ real graph raw data in the database.
 | `--db-path` | SQLite database path | `sqlite:/tmp/bitvm-node.db` |
 | `--p2p-port` | P2P listen port | `0` (random) |
 | `--bootnodes` | Bootstrap node addresses | - |
-| `--metrics-path` | Prometheus metrics endpoint | `/metrics` |
+| `--metrics-addr` | Dedicated Prometheus listener address | Disabled |
+| `--metrics-path` | Path served by the dedicated metrics listener | `/metrics` |
 | `--enable-kademlia` | Enable Kademlia DHT | `true` |
 
 ---
@@ -898,6 +901,10 @@ Relayer nodes should:
 
 ## RPC API
 
+Prometheus metrics are not served by the business RPC listener. Set
+`--metrics-addr` to a private, process-unique address and scrape
+`http://<metrics-addr>/metrics`; `GET /metrics` on `--rpc-addr` returns `404`.
+
 ### Endpoints
 
 | Endpoint | Method | Description |
@@ -914,9 +921,10 @@ Relayer nodes should:
 | `/v1/graphs/:id/tx?tx_name=cur-pre-kickoff.hex` | GET | Get specific transaction hex |
 | `/v1/graphs/ready-to-kickoff` | GET | Get graphs ready for kickoff |
 | `/bridge_in_request` | POST | Initiate Bridge-In request |
-| `/bridge_out_init` | POST | Initiate Bridge-Out request |
+| `/v1/swaps` | GET | List swap bridge-out escrows |
+| `/v1/swaps/:escrow_hash` | GET | Get swap escrow details |
 | `/challenge` | POST | Submit challenge |
-| `/metrics` | GET | Prometheus metrics |
+| `/metrics` | GET | Prometheus metrics (dedicated metrics listener only) |
 
 ---
 

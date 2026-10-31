@@ -12,6 +12,7 @@ use crate::api::proof_handler::{
     post_watchtower_proof_task, update_operator_proof_task_timeout,
     update_watchtower_proof_task_timeout,
 };
+use anyhow::Context;
 use axum::http::{Method, StatusCode};
 use axum::routing::{get, post};
 use axum::{Router, middleware};
@@ -23,15 +24,15 @@ use tower_http::cors::{Any, CorsLayer};
 
 pub(crate) use auth::{AuthorizationChain, AuthorizationChains};
 
-struct ApiState {
+pub(crate) struct ApiState {
     pub local_db: LocalDB,
     pub metrics_state: ApiMetricsState,
-    pub auth: RequestAuthorizer,
+    auth: RequestAuthorizer,
 }
 
 impl ApiState {
     /// Creates shared API state from the database, metrics, and live authorization chain.
-    fn new(
+    pub(crate) fn new(
         local_db: LocalDB,
         metrics_state: ApiMetricsState,
         authorization_chains: AuthorizationChains,
@@ -43,14 +44,13 @@ impl ApiState {
         })
     }
 }
-pub(crate) async fn serve(
+
+/// Serves the business RPC routes at `addr` with shared state until cancellation.
+pub(crate) async fn serve_with_app_state(
     addr: String,
-    local_db: LocalDB,
-    metrics_state: ApiMetricsState,
-    authorization_chains: AuthorizationChains,
+    api_state: Arc<ApiState>,
     cancellation_token: CancellationToken,
 ) -> anyhow::Result<String> {
-    let api_state = ApiState::new(local_db, metrics_state, authorization_chains);
     let instrumented_routes = Router::new()
         .route(routes::ROOT, get(root))
         .route(routes::v1::PROOFS_CHAIN_PROOFS_DESC, get(get_chain_proof_task_desc))
@@ -64,9 +64,7 @@ pub(crate) async fn serve(
         .route(routes::v1::PROOFS_OPERATOR_PROOF_DESC, get(get_operator_proof_task_desc))
         .fallback(|| async { StatusCode::NOT_FOUND })
         .layer(middleware::from_fn_with_state(api_state.clone(), metrics_middleware));
-    let server = Router::new()
-        .route(routes::METRICS, get(metrics_handler))
-        .merge(instrumented_routes)
+    let server = instrumented_routes
         .layer(CorsLayer::new().allow_headers(Any).allow_origin(Any).allow_methods(vec![
             Method::GET,
             Method::POST,
@@ -90,6 +88,45 @@ pub(crate) async fn serve(
         _ = cancellation_token.cancelled() => {
             tracing::info!("RPC service received shutdown signal");
             Ok("rpc_shutdown".to_string())
+        }
+    }
+}
+
+/// Binds the dedicated Prometheus metrics listener before background tasks start.
+pub(crate) async fn bind_metrics_listener(addr: &str) -> anyhow::Result<TcpListener> {
+    TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("failed to bind metrics listener to {addr}"))
+}
+
+/// Serves only `/metrics` from the pre-bound listener with the shared API state.
+pub(crate) async fn serve_metrics(
+    listener: TcpListener,
+    api_state: Arc<ApiState>,
+    cancellation_token: CancellationToken,
+) -> anyhow::Result<String> {
+    let router = Router::new().route(routes::METRICS, get(metrics_handler)).with_state(api_state);
+    let listening_addr =
+        listener.local_addr().context("failed to determine metrics listener address")?;
+    tracing::info!(
+        address = %listening_addr,
+        path = routes::METRICS,
+        "Metrics listener started"
+    );
+
+    tokio::select! {
+        result = axum::serve(listener, router) => {
+            match result {
+                Ok(_) => Ok("Metrics server finished normally".to_string()),
+                Err(e) => {
+                    tracing::error!("Metrics server error: {}", e);
+                    Err(anyhow::anyhow!("Metrics server error: {e}"))
+                }
+            }
+        }
+        _ = cancellation_token.cancelled() => {
+            tracing::info!("Metrics service received shutdown signal");
+            Ok("metrics_shutdown".to_string())
         }
     }
 }
@@ -178,32 +215,59 @@ mod tests {
         std::collections::HashMap::from([(gateway, chain)])
     }
 
+    async fn spawn_metrics_listener(
+        api_state: Arc<ApiState>,
+        cancellation_token: CancellationToken,
+    ) -> anyhow::Result<(String, tokio::task::JoinHandle<anyhow::Result<String>>)> {
+        let listener = bind_metrics_listener("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?.to_string();
+        let handle = tokio::spawn(serve_metrics(listener, api_state, cancellation_token));
+        Ok((addr, handle))
+    }
+
     #[tokio::test]
-    async fn metrics_use_route_templates_and_exclude_scrapes() -> anyhow::Result<()> {
+    async fn metrics_are_served_only_by_the_dedicated_listener() -> anyhow::Result<()> {
         let addr = available_addr();
         let cancellation_token = CancellationToken::new();
-        let server_token = cancellation_token.clone();
-        let server = tokio::spawn(serve(
-            addr.clone(),
+        let api_state = ApiState::new(
             store::create_local_db("sqlite::memory:").await,
             ApiMetricsState::new(),
             authorization_chains(gateway(1), Arc::new(TestAuthorizationChain::default())),
-            server_token,
+        );
+        let server = tokio::spawn(serve_with_app_state(
+            addr.clone(),
+            api_state.clone(),
+            cancellation_token.clone(),
         ));
+        let (metrics_addr, metrics_server) =
+            spawn_metrics_listener(api_state, cancellation_token.clone()).await?;
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         assert!(get(&addr, "/").await?.starts_with("HTTP/1.1 200"));
         assert!(get(&addr, "/missing").await?.starts_with("HTTP/1.1 404"));
-        let first_scrape = get(&addr, "/metrics").await?;
-        let second_scrape = get(&addr, "/metrics").await?;
+        assert!(get(&addr, "/metrics").await?.starts_with("HTTP/1.1 404"));
+        assert!(get(&metrics_addr, "/").await?.starts_with("HTTP/1.1 404"));
+        assert!(
+            get(&metrics_addr, routes::v1::PROOFS_CHAIN_PROOFS_DESC)
+                .await?
+                .starts_with("HTTP/1.1 404")
+        );
+        let first_scrape = get(&metrics_addr, "/metrics").await?;
+        let second_scrape = get(&metrics_addr, "/metrics").await?;
 
+        assert!(first_scrape.starts_with("HTTP/1.1 200"));
+        assert!(
+            first_scrape
+                .to_ascii_lowercase()
+                .contains("content-type: application/openmetrics-text;charset=utf-8;version=1.0.0")
+        );
         assert!(
             first_scrape
                 .contains("http_requests_total{method=\"GET\",route=\"/\",status=\"200\"} 1")
         );
         assert!(
             first_scrape.contains(
-                "http_requests_total{method=\"GET\",route=\"unmatched\",status=\"404\"} 1"
+                "http_requests_total{method=\"GET\",route=\"unmatched\",status=\"404\"} 2"
             )
         );
         assert!(first_scrape.contains("http_requests_in_flight 0"));
@@ -212,6 +276,19 @@ mod tests {
 
         cancellation_token.cancel();
         server.await??;
+        assert_eq!(metrics_server.await??, "metrics_shutdown");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn metrics_listener_reports_bind_conflicts() -> anyhow::Result<()> {
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let addr = occupied.local_addr()?.to_string();
+        let error = bind_metrics_listener(&addr).await.unwrap_err();
+        assert!(
+            error.to_string().contains(&format!("failed to bind metrics listener to {addr}")),
+            "unexpected error: {error}"
+        );
         Ok(())
     }
 
@@ -233,14 +310,13 @@ mod tests {
         let gateway_address = gateway(1);
         let addr = available_addr();
         let cancellation_token = CancellationToken::new();
-        let server_token = cancellation_token.clone();
-        let server = tokio::spawn(serve(
-            addr.clone(),
+        let api_state = ApiState::new(
             store::create_local_db("sqlite::memory:").await,
             ApiMetricsState::new(),
             authorization_chains(gateway_address, authorization_chain),
-            server_token,
-        ));
+        );
+        let server =
+            tokio::spawn(serve_with_app_state(addr.clone(), api_state, cancellation_token.clone()));
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let operator_submit = OperatorProofRequest {
@@ -418,14 +494,18 @@ mod tests {
             std::collections::HashMap::from([(gateway_a, chain_a), (gateway_b, chain_b)]);
         let addr = available_addr();
         let cancellation_token = CancellationToken::new();
-        let server_token = cancellation_token.clone();
-        let server = tokio::spawn(serve(
-            addr.clone(),
+        let api_state = ApiState::new(
             store::create_local_db("sqlite::memory:").await,
             ApiMetricsState::new(),
             authorization_chains,
-            server_token,
+        );
+        let server = tokio::spawn(serve_with_app_state(
+            addr.clone(),
+            api_state.clone(),
+            cancellation_token.clone(),
         ));
+        let (metrics_addr, metrics_server) =
+            spawn_metrics_listener(api_state, cancellation_token.clone()).await?;
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         for (gateway_address, expected_status) in [
@@ -453,12 +533,13 @@ mod tests {
             assert!(response.starts_with(&format!("HTTP/1.1 {expected_status}")));
         }
 
-        let metrics = get(&addr, "/metrics").await?;
+        let metrics = get(&metrics_addr, "/metrics").await?;
         assert!(metrics.contains("operation=\"operator_timeout\",result=\"invalid\""));
         assert!(metrics.contains("operation=\"operator_timeout\",result=\"unauthorized\""));
 
         cancellation_token.cancel();
         server.await??;
+        metrics_server.await??;
         Ok(())
     }
 
@@ -471,14 +552,18 @@ mod tests {
         let gateway_address = gateway(1);
         let addr = available_addr();
         let cancellation_token = CancellationToken::new();
-        let server_token = cancellation_token.clone();
-        let server = tokio::spawn(serve(
-            addr.clone(),
+        let api_state = ApiState::new(
             store::create_local_db("sqlite::memory:").await,
             ApiMetricsState::new(),
             authorization_chains(gateway_address, authorization_chain),
-            server_token,
+        );
+        let server = tokio::spawn(serve_with_app_state(
+            addr.clone(),
+            api_state.clone(),
+            cancellation_token.clone(),
         ));
+        let (metrics_addr, metrics_server) =
+            spawn_metrics_listener(api_state, cancellation_token.clone()).await?;
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let request = OperatorProofTimeoutUpdateRequest {
@@ -498,11 +583,12 @@ mod tests {
             post(&addr, routes::v1::PROOFS_OPERATOR_PROOF_TIMEOUT, &body, Some(&auth)).await?;
         assert!(response.starts_with("HTTP/1.1 503"));
 
-        let metrics = get(&addr, "/metrics").await?;
+        let metrics = get(&metrics_addr, "/metrics").await?;
         assert!(metrics.contains("operation=\"operator_timeout\",result=\"unavailable\""));
 
         cancellation_token.cancel();
         server.await??;
+        metrics_server.await??;
         Ok(())
     }
 }

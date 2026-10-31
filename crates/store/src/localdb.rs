@@ -5,8 +5,8 @@ use crate::{
     LongRunningTaskProof, Message, MessageDebugOverview, MessageDebugReason, MetricsStateCount,
     Node, NodeAlertMetricsSnapshot, NodesOverview, OperatorProof, P2pInboxMessage,
     P2pOutboxMessage, PeginGraphProcessData, PeginInstanceProcessData, PendingGraphInit,
-    SequencerSetHashChange, SequencerSetScanState, SerializableTxid, WatchContract,
-    WatchtowerProof,
+    SequencerSetHashChange, SequencerSetScanState, SerializableTxid, SwapEscrow, SwapEscrowStatus,
+    WatchContract, WatchtowerProof,
 };
 
 use indexmap::IndexMap;
@@ -69,6 +69,9 @@ fn p2p_outbox_message_from_row(row: &SqliteRow) -> Result<P2pOutboxMessage, sqlx
         next_retry_at: row.try_get("next_retry_at")?,
         lease_until: row.try_get("lease_until")?,
         last_error: row.try_get("last_error")?,
+        retry_until: row.try_get("retry_until")?,
+        retry_interval_secs: row.try_get("retry_interval_secs")?,
+        ack_peer_id: row.try_get("ack_peer_id")?,
         created_at: row.try_get("created_at")?,
     })
 }
@@ -163,9 +166,7 @@ impl LocalDB {
 
 #[derive(Clone, Debug, Default)]
 pub struct InstanceQuery {
-    pub is_bridge_in: bool,
     pub from_addr: Option<String>,
-    pub escrow_hash: Option<String>,
     pub statuses: Vec<String>,
     pub earliest_updated: Option<i64>,
     pub pegin_request_height_threshold: Option<i64>,
@@ -176,11 +177,6 @@ pub struct InstanceQuery {
 }
 
 impl InstanceQuery {
-    pub fn with_is_bridge_in(mut self, is_bridge_in: bool) -> Self {
-        self.is_bridge_in = is_bridge_in;
-        self
-    }
-
     pub fn with_from_addr(mut self, from_addr: String) -> Self {
         self.from_addr = Some(from_addr);
         self
@@ -198,11 +194,6 @@ impl InstanceQuery {
 
     pub fn with_order(mut self, order: String) -> Self {
         self.order = Some(order);
-        self
-    }
-
-    pub fn with_escrow_hash(mut self, escrow_hash: String) -> Self {
-        self.escrow_hash = Some(escrow_hash);
         self
     }
 
@@ -244,14 +235,8 @@ impl InstanceQuery {
 
     pub fn get_query_builder(&self, base_sql: &str) -> QueryBuilder {
         let mut query_builder = QueryBuilder::new(base_sql);
-        query_builder.and_where("is_bridge_in = ?", Some(QueryParam::Bool(self.is_bridge_in)));
-
         if let Some(from_addr) = &self.from_addr {
             query_builder.and_where("from_addr = ?", Some(QueryParam::Text(from_addr.clone())));
-        }
-
-        if let Some(escrow_hash) = &self.escrow_hash {
-            query_builder.and_where("escrow_hash = ?", Some(QueryParam::Text(escrow_hash.clone())));
         }
 
         if !self.statuses.is_empty() {
@@ -283,8 +268,7 @@ impl InstanceQuery {
 /// Provides a more elegant way to specify which instance fields to update
 #[derive(Debug, Clone)]
 pub struct InstanceUpdate {
-    pub instance_id: Option<Uuid>,
-    pub escrow_hash: Option<String>,
+    pub instance_id: Uuid,
     pub from_addr: Option<String>,
     pub to_addr: Option<String>,
     pub btc_txid: Option<SerializableTxid>,
@@ -294,22 +278,14 @@ pub struct InstanceUpdate {
     pub post_pegin_txhash: Option<String>,
     pub btc_height: Option<i64>,
     pub committees_answers: Option<IndexMap<String, Vec<u8>>>,
-    pub bridge_out_lock_time: Option<i64>,
-    pub bridge_out_amount: Option<String>,
-    pub goat_tx_hash: Option<String>,
-    pub goat_tx_height: Option<i64>,
-    pub user_change_addr: Option<String>,
-    pub user_refund_addr: Option<String>,
     pub only_if_status_in: Option<Vec<String>>,
-    pub only_if_is_bridge_in: Option<bool>,
-    pub only_if_goat_tx_hash: Option<String>,
 }
 
 impl InstanceUpdate {
-    fn empty() -> Self {
+    /// Create new update parameters
+    pub fn new_with_instance_id(instance_id: Uuid) -> Self {
         Self {
-            instance_id: None,
-            escrow_hash: None,
+            instance_id,
             from_addr: None,
             to_addr: None,
             btc_txid: None,
@@ -319,24 +295,8 @@ impl InstanceUpdate {
             post_pegin_txhash: None,
             btc_height: None,
             committees_answers: None,
-            bridge_out_lock_time: None,
-            bridge_out_amount: None,
-            goat_tx_hash: None,
-            goat_tx_height: None,
-            user_change_addr: None,
-            user_refund_addr: None,
             only_if_status_in: None,
-            only_if_is_bridge_in: None,
-            only_if_goat_tx_hash: None,
         }
-    }
-
-    /// Create new update parameters
-    pub fn new_with_instance_id(instance_id: Uuid) -> Self {
-        Self { instance_id: Some(instance_id), ..Self::empty() }
-    }
-    pub fn new_with_escrow_hash(escrow_hash: String) -> Self {
-        Self { escrow_hash: Some(escrow_hash), ..Self::empty() }
     }
 
     /// Set from_addr
@@ -395,37 +355,6 @@ impl InstanceUpdate {
         self
     }
 
-    /// Set bridge out lock time
-    pub fn with_bridge_out_lock_time(mut self, bridge_out_lock_time: i64) -> Self {
-        self.bridge_out_lock_time = Some(bridge_out_lock_time);
-        self
-    }
-
-    pub fn with_bridge_out_amount(mut self, bridge_out_amount: String) -> Self {
-        self.bridge_out_amount = Some(bridge_out_amount);
-        self
-    }
-
-    pub fn with_goat_tx_hash(mut self, goat_tx_hash: String) -> Self {
-        self.goat_tx_hash = Some(goat_tx_hash);
-        self
-    }
-
-    pub fn with_goat_tx_height(mut self, goat_tx_height: i64) -> Self {
-        self.goat_tx_height = Some(goat_tx_height);
-        self
-    }
-
-    pub fn with_user_change_addr(mut self, user_change_addr: String) -> Self {
-        self.user_change_addr = Some(user_change_addr);
-        self
-    }
-
-    pub fn with_user_refund_addr(mut self, user_refund_addr: String) -> Self {
-        self.user_refund_addr = Some(user_refund_addr);
-        self
-    }
-
     /// Apply this update only while the instance is still in one of the
     /// expected states. The condition is folded into the UPDATE statement.
     pub fn with_only_if_status_in(mut self, statuses: Vec<String>) -> Self {
@@ -433,23 +362,9 @@ impl InstanceUpdate {
         self
     }
 
-    /// Apply this update only to the expected bridge direction.
-    pub fn with_only_if_is_bridge_in(mut self, is_bridge_in: bool) -> Self {
-        self.only_if_is_bridge_in = Some(is_bridge_in);
-        self
-    }
-
-    /// Apply this update only when the existing Goat transaction hash is the
-    /// expected value. Used to make swap initialization idempotent.
-    pub fn with_only_if_goat_tx_hash(mut self, goat_tx_hash: String) -> Self {
-        self.only_if_goat_tx_hash = Some(goat_tx_hash);
-        self
-    }
-
     /// Check if any fields need to be updated
     pub fn has_updates(&self) -> bool {
-        self.escrow_hash.is_some()
-            || self.from_addr.is_some()
+        self.from_addr.is_some()
             || self.to_addr.is_some()
             || self.btc_txid.is_some()
             || self.status.is_some()
@@ -458,12 +373,6 @@ impl InstanceUpdate {
             || self.post_pegin_txhash.is_some()
             || self.btc_height.is_some()
             || self.committees_answers.is_some()
-            || self.bridge_out_lock_time.is_some()
-            || self.bridge_out_amount.is_some()
-            || self.goat_tx_hash.is_some()
-            || self.goat_tx_height.is_some()
-            || self.user_change_addr.is_some()
-            || self.user_refund_addr.is_some()
     }
 
     pub fn get_query_builder(&self, base_sql: &str) -> QueryBuilder {
@@ -503,31 +412,6 @@ impl InstanceUpdate {
             query_builder.set_field("btc_txid", QueryParam::BTCTxid(btc_txid.clone()));
         }
 
-        if let Some(bridge_out_lock_time) = self.bridge_out_lock_time {
-            query_builder.set_field("bridge_out_lock_time", QueryParam::Int(bridge_out_lock_time));
-        }
-
-        if let Some(ref bridge_out_amount) = self.bridge_out_amount {
-            query_builder
-                .set_field("bridge_out_amount", QueryParam::Text(bridge_out_amount.clone()));
-        }
-
-        if let Some(ref goat_tx_hash) = self.goat_tx_hash {
-            query_builder.set_field("goat_tx_hash", QueryParam::Text(goat_tx_hash.clone()));
-        }
-
-        if let Some(goat_tx_height) = self.goat_tx_height {
-            query_builder.set_field("goat_tx_height", QueryParam::Int(goat_tx_height));
-        }
-
-        if let Some(ref user_change_addr) = self.user_change_addr {
-            query_builder.set_field("user_change_addr", QueryParam::Text(user_change_addr.clone()));
-        }
-
-        if let Some(ref user_refund_addr) = self.user_refund_addr {
-            query_builder.set_field("user_refund_addr", QueryParam::Text(user_refund_addr.clone()));
-        }
-
         if let Some(ref committees_answers) = self.committees_answers {
             let committees_answers = serde_json::to_string(committees_answers)
                 .expect("IndexMap<String, Vec<u8>> serialization is infallible");
@@ -539,16 +423,10 @@ impl InstanceUpdate {
         query_builder.set_field("updated_at", QueryParam::Int(current_time));
 
         // Add WHERE clause
-        if let Some(ref instance_id) = self.instance_id {
-            query_builder.and_where(
-                "hex(instance_id) = ? COLLATE NOCASE ",
-                Some(QueryParam::Text(hex::encode(instance_id))),
-            );
-        }
-        if let Some(ref escrow_hash) = self.escrow_hash {
-            query_builder
-                .and_where("escrow_hash = ? ", Some(QueryParam::Text(escrow_hash.clone())));
-        }
+        query_builder.and_where(
+            "hex(instance_id) = ? COLLATE NOCASE ",
+            Some(QueryParam::Text(hex::encode(self.instance_id))),
+        );
 
         if let Some(ref statuses) = self.only_if_status_in {
             if statuses.is_empty() {
@@ -560,15 +438,200 @@ impl InstanceUpdate {
             }
         }
 
-        if let Some(is_bridge_in) = self.only_if_is_bridge_in {
-            query_builder.and_where("is_bridge_in = ?", Some(QueryParam::Bool(is_bridge_in)));
-        }
+        query_builder
+    }
+}
 
-        if let Some(ref goat_tx_hash) = self.only_if_goat_tx_hash {
+/// Filter parameters for listing swap escrows.
+#[derive(Clone, Debug, Default)]
+pub struct SwapEscrowQuery {
+    pub offerer_addr: Option<String>,
+    pub statuses: Vec<String>,
+    pub order: Option<String>,
+    pub offset: Option<u32>,
+    pub limit: Option<u32>,
+}
+
+impl SwapEscrowQuery {
+    pub fn with_offerer_addr(mut self, offerer_addr: String) -> Self {
+        self.offerer_addr = Some(offerer_addr);
+        self
+    }
+
+    pub fn with_status(mut self, status: String) -> Self {
+        self.statuses.push(status);
+        self
+    }
+
+    pub fn with_order(mut self, order: String) -> Self {
+        self.order = Some(order);
+        self
+    }
+
+    pub fn with_pagination(mut self, offset: u32, limit: u32) -> Self {
+        self.offset = Some(offset);
+        self.limit = Some(limit);
+        self
+    }
+
+    pub fn get_query_builder(&self, base_sql: &str) -> QueryBuilder {
+        let mut query_builder = QueryBuilder::new(base_sql);
+        if let Some(offerer_addr) = &self.offerer_addr {
             query_builder
-                .and_where("goat_tx_hash = ?", Some(QueryParam::Text(goat_tx_hash.clone())));
+                .and_where("offerer_addr = ?", Some(QueryParam::Text(offerer_addr.clone())));
+        }
+        if !self.statuses.is_empty() {
+            query_builder.and_where_in("status", &self.statuses, false);
+        }
+        if let Some(order) = &self.order {
+            query_builder.apply_order(order);
+        }
+        query_builder.apply_pagination(self.limit, self.offset);
+        query_builder
+    }
+}
+
+/// Swap escrow field update parameters, keyed by escrow hash.
+#[derive(Debug, Clone, Default)]
+pub struct SwapEscrowUpdate {
+    pub escrow_hash: String,
+    pub status: Option<String>,
+    pub claimer_addr: Option<String>,
+    pub btc_addr: Option<String>,
+    pub token: Option<String>,
+    pub amount: Option<String>,
+    pub refund_deadline: Option<i64>,
+    pub escrow_data: Option<String>,
+    pub init_tx_hash: Option<String>,
+    pub init_tx_height: Option<i64>,
+    pub claim_tx_hash: Option<String>,
+    pub claim_btc_txid: Option<SerializableTxid>,
+    pub refund_tx_hash: Option<String>,
+    pub only_if_status_in: Option<Vec<String>>,
+}
+
+impl SwapEscrowUpdate {
+    pub fn new(escrow_hash: String) -> Self {
+        Self { escrow_hash, ..Self::default() }
+    }
+
+    pub fn with_status(mut self, status: String) -> Self {
+        self.status = Some(status);
+        self
+    }
+
+    pub fn with_claimer_addr(mut self, claimer_addr: String) -> Self {
+        self.claimer_addr = Some(claimer_addr);
+        self
+    }
+
+    pub fn with_btc_addr(mut self, btc_addr: String) -> Self {
+        self.btc_addr = Some(btc_addr);
+        self
+    }
+
+    pub fn with_token(mut self, token: String) -> Self {
+        self.token = Some(token);
+        self
+    }
+
+    pub fn with_amount(mut self, amount: String) -> Self {
+        self.amount = Some(amount);
+        self
+    }
+
+    pub fn with_refund_deadline(mut self, refund_deadline: i64) -> Self {
+        self.refund_deadline = Some(refund_deadline);
+        self
+    }
+
+    pub fn with_escrow_data(mut self, escrow_data: String) -> Self {
+        self.escrow_data = Some(escrow_data);
+        self
+    }
+
+    pub fn with_init_tx(mut self, tx_hash: String, tx_height: i64) -> Self {
+        self.init_tx_hash = Some(tx_hash);
+        self.init_tx_height = Some(tx_height);
+        self
+    }
+
+    pub fn with_claim_tx_hash(mut self, tx_hash: String) -> Self {
+        self.claim_tx_hash = Some(tx_hash);
+        self
+    }
+
+    pub fn with_claim_btc_txid(mut self, txid: SerializableTxid) -> Self {
+        self.claim_btc_txid = Some(txid);
+        self
+    }
+
+    pub fn with_refund_tx_hash(mut self, tx_hash: String) -> Self {
+        self.refund_tx_hash = Some(tx_hash);
+        self
+    }
+
+    /// Apply this update only while the escrow is still in one of the
+    /// expected states. The condition is folded into the UPDATE statement.
+    pub fn with_only_if_status_in(mut self, statuses: Vec<String>) -> Self {
+        self.only_if_status_in = Some(statuses);
+        self
+    }
+
+    pub fn get_query_builder(&self, base_sql: &str) -> QueryBuilder {
+        let mut query_builder = QueryBuilder::update(base_sql);
+        if let Some(ref status) = self.status {
+            query_builder.set_field("status", QueryParam::Text(status.clone()));
+            query_builder
+                .set_field("status_updated_at", QueryParam::Int(get_current_timestamp_secs()));
+        }
+        if let Some(ref claimer_addr) = self.claimer_addr {
+            query_builder.set_field("claimer_addr", QueryParam::Text(claimer_addr.clone()));
+        }
+        if let Some(ref btc_addr) = self.btc_addr {
+            query_builder.set_field("btc_addr", QueryParam::Text(btc_addr.clone()));
+        }
+        if let Some(ref token) = self.token {
+            query_builder.set_field("token", QueryParam::Text(token.clone()));
+        }
+        if let Some(ref amount) = self.amount {
+            query_builder.set_field("amount", QueryParam::Text(amount.clone()));
+        }
+        if let Some(refund_deadline) = self.refund_deadline {
+            query_builder.set_field("refund_deadline", QueryParam::Int(refund_deadline));
+        }
+        if let Some(ref escrow_data) = self.escrow_data {
+            query_builder.set_field("escrow_data", QueryParam::Text(escrow_data.clone()));
+        }
+        if let Some(ref init_tx_hash) = self.init_tx_hash {
+            query_builder.set_field("init_tx_hash", QueryParam::Text(init_tx_hash.clone()));
+        }
+        if let Some(init_tx_height) = self.init_tx_height {
+            query_builder.set_field("init_tx_height", QueryParam::Int(init_tx_height));
+        }
+        if let Some(ref claim_tx_hash) = self.claim_tx_hash {
+            query_builder.set_field("claim_tx_hash", QueryParam::Text(claim_tx_hash.clone()));
+        }
+        if let Some(ref claim_btc_txid) = self.claim_btc_txid {
+            query_builder.set_field("claim_btc_txid", QueryParam::BTCTxid(claim_btc_txid.clone()));
+        }
+        if let Some(ref refund_tx_hash) = self.refund_tx_hash {
+            query_builder.set_field("refund_tx_hash", QueryParam::Text(refund_tx_hash.clone()));
         }
 
+        query_builder.set_field("updated_at", QueryParam::Int(get_current_timestamp_secs()));
+
+        query_builder
+            .and_where("escrow_hash = ?", Some(QueryParam::Text(self.escrow_hash.clone())));
+        if let Some(ref statuses) = self.only_if_status_in {
+            if statuses.is_empty() {
+                // An empty allow-list must reject the update rather than
+                // silently dropping the compare-and-swap guard.
+                query_builder.and_where("1 = 0", None);
+            } else {
+                query_builder.and_where_in("status", statuses, false);
+            }
+        }
         query_builder
     }
 }
@@ -901,13 +964,22 @@ impl<'a> StorageProcessor<'a> {
         let counts = sqlx::query_as::<_, MetricsStateCount>(
             r#"
             SELECT
-                CASE WHEN is_bridge_in THEN 'instance_bridge_in' ELSE 'instance_bridge_out' END AS category,
+                'instance' AS category,
                 status AS state,
                 COUNT(*) AS count,
                 MIN(created_at) AS oldest_created_at,
                 NULL AS last_success_at
             FROM instance
-            GROUP BY is_bridge_in, status
+            GROUP BY status
+            UNION ALL
+            SELECT
+                'swap_escrow' AS category,
+                status AS state,
+                COUNT(*) AS count,
+                MIN(created_at) AS oldest_created_at,
+                NULL AS last_success_at
+            FROM swap_escrow
+            GROUP BY status
             UNION ALL
             SELECT
                 'graph' AS category,
@@ -942,30 +1014,31 @@ impl<'a> StorageProcessor<'a> {
         let snapshot = sqlx::query_as::<_, NodeAlertMetricsSnapshot>(
             r#"
             SELECT
-                MIN(CASE
-                    WHEN is_bridge_in = 1
-                     AND status NOT IN (
+                (
+                    SELECT MIN(status_updated_at)
+                    FROM instance
+                    WHERE status NOT IN (
                         'RelayerL2Minted', 'PresignedFailed', 'RelayerL2MintedFailed',
                         'Timeout', 'UserCanceled', 'NoEnoughCommitteesAnswered', 'UserDiscarded',
                         'Failed', 'Success', 'Canceled'
-                     )
-                    THEN status_updated_at
-                END) AS pegin_oldest_active_status_updated_at,
-                MIN(CASE
-                    WHEN is_bridge_in = 1 AND status = 'UserInited'
-                    THEN status_updated_at
-                END) AS pegin_oldest_committee_wait_status_updated_at,
-                MIN(CASE
-                    WHEN is_bridge_in = 0 AND status NOT IN ('Claim', 'Timeout', 'Refund')
-                    THEN status_updated_at
-                END) AS pegout_oldest_active_status_updated_at,
+                    )
+                ) AS pegin_oldest_active_status_updated_at,
+                (
+                    SELECT MIN(status_updated_at)
+                    FROM instance
+                    WHERE status = 'UserInited'
+                ) AS pegin_oldest_committee_wait_status_updated_at,
+                (
+                    SELECT MIN(status_updated_at)
+                    FROM swap_escrow
+                    WHERE status NOT IN ('Claim', 'Timeout', 'Refund')
+                ) AS pegout_oldest_active_status_updated_at,
                 (
                     SELECT available_peg_btc
                     FROM node
                     WHERE peer_id = ? AND actor = 'Operator'
                     LIMIT 1
                 ) AS operator_available_pegbtc
-            FROM instance
             "#,
         )
         .bind(local_peer_id)
@@ -1052,12 +1125,11 @@ impl<'a> StorageProcessor<'a> {
         let committees_answers_json = serde_json::to_string(&instance.committees_answers)?;
         let res = sqlx::query!(
             "INSERT OR
-            REPLACE INTO instance (instance_id, is_bridge_in,  network, from_addr, to_addr, amount, fees, input_utxos, status, goat_tx_hash, goat_tx_height,
+            REPLACE INTO instance (instance_id, network, from_addr, to_addr, amount, fees, input_utxos, status, goat_tx_hash, goat_tx_height,
                         user_xonly_pubkey, user_change_addr, user_refund_addr, btc_txid, pegin_confirm_txid, pegin_cancel_txid, committees_answers,
-                       pegin_data_tx_hash, btc_height, parameters, status_updated_at, escrow_hash, bridge_out_lock_time, post_pegin_txhash, bridge_out_amount,  created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,?)",
+                       pegin_data_tx_hash, btc_height, parameters, status_updated_at, post_pegin_txhash, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             instance.instance_id,
-            instance.is_bridge_in,
             instance.network,
             instance.from_addr,
             instance.to_addr,
@@ -1078,10 +1150,7 @@ impl<'a> StorageProcessor<'a> {
             instance.btc_height,
             instance.parameters,
             instance.status_updated_at,
-            instance.escrow_hash,
-            instance.bridge_out_lock_time,
             instance.post_pegin_txhash,
-            instance.bridge_out_amount,
             instance.created_at,
             instance.updated_at
         )
@@ -1090,53 +1159,92 @@ impl<'a> StorageProcessor<'a> {
         Ok(res.rows_affected() > 0)
     }
 
-    /// Insert an instance only when its ID is not already present.
+    /// Create a bridge-in instance from a pegin request, or refresh one that
+    /// has not moved past the pegin-request stage yet.
     ///
-    /// Creation paths that race with status transitions must use this instead
-    /// of `upsert_instance`, whose `INSERT OR REPLACE` semantics can restore
-    /// a stale full row over a newer terminal status.
-    pub async fn insert_instance_if_absent(&mut self, instance: &Instance) -> anyhow::Result<bool> {
+    /// `PeginRequest` is a re-deliverable P2P message, so `upsert_instance` is
+    /// unsafe here: its `INSERT OR REPLACE` lets a replayed or forged request
+    /// roll a live instance back to its initial row and clear everything the
+    /// later stages wrote. The write is therefore a compare-and-swap over the
+    /// current status, and it only touches the columns a pegin request owns:
+    /// committee answers, instance parameters and the BTC-side fields are never
+    /// overwritten. The caller is responsible for passing canonical request
+    /// metadata - `goat_tx_hash`/`goat_tx_height` are refreshed from it, so that
+    /// a re-indexed event can still correct them.
+    ///
+    /// Returns:
+    /// - Ok(true) if the row was inserted or updated
+    /// - Ok(false) if an existing row was left untouched because its status
+    ///   is outside `allowed_statuses`
+    pub async fn upsert_pegin_request_instance(
+        &mut self,
+        instance: &Instance,
+        allowed_statuses: &[String],
+    ) -> anyhow::Result<bool> {
         let committees_answers_json = serde_json::to_string(&instance.committees_answers)?;
-        let res = sqlx::query(
+        // An empty allow-list must reject the update rather than silently
+        // dropping the compare-and-swap guard.
+        let status_guard = if allowed_statuses.is_empty() {
+            "1 = 0".to_string()
+        } else {
+            let placeholders = allowed_statuses.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+            format!("instance.status IN ({placeholders})")
+        };
+        let sql = format!(
             "INSERT INTO instance \
-             (instance_id, is_bridge_in, network, from_addr, to_addr, amount, fees, input_utxos, \
+             (instance_id, network, from_addr, to_addr, amount, fees, input_utxos, \
               status, goat_tx_hash, goat_tx_height, user_xonly_pubkey, user_change_addr, \
               user_refund_addr, btc_txid, pegin_confirm_txid, pegin_cancel_txid, committees_answers, \
-              pegin_data_tx_hash, btc_height, parameters, status_updated_at, escrow_hash, \
-              bridge_out_lock_time, post_pegin_txhash, bridge_out_amount, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
-             ON CONFLICT(instance_id) DO NOTHING",
-        )
-        .bind(instance.instance_id)
-        .bind(instance.is_bridge_in)
-        .bind(&instance.network)
-        .bind(&instance.from_addr)
-        .bind(&instance.to_addr)
-        .bind(instance.amount)
-        .bind(instance.fees)
-        .bind(&instance.input_utxos)
-        .bind(&instance.status)
-        .bind(&instance.goat_tx_hash)
-        .bind(instance.goat_tx_height)
-        .bind(instance.user_xonly_pubkey)
-        .bind(&instance.user_change_addr)
-        .bind(&instance.user_refund_addr)
-        .bind(&instance.btc_txid)
-        .bind(&instance.pegin_confirm_txid)
-        .bind(&instance.pegin_cancel_txid)
-        .bind(committees_answers_json)
-        .bind(&instance.pegin_data_tx_hash)
-        .bind(instance.btc_height)
-        .bind(&instance.parameters)
-        .bind(instance.status_updated_at)
-        .bind(&instance.escrow_hash)
-        .bind(instance.bridge_out_lock_time)
-        .bind(&instance.post_pegin_txhash)
-        .bind(&instance.bridge_out_amount)
-        .bind(instance.created_at)
-        .bind(instance.updated_at)
-        .execute(self.conn())
-        .await?;
+              pegin_data_tx_hash, btc_height, parameters, status_updated_at, \
+              post_pegin_txhash, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(instance_id) DO UPDATE SET \
+               network = excluded.network, \
+               from_addr = CASE WHEN excluded.from_addr = '' \
+                   THEN instance.from_addr ELSE excluded.from_addr END, \
+               to_addr = excluded.to_addr, \
+               amount = excluded.amount, \
+               fees = excluded.fees, \
+               input_utxos = excluded.input_utxos, \
+               status = excluded.status, \
+               goat_tx_hash = excluded.goat_tx_hash, \
+               goat_tx_height = excluded.goat_tx_height, \
+               user_xonly_pubkey = excluded.user_xonly_pubkey, \
+               user_change_addr = excluded.user_change_addr, \
+               user_refund_addr = excluded.user_refund_addr, \
+               status_updated_at = excluded.status_updated_at, \
+               updated_at = excluded.updated_at \
+             WHERE {status_guard}"
+        );
+        let mut query = sqlx::query(&sql)
+            .bind(instance.instance_id)
+            .bind(&instance.network)
+            .bind(&instance.from_addr)
+            .bind(&instance.to_addr)
+            .bind(instance.amount)
+            .bind(instance.fees)
+            .bind(&instance.input_utxos)
+            .bind(&instance.status)
+            .bind(&instance.goat_tx_hash)
+            .bind(instance.goat_tx_height)
+            .bind(instance.user_xonly_pubkey)
+            .bind(&instance.user_change_addr)
+            .bind(&instance.user_refund_addr)
+            .bind(&instance.btc_txid)
+            .bind(&instance.pegin_confirm_txid)
+            .bind(&instance.pegin_cancel_txid)
+            .bind(committees_answers_json)
+            .bind(&instance.pegin_data_tx_hash)
+            .bind(instance.btc_height)
+            .bind(&instance.parameters)
+            .bind(instance.status_updated_at)
+            .bind(&instance.post_pegin_txhash)
+            .bind(instance.created_at)
+            .bind(instance.updated_at);
+        for status in allowed_statuses {
+            query = query.bind(status);
+        }
+        let res = query.execute(self.conn()).await?;
         Ok(res.rows_affected() > 0)
     }
 
@@ -1214,6 +1322,111 @@ impl<'a> StorageProcessor<'a> {
         } else {
             Ok("".to_string())
         }
+    }
+
+    /// Insert a swap escrow only when its escrow hash is not already present.
+    ///
+    /// The chain-event watcher is the sole writer for Initialize records;
+    /// the escrow-hash primary key makes event replays idempotent.
+    pub async fn insert_swap_escrow_if_absent(
+        &mut self,
+        escrow: &SwapEscrow,
+    ) -> anyhow::Result<bool> {
+        let res = sqlx::query!(
+            "INSERT INTO swap_escrow \
+             (escrow_hash, network, status, offerer_addr, claimer_addr, btc_addr, token, amount, \
+              refund_deadline, escrow_data, init_tx_hash, init_tx_height, claim_tx_hash, \
+              claim_btc_txid, refund_tx_hash, status_updated_at, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(escrow_hash) DO NOTHING",
+            escrow.escrow_hash,
+            escrow.network,
+            escrow.status,
+            escrow.offerer_addr,
+            escrow.claimer_addr,
+            escrow.btc_addr,
+            escrow.token,
+            escrow.amount,
+            escrow.refund_deadline,
+            escrow.escrow_data,
+            escrow.init_tx_hash,
+            escrow.init_tx_height,
+            escrow.claim_tx_hash,
+            escrow.claim_btc_txid,
+            escrow.refund_tx_hash,
+            escrow.status_updated_at,
+            escrow.created_at,
+            escrow.updated_at
+        )
+        .execute(self.conn())
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Find a swap escrow by its (normalized) escrow hash.
+    pub async fn find_swap_escrow(
+        &mut self,
+        escrow_hash: &str,
+    ) -> anyhow::Result<Option<SwapEscrow>> {
+        let row =
+            sqlx::query_as::<_, SwapEscrow>("SELECT * FROM swap_escrow WHERE escrow_hash = ?")
+                .bind(escrow_hash)
+                .fetch_optional(self.conn())
+                .await?;
+        Ok(row)
+    }
+
+    /// Find swap escrows with filtering and pagination.
+    ///
+    /// Returns the matching page together with the total match count.
+    pub async fn find_swap_escrows(
+        &mut self,
+        params: SwapEscrowQuery,
+    ) -> anyhow::Result<(Vec<SwapEscrow>, i64)> {
+        let mut count_params = params.clone();
+        (count_params.order, count_params.offset) = (None, None);
+        let escrows_query_builder = params.get_query_builder("SELECT * FROM swap_escrow");
+        let count_query_builder =
+            count_params.get_query_builder("SELECT count(*) as total_escrows FROM swap_escrow");
+        let sql = escrows_query_builder.get_sql();
+        let mut data_query = sqlx::query_as::<_, SwapEscrow>(&sql);
+        data_query = escrows_query_builder.query_as(data_query);
+        let count_sql = count_query_builder.get_sql();
+        let mut count_query = sqlx::query(&count_sql);
+        count_query = count_query_builder.query(count_query);
+        Ok((
+            data_query.fetch_all(self.conn()).await?,
+            count_query.fetch_one(self.conn()).await?.get::<i64, &str>("total_escrows"),
+        ))
+    }
+
+    /// Update swap escrow fields using the builder pattern.
+    pub async fn update_swap_escrow(&mut self, params: &SwapEscrowUpdate) -> anyhow::Result<bool> {
+        let query_builder = params.get_query_builder("swap_escrow");
+        let update_sql = query_builder.get_sql();
+        let mut query = sqlx::query(&update_sql);
+        query = query_builder.query(query);
+        let result = query.execute(self.conn()).await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Mark still-initializing swap escrows whose refund deadline has passed
+    /// as timed out. Returns the number of escrows transitioned.
+    pub async fn timeout_expired_swap_escrows(&mut self, current_time: i64) -> anyhow::Result<u64> {
+        let initialize_status = SwapEscrowStatus::Initialize.to_string();
+        let timeout_status = SwapEscrowStatus::Timeout.to_string();
+        let row = sqlx::query!(
+            "UPDATE swap_escrow SET status = ?, status_updated_at = ?, updated_at = ? \
+             WHERE status = ? AND refund_deadline > 0 AND refund_deadline < ?",
+            timeout_status,
+            current_time,
+            current_time,
+            initialize_status,
+            current_time
+        )
+        .execute(self.conn())
+        .await?;
+        Ok(row.rows_affected())
     }
 
     /// Update expired instances status
@@ -1343,9 +1556,6 @@ impl<'a> StorageProcessor<'a> {
     pub async fn update_instance(&mut self, params: &InstanceUpdate) -> anyhow::Result<bool> {
         if !params.has_updates() {
             return Ok(false);
-        }
-        if params.instance_id.is_none() && params.escrow_hash.is_none() {
-            anyhow::bail!("instance update requires instance_id or escrow_hash");
         }
         let query_builder = params.get_query_builder("instance");
         // Get SQL and parameters
@@ -1920,6 +2130,27 @@ impl<'a> StorageProcessor<'a> {
         Ok(res.map(|graph| graph.graph_id))
     }
 
+    /// The operator's stored graph with the smallest kickoff index above
+    /// `kickoff_index`, regardless of status.
+    pub async fn find_next_operator_graph_after_index(
+        &mut self,
+        operator_pubkey: &str,
+        kickoff_index: i64,
+    ) -> anyhow::Result<Option<Graph>> {
+        let res = sqlx::query_as::<_, Graph>(
+            "SELECT *
+             FROM graph
+             WHERE operator_pubkey = ? AND kickoff_index > ?
+             ORDER BY kickoff_index ASC
+             LIMIT 1",
+        )
+        .bind(operator_pubkey)
+        .bind(kickoff_index)
+        .fetch_optional(self.conn())
+        .await?;
+        Ok(res)
+    }
+
     pub async fn get_graph_pre_kickoff_chain_by_cur_pre_kickoff(
         &mut self,
         current_pre_kickoff: SerializableTxid,
@@ -2168,9 +2399,8 @@ impl<'a> StorageProcessor<'a> {
         Ok(res)
     }
 
-    pub async fn get_sum_bridge_txn(
+    pub async fn get_sum_bridge_in_txn(
         &mut self,
-        is_bridge_in: bool,
         statuses: &[String],
     ) -> anyhow::Result<(i64, i64)> {
         #[derive(sqlx::FromRow)]
@@ -2182,8 +2412,7 @@ impl<'a> StorageProcessor<'a> {
         let query_str = format!(
             "SELECT SUM(amount) AS total, COUNT(*) AS tx_count
              FROM instance
-             WHERE  is_bridge_in = {} AND status IN ({})",
-            is_bridge_in,
+             WHERE status IN ({})",
             create_place_holders(statuses)
         );
         let mut query = sqlx::query_as::<_, BridgeInRow>(&query_str);
@@ -2864,6 +3093,40 @@ impl<'a> StorageProcessor<'a> {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Queue a graph-setup notification for a bounded retransmission window.
+    ///
+    /// A non-empty `ack_peer_id` is the only ACK that may stop this retry
+    /// loop early. Broadcast messages without an authenticated recipient keep
+    /// publishing until their window expires.
+    pub async fn enqueue_p2p_outbox_retry_message(
+        &mut self,
+        message_id: &str,
+        msg_type: &str,
+        content: &[u8],
+        retry_until: i64,
+        retry_interval_secs: i64,
+        ack_peer_id: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        let now = get_current_timestamp_secs();
+        let result = sqlx::query(
+            "INSERT INTO p2p_outbox \
+                (message_id, msg_type, content, state, attempt_count, next_retry_at, lease_until, retry_until, retry_interval_secs, ack_peer_id, created_at, updated_at) \
+             VALUES (?, ?, ?, 'Pending', 0, 0, 0, ?, ?, ?, ?, ?) \
+             ON CONFLICT(message_id) DO NOTHING",
+        )
+        .bind(message_id)
+        .bind(msg_type)
+        .bind(content)
+        .bind(retry_until)
+        .bind(retry_interval_secs)
+        .bind(ack_peer_id.unwrap_or_default())
+        .bind(now)
+        .bind(now)
+        .execute(self.conn())
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     pub async fn claim_p2p_outbox_messages(
         &mut self,
         now: i64,
@@ -2871,12 +3134,14 @@ impl<'a> StorageProcessor<'a> {
         limit: i64,
     ) -> anyhow::Result<Vec<P2pOutboxMessage>> {
         let rows = sqlx::query(
-            "SELECT message_id, msg_type, content, state, attempt_count, next_retry_at, lease_until, last_error, created_at \
+            "SELECT message_id, msg_type, content, state, attempt_count, next_retry_at, lease_until, last_error, retry_until, retry_interval_secs, ack_peer_id, created_at \
              FROM p2p_outbox \
-             WHERE (state = 'Pending' AND next_retry_at <= ?) \
+             WHERE ((state = 'Pending' AND next_retry_at <= ?) \
                 OR (state = 'Processing' AND lease_until <= ?) \
+             ) AND (retry_until = 0 OR retry_until > ?) \
              ORDER BY created_at ASC LIMIT ?",
         )
+        .bind(now)
         .bind(now)
         .bind(now)
         .bind(limit)
@@ -2905,6 +3170,71 @@ impl<'a> StorageProcessor<'a> {
             }
         }
         Ok(claimed)
+    }
+
+    /// End a bounded-retry message once its delivery window is exhausted.
+    pub async fn expire_p2p_outbox_retry_messages(&mut self, now: i64) -> anyhow::Result<u64> {
+        let result = sqlx::query(
+            "UPDATE p2p_outbox SET state = 'RetryExhausted', content = X'', lease_until = 0, next_retry_at = 0, \
+                 retry_until = 0, retry_interval_secs = 0, ack_peer_id = '', \
+                 last_error = 'retry window expired without expected ACK', updated_at = ? \
+             WHERE retry_until > 0 AND retry_until <= ? AND state IN ('Pending', 'Processing')",
+        )
+        .bind(now)
+        .bind(now)
+        .execute(self.conn())
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    pub async fn schedule_p2p_outbox_retry(
+        &mut self,
+        message_id: &str,
+        next_retry_at: i64,
+    ) -> anyhow::Result<bool> {
+        let result = sqlx::query(
+            "UPDATE p2p_outbox SET state = 'Pending', lease_until = 0, next_retry_at = ?, updated_at = ? \
+             WHERE message_id = ? AND state = 'Processing' AND retry_until > 0",
+        )
+        .bind(next_retry_at)
+        .bind(get_current_timestamp_secs())
+        .bind(message_id)
+        .execute(self.conn())
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn acknowledge_p2p_outbox_message(
+        &mut self,
+        message_id: &str,
+        peer_id: &str,
+    ) -> anyhow::Result<bool> {
+        let result = sqlx::query(
+            "UPDATE p2p_outbox SET state = 'Processed', content = X'', lease_until = 0, next_retry_at = 0, updated_at = ? \
+             WHERE message_id = ? AND retry_until > 0 AND ack_peer_id = ? \
+               AND state IN ('Pending', 'Processing')",
+        )
+        .bind(get_current_timestamp_secs())
+        .bind(message_id)
+        .bind(peer_id)
+        .execute(self.conn())
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Stop a local setup notification once a later protocol step makes it
+    /// obsolete and release its potentially large payload immediately.
+    pub async fn cancel_p2p_outbox_message(&mut self, message_id: &str) -> anyhow::Result<bool> {
+        let result = sqlx::query(
+            "UPDATE p2p_outbox SET state = 'Cancelled', content = X'', lease_until = 0, next_retry_at = 0, \
+                 updated_at = ? \
+             WHERE message_id = ? AND state IN ('Pending', 'Processing')",
+        )
+        .bind(get_current_timestamp_secs())
+        .bind(message_id)
+        .execute(self.conn())
+        .await?;
+        Ok(result.rows_affected() > 0)
     }
 
     pub async fn complete_p2p_outbox_message(&mut self, message_id: &str) -> anyhow::Result<bool> {
@@ -4179,13 +4509,140 @@ mod tests {
         create_local_db("sqlite::memory:").await
     }
 
+    fn pegin_instance(instance_id: Uuid, status: &str) -> Instance {
+        Instance {
+            instance_id,
+            network: "testnet".to_string(),
+            input_utxos: "[]".to_string(),
+            status: status.to_string(),
+            created_at: 100,
+            updated_at: 100,
+            ..Default::default()
+        }
+    }
+
+    fn pegin_request_statuses() -> Vec<String> {
+        vec![
+            crate::InstanceBridgeInStatus::UserIniting.to_string(),
+            crate::InstanceBridgeInStatus::UserInited.to_string(),
+        ]
+    }
+
+    #[tokio::test]
+    async fn test_upsert_pegin_request_instance_initializes_and_promotes() {
+        let db = setup_db().await;
+        let mut s = db.acquire().await.unwrap();
+        let instance_id = Uuid::new_v4();
+
+        let mut initing = pegin_instance(instance_id, "UserIniting");
+        initing.to_addr = "0xuser".to_string();
+        initing.from_addr = "bcrt1quser".to_string();
+        assert!(s.upsert_instance(&initing).await.unwrap());
+
+        let mut request = pegin_instance(instance_id, "UserInited");
+        request.to_addr = "0xuser".to_string();
+        request.amount = 10_000;
+        request.goat_tx_hash = "0xrequest".to_string();
+        request.goat_tx_height = 500;
+        request.status_updated_at = 200;
+        request.created_at = 999;
+        request.updated_at = 999;
+        assert!(
+            s.upsert_pegin_request_instance(&request, &pegin_request_statuses()).await.unwrap()
+        );
+
+        let stored = s.find_instance(&instance_id).await.unwrap().unwrap();
+        assert_eq!(stored.status, "UserInited");
+        assert_eq!(stored.amount, 10_000);
+        assert_eq!(stored.goat_tx_hash, "0xrequest");
+        assert_eq!(stored.goat_tx_height, 500);
+        assert_eq!(stored.status_updated_at, 200);
+        // An undecodable from_addr must not erase the one the request tag stored.
+        assert_eq!(stored.from_addr, "bcrt1quser");
+        // created_at belongs to whoever created the row.
+        assert_eq!(stored.created_at, 100);
+    }
+
+    #[tokio::test]
+    async fn test_upsert_pegin_request_instance_replay_keeps_accrued_state() {
+        let db = setup_db().await;
+        let mut s = db.acquire().await.unwrap();
+        let instance_id = Uuid::new_v4();
+
+        let mut inited = pegin_instance(instance_id, "UserInited");
+        inited.goat_tx_hash = "0xrequest".to_string();
+        inited.goat_tx_height = 500;
+        inited.committees_answers = IndexMap::from([("0xcommittee".to_string(), vec![1u8, 2, 3])]);
+        inited.parameters = Some("{}".to_string());
+        assert!(s.upsert_instance(&inited).await.unwrap());
+
+        // A re-delivered request refreshes the row in place; everything the
+        // instance accrued after the request must survive it.
+        let mut replay = pegin_instance(instance_id, "UserInited");
+        replay.goat_tx_hash = "0xrequest".to_string();
+        replay.goat_tx_height = 500;
+        assert!(s.upsert_pegin_request_instance(&replay, &pegin_request_statuses()).await.unwrap());
+        let stored = s.find_instance(&instance_id).await.unwrap().unwrap();
+        assert_eq!(stored.committees_answers.get("0xcommittee"), Some(&vec![1u8, 2, 3]));
+        assert_eq!(stored.parameters, Some("{}".to_string()));
+        assert_eq!(stored.goat_tx_height, 500);
+    }
+
+    #[tokio::test]
+    async fn test_upsert_pegin_request_instance_rejects_regression() {
+        let db = setup_db().await;
+        let mut s = db.acquire().await.unwrap();
+        let instance_id = Uuid::new_v4();
+
+        let mut minted = pegin_instance(instance_id, "RelayerL2Minted");
+        minted.goat_tx_hash = "0xrequest".to_string();
+        minted.goat_tx_height = 500;
+        minted.parameters = Some("{}".to_string());
+        minted.post_pegin_txhash = Some("0xmint".to_string());
+        assert!(s.upsert_instance(&minted).await.unwrap());
+
+        // Once the instance moves on, a re-delivered request may not pull it back.
+        let replay = pegin_instance(instance_id, "UserInited");
+        assert!(
+            !s.upsert_pegin_request_instance(&replay, &pegin_request_statuses()).await.unwrap()
+        );
+        let stored = s.find_instance(&instance_id).await.unwrap().unwrap();
+        assert_eq!(stored.status, "RelayerL2Minted");
+        assert_eq!(stored.parameters, Some("{}".to_string()));
+        assert_eq!(stored.post_pegin_txhash, Some("0xmint".to_string()));
+        assert_eq!(stored.goat_tx_height, 500);
+    }
+
+    #[tokio::test]
+    async fn test_upsert_pegin_request_instance_rejects_bridge_out_collision() {
+        let db = setup_db().await;
+        let mut s = db.acquire().await.unwrap();
+        let instance_id = Uuid::new_v4();
+
+        let bridge_out = pegin_instance(instance_id, "Initialize");
+        assert!(s.upsert_instance(&bridge_out).await.unwrap());
+
+        let request = pegin_instance(instance_id, "UserInited");
+        assert!(
+            !s.upsert_pegin_request_instance(&request, &pegin_request_statuses()).await.unwrap()
+        );
+        let stored = s.find_instance(&instance_id).await.unwrap().unwrap();
+        assert_eq!(stored.status, "Initialize");
+    }
+
     #[tokio::test]
     async fn test_node_metrics_state_counts() {
         let db = setup_db().await;
         let mut s = db.acquire().await.unwrap();
 
         sqlx::query(
-            "INSERT INTO instance (instance_id, is_bridge_in, status, created_at, updated_at) VALUES ('in-1', 1, 'Pending', 20, 20), ('in-2', 1, 'Pending', 10, 10), ('out-1', 0, 'Completed', 30, 30)",
+            "INSERT INTO instance (instance_id, status, created_at, updated_at) VALUES ('in-1', 'Pending', 20, 20), ('in-2', 'Pending', 10, 10)",
+        )
+        .execute(s.conn())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO swap_escrow (escrow_hash, status, created_at, updated_at) VALUES ('0xaa', 'Initialize', 30, 30)",
         )
         .execute(s.conn())
         .await
@@ -4205,16 +4662,22 @@ mod tests {
 
         let counts = s.node_metrics_state_counts().await.unwrap();
         assert_eq!(
-            counts.iter().find(|count| {
-                count.category == "instance_bridge_in" && count.state == "Pending"
-            }),
+            counts.iter().find(|count| count.category == "instance" && count.state == "Pending"),
             Some(&MetricsStateCount {
-                category: "instance_bridge_in".to_string(),
+                category: "instance".to_string(),
                 state: "Pending".to_string(),
                 count: 2,
                 oldest_created_at: Some(10),
                 last_success_at: None,
             })
+        );
+        assert_eq!(
+            counts
+                .iter()
+                .find(|count| count.category == "swap_escrow" && count.state == "Initialize")
+                .unwrap()
+                .count,
+            1
         );
         assert_eq!(
             counts

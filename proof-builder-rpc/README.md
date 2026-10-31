@@ -52,6 +52,23 @@ To enable multiple Gateways without interrupting proof polling, first upgrade Pr
 single Gateway, then upgrade all Nodes to send `gateway_address`, and finally configure the
 comma-separated Gateway list.
 
+## Metrics
+
+Prometheus metrics use a dedicated listener and are disabled unless `--metrics-addr` is set. The
+business RPC listener does not serve metrics, so `GET /metrics` on `--rpc-addr` returns `404`.
+
+```bash
+proof-builder-rpc \
+  --rpc-addr 0.0.0.0:7777 \
+  --metrics-addr 10.42.0.8:9109 \
+  --config proof-builder.toml
+```
+
+The dedicated listener serves only `/metrics`. Bind it to a private interface and allow only the
+Prometheus source network to reach it. The listener does not provide TLS or authentication and
+should not be exposed directly to the public internet. An unavailable metrics port causes startup
+to fail.
+
 ## Failure recovery
 
 Long-running proof tasks (stored in the `long_running_task_proof` table) — such as header-chain, commit-chain, and state-chain proofs — can be recovered from the database. Recovery notes:

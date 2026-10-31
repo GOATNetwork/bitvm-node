@@ -15,7 +15,7 @@ use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::metrics::histogram::{Histogram, exponential_buckets};
-use store::{GraphStatus, InstanceBridgeInStatus, InstanceBridgeOutStatus, MessageState};
+use store::{GraphStatus, InstanceBridgeInStatus, MessageState, SwapEscrowStatus};
 use tokio::time::Instant;
 
 const METRICS_CONTENT_TYPE: &str = "application/openmetrics-text;charset=utf-8;version=1.0.0";
@@ -689,14 +689,14 @@ impl MetricsState {
 
         for count in counts {
             match count.category.as_str() {
-                "instance_bridge_in" => {
+                "instance" => {
                     let status = known_status::<InstanceBridgeInStatus>(&count.state);
                     self.instances
                         .get_or_create(&InstanceLabels { flow: "bridge_in".to_string(), status })
                         .inc_by(count.count);
                 }
-                "instance_bridge_out" => {
-                    let status = known_status::<InstanceBridgeOutStatus>(&count.state);
+                "swap_escrow" => {
+                    let status = known_status::<SwapEscrowStatus>(&count.state);
                     self.instances
                         .get_or_create(&InstanceLabels { flow: "bridge_out".to_string(), status })
                         .inc_by(count.count);

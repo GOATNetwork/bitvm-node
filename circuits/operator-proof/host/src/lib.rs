@@ -206,7 +206,7 @@ pub async fn fetch_target_block_and_watchtower_tx(
     esplora_url: &str,
     latest_sequencer_commit_txid: &str,
     operator_committed_blockhash: &str,
-    watchtower_challenge_init_txid: &String,
+    watchtower_challenge_init_txid: &str,
     watchtower_challenge_txids: &str,
     watchtower_public_keys: &str,
     bitcoin_network: Network,

@@ -1,19 +1,21 @@
 use crate::action::*;
 use crate::env::{
     COMMITTEE_INSTANCE_KEYS_DIR, get_babe_gc_asset_paths, get_bitvm_key, get_node_goat_address,
-    get_soldering_proof_payload_store_path, is_relayer,
+    get_peer_id, get_soldering_proof_payload_store_path, get_verifier_candidate_backup_count,
+    get_verifier_candidate_collection_window_secs, is_relayer,
 };
 use crate::error::SpecialError;
 use crate::metrics_service::MetricsState;
 use crate::middleware::AllBehaviours;
+use crate::rpc_service::current_time_secs;
 use crate::scheduled_tasks::graph_maintenance_tasks::ChallengeSubStatus;
 use crate::soldering_payload_store::{
     read_soldering_proof_store_payload, soldering_proof_payload_store_path,
 };
 use crate::utils::*;
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use ark_serialize::CanonicalSerialize;
-use bitcoin::{Amount, OutPoint, Txid, hashes::Hash};
+use bitcoin::{Amount, OutPoint, Txid, hashes::Hash, key::Keypair};
 use bitcoin::{PublicKey, XOnlyPublicKey};
 use bitvm_lib::actors::Actor;
 use bitvm_lib::babe_adapter::{
@@ -28,9 +30,12 @@ use bitvm_lib::babe_adapter::{
 use bitvm_lib::committee::*;
 use bitvm_lib::keys::*;
 use bitvm_lib::operator::*;
-use bitvm_lib::types::{BitvmGcCircuitData, BitvmGcGraph, SimplifiedBitvmGcGraph};
+use bitvm_lib::types::{
+    BitvmGcCircuitData, BitvmGcGraph, BitvmGcInstanceParameters, SimplifiedBitvmGcGraph,
+};
 use bitvm_lib::verifier::*;
 use client::goat_chain::{DisproveTxType, PeginStatus, WithdrawStatus};
+use client::graphs::graph_query::BridgeInRequestEvent;
 use client::http_client::async_client::HttpAsyncClient;
 use client::{btc_chain::BTCClient, goat_chain::GOATClient};
 use goat::transactions::base::output_topology;
@@ -39,10 +44,12 @@ use goat::transactions::pre_signed_musig2::verify_public_nonce;
 use goat::wots::{Wots, Wots96};
 use libp2p::gossipsub::MessageId;
 use libp2p::{PeerId, Swarm};
+use secp256k1::{Message as SecpMessage, SECP256K1};
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Instant;
 use store::localdb::LocalDB;
-use store::{GraphStatus, SerializableTxid};
+use store::{GoatTxType, GraphStatus, SerializableTxid};
 use uuid::Uuid;
 
 pub struct HandlerContext<'a> {
@@ -140,7 +147,7 @@ pub(crate) fn is_heavy_task_message_type(message_type: &str, actor: &Actor) -> b
 pub(crate) async fn run_heavy_task(context: &HeavyTaskContext, task: HeavyTask) -> Result<()> {
     match task {
         HeavyTask::GenerateVerifierSetup(message) => {
-            handle_init_graph_verifier(context, message.instance_id, message.graph_id).await
+            handle_init_graph_verifier(context, message).await
         }
         HeavyTask::GenerateSolderingProof(message) => {
             handle_cut_circuits_verifier(
@@ -148,7 +155,7 @@ pub(crate) async fn run_heavy_task(context: &HeavyTaskContext, task: HeavyTask) 
                 message.instance_id,
                 message.graph_id,
                 &message.verifier_pubkey,
-                message.verifier_index,
+                message.candidate_index,
                 &message.selected_circuit_indexes,
             )
             .await
@@ -168,7 +175,7 @@ pub(crate) async fn run_heavy_task(context: &HeavyTaskContext, task: HeavyTask) 
                 context,
                 message.instance_id,
                 message.graph_id,
-                message.verifier_index,
+                message.candidate_index,
                 message.payload_hash,
                 message.total_len,
             )
@@ -239,11 +246,42 @@ fn load_or_create_committee_instance_keypair(
 pub async fn dispatch(ctx: &mut HandlerContext<'_>, content: &GOATMessageContent) -> Result<()> {
     match (content, &ctx.actor) {
         (
+            GOATMessageContent::GraphSetupAck(GraphSetupAck {
+                outbox_id,
+                acknowledger_peer_id,
+                ..
+            }),
+            _,
+        ) => {
+            if acknowledger_peer_id != &ctx.from_peer_id.to_string() {
+                tracing::warn!(
+                    outbox_id,
+                    from_peer_id = %ctx.from_peer_id,
+                    acknowledger_peer_id,
+                    "Ignore GraphSetupAck with mismatched source peer"
+                );
+                return Ok(());
+            }
+            let acknowledged = ctx
+                .local_db
+                .acquire()
+                .await?
+                .acknowledge_p2p_outbox_message(outbox_id, acknowledger_peer_id)
+                .await?;
+            tracing::debug!(
+                outbox_id,
+                from_peer_id = %ctx.from_peer_id,
+                acknowledged,
+                "processed GraphSetupAck"
+            );
+            Ok(())
+        }
+        (
             GOATMessageContent::PeginRequest(PeginRequest {
                 instance_id,
                 pegin_request_tx_hash,
                 pegin_request_height,
-                pegin_timestamp,
+                ..
             }),
             Actor::Committee,
         ) => {
@@ -252,7 +290,6 @@ pub async fn dispatch(ctx: &mut HandlerContext<'_>, content: &GOATMessageContent
                 *instance_id,
                 pegin_request_tx_hash,
                 *pegin_request_height,
-                *pegin_timestamp,
             )
             .await
         }
@@ -261,7 +298,7 @@ pub async fn dispatch(ctx: &mut HandlerContext<'_>, content: &GOATMessageContent
                 instance_id,
                 pegin_request_tx_hash,
                 pegin_request_height,
-                pegin_timestamp,
+                ..
             }),
             _,
         ) => {
@@ -270,7 +307,6 @@ pub async fn dispatch(ctx: &mut HandlerContext<'_>, content: &GOATMessageContent
                 *instance_id,
                 pegin_request_tx_hash,
                 *pegin_request_height,
-                *pegin_timestamp,
             )
             .await
         }
@@ -381,6 +417,27 @@ pub async fn dispatch(ctx: &mut HandlerContext<'_>, content: &GOATMessageContent
                 received_committee_pubkey,
                 pub_nonces,
                 nonce_sigs,
+            )
+            .await
+        }
+        (
+            GOATMessageContent::AggNonceConsensus(AggNonceConsensus {
+                instance_id,
+                graph_id,
+                committee_pubkey: received_committee_pubkey,
+                consensus_hash,
+                signature,
+            }),
+            Actor::Committee,
+        ) => {
+            handle_agg_nonce_consensus_committee(
+                ctx,
+                *instance_id,
+                *graph_id,
+                received_committee_pubkey,
+                *consensus_hash,
+                signature,
+                content,
             )
             .await
         }
@@ -507,6 +564,25 @@ pub async fn dispatch(ctx: &mut HandlerContext<'_>, content: &GOATMessageContent
                 received_committee_pubkey,
                 pub_nonce,
                 nonce_sig,
+                content,
+            )
+            .await
+        }
+        (
+            GOATMessageContent::PeginConfirmNonceConsensus(PeginConfirmNonceConsensus {
+                instance_id,
+                committee_pubkey: received_committee_pubkey,
+                consensus_hash,
+                signature,
+            }),
+            Actor::Committee,
+        ) => {
+            handle_pegin_confirm_nonce_consensus_committee(
+                ctx,
+                *instance_id,
+                received_committee_pubkey,
+                *consensus_hash,
+                signature,
                 content,
             )
             .await
@@ -740,6 +816,17 @@ fn make_message(ctx: &HandlerContext<'_>, content: &GOATMessageContent) -> GOATM
     GOATMessage::new(ctx.actor.clone(), content.clone())
 }
 
+fn build_signed_init_graph(
+    instance_id: Uuid,
+    graph_id: Uuid,
+    operator_keypair: &Keypair,
+) -> Result<InitGraph> {
+    let operator_peer_id = PeerId::from_str(&get_peer_id())
+        .context("decode local operator peer id for InitGraph")?
+        .to_bytes();
+    Ok(sign_init_graph(instance_id, graph_id, operator_keypair, operator_peer_id))
+}
+
 /// A graph-bearing message has two identity representations: its envelope and
 /// the signed graph parameters. Never use one to read/write local state while
 /// using the other to reconstruct or scan the graph.
@@ -766,9 +853,10 @@ fn message_identity_matches(
     false
 }
 
-/// Freezes the first accepted Verifiers and assigns deterministic graph slots.
+/// Closes a bounded candidate collection window and assigns provisional slots.
+/// Final graph slots are assigned only after valid soldering proofs are collected.
 fn freeze_operator_candidates(state: &mut OperatorBabeSetupState) -> Result<()> {
-    if state.frozen_verifier_pubkeys.is_some() {
+    if state.candidate_verifier_pubkeys.is_some() {
         return Ok(());
     }
     if state.candidates.len() < min_required_verifier() {
@@ -784,38 +872,92 @@ fn freeze_operator_candidates(state: &mut OperatorBabeSetupState) -> Result<()> 
             bail!("cannot freeze duplicate verifier peer id");
         }
     }
-    state.candidates.truncate(min_required_verifier());
     state.candidates.sort_by_key(|candidate| candidate.verifier_pubkey.to_bytes());
-    for (verifier_index, candidate) in state.candidates.iter_mut().enumerate() {
-        candidate.verifier_index = Some(verifier_index);
+    for (candidate_index, candidate) in state.candidates.iter_mut().enumerate() {
+        candidate.candidate_index = Some(candidate_index);
         candidate.selected_circuit_indexes =
             derive_finalized_indices(&candidate.setup_package, BABE_M_CC)?;
     }
-    state.frozen_verifier_pubkeys =
+    state.candidate_verifier_pubkeys =
         Some(state.candidates.iter().map(|candidate| candidate.verifier_pubkey).collect());
     Ok(())
 }
 
-/// Stores one selected Verifier slot and emits ordered graph data when complete.
+fn seal_selected_verifiers(
+    state: &mut OperatorBabeSetupState,
+    selected_verifier_pubkeys: Vec<PublicKey>,
+) -> Result<()> {
+    if let Some(existing) = &state.selected_verifier_pubkeys {
+        if existing != &selected_verifier_pubkeys {
+            bail!("refuse to replace the sealed verifier selection");
+        }
+        return Ok(());
+    }
+    if selected_verifier_pubkeys.len() != min_required_verifier() {
+        bail!(
+            "selected verifier count {} does not match required {}",
+            selected_verifier_pubkeys.len(),
+            min_required_verifier()
+        );
+    }
+    if selected_verifier_pubkeys.windows(2).any(|pair| pair[0].to_bytes() >= pair[1].to_bytes()) {
+        bail!("selected verifier public keys must be unique and canonically ordered");
+    }
+    if selected_verifier_pubkeys.iter().any(|selected| {
+        !state.candidates.iter().any(|candidate| candidate.verifier_pubkey == *selected)
+    }) {
+        bail!("sealed verifier selection contains a non-candidate public key");
+    }
+    state.selected_verifier_pubkeys = Some(selected_verifier_pubkeys);
+    Ok(())
+}
+
+fn selected_gc_data(state: &OperatorBabeSetupState) -> Result<Vec<BitvmGcCircuitData>> {
+    let selected = state
+        .selected_verifier_pubkeys
+        .as_ref()
+        .ok_or_else(|| anyhow!("verifier selection is not sealed"))?;
+    selected
+        .iter()
+        .map(|verifier_pubkey| {
+            state
+                .candidates
+                .iter()
+                .find(|candidate| candidate.verifier_pubkey == *verifier_pubkey)
+                .and_then(|candidate| candidate.gc_data.clone())
+                .ok_or_else(|| {
+                    anyhow!("missing verified GC data for sealed verifier {verifier_pubkey}")
+                })
+        })
+        .collect()
+}
+
+fn selected_candidate_for_graph_index(
+    state: &OperatorBabeSetupState,
+    verifier_index: usize,
+) -> Result<&OperatorVerifierCandidate> {
+    let verifier_pubkey = state
+        .selected_verifier_pubkeys
+        .as_ref()
+        .and_then(|selected| selected.get(verifier_index))
+        .ok_or_else(|| anyhow!("missing sealed verifier slot {verifier_index}"))?;
+    state
+        .candidates
+        .iter()
+        .find(|candidate| candidate.verifier_pubkey == *verifier_pubkey)
+        .ok_or_else(|| anyhow!("missing candidate for sealed verifier slot {verifier_index}"))
+}
+
+/// Stores verified proof data against its immutable candidate slot.
 fn record_candidate_gc_data(
     state: &mut OperatorBabeSetupState,
     verifier_pubkey: PublicKey,
-    verifier_index: usize,
+    candidate_index: usize,
     setup_package: &CACSetupPackage,
     gc_data: BitvmGcCircuitData,
     prover_state: &BabeProverState,
     soldering_proof_ready: SolderingProofReady,
-) -> Result<Option<Vec<BitvmGcCircuitData>>> {
-    let frozen = state
-        .frozen_verifier_pubkeys
-        .as_ref()
-        .ok_or_else(|| anyhow!("operator verifier membership is not frozen"))?;
-    let expected_pubkey = frozen
-        .get(verifier_index)
-        .ok_or_else(|| anyhow!("verifier index {verifier_index} out of frozen slot range"))?;
-    if expected_pubkey != &verifier_pubkey {
-        bail!("verifier public key does not own slot {verifier_index}");
-    }
+) -> Result<()> {
     if gc_data.verifier_pubkey != verifier_pubkey {
         bail!("GC slot owner does not match soldering proof verifier");
     }
@@ -824,8 +966,8 @@ fn record_candidate_gc_data(
         .iter_mut()
         .find(|candidate| candidate.verifier_pubkey == verifier_pubkey)
         .ok_or_else(|| anyhow!("selected verifier candidate is missing"))?;
-    if candidate.verifier_index != Some(verifier_index) {
-        bail!("candidate verifier index does not match soldering proof slot");
+    if candidate.candidate_index != Some(candidate_index) {
+        bail!("candidate index does not match soldering proof slot");
     }
     if candidate.setup_package != *setup_package {
         bail!("soldering proof setup package does not match selected verifier candidate");
@@ -836,8 +978,8 @@ fn record_candidate_gc_data(
     if candidate.selected_circuit_indexes != prover_state.soldering.finalized_indices {
         bail!("BABE prover state finalized indices do not match selected verifier cut");
     }
-    if soldering_proof_ready.verifier_index != verifier_index {
-        bail!("soldering proof reference verifier index does not match selected verifier slot");
+    if soldering_proof_ready.candidate_index != candidate_index {
+        bail!("soldering proof reference candidate index does not match selected verifier");
     }
     if prover_state.finalized.len() != BABE_M_CC || prover_state.h_msgs.len() != BABE_M_CC {
         bail!("BABE prover state must contain exactly {BABE_M_CC} finalized instances and hashes");
@@ -848,12 +990,12 @@ fn record_candidate_gc_data(
     if let Some(existing) = &candidate.gc_data
         && existing != &gc_data
     {
-        bail!("conflicting GC slot received for selected verifier");
+        bail!("conflicting GC data received for verifier candidate");
     }
     if let Some(existing) = &candidate.soldering_proof_ready
         && existing != &soldering_proof_ready
     {
-        bail!("conflicting soldering proof reference received for selected verifier");
+        bail!("conflicting soldering proof reference received for verifier candidate");
     }
     if candidate.gc_data.is_none() {
         candidate.gc_data = Some(gc_data);
@@ -861,10 +1003,7 @@ fn record_candidate_gc_data(
     if candidate.soldering_proof_ready.is_none() {
         candidate.soldering_proof_ready = Some(soldering_proof_ready);
     }
-    if state.candidates.iter().any(|candidate| candidate.gc_data.is_none()) {
-        return Ok(None);
-    }
-    Ok(Some(state.candidates.iter().map(|candidate| candidate.gc_data.clone().unwrap()).collect()))
+    Ok(())
 }
 
 fn build_babe_prover_state(
@@ -976,6 +1115,63 @@ fn validate_expected_challenge_assert_txid(
         );
     }
     Ok(())
+}
+
+/// Resolve the request metadata a `PeginRequest` carries from the canonical
+/// `BridgeInRequest` event this node indexed itself.
+///
+/// The message is gossiped, so its tx hash, height and timestamp are all
+/// sender-controlled, and the height alone decides
+/// whether the instance ever matches the response-window query in
+/// `instance_window_expiration_monitor`. The event watcher already stores the
+/// canonical request transaction in `goat_tx_record`, so take all three values
+/// from there and never from the message.
+///
+/// Returns `None` when the event watcher has not indexed the request yet. The
+/// current trigger is ignored in that case: once the watcher observes the
+/// event, `instance_answers_monitor` creates a canonical local `PeginRequest`.
+async fn resolve_pegin_request_metadata(
+    local_db: &LocalDB,
+    instance_id: Uuid,
+    pegin_request_tx_hash: &str,
+    pegin_request_height: i64,
+) -> Result<Option<(String, i64, i64)>> {
+    let tx_record = {
+        let mut storage_processor = local_db.acquire().await?;
+        storage_processor
+            .find_graph_goat_tx_record(
+                &instance_id,
+                &Uuid::nil(),
+                &GoatTxType::BridgeInRequest.to_string(),
+            )
+            .await?
+    };
+    let Some(tx_record) = tx_record else {
+        tracing::info!(
+            "Ignore PeginRequest for {instance_id}: no local BridgeInRequest event record yet; \
+             the event watcher will enqueue the canonical request"
+        );
+        return Ok(None);
+    };
+    if tx_record.tx_hash != pegin_request_tx_hash || tx_record.height != pegin_request_height {
+        // Not fatal - the canonical record wins either way - but a mismatch is
+        // the signature of a forged or stale request, so make it visible.
+        tracing::warn!(
+            "PeginRequest for {instance_id} claims tx {pegin_request_tx_hash} at height \
+             {pegin_request_height}, the indexed BridgeInRequest is tx {} at height {}",
+            tx_record.tx_hash,
+            tx_record.height
+        );
+    }
+    // The block timestamp comes from the same indexed event; fall back to now
+    // rather than to anything the sender supplied.
+    let timestamp = tx_record
+        .extra
+        .as_deref()
+        .and_then(|extra| serde_json::from_str::<BridgeInRequestEvent>(extra).ok())
+        .and_then(|event| event.block_timestamp.parse::<i64>().ok())
+        .unwrap_or_else(current_time_secs);
+    Ok(Some((tx_record.tx_hash, tx_record.height, timestamp)))
 }
 
 fn should_ignore_invalid_pegin_request(e: &anyhow::Error, instance_id: Uuid) -> bool {
@@ -1213,11 +1409,22 @@ async fn handle_pegin_request_committee(
     instance_id: Uuid,
     pegin_request_tx_hash: &str,
     pegin_request_height: i64,
-    pegin_timestamp: i64,
 ) -> Result<()> {
     // triggered by BridgeInRequest event
-    // 1. read & check the pegin request data
-    let (user_info, pegin_amount) =
+    // 1. bind the request metadata to the event this node indexed itself
+    let Some((pegin_request_tx_hash, pegin_request_height, pegin_timestamp)) =
+        resolve_pegin_request_metadata(
+            ctx.local_db,
+            instance_id,
+            pegin_request_tx_hash,
+            pegin_request_height,
+        )
+        .await?
+    else {
+        return Ok(());
+    };
+    // 2. read & check the pegin request data
+    let (user_info, pegin_amount, answered_by) =
         match read_pegin_request(ctx.btc_client, ctx.goat_client, instance_id).await {
             Ok(v) => v,
             Err(e) => {
@@ -1228,21 +1435,39 @@ async fn handle_pegin_request_committee(
             }
         };
 
-    // 2. save the pegin request data to local db
-    store_pegin_request(
+    // 3. save the pegin request data to local db
+    let stored = store_pegin_request(
         ctx.btc_client,
         ctx.local_db,
         GenerateInstanceParams {
             instance_id,
             user_info,
             pegin_amount,
-            pegin_request_tx_hash: pegin_request_tx_hash.to_string(),
+            pegin_request_tx_hash,
             pegin_request_height,
             pegin_timestamp,
         },
     )
     .await?;
-    // 3. call Gateway.answerPeginRequest
+    if !stored {
+        // The instance has already moved on, so answering now would be a
+        // duplicate on-chain call for a request this node handled long ago.
+        return Ok(());
+    }
+    // 4. call Gateway.answerPeginRequest
+    //
+    // PeginRequest is gossiped and re-deliverable, and the pegin data stays
+    // Pending while answers accumulate, so nothing above notices a replay.
+    // Gateway.answerPeginRequest does not reject a repeat answer either - it
+    // overwrites the stored pubkey and re-emits CommitteeResponse - so without
+    // this every re-delivery spends another transaction. The contract keys
+    // answers on msg.sender, so compare against the signer that sends it.
+    if answered_by.contains(&ctx.goat_client.get_default_signer_address()) {
+        tracing::info!(
+            "Skip answerPeginRequest for {instance_id}: this committee already answered"
+        );
+        return Ok(());
+    }
     let committee_master_key = CommitteeMasterKey::new(get_bitvm_key()?);
     let instance_keypair =
         load_or_create_committee_instance_keypair(&committee_master_key, instance_id)?;
@@ -1257,11 +1482,22 @@ async fn handle_pegin_request_default(
     instance_id: Uuid,
     pegin_request_tx_hash: &str,
     pegin_request_height: i64,
-    pegin_timestamp: i64,
 ) -> Result<()> {
     // triggered by BridgeInRequest event
-    // 1. read & check the pegin request data
-    let (user_info, pegin_amount) =
+    // 1. bind the request metadata to the event this node indexed itself
+    let Some((pegin_request_tx_hash, pegin_request_height, pegin_timestamp)) =
+        resolve_pegin_request_metadata(
+            ctx.local_db,
+            instance_id,
+            pegin_request_tx_hash,
+            pegin_request_height,
+        )
+        .await?
+    else {
+        return Ok(());
+    };
+    // 2. read & check the pegin request data
+    let (user_info, pegin_amount, _) =
         match read_pegin_request(ctx.btc_client, ctx.goat_client, instance_id).await {
             Ok(v) => v,
             Err(e) => {
@@ -1271,7 +1507,7 @@ async fn handle_pegin_request_default(
                 bail!(e)
             }
         };
-    // 2. save the pegin request data to local db
+    // 3. save the pegin request data to local db
     store_pegin_request(
         ctx.btc_client,
         ctx.local_db,
@@ -1279,7 +1515,7 @@ async fn handle_pegin_request_default(
             instance_id,
             user_info,
             pegin_amount,
-            pegin_request_tx_hash: pegin_request_tx_hash.to_string(),
+            pegin_request_tx_hash,
             pegin_request_height,
             pegin_timestamp,
         },
@@ -1438,8 +1674,17 @@ async fn handle_confirm_instance_operator(
             return Ok(());
         }
         tracing::info!("Resume pending graph setup for {instance_id}, graph_id: {graph_id}");
-        let message_content = GOATMessageContent::InitGraph(InitGraph { instance_id, graph_id });
-        send_to_peer(ctx.swarm, GOATMessage::new(Actor::Verifier, message_content)).await?;
+        let message_content = GOATMessageContent::InitGraph(build_signed_init_graph(
+            instance_id,
+            graph_id,
+            &operator_master_key.master_keypair(),
+        )?);
+        enqueue_graph_setup_outbox_message(
+            ctx.local_db,
+            GOATMessage::new(Actor::Verifier, message_content),
+            None,
+        )
+        .await?;
 
         return Ok(());
     }
@@ -1483,26 +1728,74 @@ async fn handle_confirm_instance_operator(
     storage
         .upsert_pending_graph_init(&instance_id, &local_operator_pubkey.to_string(), &graph_id)
         .await?;
-    let message_content = GOATMessageContent::InitGraph(InitGraph { instance_id, graph_id });
-    send_to_peer(ctx.swarm, GOATMessage::new(Actor::Verifier, message_content)).await?;
+    let message_content = GOATMessageContent::InitGraph(build_signed_init_graph(
+        instance_id,
+        graph_id,
+        &operator_master_key.master_keypair(),
+    )?);
+    enqueue_graph_setup_outbox_message(
+        ctx.local_db,
+        GOATMessage::new(Actor::Verifier, message_content),
+        None,
+    )
+    .await?;
 
     Ok(())
 }
 
 // Generate garbled circuits and enqueue GenCircuits without blocking the swarm.
-#[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
-async fn handle_init_graph_verifier(
-    context: &HeavyTaskContext,
-    instance_id: Uuid,
-    graph_id: Uuid,
-) -> Result<()> {
+#[tracing::instrument(level = "info", skip_all, fields(instance_id = %message.instance_id, graph_id = %message.graph_id))]
+async fn handle_init_graph_verifier(context: &HeavyTaskContext, message: InitGraph) -> Result<()> {
+    let InitGraph { instance_id, graph_id, operator_pubkey, operator_peer_id, .. } = &message;
+    if operator_peer_id != &context.from_peer_id.to_bytes() {
+        tracing::warn!(
+            instance_id = %instance_id,
+            graph_id = %graph_id,
+            from_peer_id = %context.from_peer_id,
+            "Ignore InitGraph whose signed operator peer id differs from its P2P source"
+        );
+        return Ok(());
+    }
+    if !verify_init_graph_signature(&message) {
+        tracing::warn!(
+            instance_id = %instance_id,
+            graph_id = %graph_id,
+            operator_pubkey = %operator_pubkey,
+            "Ignore InitGraph with invalid operator signature"
+        );
+        return Ok(());
+    }
+    if let Err(error) = validate_operator_stake(&context.goat_client, operator_pubkey).await {
+        tracing::warn!(
+            instance_id = %instance_id,
+            graph_id = %graph_id,
+            operator_pubkey = %operator_pubkey,
+            error = %error,
+            "Ignore InitGraph from an operator that does not meet stake requirements"
+        );
+        return Ok(());
+    }
+
     let verifier_master_key = VerifierMasterKey::new(get_bitvm_key()?);
     let verifier_pubkey = verifier_master_key.master_keypair().public_key().into();
 
-    let saved_verifier_state = load_babe_setup_state(&context.local_db, instance_id, graph_id)?
+    let saved_verifier_state = load_babe_setup_state(&context.local_db, *instance_id, *graph_id)?
         .and_then(|state| state.verifier)
         .filter(|state| state.verifier_pubkey == verifier_pubkey);
     let verifier_state = if let Some(saved) = saved_verifier_state {
+        if saved.operator_pubkey != *operator_pubkey || saved.operator_peer_id != *operator_peer_id
+        {
+            tracing::warn!(
+                instance_id = %instance_id,
+                graph_id = %graph_id,
+                expected_operator_peer = %PeerId::from_bytes(&saved.operator_peer_id)
+                    .map(|peer_id| peer_id.to_string())
+                    .unwrap_or_else(|_| "invalid".to_owned()),
+                from_peer_id = %context.from_peer_id,
+                "Ignore InitGraph with a different authenticated operator identity for an existing verifier setup"
+            );
+            return Ok(());
+        }
         saved
     } else {
         get_babe_gc_asset_paths()?;
@@ -1516,6 +1809,8 @@ async fn handle_init_graph_verifier(
         tracing::info!("Verifier setup done.");
         VerifierBabeSetupState {
             verifier_pubkey,
+            operator_pubkey: *operator_pubkey,
+            operator_peer_id: operator_peer_id.clone(),
             setup_package,
             private_state,
             finalized_indices: vec![],
@@ -1524,23 +1819,23 @@ async fn handle_init_graph_verifier(
     };
 
     let setup_package = verifier_state.setup_package.clone();
-    update_babe_setup_state(&context.local_db, instance_id, graph_id, |state| {
+    let operator_peer_id = PeerId::from_bytes(&verifier_state.operator_peer_id)
+        .map(|peer_id| peer_id.to_string())
+        .context("decode operator peer id saved from InitGraph")?;
+    update_babe_setup_state(&context.local_db, *instance_id, *graph_id, |state| {
         state.verifier = Some(verifier_state);
     })?;
 
-    let gen_circuits = GenCircuits { instance_id, graph_id, verifier_pubkey, setup_package };
-    let outbox_id = format!(
-        "gen-circuits:{}:{}:{}",
-        gen_circuits.instance_id, gen_circuits.graph_id, gen_circuits.verifier_pubkey,
-    );
+    let gen_circuits = GenCircuits {
+        instance_id: *instance_id,
+        graph_id: *graph_id,
+        verifier_pubkey,
+        setup_package,
+    };
     let message = GOATMessage::new(Actor::Operator, GOATMessageContent::GenCircuits(gen_circuits));
-    let serialized = message.serialize_message().await?;
-    context
-        .local_db
-        .acquire()
-        .await?
-        .enqueue_p2p_outbox_message(&outbox_id, message.content.event_type(), &serialized)
-        .await?;
+    let outbox_id =
+        enqueue_graph_setup_outbox_message(&context.local_db, message, Some(&operator_peer_id))
+            .await?;
     tracing::info!(
         event = "verifier_gc_setup",
         outcome = "enqueued",
@@ -1599,12 +1894,15 @@ async fn handle_gen_circuits_operator(
 
     let mut state = load_babe_setup_state(ctx.local_db, instance_id, graph_id)?.unwrap_or_default();
     let operator_state = state.operator.get_or_insert_with(|| OperatorBabeSetupState {
-        frozen_verifier_pubkeys: None,
+        candidate_verifier_pubkeys: None,
         candidates: vec![],
+        candidate_collection_started_at: None,
+        proof_collection_started_at: None,
+        selected_verifier_pubkeys: None,
         asserted_operator_proof: None,
     });
 
-    let was_frozen = operator_state.frozen_verifier_pubkeys.is_some();
+    let was_frozen = operator_state.candidate_verifier_pubkeys.is_some();
     if let Some(existing) = operator_state
         .candidates
         .iter()
@@ -1636,49 +1934,74 @@ async fn handle_gen_circuits_operator(
 
         return Ok(());
     } else {
+        if operator_state.candidates.len()
+            >= min_required_verifier().saturating_add(get_verifier_candidate_backup_count())
+        {
+            tracing::debug!(
+                "Ignore GenCircuits for {instance_id}:{graph_id}: candidate collection reached its configured limit"
+            );
+            return Ok(());
+        }
         operator_state.candidates.push(OperatorVerifierCandidate {
             verifier_peer_id,
             verifier_pubkey: *verifier_pubkey,
             setup_package: setup_package.clone(),
-            verifier_index: None,
+            candidate_index: None,
             selected_circuit_indexes: vec![],
             gc_data: None,
             soldering_proof_ready: None,
         });
+        operator_state.candidate_collection_started_at.get_or_insert_with(current_time_secs);
     }
 
-    if operator_state.frozen_verifier_pubkeys.is_none()
-        && operator_state.candidates.len() < min_required_verifier()
-    {
-        save_babe_setup_state(ctx.local_db, instance_id, graph_id, &state)?;
-
-        return Ok(());
+    if operator_state.candidate_verifier_pubkeys.is_none() {
+        let started_at =
+            operator_state.candidate_collection_started_at.get_or_insert_with(current_time_secs);
+        let elapsed = current_time_secs() - *started_at;
+        let window = get_verifier_candidate_collection_window_secs();
+        let reached_limit = operator_state.candidates.len()
+            >= min_required_verifier().saturating_add(get_verifier_candidate_backup_count());
+        if operator_state.candidates.len() < min_required_verifier()
+            || (!reached_limit && elapsed < window)
+        {
+            let retry_after_secs = (window - elapsed).max(1);
+            let candidate_count = operator_state.candidates.len();
+            save_babe_setup_state(ctx.local_db, instance_id, graph_id, &state)?;
+            return Err(retryable_dispatch_error(
+                RetryableDispatchReason::DependencyPending,
+                Some(retry_after_secs),
+                format!(
+                    "collecting verifier candidates: {}/{} received",
+                    candidate_count,
+                    min_required_verifier(),
+                ),
+            ));
+        }
     }
 
-    freeze_operator_candidates(operator_state)?;
-    let cut_candidates = if was_frozen {
-        operator_state
-            .candidates
-            .iter()
-            .filter(|candidate| candidate.verifier_pubkey == *verifier_pubkey)
-            .cloned()
-            .collect::<Vec<_>>()
-    } else {
-        operator_state.candidates.clone()
-    };
+    if operator_state.candidate_verifier_pubkeys.is_none() {
+        freeze_operator_candidates(operator_state)?;
+    }
+    let cut_candidates = if was_frozen { Vec::new() } else { operator_state.candidates.clone() };
 
     save_babe_setup_state(ctx.local_db, instance_id, graph_id, &state)?;
     for candidate in cut_candidates {
-        let message_content = GOATMessageContent::CutCircuits(CutCircuits {
-            instance_id,
-            graph_id,
-            verifier_pubkey: candidate.verifier_pubkey,
-            verifier_index: candidate.verifier_index.unwrap(),
-            selected_circuit_indexes: candidate.selected_circuit_indexes,
-        });
-        send_to_peer(ctx.swarm, GOATMessage::new(Actor::Verifier, message_content)).await?;
+        let message = GOATMessage::new(
+            Actor::Verifier,
+            GOATMessageContent::CutCircuits(CutCircuits {
+                instance_id,
+                graph_id,
+                verifier_pubkey: candidate.verifier_pubkey,
+                candidate_index: candidate
+                    .candidate_index
+                    .expect("candidate slot assigned before CutCircuits"),
+                selected_circuit_indexes: candidate.selected_circuit_indexes,
+            }),
+        );
+        let ack_peer_id =
+            PeerId::from_bytes(&candidate.verifier_peer_id).map(|peer_id| peer_id.to_string()).ok();
+        enqueue_graph_setup_outbox_message(ctx.local_db, message, ack_peer_id.as_deref()).await?;
     }
-
     Ok(())
 }
 
@@ -1689,7 +2012,7 @@ async fn handle_cut_circuits_verifier(
     instance_id: Uuid,
     graph_id: Uuid,
     verifier_pubkey: &PublicKey,
-    verifier_index: usize,
+    candidate_index: usize,
     selected_circuit_indexes: &Vec<usize>,
 ) -> Result<()> {
     let verifier_master_key = VerifierMasterKey::new(get_bitvm_key()?);
@@ -1718,18 +2041,42 @@ async fn handle_cut_circuits_verifier(
 
         return Ok(());
     }
+    if verifier_state.operator_peer_id != context.from_peer_id.to_bytes() {
+        tracing::warn!(
+            instance_id = %instance_id,
+            graph_id = %graph_id,
+            from_peer_id = %context.from_peer_id,
+            "Ignore CutCircuits from a peer other than the operator that initiated verifier setup"
+        );
+        return Ok(());
+    }
 
     if let Some(soldering_proof_ready) = verifier_state.soldering_proof_ready.clone() {
-        if soldering_proof_ready.verifier_index != verifier_index {
+        if soldering_proof_ready.candidate_index != candidate_index {
             bail!(
-                "CutCircuits verifier index {verifier_index} conflicts with persisted slot {}",
-                soldering_proof_ready.verifier_index
+                "CutCircuits candidate index {candidate_index} conflicts with persisted slot {}",
+                soldering_proof_ready.candidate_index
             );
         }
         if verifier_state.finalized_indices != *selected_circuit_indexes {
             bail!("CutCircuits finalized indices conflict with persisted selection");
         }
-        enqueue_soldering_proof_ready(context, soldering_proof_ready).await?;
+        let message = GOATMessage::new(
+            Actor::Operator,
+            GOATMessageContent::SolderingProofReady(soldering_proof_ready),
+        );
+        let operator_peer_id = PeerId::from_bytes(&verifier_state.operator_peer_id)
+            .map(|peer_id| peer_id.to_string())
+            .context("decode operator peer id saved from InitGraph")?;
+        let outbox_id =
+            enqueue_graph_setup_outbox_message(&context.local_db, message, Some(&operator_peer_id))
+                .await?;
+        tracing::info!(
+            event = "verifier_soldering_proof",
+            outcome = "enqueued",
+            outbox_id,
+            "enqueued SolderingProofReady for swarm publication"
+        );
 
         return Ok(());
     }
@@ -1764,7 +2111,7 @@ async fn handle_cut_circuits_verifier(
     let soldering_proof_ready = save_soldering_proof_payload(
         instance_id,
         graph_id,
-        verifier_index,
+        candidate_index,
         &opened,
         &finalized,
         &soldering,
@@ -1773,42 +2120,27 @@ async fn handle_cut_circuits_verifier(
     verifier_state.finalized_indices = selected_circuit_indexes.clone();
     verifier_state.soldering_proof_ready = Some(soldering_proof_ready.clone());
 
+    let operator_peer_id = PeerId::from_bytes(&verifier_state.operator_peer_id)
+        .map(|peer_id| peer_id.to_string())
+        .context("decode operator peer id saved from InitGraph")?;
     update_babe_setup_state(&context.local_db, instance_id, graph_id, |state| {
         state.verifier = Some(verifier_state);
     })?;
 
-    enqueue_soldering_proof_ready(context, soldering_proof_ready).await?;
-
-    Ok(())
-}
-
-async fn enqueue_soldering_proof_ready(
-    context: &HeavyTaskContext,
-    soldering_proof_ready: SolderingProofReady,
-) -> Result<()> {
-    let outbox_id = format!(
-        "soldering-proof-ready:{}:{}:{}",
-        soldering_proof_ready.graph_id,
-        soldering_proof_ready.verifier_index,
-        hex::encode(soldering_proof_ready.payload_hash),
-    );
     let message = GOATMessage::new(
         Actor::Operator,
         GOATMessageContent::SolderingProofReady(soldering_proof_ready),
     );
-    let serialized = message.serialize_message().await?;
-    context
-        .local_db
-        .acquire()
-        .await?
-        .enqueue_p2p_outbox_message(&outbox_id, message.content.event_type(), &serialized)
-        .await?;
+    let outbox_id =
+        enqueue_graph_setup_outbox_message(&context.local_db, message, Some(&operator_peer_id))
+            .await?;
     tracing::info!(
         event = "verifier_soldering_proof",
         outcome = "enqueued",
         outbox_id,
         "enqueued SolderingProofReady for swarm publication"
     );
+
     Ok(())
 }
 
@@ -1817,7 +2149,7 @@ pub(crate) async fn handle_soldering_proof_ready_operator(
     context: &HeavyTaskContext,
     instance_id: Uuid,
     graph_id: Uuid,
-    verifier_index: usize,
+    candidate_index: usize,
     payload_hash: [u8; 32],
     total_len: usize,
 ) -> Result<()> {
@@ -1825,7 +2157,7 @@ pub(crate) async fn handle_soldering_proof_ready_operator(
         bail!("SolderingProofReady total_len must be greater than zero");
     }
     let soldering_proof_ready =
-        SolderingProofReady { instance_id, graph_id, verifier_index, payload_hash, total_len };
+        SolderingProofReady { instance_id, graph_id, candidate_index, payload_hash, total_len };
     let operator_master_key = OperatorMasterKey::new(get_bitvm_key()?);
     let local_operator_pubkey = operator_master_key.master_keypair().public_key().into();
     if !pending_graph_belongs_to_operator(
@@ -1858,28 +2190,40 @@ pub(crate) async fn handle_soldering_proof_ready_operator(
             format!("missing operator BABE setup state for pending graph {graph_id}"),
         )
     })?;
-    let frozen = operator_state.frozen_verifier_pubkeys.as_ref().ok_or_else(|| {
+    let frozen = operator_state.candidate_verifier_pubkeys.as_ref().ok_or_else(|| {
         retryable_dispatch_error(
             RetryableDispatchReason::DependencyPending,
             Some(30),
             "operator verifier membership is not frozen",
         )
     })?;
-    let verifier_pubkey = frozen.get(verifier_index).ok_or_else(|| {
-        anyhow!("SolderingProofReady verifier index {verifier_index} out of range")
+    let verifier_pubkey = frozen.get(candidate_index).ok_or_else(|| {
+        anyhow!("SolderingProofReady candidate index {candidate_index} out of range")
     })?;
     let candidate = operator_state
         .candidates
         .iter()
         .find(|candidate| candidate.verifier_pubkey == *verifier_pubkey)
         .ok_or_else(|| anyhow!("selected verifier candidate is missing"))?;
-    if candidate.verifier_index != Some(verifier_index) {
+    if candidate.candidate_index != Some(candidate_index) {
         bail!("selected verifier candidate index does not match SolderingProofReady slot");
+    }
+    if operator_state.selected_verifier_pubkeys.as_ref().is_some_and(|selected| {
+        !selected.iter().any(|selected_pubkey| selected_pubkey == verifier_pubkey)
+    }) {
+        tracing::info!(
+            instance_id = %instance_id,
+            graph_id = %graph_id,
+            candidate_index,
+            verifier_pubkey = %verifier_pubkey,
+            "Ignore late SolderingProofReady from verifier outside the sealed graph selection"
+        );
+        return Ok(());
     }
     let verifier_peer_id = context.from_peer_id.to_bytes();
     if candidate.verifier_peer_id != verifier_peer_id {
         tracing::warn!(
-            "Ignore SolderingProofReady for {instance_id}:{graph_id}: sender {} does not own verifier slot {verifier_index}",
+            "Ignore SolderingProofReady for {instance_id}:{graph_id}: sender {} does not own verifier candidate {candidate_index}",
             context.from_peer_id
         );
         return Ok(());
@@ -1890,14 +2234,14 @@ pub(crate) async fn handle_soldering_proof_ready_operator(
         &store_base_path,
         instance_id,
         graph_id,
-        verifier_index,
+        candidate_index,
         &payload_hash,
     )?;
     tracing::info!(
         from_peer_id = %context.from_peer_id,
         instance_id = %instance_id,
         graph_id = %graph_id,
-        verifier_index,
+        candidate_index,
         total_len,
         payload_hash = %soldering_payload_hash_hex(&payload_hash),
         payload_path = %payload_path,
@@ -1909,7 +2253,7 @@ pub(crate) async fn handle_soldering_proof_ready_operator(
             tracing::error!(
                 instance_id = %instance_id,
                 graph_id = %graph_id,
-                verifier_index,
+                candidate_index,
                 payload_path = %payload_path,
                 error = %err,
                 "failed to read soldering proof payload from store"
@@ -1924,7 +2268,7 @@ pub(crate) async fn handle_soldering_proof_ready_operator(
     tracing::info!(
         instance_id = %instance_id,
         graph_id = %graph_id,
-        verifier_index,
+        candidate_index,
         bytes = payload.len(),
         total_len,
         payload_hash = %soldering_payload_hash_hex(&payload_hash),
@@ -1941,13 +2285,13 @@ fn decode_soldering_proof_payload(
     soldering_proof_ready: &SolderingProofReady,
     payload: &[u8],
 ) -> Result<CompactSolderingProofPayload> {
-    let SolderingProofReady { instance_id, graph_id, verifier_index, payload_hash, total_len } =
+    let SolderingProofReady { instance_id, graph_id, candidate_index, payload_hash, total_len } =
         soldering_proof_ready;
     if payload.len() != *total_len {
         tracing::warn!(
             instance_id = %instance_id,
             graph_id = %graph_id,
-            verifier_index,
+            candidate_index,
             actual_len = payload.len(),
             total_len,
             payload_hash = %soldering_payload_hash_hex(payload_hash),
@@ -1963,7 +2307,7 @@ fn decode_soldering_proof_payload(
         tracing::warn!(
             instance_id = %instance_id,
             graph_id = %graph_id,
-            verifier_index,
+            candidate_index,
             expected_hash = %soldering_payload_hash_hex(payload_hash),
             actual_hash = %soldering_payload_hash_hex(&actual_hash),
             "SolderingProof payload hash mismatch"
@@ -1983,7 +2327,7 @@ pub(crate) async fn handle_soldering_proof_payload_operator(
         event = "operator_soldering_proof",
         stage = "payload_decode",
         outcome = "started",
-        verifier_index = soldering_proof_ready.verifier_index,
+        candidate_index = soldering_proof_ready.candidate_index,
         payload_len = payload.len(),
         "decoding soldering proof payload"
     );
@@ -1992,7 +2336,7 @@ pub(crate) async fn handle_soldering_proof_payload_operator(
         event = "operator_soldering_proof",
         stage = "payload_decode",
         outcome = "completed",
-        verifier_index = soldering_proof_ready.verifier_index,
+        candidate_index = soldering_proof_ready.candidate_index,
         elapsed_ms = decode_started_at.elapsed().as_millis(),
         "decoded soldering proof payload"
     );
@@ -2008,7 +2352,7 @@ async fn handle_compact_soldering_proof_operator(
 ) -> Result<()> {
     let instance_id = soldering_proof_ready.instance_id;
     let graph_id = soldering_proof_ready.graph_id;
-    let verifier_index = soldering_proof_ready.verifier_index;
+    let candidate_index = soldering_proof_ready.candidate_index;
     let operator_master_key = OperatorMasterKey::new(get_bitvm_key()?);
     let local_operator_pubkey = operator_master_key.master_keypair().public_key().into();
     if !pending_graph_belongs_to_operator(
@@ -2041,7 +2385,7 @@ async fn handle_compact_soldering_proof_operator(
             format!("missing operator BABE setup state for pending graph {graph_id}"),
         )
     })?;
-    let frozen = operator_state.frozen_verifier_pubkeys.as_ref().ok_or_else(|| {
+    let frozen = operator_state.candidate_verifier_pubkeys.as_ref().ok_or_else(|| {
         retryable_dispatch_error(
             RetryableDispatchReason::DependencyPending,
             Some(30),
@@ -2049,15 +2393,15 @@ async fn handle_compact_soldering_proof_operator(
         )
     })?;
     let verifier_pubkey = *frozen
-        .get(verifier_index)
-        .ok_or_else(|| anyhow!("SolderingProof verifier index {verifier_index} out of range"))?;
+        .get(candidate_index)
+        .ok_or_else(|| anyhow!("SolderingProof candidate index {candidate_index} out of range"))?;
 
     let candidate = operator_state
         .candidates
         .iter()
         .find(|candidate| candidate.verifier_pubkey == verifier_pubkey)
         .ok_or_else(|| anyhow!("selected verifier candidate is missing"))?;
-    if candidate.verifier_index != Some(verifier_index) {
+    if candidate.candidate_index != Some(candidate_index) {
         bail!("selected verifier candidate index does not match SolderingProof slot");
     }
     let setup_package = candidate.setup_package.clone();
@@ -2067,7 +2411,7 @@ async fn handle_compact_soldering_proof_operator(
         event = "operator_soldering_proof",
         stage = "payload_expand",
         outcome = "started",
-        verifier_index,
+        candidate_index,
         "expanding compact soldering proof"
     );
     let (opened, finalized, soldering) = expand_compact_soldering_proof_payload(payload)
@@ -2076,7 +2420,7 @@ async fn handle_compact_soldering_proof_operator(
         event = "operator_soldering_proof",
         stage = "payload_expand",
         outcome = "completed",
-        verifier_index,
+        candidate_index,
         opened_instances = opened.len(),
         finalized_instances = finalized.len(),
         elapsed_ms = expand_started_at.elapsed().as_millis(),
@@ -2101,7 +2445,7 @@ async fn handle_compact_soldering_proof_operator(
         event = "operator_soldering_proof",
         stage = "setup_verify",
         outcome = "started",
-        verifier_index,
+        candidate_index,
         opened_instances = opened.len(),
         finalized_instances = finalized.len(),
         "verifying verifier soldering proof"
@@ -2124,7 +2468,7 @@ async fn handle_compact_soldering_proof_operator(
         event = "operator_soldering_proof",
         stage = "setup_verify",
         outcome = "completed",
-        verifier_index,
+        candidate_index,
         elapsed_ms = verification_started_at.elapsed().as_millis(),
         "verified verifier soldering proof"
     );
@@ -2132,7 +2476,7 @@ async fn handle_compact_soldering_proof_operator(
     tracing::info!(
         event = "operator_graph_creation",
         outcome = "soldering_verified",
-        verifier_index,
+        candidate_index,
         verifier_pubkey = %verifier_pubkey,
         finalized_instances = finalized.len(),
         payload_hash = %hex::encode(soldering_proof_ready.payload_hash),
@@ -2148,7 +2492,7 @@ async fn handle_compact_soldering_proof_operator(
         event = "operator_soldering_proof",
         stage = "gc_data_extract",
         outcome = "started",
-        verifier_index,
+        candidate_index,
         "building BABE prover state and extracting GC data"
     );
     let prover_state = build_babe_prover_state(&setup_package, finalized, soldering)?;
@@ -2157,33 +2501,34 @@ async fn handle_compact_soldering_proof_operator(
         event = "operator_soldering_proof",
         stage = "gc_data_extract",
         outcome = "completed",
-        verifier_index,
+        candidate_index,
         elapsed_ms = gc_data_started_at.elapsed().as_millis(),
         "extracted GC data from soldering proof"
     );
-    let Some(bitvm_gc_circuit_datas) = record_candidate_gc_data(
+    record_candidate_gc_data(
         operator_state,
         verifier_pubkey,
-        verifier_index,
+        candidate_index,
         &setup_package,
         gc_data,
         &prover_state,
         soldering_proof_ready.clone(),
-    )?
-    else {
-        let completed_slots = operator_state
-            .candidates
-            .iter()
-            .filter(|candidate| candidate.gc_data.is_some())
-            .count();
-        let expected_slots = operator_state.candidates.len();
+    )?;
+    let completed_slots =
+        operator_state.candidates.iter().filter(|candidate| candidate.gc_data.is_some()).count();
+    let required_slots = min_required_verifier();
+    let proof_window_started_at =
+        operator_state.proof_collection_started_at.get_or_insert_with(current_time_secs);
+    let elapsed = current_time_secs() - *proof_window_started_at;
+    let collection_window = get_verifier_candidate_collection_window_secs();
+    if completed_slots < required_slots || elapsed < collection_window {
         if let Err(error) = save_babe_setup_state(&context.local_db, instance_id, graph_id, &state)
         {
             tracing::error!(
                 event = "operator_graph_creation",
                 outcome = "failed",
                 stage = "babe_state_persist",
-                verifier_index,
+                candidate_index,
                 error = %error,
                 "failed to persist incomplete operator BABE setup state"
             );
@@ -2192,19 +2537,45 @@ async fn handle_compact_soldering_proof_operator(
         tracing::info!(
             event = "operator_graph_creation",
             outcome = "waiting_for_soldering",
-            verifier_index,
+            candidate_index,
             completed_slots,
-            expected_slots,
-            "persisted verifier soldering proof; waiting for remaining graph slots"
+            required_slots,
+            retry_after_secs = (collection_window - elapsed).max(1),
+            "persisted verified soldering proof; waiting for the proof selection window"
         );
-        return Ok(());
-    };
+        return Err(retryable_dispatch_error(
+            RetryableDispatchReason::DependencyPending,
+            Some((collection_window - elapsed).max(1)),
+            format!("collecting verified soldering proofs: {completed_slots}/{required_slots}"),
+        ));
+    }
+
+    let selected_verifier_pubkeys =
+        if let Some(selected) = &operator_state.selected_verifier_pubkeys {
+            selected.clone()
+        } else {
+            let mut selected = operator_state
+                .candidates
+                .iter()
+                .filter(|candidate| candidate.gc_data.is_some())
+                .map(|candidate| candidate.verifier_pubkey)
+                .collect::<Vec<_>>();
+            selected.sort_by_key(|candidate| candidate.to_bytes());
+            selected.truncate(required_slots);
+            selected
+        };
+    seal_selected_verifiers(operator_state, selected_verifier_pubkeys)?;
+    let bitvm_gc_circuit_datas = selected_gc_data(operator_state)?;
+    let mut obsolete_setup_outbox_ids = vec![format!("init-graph:{graph_id}")];
+    obsolete_setup_outbox_ids.extend(operator_state.candidates.iter().map(|candidate| {
+        format!("cut-circuits:{instance_id}:{graph_id}:{}", candidate.verifier_pubkey)
+    }));
     if let Err(error) = save_babe_setup_state(&context.local_db, instance_id, graph_id, &state) {
         tracing::error!(
             event = "operator_graph_creation",
             outcome = "failed",
             stage = "babe_state_persist",
-            verifier_index,
+            candidate_index,
             error = %error,
             "failed to persist complete operator BABE setup state"
         );
@@ -2314,6 +2685,11 @@ async fn handle_compact_soldering_proof_operator(
     storage
         .insert_p2p_outbox_message(&outbox_id, message.content.event_type(), &serialized)
         .await?;
+    let mut cancelled_setup_messages = 0;
+    for setup_outbox_id in obsolete_setup_outbox_ids {
+        cancelled_setup_messages +=
+            storage.cancel_p2p_outbox_message(&setup_outbox_id).await? as u64;
+    }
     drop(storage);
     tracing::info!(
         event = "operator_graph_creation",
@@ -2322,6 +2698,7 @@ async fn handle_compact_soldering_proof_operator(
         graph_nonce,
         definition_hash = %definition_hash,
         outbox_id,
+        cancelled_setup_messages,
         "enqueued CreateGraph for swarm publication"
     );
 
@@ -2426,19 +2803,12 @@ async fn handle_create_graph_verifier(
         );
         return Ok(());
     };
-    if soldering_proof_ready.verifier_index != verifier_index {
-        bail!(
-            "CreateGraph verifier index {verifier_index} conflicts with persisted slot {}",
-            soldering_proof_ready.verifier_index
-        );
-    }
-
     let store_base_path = get_soldering_proof_payload_store_path()?;
     let payload_path = soldering_proof_payload_store_path(
         &store_base_path,
         instance_id,
         graph_id,
-        verifier_index,
+        soldering_proof_ready.candidate_index,
         &soldering_proof_ready.payload_hash,
     )?;
     let payload = read_soldering_proof_store_payload(&payload_path)
@@ -2478,15 +2848,25 @@ async fn handle_create_graph_verifier(
     let serialized = message.serialize_message().await?;
     let endorsement_outbox_id =
         format!("verifier-graph-params-endorsement:{graph_id}:{verifier_index}");
-    context
-        .local_db
-        .acquire()
-        .await?
+    let mut storage = context.local_db.acquire().await?;
+    storage
         .enqueue_p2p_outbox_message(
             &endorsement_outbox_id,
             message.content.event_type(),
             &serialized,
         )
+        .await?;
+    let cancelled_gen_circuits = storage
+        .cancel_p2p_outbox_message(&format!(
+            "gen-circuits:{instance_id}:{graph_id}:{local_verifier_pubkey}"
+        ))
+        .await?;
+    let cancelled_soldering_proof = storage
+        .cancel_p2p_outbox_message(&format!(
+            "soldering-proof-ready:{graph_id}:{}:{}",
+            soldering_proof_ready.candidate_index,
+            hex::encode(soldering_proof_ready.payload_hash),
+        ))
         .await?;
 
     tracing::info!(
@@ -2496,6 +2876,8 @@ async fn handle_create_graph_verifier(
         graph_id = %graph_id,
         verifier_index,
         endorsement_outbox_id,
+        cancelled_gen_circuits,
+        cancelled_soldering_proof,
         "validated CreateGraph and enqueued verifier graph params endorsement"
     );
     Ok(())
@@ -2537,17 +2919,9 @@ async fn try_start_graph_committee_setup(
     // generate Musig2 nonces & broadcast NonceGeneration
     let committee_master_key = CommitteeMasterKey::new(get_bitvm_key()?);
     let instance_keypair = load_committee_instance_keypair(&committee_master_key, instance_id)?;
-    let verifier_num = graph.parameters.gc_data.len();
-    let watchtower_num = graph.parameters.watchtower_pubkeys.len();
-    let graph_parameters_hash = graph.parameters_hash()?;
-    let (pub_nonces, _, nonce_sigs) = committee_master_key.nonces_for_graph_job_with_keypair(
-        instance_id,
-        graph_id,
-        graph_parameters_hash,
-        watchtower_num,
-        verifier_num,
-        instance_keypair,
-    );
+    let full_graph = BitvmGcGraph::from_simplified(graph)?;
+    let (pub_nonces, _, nonce_sigs) =
+        committee_master_key.nonces_for_graph_job_with_keypair(&full_graph, instance_keypair)?;
     let local_committee_pubkey = instance_keypair.public_key().into();
     if get_committee_partial_sigs_for_graph_member(
         ctx.local_db,
@@ -2579,72 +2953,199 @@ async fn try_start_graph_committee_setup(
         pub_nonces,
     )
     .await?;
-    // if collected enough pub_nonces, generate partial signatures & broadcast CommitteePresign
+    maybe_vote_and_presign_graph(ctx, instance_id, graph_id, graph).await
+}
+
+async fn graph_nonce_consensus_context(
+    ctx: &HandlerContext<'_>,
+    instance_id: Uuid,
+    graph_id: Uuid,
+    graph: &SimplifiedBitvmGcGraph,
+) -> Result<Option<(BitvmGcGraph, Vec<PublicKey>, CommitteeAggNonces, [u8; 32])>> {
     let committee_pubkeys = ctx.goat_client.gateway_get_committee_pubkeys(&instance_id).await?;
     let pub_nonces_unchecked =
         get_committee_pub_nonces_for_graph(ctx.local_db, instance_id, graph_id).await?;
-    if pub_nonces_unchecked.len() == committee_pubkeys.len() {
-        let mut graph = BitvmGcGraph::from_simplified(graph)?;
-        let verifier_num = graph.verifier_asserts.len();
-        let watchtower_num = graph.parameters.watchtower_pubkeys.len();
-        let mut checked_pub_nonces = Vec::with_capacity(pub_nonces_unchecked.len());
-        for (pk, pn) in pub_nonces_unchecked.iter() {
-            if let Err(e) = pn.validate_length(watchtower_num, verifier_num) {
-                tracing::warn!("PubNonces from {} has invalid length: {e}", pk.to_string());
-                return Ok(());
-            }
-            checked_pub_nonces.push((*pk, pn.clone()));
-        }
-        let pub_nonces = order_committee_values(
-            &committee_pubkeys,
-            checked_pub_nonces,
-            "graph committee pub nonces",
-        )?;
-        let agg_nonces = nonces_aggregation(&pub_nonces)?;
-        let committee_master_key = CommitteeMasterKey::new(get_bitvm_key()?);
-        let instance_keypair = load_committee_instance_keypair(&committee_master_key, instance_id)?;
-        let local_committee_pubkey = instance_keypair.public_key().into();
-        if get_committee_partial_sigs_for_graph_member(
-            ctx.local_db,
-            instance_id,
-            graph_id,
-            &local_committee_pubkey,
-        )
-        .await?
-        .is_some()
-        {
-            tracing::warn!(
-                "Skip committee pre-sign for {instance_id}:{graph_id}: local committee partial signatures already exist"
-            );
-            return Ok(());
-        }
-        let (_, sec_nonces, _) = committee_master_key.nonces_for_graph_job_with_keypair(
-            instance_id,
-            graph_id,
-            graph_parameters_hash,
-            watchtower_num,
-            verifier_num,
-            instance_keypair,
-        );
-        let committee_partial_sigs =
-            committee_pre_sign(instance_keypair, sec_nonces, agg_nonces.clone(), &mut graph)?;
-        store_committee_partial_sigs_for_graph(
+    if pub_nonces_unchecked.len() < committee_pubkeys.len() {
+        return Ok(None);
+    }
+
+    let full_graph = BitvmGcGraph::from_simplified(graph)?;
+    let verifier_num = full_graph.parameters.gc_data.len();
+    let watchtower_num = full_graph.parameters.watchtower_pubkeys.len();
+    let mut checked_pub_nonces = Vec::with_capacity(pub_nonces_unchecked.len());
+    for (pubkey, pub_nonces) in pub_nonces_unchecked {
+        pub_nonces.validate_length(watchtower_num, verifier_num).map_err(|error| {
+            anyhow!("committee public nonces from {pubkey} have invalid length: {error}")
+        })?;
+        checked_pub_nonces.push((pubkey, pub_nonces));
+    }
+    let ordered_pub_nonces = order_committee_values(
+        &committee_pubkeys,
+        checked_pub_nonces,
+        "graph committee pub nonces",
+    )?;
+    let agg_nonces = nonces_aggregation(&ordered_pub_nonces)?;
+    let consensus_hash =
+        committee_nonce_consensus_hash(&full_graph, &committee_pubkeys, &ordered_pub_nonces)?;
+    Ok(Some((full_graph, committee_pubkeys, agg_nonces, consensus_hash)))
+}
+
+async fn maybe_vote_and_presign_graph(
+    ctx: &mut HandlerContext<'_>,
+    instance_id: Uuid,
+    graph_id: Uuid,
+    graph: &SimplifiedBitvmGcGraph,
+) -> Result<()> {
+    let Some((mut full_graph, committee_pubkeys, agg_nonces, consensus_hash)) =
+        graph_nonce_consensus_context(ctx, instance_id, graph_id, graph).await?
+    else {
+        return Ok(());
+    };
+
+    let committee_master_key = CommitteeMasterKey::new(get_bitvm_key()?);
+    let instance_keypair = load_committee_instance_keypair(&committee_master_key, instance_id)?;
+    let local_committee_pubkey = instance_keypair.public_key().into();
+    if get_committee_partial_sigs_for_graph_member(
+        ctx.local_db,
+        instance_id,
+        graph_id,
+        &local_committee_pubkey,
+    )
+    .await?
+    .is_some()
+    {
+        return endorse_graph_if_presigned(ctx, instance_id, graph_id, &full_graph).await;
+    }
+
+    let consensus_votes =
+        get_committee_agg_nonce_consensus_for_graph(ctx.local_db, instance_id, graph_id).await?;
+    if let Some((_, stored_hash, _)) = consensus_votes
+        .iter()
+        .find(|(committee_pubkey, _, _)| *committee_pubkey == local_committee_pubkey)
+        && *stored_hash != consensus_hash
+    {
+        bail!(SpecialError::InvalidGraph(format!(
+            "local committee agg nonce consensus differs for graph {graph_id}"
+        )));
+    }
+    if !consensus_votes
+        .iter()
+        .any(|(committee_pubkey, _, _)| *committee_pubkey == local_committee_pubkey)
+    {
+        let signature =
+            SECP256K1.sign_schnorr(&SecpMessage::from_digest(consensus_hash), &instance_keypair);
+        store_committee_agg_nonce_consensus_for_graph(
             ctx.local_db,
             instance_id,
             graph_id,
             local_committee_pubkey,
-            committee_partial_sigs.clone(),
+            consensus_hash,
+            signature,
         )
         .await?;
-        let message_content = GOATMessageContent::CommitteePresign(CommitteePresign {
+        let message_content = GOATMessageContent::AggNonceConsensus(AggNonceConsensus {
             instance_id,
             graph_id,
             committee_pubkey: local_committee_pubkey,
-            committee_partial_sigs,
-            agg_nonces,
+            consensus_hash,
+            signature,
         });
-        send_to_peer(ctx.swarm, GOATMessage::new(Actor::All, message_content)).await?;
+        send_to_peer(ctx.swarm, GOATMessage::new(Actor::Committee, message_content)).await?;
     }
+
+    let consensus_votes =
+        get_committee_agg_nonce_consensus_for_graph(ctx.local_db, instance_id, graph_id).await?;
+    if consensus_votes.len() < committee_pubkeys.len() {
+        tracing::info!(
+            "Defer committee pre-sign for {instance_id}:{graph_id}: waiting for agg nonce consensus ({}/{})",
+            consensus_votes.len(),
+            committee_pubkeys.len(),
+        );
+        return Ok(());
+    }
+    let ordered_votes = order_committee_values(
+        &committee_pubkeys,
+        consensus_votes
+            .into_iter()
+            .map(|(committee_pubkey, consensus_hash, signature)| {
+                (committee_pubkey, (consensus_hash, signature))
+            })
+            .collect(),
+        "graph committee agg nonce consensus",
+    )?;
+    for (committee_pubkey, (received_hash, signature)) in
+        committee_pubkeys.iter().zip(ordered_votes)
+    {
+        if received_hash != consensus_hash {
+            bail!(SpecialError::InvalidGraph(format!(
+                "committee agg nonce consensus differs for graph {graph_id} and committee {committee_pubkey}"
+            )));
+        }
+        SECP256K1
+            .verify_schnorr(
+                &signature,
+                &SecpMessage::from_digest(consensus_hash),
+                &XOnlyPublicKey::from(*committee_pubkey),
+            )
+            .map_err(|error| {
+                SpecialError::InvalidGraph(format!(
+                    "invalid agg nonce consensus signature for graph {graph_id} and committee {committee_pubkey}: {error}"
+                ))
+            })?;
+    }
+
+    let (_, sec_nonces, _) =
+        committee_master_key.nonces_for_graph_job_with_keypair(&full_graph, instance_keypair)?;
+    let committee_partial_sigs =
+        committee_pre_sign(instance_keypair, sec_nonces, agg_nonces.clone(), &mut full_graph)?;
+    store_committee_partial_sigs_for_graph(
+        ctx.local_db,
+        instance_id,
+        graph_id,
+        local_committee_pubkey,
+        committee_partial_sigs.clone(),
+    )
+    .await?;
+    let message_content = GOATMessageContent::CommitteePresign(CommitteePresign {
+        instance_id,
+        graph_id,
+        committee_pubkey: local_committee_pubkey,
+        committee_partial_sigs,
+        agg_nonces,
+    });
+    send_to_peer(ctx.swarm, GOATMessage::new(Actor::All, message_content)).await?;
+    endorse_graph_if_presigned(ctx, instance_id, graph_id, &full_graph).await
+}
+
+async fn endorse_graph_if_presigned(
+    ctx: &mut HandlerContext<'_>,
+    instance_id: Uuid,
+    graph_id: Uuid,
+    graph: &BitvmGcGraph,
+) -> Result<()> {
+    let committee_pubkeys = ctx.goat_client.gateway_get_committee_pubkeys(&instance_id).await?;
+    let committee_partial_sigs =
+        get_committee_partial_sigs_for_graph(ctx.local_db, instance_id, graph_id).await?;
+    if committee_partial_sigs.len() != committee_pubkeys.len() {
+        return Ok(());
+    }
+
+    let committee_sig_for_graph = endorse_graph(ctx.goat_client, graph).await?;
+    let committee_sig_for_params = endorse_graph_params(graph).await?;
+    let committee_master_key = CommitteeMasterKey::new(get_bitvm_key()?);
+    let instance_keypair = load_committee_instance_keypair(&committee_master_key, instance_id)?;
+    let local_committee_pubkey = instance_keypair.public_key().into();
+    let committee_evm_address = get_node_goat_address()
+        .ok_or_else(|| anyhow!("failed to get node goat address".to_string()))?;
+    let message_content = GOATMessageContent::EndorseGraph(EndorseGraph {
+        instance_id,
+        graph_id,
+        committee_pubkey: local_committee_pubkey,
+        committee_sig_for_graph: committee_sig_for_graph.as_bytes().to_vec(),
+        committee_sig_for_params: committee_sig_for_params.as_bytes().to_vec(),
+        committee_evm_address,
+    });
+    send_to_peer(ctx.swarm, GOATMessage::new(Actor::All, message_content)).await?;
     Ok(())
 }
 
@@ -2885,8 +3386,7 @@ async fn handle_nonce_generation_committee(
         );
         return Ok(());
     }
-    // TODO: deal with the case that one committee member sends different pub_nonces for the same graph
-    // 2. save the pub_nonces to local db
+    // 2. Save immutable pub_nonces for this committee member and graph.
     store_committee_pub_nonces_for_graph(
         ctx.local_db,
         instance_id,
@@ -2895,96 +3395,93 @@ async fn handle_nonce_generation_committee(
         pub_nonces.clone(),
     )
     .await?;
-    // 3. if received enough pub_nonces, generate partial signatures & broadcast CommitteePresign
-    let committee_pubkeys = ctx.goat_client.gateway_get_committee_pubkeys(&instance_id).await?;
-    let pub_nonces_unchecked =
-        get_committee_pub_nonces_for_graph(ctx.local_db, instance_id, graph_id).await?;
-    if pub_nonces_unchecked.len() == committee_pubkeys.len() {
-        let committee_master_key = CommitteeMasterKey::new(get_bitvm_key()?);
-        let instance_keypair = load_committee_instance_keypair(&committee_master_key, instance_id)?;
-        let local_committee_pubkey = instance_keypair.public_key().into();
-        if get_committee_partial_sigs_for_graph_member(
+    maybe_vote_and_presign_graph(ctx, instance_id, graph_id, &graph).await
+}
+
+#[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
+async fn handle_agg_nonce_consensus_committee(
+    ctx: &mut HandlerContext<'_>,
+    instance_id: Uuid,
+    graph_id: Uuid,
+    received_committee_pubkey: &PublicKey,
+    received_consensus_hash: [u8; 32],
+    signature: &secp256k1::schnorr::Signature,
+    content: &GOATMessageContent,
+) -> Result<()> {
+    if !ensure_self_or_valid_committee(
+        ctx,
+        instance_id,
+        Some(graph_id),
+        received_committee_pubkey,
+        "AggNonceConsensus",
+    )
+    .await?
+    {
+        return Ok(());
+    }
+
+    let message = make_message(ctx, content);
+    let graph = match get_graph_or_defer(
+        ctx.swarm,
+        ctx.local_db,
+        ctx.goat_client,
+        instance_id,
+        graph_id,
+        &message,
+    )
+    .await?
+    {
+        Some(graph) => graph,
+        None => return Ok(()),
+    };
+    let Some((_, _, _, expected_consensus_hash)) =
+        graph_nonce_consensus_context(ctx, instance_id, graph_id, &graph).await?
+    else {
+        push_local_unhandled_messages_with_reason(
             ctx.local_db,
-            instance_id,
             graph_id,
-            &local_committee_pubkey,
-        )
-        .await?
-        .is_some()
-        {
-            tracing::warn!(
-                "Skip committee pre-sign for {instance_id}:{graph_id}: local committee partial signatures already exist"
-            );
-            return Ok(());
-        }
-        let mut graph = BitvmGcGraph::from_simplified(&graph)?;
-        let verifier_num = graph.verifier_asserts.len();
-        let watchtower_num = graph.parameters.watchtower_pubkeys.len();
-        let mut checked_pub_nonces = Vec::with_capacity(pub_nonces_unchecked.len());
-        for (pk, pn) in pub_nonces_unchecked.iter() {
-            if let Err(e) = pn.validate_length(watchtower_num, verifier_num) {
-                tracing::warn!("PubNonces from {} has invalid length: {e}", pk.to_string());
-                return Ok(());
-            }
-            checked_pub_nonces.push((*pk, pn.clone()));
-        }
-        let pub_nonces = order_committee_values(
-            &committee_pubkeys,
-            checked_pub_nonces,
-            "graph committee pub nonces",
-        )?;
-        let agg_nonces = nonces_aggregation(&pub_nonces)?;
-        let graph_parameters_hash = graph.parameters.parameters_hash()?;
-        let (_, sec_nonces, _) = committee_master_key.nonces_for_graph_job_with_keypair(
-            instance_id,
-            graph_id,
-            graph_parameters_hash,
-            watchtower_num,
-            verifier_num,
-            instance_keypair,
-        );
-        // 4. if received enough valid committee partial sigs, endorse the graph
-        let committee_partial_sigs =
-            committee_pre_sign(instance_keypair, sec_nonces, agg_nonces.clone(), &mut graph)?;
-        store_committee_partial_sigs_for_graph(
-            ctx.local_db,
-            instance_id,
-            graph_id,
-            local_committee_pubkey,
-            committee_partial_sigs.clone(),
+            &message,
+            30,
+            MessageDeferReason::CommitteeNoncesPending,
+            "waiting for committee public nonces before validating agg nonce consensus",
         )
         .await?;
-        let message_content = GOATMessageContent::CommitteePresign(CommitteePresign {
-            instance_id,
-            graph_id,
-            committee_pubkey: local_committee_pubkey,
-            committee_partial_sigs: committee_partial_sigs.clone(),
-            agg_nonces,
-        });
-        send_to_peer(ctx.swarm, GOATMessage::new(Actor::All, message_content)).await?;
-        let committee_partial_sigs =
-            get_committee_partial_sigs_for_graph(ctx.local_db, instance_id, graph_id)
-                .await?
-                .into_iter()
-                .map(|(_, ps)| ps)
-                .collect::<Vec<_>>();
-        if committee_partial_sigs.len() == committee_pubkeys.len() {
-            let committee_sig_for_graph = endorse_graph(ctx.goat_client, &graph).await?;
-            let committee_sig_for_params = endorse_graph_params(&graph).await?;
-            let committee_evm_address = get_node_goat_address()
-                .ok_or_else(|| anyhow::anyhow!("failed to get node goat address".to_string()))?;
-            let message_content = GOATMessageContent::EndorseGraph(EndorseGraph {
-                instance_id,
-                graph_id,
-                committee_pubkey: local_committee_pubkey,
-                committee_sig_for_graph: committee_sig_for_graph.as_bytes().to_vec(),
-                committee_sig_for_params: committee_sig_for_params.as_bytes().to_vec(),
-                committee_evm_address,
-            });
-            send_to_peer(ctx.swarm, GOATMessage::new(Actor::All, message_content)).await?;
-        }
+        tracing::info!(
+            "Defer AggNonceConsensus for {instance_id}:{graph_id}: waiting for committee pub nonces"
+        );
+        return Ok(());
+    };
+    if received_consensus_hash != expected_consensus_hash {
+        tracing::warn!(
+            "Ignore AggNonceConsensus for {instance_id}:{graph_id} from {}: consensus hash mismatch",
+            received_committee_pubkey,
+        );
+        return Ok(());
     }
-    Ok(())
+    if SECP256K1
+        .verify_schnorr(
+            signature,
+            &SecpMessage::from_digest(expected_consensus_hash),
+            &XOnlyPublicKey::from(*received_committee_pubkey),
+        )
+        .is_err()
+    {
+        tracing::warn!(
+            "Ignore AggNonceConsensus for {instance_id}:{graph_id} from {}: invalid signature",
+            received_committee_pubkey,
+        );
+        return Ok(());
+    }
+    store_committee_agg_nonce_consensus_for_graph(
+        ctx.local_db,
+        instance_id,
+        graph_id,
+        *received_committee_pubkey,
+        received_consensus_hash,
+        *signature,
+    )
+    .await?;
+    maybe_vote_and_presign_graph(ctx, instance_id, graph_id, &graph).await
 }
 
 #[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
@@ -3042,8 +3539,7 @@ async fn handle_nonce_generation_operator(
         );
         return Ok(());
     }
-    // TODO: deal with the case that one committee member sends different pub_nonces for the same graph
-    // 2. save the pub_nonces to local db
+    // 2. Save immutable pub_nonces for this committee member and graph.
     store_committee_pub_nonces_for_graph(
         ctx.local_db,
         instance_id,
@@ -3211,33 +3707,9 @@ async fn handle_committee_presign_committee(
         committee_partial_sigs.clone(),
     )
     .await?;
-    // 2. if received enough valid committee partial sigs, endorse the graph
-    let committee_pubkeys = ctx.goat_client.gateway_get_committee_pubkeys(&instance_id).await?;
-    let committee_partial_sigs =
-        get_committee_partial_sigs_for_graph(ctx.local_db, instance_id, graph_id)
-            .await?
-            .into_iter()
-            .map(|(_, ps)| ps)
-            .collect::<Vec<_>>();
-    if committee_partial_sigs.len() == committee_pubkeys.len() {
-        let committee_sig_for_graph = endorse_graph(ctx.goat_client, &graph).await?;
-        let committee_sig_for_params = endorse_graph_params(&graph).await?;
-        let committee_master_key = CommitteeMasterKey::new(get_bitvm_key()?);
-        let instance_keypair = load_committee_instance_keypair(&committee_master_key, instance_id)?;
-        let local_committee_pubkey = instance_keypair.public_key().into();
-        let committee_evm_address = get_node_goat_address()
-            .ok_or_else(|| anyhow::anyhow!("failed to get node goat address".to_string()))?;
-        let message_content = GOATMessageContent::EndorseGraph(EndorseGraph {
-            instance_id,
-            graph_id,
-            committee_pubkey: local_committee_pubkey,
-            committee_sig_for_graph: committee_sig_for_graph.as_bytes().to_vec(),
-            committee_sig_for_params: committee_sig_for_params.as_bytes().to_vec(),
-            committee_evm_address,
-        });
-        send_to_peer(ctx.swarm, GOATMessage::new(Actor::All, message_content)).await?;
-    }
-    Ok(())
+    // 2. This also covers the case where the local partial signature was the last one and is
+    // not delivered back by gossip.
+    endorse_graph_if_presigned(ctx, instance_id, graph_id, &graph).await
 }
 
 #[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id, graph_id = %graph_id))]
@@ -3487,31 +3959,30 @@ async fn handle_graph_finalize_committee(
                 tracing::warn!(
                     "Skip PeginConfirm nonce for {instance_id}: local committee partial signature already exists"
                 );
-                return Ok(());
-            }
-            let instance_parameters_hash =
-                graph.parameters.instance_parameters.parameters_hash()?;
-            let (_, pub_nonce, nonce_sig) = committee_master_key
-                .nonce_for_instance_job_with_keypair(
+            } else {
+                let (_, pub_nonce, nonce_sig) = committee_master_key
+                    .nonce_for_instance_job_with_keypair(
+                        &graph.parameters.instance_parameters,
+                        instance_keypair,
+                    )?;
+                let message_content = GOATMessageContent::PeginConfirmNonce(PeginConfirmNonce {
                     instance_id,
-                    instance_parameters_hash,
-                    instance_keypair,
-                );
-            let message_content = GOATMessageContent::PeginConfirmNonce(PeginConfirmNonce {
-                instance_id,
-                committee_pubkey: local_committee_pubkey,
-                pub_nonce: pub_nonce.clone(),
-                nonce_sig,
-            });
-            store_committee_pub_nonce_for_instance(
-                ctx.local_db,
-                instance_id,
-                local_committee_pubkey,
-                pub_nonce,
-            )
-            .await?;
-            send_to_peer(ctx.swarm, GOATMessage::new(Actor::Committee, message_content)).await?;
+                    committee_pubkey: local_committee_pubkey,
+                    pub_nonce: pub_nonce.clone(),
+                    nonce_sig,
+                });
+                store_committee_pub_nonce_for_instance(
+                    ctx.local_db,
+                    instance_id,
+                    local_committee_pubkey,
+                    pub_nonce,
+                )
+                .await?;
+                send_to_peer(ctx.swarm, GOATMessage::new(Actor::Committee, message_content))
+                    .await?;
+            }
         }
+        maybe_vote_and_sign_pegin_confirm(ctx, instance_id).await?;
     }
     // 4. (Relayer) try to call Gateway.postGraphData
     // GraphFinalize may come after PostReady, so we need to check it here
@@ -3598,6 +4069,228 @@ async fn handle_graph_finalize_default(
     Ok(())
 }
 
+async fn pegin_confirm_nonce_consensus_context(
+    ctx: &HandlerContext<'_>,
+    instance_id: Uuid,
+) -> Result<
+    Option<(
+        BitvmGcInstanceParameters,
+        Vec<PublicKey>,
+        Vec<musig2::PubNonce>,
+        musig2::AggNonce,
+        [u8; 32],
+    )>,
+> {
+    let instance_parameters = get_instance_parameters(ctx.local_db, instance_id)
+        .await?
+        .ok_or_else(|| anyhow!("Instance parameters not found for {instance_id}"))?;
+    let committee_pubkeys = ctx.goat_client.gateway_get_committee_pubkeys(&instance_id).await?;
+    let pub_nonces = get_committee_pub_nonces_for_instance(ctx.local_db, instance_id).await?;
+    if pub_nonces.len() < committee_pubkeys.len() {
+        return Ok(None);
+    }
+    let ordered_pub_nonces =
+        order_committee_values(&committee_pubkeys, pub_nonces, "pegin committee pub nonces")?;
+    let agg_nonce = nonce_aggregation(&ordered_pub_nonces);
+    let consensus_hash = pegin_confirm_nonce_consensus_hash(
+        &instance_parameters,
+        &committee_pubkeys,
+        &ordered_pub_nonces,
+    )?;
+    Ok(Some((
+        instance_parameters,
+        committee_pubkeys,
+        ordered_pub_nonces,
+        agg_nonce,
+        consensus_hash,
+    )))
+}
+
+async fn has_complete_pegin_confirm_nonce_consensus(
+    ctx: &HandlerContext<'_>,
+    instance_id: Uuid,
+    committee_pubkeys: &[PublicKey],
+    consensus_hash: [u8; 32],
+) -> Result<bool> {
+    let consensus_votes =
+        get_committee_agg_nonce_consensus_for_instance(ctx.local_db, instance_id).await?;
+    if consensus_votes.len() != committee_pubkeys.len() {
+        return Ok(false);
+    }
+    let ordered_votes = order_committee_values(
+        committee_pubkeys,
+        consensus_votes
+            .into_iter()
+            .map(|(committee_pubkey, vote_hash, signature)| {
+                (committee_pubkey, (vote_hash, signature))
+            })
+            .collect(),
+        "PeginConfirm agg nonce consensus",
+    )?;
+    for (committee_pubkey, (received_hash, signature)) in
+        committee_pubkeys.iter().zip(ordered_votes)
+    {
+        ensure!(
+            received_hash == consensus_hash,
+            "committee PeginConfirm nonce consensus differs for instance {instance_id} and committee {committee_pubkey}"
+        );
+        SECP256K1
+            .verify_schnorr(
+                &signature,
+                &SecpMessage::from_digest(consensus_hash),
+                &XOnlyPublicKey::from(*committee_pubkey),
+            )
+            .map_err(|error| {
+                SpecialError::InvalidPeginData(format!(
+                    "invalid PeginConfirm nonce consensus signature for instance {instance_id} and committee {committee_pubkey}: {error}"
+                ))
+            })?;
+    }
+    Ok(true)
+}
+
+async fn broadcast_pegin_confirm_if_presigned(
+    ctx: &mut HandlerContext<'_>,
+    instance_id: Uuid,
+    instance_parameters: &BitvmGcInstanceParameters,
+    committee_pubkeys: &[PublicKey],
+) -> Result<()> {
+    if !is_relayer() {
+        return Ok(());
+    }
+    let pub_nonces = get_committee_pub_nonces_for_instance(ctx.local_db, instance_id).await?;
+    let partial_sigs = get_committee_partial_sigs_for_instance(ctx.local_db, instance_id).await?;
+    if pub_nonces.len() != committee_pubkeys.len() || partial_sigs.len() != committee_pubkeys.len()
+    {
+        return Ok(());
+    }
+    let pub_nonces =
+        order_committee_values(committee_pubkeys, pub_nonces, "pegin committee pub nonces")?;
+    let partial_sigs =
+        order_committee_values(committee_pubkeys, partial_sigs, "pegin committee partial sigs")?;
+    let mut pegin_confirm = instance_parameters.build_pegin_tx()?.1;
+    let agg_nonce = nonce_aggregation(&pub_nonces);
+    let context = instance_parameters.get_base_context();
+    let full_sig = pegin_confirm
+        .aggregate_input_0_musig2_signatures(&context, partial_sigs, &agg_nonce)
+        .map_err(|error| {
+            anyhow!("Failed to aggregate PeginConfirm signatures for {instance_id}: {error}")
+        })?;
+    let connector_z = instance_parameters.connector_z();
+    pegin_confirm.push_input_0_signature(&connector_z, full_sig);
+    let result = broadcast_tx(ctx.btc_client, pegin_confirm.tx()).await;
+    ctx.metrics_state.record_pegin_confirm(result.is_ok());
+    result?;
+    Ok(())
+}
+
+async fn maybe_vote_and_sign_pegin_confirm(
+    ctx: &mut HandlerContext<'_>,
+    instance_id: Uuid,
+) -> Result<()> {
+    let Some((instance_parameters, committee_pubkeys, _pub_nonces, agg_nonce, consensus_hash)) =
+        pegin_confirm_nonce_consensus_context(ctx, instance_id).await?
+    else {
+        return Ok(());
+    };
+    let committee_master_key = CommitteeMasterKey::new(get_bitvm_key()?);
+    let instance_keypair = load_committee_instance_keypair(&committee_master_key, instance_id)?;
+    let local_committee_pubkey = instance_keypair.public_key().into();
+    if get_committee_partial_sig_for_instance(ctx.local_db, instance_id, &local_committee_pubkey)
+        .await?
+        .is_some()
+    {
+        return broadcast_pegin_confirm_if_presigned(
+            ctx,
+            instance_id,
+            &instance_parameters,
+            &committee_pubkeys,
+        )
+        .await;
+    }
+
+    let consensus_votes =
+        get_committee_agg_nonce_consensus_for_instance(ctx.local_db, instance_id).await?;
+    if let Some((_, stored_hash, _)) = consensus_votes
+        .iter()
+        .find(|(committee_pubkey, _, _)| *committee_pubkey == local_committee_pubkey)
+        && *stored_hash != consensus_hash
+    {
+        bail!(SpecialError::InvalidPeginData(format!(
+            "local PeginConfirm nonce consensus differs for instance {instance_id}"
+        )));
+    }
+    if !consensus_votes
+        .iter()
+        .any(|(committee_pubkey, _, _)| *committee_pubkey == local_committee_pubkey)
+    {
+        let signature =
+            SECP256K1.sign_schnorr(&SecpMessage::from_digest(consensus_hash), &instance_keypair);
+        store_committee_agg_nonce_consensus_for_instance(
+            ctx.local_db,
+            instance_id,
+            local_committee_pubkey,
+            consensus_hash,
+            signature,
+        )
+        .await?;
+        let message_content =
+            GOATMessageContent::PeginConfirmNonceConsensus(PeginConfirmNonceConsensus {
+                instance_id,
+                committee_pubkey: local_committee_pubkey,
+                consensus_hash,
+                signature,
+            });
+        send_to_peer(ctx.swarm, GOATMessage::new(Actor::Committee, message_content)).await?;
+    }
+    if !has_complete_pegin_confirm_nonce_consensus(
+        ctx,
+        instance_id,
+        &committee_pubkeys,
+        consensus_hash,
+    )
+    .await?
+    {
+        tracing::info!(
+            "Defer PeginConfirm partial signature for {instance_id}: waiting for agg nonce consensus"
+        );
+        return Ok(());
+    }
+
+    let (sec_nonce, _, _) = committee_master_key
+        .nonce_for_instance_job_with_keypair(&instance_parameters, instance_keypair)?;
+    let mut pegin_confirm = instance_parameters.build_pegin_tx()?.1;
+    let committee_context = instance_parameters.get_committee_context(instance_keypair)?;
+    let partial_sig = pegin_confirm
+        .sign_input_0_musig2(&committee_context, &sec_nonce, &agg_nonce)
+        .map_err(|error| anyhow!("Failed to sign PeginConfirm for {instance_id}: {error}"))?;
+    let endorse_sig =
+        endorse_pegin(ctx.goat_client, instance_id, &pegin_confirm.tx().compute_txid()).await?;
+    store_committee_partial_sig_for_instance(
+        ctx.local_db,
+        instance_id,
+        local_committee_pubkey,
+        partial_sig,
+    )
+    .await?;
+    store_committee_endorse_sig_for_pegin(
+        ctx.local_db,
+        instance_id,
+        local_committee_pubkey,
+        endorse_sig.as_bytes().to_vec(),
+    )
+    .await?;
+    let message_content = GOATMessageContent::PeginConfirmPartialSig(PeginConfirmPartialSig {
+        instance_id,
+        committee_pubkey: local_committee_pubkey,
+        partial_sig,
+        endorse_sig: endorse_sig.as_bytes().to_vec(),
+    });
+    send_to_peer(ctx.swarm, GOATMessage::new(Actor::Committee, message_content)).await?;
+    broadcast_pegin_confirm_if_presigned(ctx, instance_id, &instance_parameters, &committee_pubkeys)
+        .await
+}
+
 #[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id))]
 async fn handle_pegin_confirm_nonce_committee(
     ctx: &mut HandlerContext<'_>,
@@ -3639,93 +4332,78 @@ async fn handle_pegin_confirm_nonce_committee(
     if ctx.id == GOATMessage::default_message_id() {
         send_to_peer(ctx.swarm, GOATMessage::new(Actor::Committee, content.clone())).await?;
     }
-    // 3. if received enough pub_nonces, generate partial signature & broadcast PeginConfirmPartialSig
-    let committee_pubkeys = ctx.goat_client.gateway_get_committee_pubkeys(&instance_id).await?;
-    let pub_nonces = get_committee_pub_nonces_for_instance(ctx.local_db, instance_id).await?;
-    if pub_nonces.len() == committee_pubkeys.len() {
-        let committee_master_key = CommitteeMasterKey::new(get_bitvm_key()?);
-        let instance_keypair = load_committee_instance_keypair(&committee_master_key, instance_id)?;
-        let local_committee_pubkey = instance_keypair.public_key().into();
-        if get_committee_partial_sig_for_instance(
-            ctx.local_db,
-            instance_id,
-            &local_committee_pubkey,
-        )
-        .await?
-        .is_some()
-        {
-            tracing::warn!(
-                "Skip PeginConfirm partial signature for {instance_id}: local committee partial signature already exists"
-            );
-            return Ok(());
-        }
-        let pub_nonces =
-            order_committee_values(&committee_pubkeys, pub_nonces, "pegin committee pub nonces")?;
-        let agg_nonce = nonce_aggregation(&pub_nonces);
-        let instance_params = get_instance_parameters(ctx.local_db, instance_id)
-            .await?
-            .ok_or_else(|| anyhow!("Instance parameters not found for {instance_id}"))?;
-        let instance_parameters_hash = instance_params.parameters_hash()?;
-        let (sec_nonce, _, _) = committee_master_key.nonce_for_instance_job_with_keypair(
-            instance_id,
-            instance_parameters_hash,
-            instance_keypair,
-        );
-        let mut pegin_confirm = instance_params.build_pegin_tx()?.1;
-        let context = instance_params.get_committee_context(instance_keypair)?;
-        let partial_sig = pegin_confirm
-            .sign_input_0_musig2(&context, &sec_nonce, &agg_nonce)
-            .map_err(|e| anyhow!("Failed to sign pegin confirm for {instance_id}: {e}"))?;
-        let endorse_sig =
-            endorse_pegin(ctx.goat_client, instance_id, &pegin_confirm.tx().compute_txid()).await?;
-        store_committee_partial_sig_for_instance(
-            ctx.local_db,
-            instance_id,
-            local_committee_pubkey,
-            partial_sig,
-        )
-        .await?;
-        store_committee_endorse_sig_for_pegin(
-            ctx.local_db,
-            instance_id,
-            local_committee_pubkey,
-            endorse_sig.as_bytes().to_vec(),
-        )
-        .await?;
-        let message_content = GOATMessageContent::PeginConfirmPartialSig(PeginConfirmPartialSig {
-            instance_id,
-            committee_pubkey: local_committee_pubkey,
-            partial_sig,
-            endorse_sig: endorse_sig.as_bytes().to_vec(),
-        });
-        send_to_peer(ctx.swarm, GOATMessage::new(Actor::Committee, message_content)).await?;
-        // 4. (Relayer) if received enough partial signatures, aggregate the sigs
-        if is_relayer() {
-            let partial_sigs =
-                get_committee_partial_sigs_for_instance(ctx.local_db, instance_id).await?;
-            let context = instance_params.get_base_context();
-            if partial_sigs.len() == committee_pubkeys.len() {
-                let partial_sigs = order_committee_values(
-                    &committee_pubkeys,
-                    partial_sigs,
-                    "pegin committee partial sigs",
-                )?;
-                let full_sig = pegin_confirm
-                    .aggregate_input_0_musig2_signatures(&context, partial_sigs, &agg_nonce)
-                    .map_err(|e| {
-                        anyhow!(
-                            "Failed to aggregate Pegin-Confirm's signatures for {instance_id}: {e}"
-                        )
-                    })?;
-                let connector_z = instance_params.connector_z();
-                pegin_confirm.push_input_0_signature(&connector_z, full_sig);
-                let result = broadcast_tx(ctx.btc_client, pegin_confirm.tx()).await;
-                ctx.metrics_state.record_pegin_confirm(result.is_ok());
-                result?;
-            }
-        }
+    // 3. Agree on the full nonce transcript before generating a partial signature.
+    maybe_vote_and_sign_pegin_confirm(ctx, instance_id).await
+}
+
+#[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id))]
+async fn handle_pegin_confirm_nonce_consensus_committee(
+    ctx: &mut HandlerContext<'_>,
+    instance_id: Uuid,
+    received_committee_pubkey: &PublicKey,
+    received_consensus_hash: [u8; 32],
+    signature: &secp256k1::schnorr::Signature,
+    content: &GOATMessageContent,
+) -> Result<()> {
+    if !ensure_self_or_valid_committee(
+        ctx,
+        instance_id,
+        None,
+        received_committee_pubkey,
+        "PeginConfirmNonceConsensus",
+    )
+    .await?
+    {
+        return Ok(());
     }
-    Ok(())
+    let message = make_message(ctx, content);
+    let Some((_, _, _, _, expected_consensus_hash)) =
+        pegin_confirm_nonce_consensus_context(ctx, instance_id).await?
+    else {
+        push_local_unhandled_messages_with_reason(
+            ctx.local_db,
+            instance_id,
+            &message,
+            30,
+            MessageDeferReason::CommitteeNoncesPending,
+            "waiting for committee public nonces before validating PeginConfirm nonce consensus",
+        )
+        .await?;
+        tracing::info!(
+            "Defer PeginConfirmNonceConsensus for {instance_id}: waiting for committee pub nonces"
+        );
+        return Ok(());
+    };
+    if received_consensus_hash != expected_consensus_hash {
+        tracing::warn!(
+            "Ignore PeginConfirmNonceConsensus for {instance_id} from {}: consensus hash mismatch",
+            received_committee_pubkey
+        );
+        return Ok(());
+    }
+    if SECP256K1
+        .verify_schnorr(
+            signature,
+            &SecpMessage::from_digest(expected_consensus_hash),
+            &XOnlyPublicKey::from(*received_committee_pubkey),
+        )
+        .is_err()
+    {
+        tracing::warn!(
+            "Ignore PeginConfirmNonceConsensus for {instance_id} from {}: invalid signature",
+            received_committee_pubkey
+        );
+        return Ok(());
+    }
+    store_committee_agg_nonce_consensus_for_instance(
+        ctx.local_db,
+        instance_id,
+        *received_committee_pubkey,
+        received_consensus_hash,
+        *signature,
+    )
+    .await?;
+    maybe_vote_and_sign_pegin_confirm(ctx, instance_id).await
 }
 
 #[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id))]
@@ -3800,6 +4478,30 @@ async fn handle_pegin_confirm_partial_sig_committee(
     let instance_params = get_instance_parameters(ctx.local_db, instance_id)
         .await?
         .ok_or_else(|| anyhow!("Instance parameters not found for {instance_id}"))?;
+    let consensus_hash =
+        pegin_confirm_nonce_consensus_hash(&instance_params, &committee_pubkeys, &pub_nonces)?;
+    if !has_complete_pegin_confirm_nonce_consensus(
+        ctx,
+        instance_id,
+        &committee_pubkeys,
+        consensus_hash,
+    )
+    .await?
+    {
+        push_local_unhandled_messages_with_reason(
+            ctx.local_db,
+            instance_id,
+            &message,
+            30,
+            MessageDeferReason::CommitteeNonceConsensusPending,
+            "waiting for committee PeginConfirm agg nonce consensus",
+        )
+        .await?;
+        tracing::info!(
+            "Defer PeginConfirmPartialSig for {instance_id}: waiting for agg nonce consensus"
+        );
+        return Ok(());
+    }
     if let Err(e) = verify_pegin_confirm_partial_sig(
         &instance_params,
         &committee_pubkeys,
@@ -3868,40 +4570,8 @@ async fn handle_pegin_confirm_partial_sig_committee(
     if ctx.id == GOATMessage::default_message_id() {
         send_to_peer(ctx.swarm, GOATMessage::new(Actor::Committee, content.clone())).await?;
     }
-    // 3. (Relayer) if received enough partial signatures, aggregate the sigs
-    if is_relayer() {
-        let pub_nonces = get_committee_pub_nonces_for_instance(ctx.local_db, instance_id).await?;
-        let partial_sigs =
-            get_committee_partial_sigs_for_instance(ctx.local_db, instance_id).await?;
-        if pub_nonces.len() == committee_pubkeys.len()
-            && partial_sigs.len() == committee_pubkeys.len()
-        {
-            let mut pegin_confirm = instance_params.build_pegin_tx()?.1;
-            let pub_nonces = order_committee_values(
-                &committee_pubkeys,
-                pub_nonces,
-                "pegin committee pub nonces",
-            )?;
-            let partial_sigs = order_committee_values(
-                &committee_pubkeys,
-                partial_sigs,
-                "pegin committee partial sigs",
-            )?;
-            let agg_nonce = nonce_aggregation(&pub_nonces);
-            let context = instance_params.get_base_context();
-            let full_sig = pegin_confirm
-                .aggregate_input_0_musig2_signatures(&context, partial_sigs, &agg_nonce)
-                .map_err(|e| {
-                    anyhow!("Failed to aggregate Pegin-Confirm's signatures for {instance_id}: {e}")
-                })?;
-            let connector_z = instance_params.connector_z();
-            pegin_confirm.push_input_0_signature(&connector_z, full_sig);
-            let result = broadcast_tx(ctx.btc_client, pegin_confirm.tx()).await;
-            ctx.metrics_state.record_pegin_confirm(result.is_ok());
-            result?;
-        }
-    }
-    Ok(())
+    broadcast_pegin_confirm_if_presigned(ctx, instance_id, &instance_params, &committee_pubkeys)
+        .await
 }
 
 #[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id))]
@@ -4403,16 +5073,27 @@ async fn handle_kickoff_sent_verifier(
     let goat_confirmed_btc_height = ctx.goat_client.btc_spv_latest_height().await? as u32;
     if [WithdrawStatus::None, WithdrawStatus::Canceled].contains(&withdraw_status) {
         if kickoff_height >= goat_confirmed_btc_height {
-            tracing::warn!(
-                "Ignore KickoffSent for {instance_id}:{graph_id}: kickoff tx not confirmed by goat spv yet"
+            let delay_secs = avg_block_time_secs(ctx.btc_client.network())
+                * (kickoff_height - goat_confirmed_btc_height) as u64;
+            push_local_unhandled_messages_with_reason(
+                ctx.local_db,
+                graph_id,
+                &message,
+                delay_secs as usize,
+                MessageDeferReason::GoatSpvPending,
+                "kickoff block is not available through GOAT SPV",
+            )
+            .await?;
+            tracing::info!(
+                "Retry Challenge later for {instance_id}:{graph_id}: kickoff tx block is not posted to GOAT SPV yet"
             );
             return Ok(());
-        } else {
-            let (challenge_tx, _) = export_challenge_tx(&graph).unwrap();
-            let challenge_txid = challenge_tx.compute_txid();
-            if ctx.btc_client.get_tx(&challenge_txid).await?.is_none() {
-                send_challenge_tx(ctx.btc_client, &graph).await?;
-            }
+        }
+
+        let (challenge_tx, _) = export_challenge_tx(&graph).unwrap();
+        let challenge_txid = challenge_tx.compute_txid();
+        if ctx.btc_client.get_tx(&challenge_txid).await?.is_none() {
+            send_challenge_tx(ctx.btc_client, &graph).await?;
         }
     } else {
         tracing::info!(
@@ -5342,33 +6023,86 @@ async fn handle_assert_sent_verifier(
     };
     validate_verifier_slot(&graph, verifier_index)?;
 
-    // check pubin first, if invalid, directly send PubinDisprove without building ChallengeAssert transaction
-    if let Ok(connector_e_input) = graph.watchtower_challenge_init.connector_e_input() {
-        let outpoint = connector_e_input.outpoint;
-        if let Some(commit_pubin_txid) =
-            outpoint_spent_txid(ctx.btc_client, &outpoint.txid, outpoint.vout as u64).await?
-            && let Some(commit_pubin_tx) = ctx.btc_client.get_tx(&commit_pubin_txid).await?
-            && let Some(commit_pubin_txin) = commit_pubin_tx.input.first()
-        {
-            let assert_txin = assert_tx
-                .input
-                .first()
-                .ok_or_else(|| anyhow!("operator assert transaction has no input"))?;
-            let wci_txid = graph.watchtower_challenge_init.tx().compute_txid();
-            let watchtower_timeout_txids = graph
-                .watchtower_challenge_timeouts
-                .iter()
-                .map(|tx| tx.tx().compute_txid())
-                .collect::<Vec<_>>();
-            let ack_txins = match collect_ack_txins(
-                ctx.btc_client,
-                &wci_txid,
-                &watchtower_timeout_txids,
+    // ChallengeAssert may only be skipped after this graph's commit-pubin is
+    // on-chain and proves consistent with the assert witness. OperatorAssert
+    // can otherwise be broadcast before connector-E is spent.
+    let connector_e_input = graph
+        .watchtower_challenge_init
+        .connector_e_input()
+        .map_err(|error| anyhow!("failed to resolve connector-E input: {error}"))?;
+    let connector_e_outpoint = connector_e_input.outpoint;
+    let Some(connector_e_spent_txid) = outpoint_spent_txid(
+        ctx.btc_client,
+        &connector_e_outpoint.txid,
+        connector_e_outpoint.vout as u64,
+    )
+    .await?
+    else {
+        let delay_secs = avg_block_time_secs(ctx.btc_client.network());
+        let message = make_message(ctx, content);
+        push_local_unhandled_messages_with_reason(
+            ctx.local_db,
+            graph_id,
+            &message,
+            delay_secs as usize,
+            MessageDeferReason::ProtocolInputsPending,
+            "operator commit-pubin is not on chain yet",
+        )
+        .await?;
+        tracing::info!(
+            "Retry AssertSent later for {instance_id}:{graph_id}: operator commit-pubin is not on chain yet"
+        );
+        return Ok(());
+    };
+
+    let mut pubin_consistent = false;
+    if connector_e_spent_txid != graph.operator_commit_timeout.tx().compute_txid() {
+        if !ctx.btc_client.get_tx_status(&connector_e_spent_txid).await?.confirmed {
+            let delay_secs = avg_block_time_secs(ctx.btc_client.network());
+            let message = make_message(ctx, content);
+            push_local_unhandled_messages_with_reason(
+                ctx.local_db,
+                graph_id,
+                &message,
+                delay_secs as usize,
+                MessageDeferReason::ProtocolInputsPending,
+                "operator commit-pubin transaction is not confirmed yet",
             )
-            .await
-            {
+            .await?;
+            return Ok(());
+        }
+        let Some(commit_pubin_tx) = ctx.btc_client.get_tx(&connector_e_spent_txid).await? else {
+            let delay_secs = avg_block_time_secs(ctx.btc_client.network());
+            let message = make_message(ctx, content);
+            push_local_unhandled_messages_with_reason(
+                ctx.local_db,
+                graph_id,
+                &message,
+                delay_secs as usize,
+                MessageDeferReason::ProtocolInputsPending,
+                "operator commit-pubin transaction is not available yet",
+            )
+            .await?;
+            return Ok(());
+        };
+        let assert_txin = assert_tx
+            .input
+            .first()
+            .ok_or_else(|| anyhow!("operator assert transaction has no input"))?;
+        let commit_pubin_txin = commit_pubin_tx
+            .input
+            .first()
+            .ok_or_else(|| anyhow!("operator commit-pubin transaction has no input"))?;
+        let wci_txid = graph.watchtower_challenge_init.tx().compute_txid();
+        let watchtower_timeout_txids = graph
+            .watchtower_challenge_timeouts
+            .iter()
+            .map(|tx| tx.tx().compute_txid())
+            .collect::<Vec<_>>();
+        let ack_txins =
+            match collect_ack_txins(ctx.btc_client, &wci_txid, &watchtower_timeout_txids).await {
                 Ok(txins) => txins,
-                Err(e) => {
+                Err(error) => {
                     let delay_secs = avg_block_time_secs(ctx.btc_client.network());
                     let message = make_message(ctx, content);
                     push_local_unhandled_messages_with_reason(
@@ -5377,74 +6111,55 @@ async fn handle_assert_sent_verifier(
                         &message,
                         delay_secs as usize,
                         MessageDeferReason::ProtocolInputsPending,
-                        &format!("operator ACK inputs are not ready: {e}"),
+                        &format!("operator ACK inputs are not ready: {error}"),
                     )
                     .await?;
-                    tracing::info!(
-                        "Retry AssertSent later for {instance_id}:{graph_id}: ACK inputs are not ready: {e}"
-                    );
                     return Ok(());
                 }
             };
-            match validate_pubin_disprove(&graph, commit_pubin_txin, assert_txin, &ack_txins) {
-                Ok(Some((witness_data, _))) => {
-                    // PubinDisprove is not pre-signed, so fund it directly rather
-                    // than relying on CPFP.
-                    let pubin_disprove_tx_total_input_amount = graph
-                        .operator_assert
-                        .connector_d_input()
-                        .map_err(|e| anyhow!("failed to get connector-d input: {e}"))?
-                        .amount;
-                    let pubin_disprove_txin = build_pubin_disprove_txin(&graph, witness_data)?;
-                    let pubin_disprove_tx = bitcoin::Transaction {
-                        version: bitcoin::transaction::Version(2),
-                        lock_time: bitcoin::absolute::LockTime::ZERO,
-                        input: vec![pubin_disprove_txin],
-                        output: vec![
-                            goat::scripts::p2a_output(),
-                            // Keep the transaction above Bitcoin Core's minimum
-                            // non-witness relay size.
-                            bitcoin::TxOut {
-                                value: Amount::ZERO,
-                                script_pubkey: goat::scripts::generate_opreturn_script(
-                                    PUBIN_DISPROVE_OP_RETURN_DATA.to_vec(),
-                                ),
-                            },
-                        ],
-                    };
-                    let verifier_keypair =
-                        VerifierMasterKey::new(get_bitvm_key()?).master_keypair();
-                    build_sign_and_broadcast_tx(
-                        ctx.btc_client,
-                        verifier_keypair,
-                        pubin_disprove_tx.input,
-                        pubin_disprove_tx_total_input_amount,
-                        pubin_disprove_tx.output,
-                    )
-                    .await?;
-                    return Ok(());
-                }
-                Ok(None) => tracing::debug!(
-                    "PubinDisprove invalid for {instance_id}:{graph_id}: operator pubin consistent, proceeding to ChallengeAssert"
-                ),
-                Err(e) => {
-                    let delay_secs = avg_block_time_secs(ctx.btc_client.network());
-                    let message = make_message(ctx, content);
-                    push_local_unhandled_messages_with_reason(
-                        ctx.local_db,
-                        graph_id,
-                        &message,
-                        delay_secs as usize,
-                        MessageDeferReason::ValidationRetry,
-                        &format!("PubinDisprove validation could not complete: {e}"),
-                    )
-                    .await?;
-                    tracing::warn!(
-                        "Retry AssertSent later for {instance_id}:{graph_id}: PubinDisprove check failed: {e}"
-                    );
-                    return Ok(());
-                }
+        match validate_pubin_disprove(&graph, commit_pubin_txin, assert_txin, &ack_txins) {
+            Ok(Some((witness_data, _))) => {
+                // PubinDisprove is not pre-signed, so fund it directly rather
+                // than relying on CPFP.
+                let pubin_disprove_tx_total_input_amount = graph
+                    .operator_assert
+                    .connector_d_input()
+                    .map_err(|e| anyhow!("failed to get connector-d input: {e}"))?
+                    .amount;
+                let pubin_disprove_txin = build_pubin_disprove_txin(&graph, witness_data)?;
+                let pubin_disprove_tx = bitcoin::Transaction {
+                    version: bitcoin::transaction::Version(2),
+                    lock_time: bitcoin::absolute::LockTime::ZERO,
+                    input: vec![pubin_disprove_txin],
+                    output: vec![
+                        goat::scripts::p2a_output(),
+                        // Keep the transaction above Bitcoin Core's minimum
+                        // non-witness relay size.
+                        bitcoin::TxOut {
+                            value: Amount::ZERO,
+                            script_pubkey: goat::scripts::generate_opreturn_script(
+                                PUBIN_DISPROVE_OP_RETURN_DATA.to_vec(),
+                            ),
+                        },
+                    ],
+                };
+                let verifier_keypair = VerifierMasterKey::new(get_bitvm_key()?).master_keypair();
+                build_sign_and_broadcast_tx(
+                    ctx.btc_client,
+                    verifier_keypair,
+                    pubin_disprove_tx.input,
+                    pubin_disprove_tx_total_input_amount,
+                    pubin_disprove_tx.output,
+                )
+                .await?;
+                return Ok(());
             }
+            Ok(None) => {
+                pubin_consistent = true;
+            }
+            Err(error) => tracing::warn!(
+                "PubinDisprove validation failed for {instance_id}:{graph_id}: {error}; proceeding to ChallengeAssert"
+            ),
         }
     }
 
@@ -5457,7 +6172,7 @@ async fn handle_assert_sent_verifier(
         .map_err(|e| anyhow!("failed to extract operator assert witness: {e}"))?;
     let vk = crate::vk::get_vk().await.context("load Groth16 verifying key for operator assert")?;
     let static_input = derive_operator_static_input()?;
-    if assert_witness.verify_groth16_proof(&vk, &[static_input]) {
+    if pubin_consistent && assert_witness.verify_groth16_proof(&vk, &[static_input]) {
         tracing::info!(
             "Skip ChallengeAssert for {instance_id}:{graph_id}: operator assert proof is valid"
         );
@@ -5525,21 +6240,12 @@ pub async fn broadcast_verifier_challenge_assert_tx(
         );
         return Ok(None);
     };
-    let Some(soldering_proof_ready) = saved_verifier_state.soldering_proof_ready.as_ref() else {
+    if saved_verifier_state.soldering_proof_ready.is_none() {
         if strict {
             bail!("missing soldering proof reference for {instance_id}:{graph_id}");
         }
         tracing::warn!(
             "Ignore AssertSent for {instance_id}:{graph_id}: missing soldering proof reference"
-        );
-        return Ok(None);
-    };
-    if soldering_proof_ready.verifier_index != verifier_index {
-        if strict {
-            bail!("local setup slot does not match graph owner slot for {instance_id}:{graph_id}");
-        }
-        tracing::warn!(
-            "Ignore AssertSent for {instance_id}:{graph_id}: local setup slot does not match graph owner slot"
         );
         return Ok(None);
     }
@@ -5672,11 +6378,7 @@ async fn handle_challenge_assert_sent_operator(
     let operator_state = setup_state
         .operator
         .ok_or_else(|| anyhow!("missing operator BABE setup state for graph {graph_id}"))?;
-    let candidate = operator_state
-        .candidates
-        .iter()
-        .find(|candidate| candidate.verifier_index == Some(verifier_index))
-        .ok_or_else(|| anyhow!("missing BABE prover state for verifier slot {verifier_index}"))?;
+    let candidate = selected_candidate_for_graph_index(&operator_state, verifier_index)?;
     let soldering_proof_ready = candidate.soldering_proof_ready.as_ref().ok_or_else(|| {
         anyhow!("missing soldering proof reference for verifier slot {verifier_index}")
     })?;
@@ -5685,7 +6387,7 @@ async fn handle_challenge_assert_sent_operator(
         &store_base_path,
         instance_id,
         graph_id,
-        verifier_index,
+        soldering_proof_ready.candidate_index,
         &soldering_proof_ready.payload_hash,
     )?;
     let payload = read_soldering_proof_store_payload(&payload_path)
@@ -6498,11 +7200,34 @@ async fn handle_sync_graph(
     Ok(())
 }
 
+/// A `NodeInfo` payload is entirely self-declared, so only accept it as the
+/// sender's own record: the registry is keyed by `peer_id`, and without this
+/// check any peer could overwrite any other node's row.
+fn accept_node_info(ctx: &HandlerContext<'_>, node_info: &NodeInfo, message_kind: &str) -> bool {
+    if !node_info_matches_sender(node_info, &ctx.from_peer_id) {
+        tracing::warn!(
+            "Ignore {message_kind} from {}: payload claims peer_id {}",
+            ctx.from_peer_id,
+            node_info.peer_id
+        );
+        return false;
+    }
+    if let Err(reason) = validate_node_info_payload(node_info) {
+        tracing::warn!("Ignore {message_kind} from {}: {reason}", ctx.from_peer_id);
+        return false;
+    }
+    true
+}
+
 async fn handle_request_node_info(
     ctx: &mut HandlerContext<'_>,
     node_info: &NodeInfo,
 ) -> Result<()> {
-    save_node_info(ctx.local_db, node_info).await?;
+    if accept_node_info(ctx, node_info, "RequestNodeInfo") {
+        save_node_info(ctx.local_db, node_info).await?;
+    }
+    // Answer regardless: the response only carries this node's own public info,
+    // and staying silent would break discovery for a misconfigured peer.
     let message_content = GOATMessageContent::ResponseNodeInfo(crate::env::get_local_node_info());
     send_to_peer(ctx.swarm, GOATMessage::new(Actor::All, message_content)).await?;
     Ok(())
@@ -6512,7 +7237,9 @@ async fn handle_response_node_info(
     ctx: &mut HandlerContext<'_>,
     node_info: &NodeInfo,
 ) -> Result<()> {
-    save_node_info(ctx.local_db, node_info).await?;
+    if accept_node_info(ctx, node_info, "ResponseNodeInfo") {
+        save_node_info(ctx.local_db, node_info).await?;
+    }
     Ok(())
 }
 
@@ -6525,6 +7252,25 @@ mod tests {
     use std::str::FromStr;
 
     use super::*;
+
+    #[tokio::test]
+    async fn missing_pegin_event_is_ignored_without_enqueuing_retry() {
+        let local_db = store::create_local_db("sqlite::memory:").await;
+        let instance_id = Uuid::new_v4();
+
+        let metadata =
+            resolve_pegin_request_metadata(&local_db, instance_id, "0xuntrusted", i64::MAX)
+                .await
+                .unwrap();
+
+        assert!(metadata.is_none());
+        let mut storage_processor = local_db.acquire().await.unwrap();
+        let queued = storage_processor
+            .find_message_by_business_id(&instance_id, "PeginRequest")
+            .await
+            .unwrap();
+        assert!(queued.is_none());
+    }
 
     fn verifier_pubkey() -> PublicKey {
         PublicKey::from_str("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
@@ -6552,7 +7298,7 @@ mod tests {
         SolderingProofReady {
             instance_id: Uuid::nil(),
             graph_id: Uuid::nil(),
-            verifier_index: 0,
+            candidate_index: 0,
             payload_hash: [hash_byte; 32],
             total_len: 1,
         }
@@ -6560,16 +7306,19 @@ mod tests {
 
     fn operator_state(package: CACSetupPackage) -> OperatorBabeSetupState {
         OperatorBabeSetupState {
-            frozen_verifier_pubkeys: Some(vec![verifier_pubkey()]),
+            candidate_verifier_pubkeys: Some(vec![verifier_pubkey()]),
             candidates: vec![OperatorVerifierCandidate {
                 verifier_peer_id: vec![1],
                 verifier_pubkey: verifier_pubkey(),
                 setup_package: package,
-                verifier_index: Some(0),
+                candidate_index: Some(0),
                 selected_circuit_indexes: (0..BABE_M_CC).collect(),
                 gc_data: None,
                 soldering_proof_ready: None,
             }],
+            candidate_collection_started_at: None,
+            proof_collection_started_at: None,
+            selected_verifier_pubkeys: None,
             asserted_operator_proof: None,
         }
     }
@@ -6578,16 +7327,19 @@ mod tests {
     fn freeze_operator_candidate_selects_protocol_finalized_count() {
         let package = build_setup_package(BABE_M_CC + 1).unwrap();
         let mut state = OperatorBabeSetupState {
-            frozen_verifier_pubkeys: None,
+            candidate_verifier_pubkeys: None,
             candidates: vec![OperatorVerifierCandidate {
                 verifier_peer_id: vec![1],
                 verifier_pubkey: verifier_pubkey(),
                 setup_package: package,
-                verifier_index: None,
+                candidate_index: None,
                 selected_circuit_indexes: vec![],
                 gc_data: None,
                 soldering_proof_ready: None,
             }],
+            candidate_collection_started_at: None,
+            proof_collection_started_at: None,
+            selected_verifier_pubkeys: None,
             asserted_operator_proof: None,
         };
 
@@ -6602,7 +7354,7 @@ mod tests {
         let mut state = operator_state(package.clone());
         let soldering_proof_ready = soldering_proof_ready(1);
 
-        let graph_data = record_candidate_gc_data(
+        record_candidate_gc_data(
             &mut state,
             verifier_pubkey(),
             0,
@@ -6611,17 +7363,18 @@ mod tests {
             &prover_state,
             soldering_proof_ready.clone(),
         )
-        .unwrap()
         .unwrap();
 
-        assert_eq!(graph_data.len(), 1);
-        assert_eq!(graph_data[0].final_msg_hashlocks.len(), BABE_M_CC);
+        assert_eq!(
+            state.candidates[0].gc_data.as_ref().unwrap().final_msg_hashlocks.len(),
+            BABE_M_CC
+        );
         assert_eq!(
             state.candidates[0].soldering_proof_ready.as_ref(),
             Some(&soldering_proof_ready)
         );
 
-        let duplicate = record_candidate_gc_data(
+        record_candidate_gc_data(
             &mut state,
             verifier_pubkey(),
             0,
@@ -6630,9 +7383,7 @@ mod tests {
             &prover_state,
             soldering_proof_ready.clone(),
         )
-        .unwrap()
         .unwrap();
-        assert_eq!(duplicate.len(), 1);
 
         let mut conflict = prover_state;
         conflict.h_msgs[0][0] ^= 1;

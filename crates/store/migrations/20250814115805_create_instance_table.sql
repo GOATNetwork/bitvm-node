@@ -3,7 +3,6 @@ DROP TABLE IF EXISTS `instance`;
 CREATE TABLE instance
 (
     `instance_id`        TEXT            NOT NULL DEFAULT '',
-    `is_bridge_in`       BOOL            NOT NULL DEFAULT 1,
     `network`            TEXT            NOT NULL DEFAULT 'test',
     `from_addr`          TEXT            NOT NULL DEFAULT '',
     `to_addr`            TEXT            NOT NULL DEFAULT '',
@@ -23,9 +22,6 @@ CREATE TABLE instance
     `pegin_data_tx_hash` TEXT            NOT NULL DEFAULT '',
     `btc_height`         BIGINT UNSIGNED NOT NULL DEFAULT 0,
     `parameters`         TEXT,
-    `escrow_hash`        TEXT,
-    `bridge_out_amount`  TEXT            NOT NULL DEFAULT '0',
-    `bridge_out_lock_time` BIGINT NOT NULL DEFAULT 0,
     `post_pegin_txhash`  TEXT,
     `status_updated_at`  BIGINT          NOT NULL DEFAULT 0,
     `created_at`         BIGINT          NOT NULL DEFAULT 0,

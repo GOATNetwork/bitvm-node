@@ -2,6 +2,7 @@ use anyhow::{Result, bail, ensure};
 use bitcoin::XOnlyPublicKey;
 use bitcoin::{
     PublicKey, Script, TapLeafHash, TapSighash, TapSighashType, Transaction, TxOut,
+    hashes::Hash,
     key::Keypair,
     sighash::{Prevouts, SighashCache},
     taproot::{ControlBlock, LeafVersion, Signature as TaprootSignature},
@@ -15,11 +16,16 @@ use musig2::secp::Point;
 use musig2::{AggNonce, KeyAggContext, PartialSignature, PubNonce, SecNonce, verify_partial};
 use secp256k1::{Message, SECP256K1, schnorr::Signature as SchnorrSignature};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::keys::hkdf_derive_bytes;
 use crate::types::{BitvmGcGraph, BitvmGcInstanceParameters};
 
 const COMMITTEE_NONCE_HKDF_SALT: &[u8] = b"bitvm-gc/committee-nonce/v1";
+const COMMITTEE_PRESIGN_SIGHASH_DOMAIN: &[u8] = b"GOAT_BITVM_GC_COMMITTEE_PRESIGN_SIGHASHES_V1";
+const COMMITTEE_NONCE_CONSENSUS_DOMAIN: &[u8] = b"GOAT_BITVM_GC_COMMITTEE_NONCE_CONSENSUS_V1";
+const PEGIN_CONFIRM_NONCE_CONSENSUS_DOMAIN: &[u8] =
+    b"GOAT_BITVM_GC_PEGIN_CONFIRM_NONCE_CONSENSUS_V1";
 
 pub fn take1_pre_sign_num() -> usize {
     2
@@ -55,6 +61,55 @@ pub fn sign_pegin_confirm(
     pegin_confirm
         .sign_input_0_musig2(&committee_context, &committee_member_sec_nonce, &committee_agg_nonce)
         .map_err(|e| anyhow::anyhow!("fail to sign pegin confirm {}: {e}", pegin_confirm.name()))
+}
+
+/// Return the exact MuSig2 message signed by PeginConfirm input 0.
+pub fn pegin_confirm_sighash(instance_parameters: &BitvmGcInstanceParameters) -> Result<[u8; 32]> {
+    let pegin_confirm = instance_parameters.build_pegin_tx()?.1;
+    let script = pegin_confirm
+        .prev_scripts()
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("{} input 0 script is missing", pegin_confirm.name()))?;
+    let leaf_hash = TapLeafHash::from_script(script, LeafVersion::TapScript);
+    Ok(taproot_script_spend_sighash(
+        pegin_confirm.tx(),
+        0,
+        pegin_confirm.prev_outs(),
+        leaf_hash,
+        TapSighashType::All,
+    )?
+    .to_byte_array())
+}
+
+/// Build the transcript committee members must agree on before PeginConfirm signing.
+/// Aggregate nonce is derived internally from canonical public nonces.
+pub fn pegin_confirm_nonce_consensus_hash(
+    instance_parameters: &BitvmGcInstanceParameters,
+    committee_pubkeys: &[PublicKey],
+    ordered_pub_nonces: &[PubNonce],
+) -> Result<[u8; 32]> {
+    ensure!(
+        committee_pubkeys.len() == ordered_pub_nonces.len(),
+        "committee public key and nonce counts differ"
+    );
+
+    let agg_nonce = nonce_aggregation(&ordered_pub_nonces.to_vec());
+    let mut hasher = Sha256::new();
+    hasher.update(PEGIN_CONFIRM_NONCE_CONSENSUS_DOMAIN);
+    hasher.update(instance_parameters.instance_id.as_bytes());
+    hasher.update(instance_parameters.parameters_hash()?);
+    hasher.update(pegin_confirm_sighash(instance_parameters)?);
+    hasher.update((committee_pubkeys.len() as u32).to_be_bytes());
+    for (committee_pubkey, pub_nonce) in committee_pubkeys.iter().zip(ordered_pub_nonces) {
+        hasher.update(committee_pubkey.to_bytes());
+        let encoded = serde_json::to_vec(pub_nonce)?;
+        hasher.update((encoded.len() as u64).to_be_bytes());
+        hasher.update(encoded);
+    }
+    let encoded_agg_nonce = serde_json::to_vec(&agg_nonce)?;
+    hasher.update((encoded_agg_nonce.len() as u64).to_be_bytes());
+    hasher.update(encoded_agg_nonce);
+    Ok(hasher.finalize().into())
 }
 
 pub fn agg_and_push_pegin_confirm_sigs(
@@ -135,13 +190,152 @@ pub fn key_aggregation(pubkeys: &[PublicKey]) -> PublicKey {
     generate_n_of_n_public_key(pubkeys).0
 }
 
+/// Hash every MuSig2 signing context used by committee pre-signing in nonce-slot order.
+///
+/// This is deliberately independent of witnesses and partial signatures. It commits to the
+/// exact taproot sighashes that deterministic committee nonces will be used to sign.
+pub fn committee_presign_sighash_digest(graph: &BitvmGcGraph) -> Result<[u8; 32]> {
+    fn add_sighash<T: PreSignedTransaction + BaseTransaction>(
+        hasher: &mut Sha256,
+        slot: &[u8],
+        tx: &T,
+        input_index: usize,
+        sighash_type: TapSighashType,
+    ) -> Result<()> {
+        let script = tx.prev_scripts().get(input_index).ok_or_else(|| {
+            anyhow::anyhow!("{} input {input_index} script is missing", tx.name())
+        })?;
+        let leaf_hash = TapLeafHash::from_script(script, LeafVersion::TapScript);
+        let sighash = taproot_script_spend_sighash(
+            tx.tx(),
+            input_index,
+            tx.prev_outs(),
+            leaf_hash,
+            sighash_type,
+        )?;
+
+        hasher.update((slot.len() as u32).to_be_bytes());
+        hasher.update(slot);
+        hasher.update(sighash.to_byte_array());
+        Ok(())
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(COMMITTEE_PRESIGN_SIGHASH_DOMAIN);
+    add_sighash(&mut hasher, b"take1/0/all", &graph.take1, 0, TapSighashType::All)?;
+    add_sighash(&mut hasher, b"take1/3/all", &graph.take1, 3, TapSighashType::All)?;
+    add_sighash(&mut hasher, b"take2/0/all", &graph.take2, 0, TapSighashType::All)?;
+    add_sighash(
+        &mut hasher,
+        b"challenge/0/single_anyonecanpay",
+        &graph.challenge,
+        0,
+        TapSighashType::SinglePlusAnyoneCanPay,
+    )?;
+    for (index, tx) in graph.watchtower_challenge_timeouts.iter().enumerate() {
+        add_sighash(
+            &mut hasher,
+            format!("watchtower_challenge_timeout/{index}/1/none").as_bytes(),
+            tx,
+            1,
+            TapSighashType::None,
+        )?;
+    }
+    for (index, tx) in graph.operator_challenge_nacks.iter().enumerate() {
+        add_sighash(
+            &mut hasher,
+            format!("operator_challenge_nack/{index}/0/all").as_bytes(),
+            tx,
+            0,
+            TapSighashType::All,
+        )?;
+        add_sighash(
+            &mut hasher,
+            format!("operator_challenge_nack/{index}/1/all").as_bytes(),
+            tx,
+            1,
+            TapSighashType::All,
+        )?;
+    }
+    add_sighash(
+        &mut hasher,
+        b"operator_commit_timeout/0/all",
+        &graph.operator_commit_timeout,
+        0,
+        TapSighashType::All,
+    )?;
+    add_sighash(
+        &mut hasher,
+        b"operator_commit_timeout/1/all",
+        &graph.operator_commit_timeout,
+        1,
+        TapSighashType::All,
+    )?;
+    for (index, tx) in graph.disproves.iter().enumerate() {
+        add_sighash(
+            &mut hasher,
+            format!("disprove/{index}/0/none").as_bytes(),
+            tx,
+            0,
+            TapSighashType::None,
+        )?;
+        add_sighash(
+            &mut hasher,
+            format!("disprove/{index}/1/none").as_bytes(),
+            tx,
+            1,
+            TapSighashType::None,
+        )?;
+    }
+    Ok(hasher.finalize().into())
+}
+
+/// Build the transcript every committee member must confirm before generating a partial
+/// signature. Aggregate nonces are derived from the ordered public nonces here so callers
+/// cannot supply a different aggregation to the consensus transcript.
+pub fn committee_nonce_consensus_hash(
+    graph: &BitvmGcGraph,
+    committee_pubkeys: &[PublicKey],
+    ordered_pub_nonces: &[CommitteePubNonces],
+) -> Result<[u8; 32]> {
+    ensure!(
+        committee_pubkeys.len() == ordered_pub_nonces.len(),
+        "committee public key and nonce counts differ"
+    );
+    let watchtower_num = graph.parameters.watchtower_pubkeys.len();
+    let verifier_num = graph.parameters.gc_data.len();
+    for pub_nonces in ordered_pub_nonces {
+        pub_nonces.validate_length(watchtower_num, verifier_num)?;
+    }
+    let agg_nonces = nonces_aggregation(ordered_pub_nonces)?;
+    agg_nonces.validate_length(watchtower_num, verifier_num)?;
+
+    let mut hasher = Sha256::new();
+    hasher.update(COMMITTEE_NONCE_CONSENSUS_DOMAIN);
+    hasher.update(graph.parameters.instance_parameters.instance_id.as_bytes());
+    hasher.update(graph.parameters.graph_id.as_bytes());
+    hasher.update(graph.parameters.parameters_hash()?);
+    hasher.update(committee_presign_sighash_digest(graph)?);
+    hasher.update((committee_pubkeys.len() as u32).to_be_bytes());
+    for (committee_pubkey, pub_nonces) in committee_pubkeys.iter().zip(ordered_pub_nonces) {
+        hasher.update(committee_pubkey.to_bytes());
+        let encoded = serde_json::to_vec(pub_nonces)?;
+        hasher.update((encoded.len() as u64).to_be_bytes());
+        hasher.update(encoded);
+    }
+    let encoded_agg_nonces = serde_json::to_vec(&agg_nonces)?;
+    hasher.update((encoded_agg_nonces.len() as u64).to_be_bytes());
+    hasher.update(encoded_agg_nonces);
+    Ok(hasher.finalize().into())
+}
+
 pub fn committee_pre_sign(
     committee_member_keypair: Keypair,
     committee_member_sec_nonce: CommitteeSecNonces,
     committee_agg_nonce: CommitteeAggNonces,
     graph: &mut BitvmGcGraph,
 ) -> Result<CommitteePartialSignatures> {
-    let verifier_num = graph.verifier_asserts.len();
+    let verifier_num = graph.parameters.gc_data.len();
     let watchtower_num = graph.parameters.watchtower_pubkeys.len();
     committee_member_sec_nonce.validate_length(watchtower_num, verifier_num)?;
     committee_agg_nonce.validate_length(watchtower_num, verifier_num)?;
@@ -295,7 +489,7 @@ pub fn signature_aggregation(
     graph: &BitvmGcGraph,
 ) -> Result<CommitteeSignatures> {
     let context = graph.parameters.get_base_context();
-    let verifier_num = graph.verifier_asserts.len();
+    let verifier_num = graph.parameters.gc_data.len();
     let watchtower_num = graph.parameters.watchtower_pubkeys.len();
     agg_nonces.validate_length(watchtower_num, verifier_num)?;
     for r in partial_sigs {
@@ -583,7 +777,7 @@ pub fn verify_graph_committee_partial_sigs(
         committee_pubkeys.contains(committee_pubkey),
         "committee pubkey {committee_pubkey} is not in the committee set"
     );
-    let verifier_num = graph.verifier_asserts.len();
+    let verifier_num = graph.parameters.gc_data.len();
     let watchtower_num = graph.parameters.watchtower_pubkeys.len();
     pub_nonces.validate_length(watchtower_num, verifier_num)?;
     agg_nonces.validate_length(watchtower_num, verifier_num)?;
@@ -786,7 +980,7 @@ pub fn push_committee_pre_signatures(
     graph: &mut BitvmGcGraph,
     sigs: &CommitteeSignatures,
 ) -> Result<()> {
-    let verifier_num = graph.verifier_asserts.len();
+    let verifier_num = graph.parameters.gc_data.len();
     let watchtower_num = graph.parameters.watchtower_pubkeys.len();
     if graph.committee_pre_signed {
         bail!("already pre-signed by committee".to_string())
