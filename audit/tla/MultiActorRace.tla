@@ -2,7 +2,7 @@
 (***************************************************************************)
 (* Take2DisproveRace.tla abstracted "the watchtower" and "the verifier" as *)
 (* single actors. The real protocol has N independent watchtowers and M    *)
-(* independent verifiers (node/tla/Take2DisproveRace.tla's header /        *)
+(* independent verifiers (audit/tla/Take2DisproveRace.tla's header /        *)
 (* node/README.md document the single-actor version). This module checks  *)
 (* whether N=2/M=2 introduces anything the single-actor abstraction        *)
 (* couldn't see - the concern being: with multiple independent actors      *)
