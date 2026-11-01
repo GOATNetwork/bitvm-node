@@ -1,83 +1,31 @@
 ---- MODULE CommitteeKeyDeletion ----
 (***************************************************************************)
-(* PURPOSE. H2: the bridge's existential-honesty argument - "one honest    *)
-(* committee member deletes its instance key, so n-of-n can never sign     *)
-(* again" - does not hold for the code as configured and as written.       *)
-(*                                                                         *)
-(* CODE SCOPE (dev 60562f8, after #476):                                   *)
-(*  crates/bitvm-gc/src/keys.rs:217-264 create_instance_keypair_envelope:  *)
-(*    the instance key is random (OsRng) and lives only in an envelope     *)
-(*    encrypted under a KEK derived from the node master key; keys.rs:332  *)
-(*    delete_instance_keypair_envelope deletes it. So deletion is          *)
-(*    meaningful: master key + disk of every member recovers every n-of-n  *)
-(*    instance key that was not deleted.                                   *)
-(*  node/src/env.rs:157-161: DEFAULT_ENABLE_COMMITTEE_INSTANCE_KEY_DELETE  *)
-(*    = false; delete timelock 32 blocks (KD, all networks; not exported   *)
-(*    to ShippedTimelockValues, so KDShipped below).                       *)
-(*  node/src/aggregates/instance.rs:906-919 request_key_delete: with       *)
-(*    deletion disabled "the intent is only recorded";                     *)
-(*    node/src/aggregates/instance_jobs.rs:1086-1094 DeleteInstanceKeyRunner*)
-(*    likewise.                                                            *)
-(*  crates/store/src/schema.rs:242-249 deletes_key_on_entry =              *)
-(*    NoEnoughCommitteesAnswered | UserDiscarded | UserCanceled (never      *)
-(*    Timeout); instance.rs:890-899 enter_failure keeps the key "for       *)
-(*    manual handling" on Timeout.                                         *)
-(*  instance.rs:508-517 decide_btc_snapshot step 3: success side deletes   *)
-(*    once the Confirm is KD deep, only from RelayerL1Broadcasted |        *)
-(*    RelayerL2Minted, and those statuses are only scanned when deletion   *)
-(*    is enabled (node/src/aggregates/instance_scan.rs:182-190).           *)
-(*  instance.rs:456-468: Timeout + confirmed Confirm only alerts; the row  *)
-(*    leaves the scan (instance_scan.rs:228-239). No later deletion.       *)
-(*                                                                         *)
-(* MODEL. BTC under n-of-n: connector_z leaf 0 (the Peg-In-Prepare output, *)
-(* until the user's Cancel spends it) and C0 (Peg-In-Confirm output). The  *)
-(* n-of-n needs EVERY member's key, so with >= 1 honest-at-the-time member *)
-(* the BTC is safe iff that member's key is gone. The model tracks the one *)
-(* honest member; Byzantine members keep their keys forever.               *)
-(* The security claim, with a window W: once the instance settled - the    *)
-(* Confirm confirmed, or the honest node gave it up (Timeout) - and W more *)
-(* blocks passed, a compromise of every member finds the honest key gone.  *)
-(* A Cancel spends connector_z, so nothing is at stake after it.           *)
-(* CommitteesAnswered keeps the key too (it never expires), but no BTC is  *)
-(* under the n-of-n before Peg-In-Prepare confirms: not modeled.           *)
-(* No hidden timing: the honest node scans - and its queued delete job     *)
-(* runs - at most react blocks late (block x is handled before block       *)
-(* x + react + 1 arrives; react = 0 is "before the next block"); the       *)
-(* adversary schedules within that bound. The Confirm and the Cancel are   *)
-(* carried by blocks, so a scan of block x sees what block x holds.        *)
-(*                                                                         *)
-(* PARAMETERS (frozen variables): t0, b (Timeout at H_p+T0+B), kd          *)
-(* (success-side delete delay), react (scan lag bound), tdelay (fix:       *)
-(* blocks after entering Timeout before deleting), win (the claim's W).    *)
-(* Generic sweep (NetSet = {}): from the *Range constants. Shipped: t0 =   *)
-(* ConnectorZ[net], b = PeginAbandonBufferBlocks[net], kd = 32, react =    *)
-(* ReactionBlocks[net], tdelay = kd (the fix reuses the delete timelock),  *)
-(* win = kd + react (the window the success side is built for).            *)
-(*                                                                         *)
-(* EXHAUSTIVENESS. Deletion is due at confirmH + kd (success) or timeoutH  *)
-(* + tdelay (fix) and happens at most react blocks later; a compromise     *)
-(* needs tip > settle + win. So only kd + react vs win and tdelay + react  *)
-(* vs win matter: kd, tdelay, react \in 0..2, win \in 0..4 cover every     *)
-(* class (difference <= -1, 0, 1, >= 2). T0 and B only place the Cancel    *)
-(* and Timeout points: the model starts at tip H_p+T0-1 (a Confirm mined   *)
-(* earlier behaves like one mined there - only the success path exists     *)
-(* before T0), so every T0 gives a translate, and every B >= 1 the same    *)
-(* orderings; T0, B \in 1..2 suffice. The model stops at                   *)
-(* H_p+T0+B+react+win+3: a Confirm that stays pending blocks Timeout and   *)
-(* can be mined earlier with the same relative timing, so every settle     *)
-(* point and its compromise height fit.                                    *)
-(*                                                                         *)
-(* FIX DESIGN. Deletion on, every terminal state deletes incl. Timeout.    *)
-(* ParamsOK: kd + react <= win /\ tdelay + react <= win. EXACT (checked    *)
-(* point by point; the Boundary cfg fails).                                *)
-(*                                                                         *)
-(* CONFIGS -> TIERS (audit/tla/checks.txt):                                *)
-(*   live     CommitteeKeyDeletion/H2.cfg (deletion off, sweep),              *)
-(*            CommitteeKeyDeletion/Timeout.cfg (on, never on Timeout),      *)
-(*            ...Shipped.cfg, ...TimeoutShipped.cfg (shipped values)       *)
-(*   design   CommitteeKeyDeletion/Fixed.cfg (ParamsOK sweep),              *)
-(*            CommitteeKeyDeletion/FixedShipped.cfg                         *)
-(*   boundary CommitteeKeyDeletion/FixedBoundary.cfg (~ParamsOK sweep)      *)
+(* H2: "one honest committee member deletes its instance key, so the       *)
+(* n-of-n can never sign again" does not hold for the code. The instance   *)
+(* key is random and lives only in an envelope under a KEK from the node   *)
+(* master key (crates/bitvm-gc/src/keys.rs:217, deleted at :332), so       *)
+(* master key + disk recover every key that was not deleted.               *)
+(* Code: deletion is off by default (node/src/env.rs:158); Timeout keeps   *)
+(*   the key (schema.rs:242 deletes_key_on_entry; instance.rs:890-900),    *)
+(*   also when the Confirm confirms later (instance.rs:459-465 alerts).    *)
+(* Model: the BTC under the n-of-n (connector_z leaf 0, then C0) is safe   *)
+(*   iff the one honest member's key is gone. NoSweepAfterSettlement: W    *)
+(*   blocks after the instance settled (Confirm confirmed, or the honest   *)
+(*   node in Timeout), a compromise of every member finds the honest key   *)
+(*   deleted. The honest node handles block x before block x + react + 1.  *)
+(* Parameters (frozen variables): t0; b (Timeout at H_p + T0 + B); kd      *)
+(*   (success-side delete delay); react; tdelay (fix: delete delay after   *)
+(*   Timeout); win (W). NetSet = {}: sweep the *Range constants; shipped:  *)
+(*   ConnectorZ, PeginAbandonBufferBlocks, kd = tdelay = 32,               *)
+(*   ReactionBlocks, W = kd + react.                                       *)
+(* Fix: deletion on, every terminal state deletes, Timeout too. ParamsOK   *)
+(*   (kd + react <= W /\ tdelay + react <= W) is exact.                    *)
+(* Exhaustiveness: deletion is due at confirmH + kd or timeoutH + tdelay   *)
+(*   and runs up to react blocks later, so only kd + react and tdelay +    *)
+(*   react vs W matter: kd, tdelay, react 0..2, W 0..4 cover every class.  *)
+(*   T0 and B only place the Cancel and Timeout: T0, B 1..2 suffice.       *)
+(* Configs: configs/node/aggregates/instance/CommitteeKeyDeletion/, tiers  *)
+(*   in audit/tla/checks.txt.                                              *)
 (***************************************************************************)
 EXTENDS Naturals, ShippedTimelockValues
 
@@ -90,7 +38,7 @@ CONSTANTS
     TimeoutDelayRange,  \* generic sweep: fix's delete delay after Timeout
     WindowRange,        \* generic sweep: the claim's window W
     ParamFilter,        \* "all" | "ok" (ParamsOK) | "notok"
-    DeleteEnabled,      \* ENABLE_COMMITTEE_INSTANCE_KEY_DELETE (code default FALSE)
+    DeleteEnabled,      \* ENABLE_COMMITTEE_INSTANCE_KEY_DELETE (default FALSE, env.rs:158)
     DeleteOnTimeout     \* fix: delete on Timeout too
 
 ASSUME /\ NetSet \subseteq Networks
@@ -113,7 +61,7 @@ ConfirmStates == {NotSent, Pending, Confirmed}
 
 Hp == 1              \* Peg-In-Prepare height (only differences matter)
 Generic == "generic" \* net value of a generic-sweep run
-KDShipped == 32      \* env.rs:161 DEFAULT_COMMITTEE_INSTANCE_KEY_DELETE_TIMELOCK_BLOCKS
+KDShipped == 32      \* DEFAULT_COMMITTEE_INSTANCE_KEY_DELETE_TIMELOCK_BLOCKS (env.rs:161)
 
 VARIABLES
     net,         \* frozen: network whose shipped values are used (Generic in a sweep)
@@ -131,14 +79,19 @@ VARIABLES
     status,      \* the honest member's instance status
     timeoutH,    \* tip at which the honest node entered Timeout
     keyDeleted,  \* the honest member's envelope deleted
-    swept        \* all keys compromised and the BTC moved after settlement
+    swept        \* all keys compromised and the BTC moved after settlement + W
 
 params == <<net, t0, b, kd, react, tdelay, win>>
 vars == <<params, h, scannedH, confirm, confirmH, cancel, status, timeoutH, keyDeleted, swept>>
 
-H0 == Hp + t0 - 1                        \* window start (see header)
-MaxH == Hp + t0 + b + react + win + 3    \* window end (see header)
+\* First tip: before T0 only the success path exists, and a Confirm mined
+\* earlier behaves like one mined here.
+H0 == Hp + t0 - 1
+\* Last tip: a pending Confirm blocks Timeout and can be mined earlier with
+\* the same relative timing, so every settle point and its compromise fit.
+MaxH == Hp + t0 + b + react + win + 3
 
+\* The fix's condition: every deletion lands within W of settling.
 ParamsOK == kd + react <= win /\ (DeleteOnTimeout => tdelay + react <= win)
 
 InitParams ==
@@ -173,10 +126,9 @@ Init ==
 --------------------------------------------------------------------------
 (* Actions: environment *)
 
-\* Action: the next block arrives - only while the honest node is at most
-\*   react blocks behind - carrying the pending Confirm, the user's CSV-valid
-\*   Cancel (they conflict), or neither.
-\* Source: Bitcoin consensus (connector_z leaf 1 CSV T0 for the Cancel)
+\* Action: the next block, while the honest node is at most react blocks
+\* behind, carrying the pending Confirm, the CSV-valid Cancel, or neither.
+\* Source: Bitcoin consensus
 Tick ==
     /\ h - scannedH <= react /\ h < MaxH /\ h' = h + 1
     /\ \/ /\ confirm = Pending /\ ~cancel
@@ -188,10 +140,10 @@ Tick ==
        \/ UNCHANGED <<confirm, confirmH, cancel>>
     /\ UNCHANGED <<params, scannedH, status, timeoutH, keyDeleted, swept>>
 
-\* Action: the signed Confirm is broadcast - by the relayer before T0, or
-\*   later by anyone holding it (re-relay, a Byzantine aggregator).
-\* Source: broadcast_pegin_confirm() in node/src/aggregates/instance_jobs.rs:900;
-\*   environment (re-relay, Byzantine aggregator)
+\* Action: the signed Confirm is broadcast, by the relayer before T0 or later
+\* by anyone holding it.
+\* Source: broadcast_pegin_confirm() in node/src/aggregates/instance_jobs.rs:900
+\* Source: environment (re-relay, Byzantine aggregator)
 Broadcast ==
     /\ confirm = NotSent /\ ~cancel
     /\ confirm' = Pending
@@ -200,16 +152,18 @@ Broadcast ==
 --------------------------------------------------------------------------
 (* Actions: the honest member's node *)
 
+\* The key after a step that requests deletion when cond holds.
 Del(cond) == keyDeleted \/ (DeleteEnabled /\ cond)
 
-\* Action: the honest node scans the tip: decides the status (confirmed
-\*   Confirm -> RelayerL1Broadcasted, Cancel -> UserCanceled, past
-\*   H_p+T0+B with no Confirm visible -> Timeout) and runs the key deletion
-\*   the transition queues: on entering UserCanceled, on the success side
-\*   once the Confirm is kd deep, and (fix) tdelay after entering Timeout.
-\* Source: decide_btc_snapshot() in node/src/aggregates/instance.rs:442 (456-468, 488-517);
-\*   enter_failure() instance.rs:826 (890-899); request_key_delete() instance.rs:906;
-\*   DeleteInstanceKeyRunner instance_jobs.rs:1086; deletes_key_on_entry() crates/store/src/schema.rs:242
+\* Action: the honest node scans the tip, decides the status (Confirm ->
+\* RelayerL1Broadcasted, Cancel -> UserCanceled, past H_p + T0 + B with no
+\* Confirm visible -> Timeout) and runs the key deletion it queues: on
+\* entering UserCanceled, once the Confirm is kd deep, (fix) tdelay after Timeout.
+\* Source: decide_btc_snapshot() in node/src/aggregates/instance.rs:456-468,489-517
+\* Source: enter_failure() in node/src/aggregates/instance.rs:890-900
+\* Source: request_key_delete() in node/src/aggregates/instance.rs:906-929
+\* Source: DeleteInstanceKeyRunner in node/src/aggregates/instance_jobs.rs:1086-1094
+\* Source: deletes_key_on_entry() in crates/store/src/schema.rs:242-249
 Scan ==
     /\ scannedH < h
     /\ scannedH' = h
@@ -233,15 +187,14 @@ Scan ==
 
 FundsAtRisk == ~cancel   \* connector_z leaf 0 or C0 still holds the BTC
 
+\* The instance settled more than W blocks ago.
 Settled ==
     \/ confirm = Confirmed /\ h > confirmH + win
     \/ status = Timeout /\ h > timeoutH + win
 
-\* Action: the attacker compromises every member's master key + disk once
-\*   the instance settled W blocks ago, and moves the BTC with the n-of-n if
-\*   all keys still exist.
-\* Source: environment (key compromise; keys.rs:217-264 recovers every
-\*   undeleted envelope from master key + disk)
+\* Action: the attacker compromises every member's master key and disk after
+\* settlement + W and moves the BTC with the n-of-n if all keys still exist.
+\* Source: environment (key compromise; crates/bitvm-gc/src/keys.rs:217-264 envelopes)
 Compromise ==
     /\ Settled /\ FundsAtRisk /\ ~keyDeleted /\ ~swept
     /\ swept' = TRUE
@@ -253,20 +206,18 @@ Next ==
     \/ Scan
     \/ Compromise
 
-\* Safety only: no fairness needed.
+\* Safety only: no fairness.
 Spec == Init /\ [][Next]_vars
 
 --------------------------------------------------------------------------
 (* Safety invariants *)
 
-\* No full compromise after settlement + W finds the honest key still present.
+\* No full compromise after settlement + W finds the honest key present.
 NoSweepAfterSettlement == ~swept
 
-\* The success side never deletes before the Confirm is kd deep (sanity).
+\* The success side never deletes before the Confirm is kd deep.
 NoEarlySuccessDelete ==
     (keyDeleted /\ status = RelayerL1Broadcasted /\ ~DeleteOnTimeout)
         => confirmH + kd <= h
-
-(* Safety properties: none. Liveness: none (safety findings). *)
 
 ====

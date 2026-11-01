@@ -1,64 +1,33 @@
 ---- MODULE GraphLifecycle ----
 (***************************************************************************)
 (* One graph's Graph.status column and every code path that writes it,     *)
-(* racing each other and the two chains.                                   *)
-(*                                                                         *)
-(* Finding 1 (fixed in 991faaa): the Bitcoin chain scan and the GoatChain   *)
-(* event watcher both wrote Graph.status with a raw UPDATE, so a stale Goat *)
-(* event could knock a later status back or off a closed one. #476 kept    *)
-(* the fix and widened it: every write now goes through                    *)
-(* StorageProcessor::transition_graph_status                               *)
-(* (crates/store/src/localdb/graph.rs:450), a conditional UPDATE ... WHERE  *)
-(* status IN GraphStatus::allowed_transition_from(target, source)           *)
-(* (crates/store/src/schema.rs:438), modeled by Transition in               *)
-(* GraphTopology.tla. This spec re-derives the writers from the current     *)
-(* tree and checks the guard still keeps the column consistent.             *)
-(*                                                                         *)
-(* Code scope (dev after #476). Writers of Graph.status:                   *)
-(*   Definition     - ingest_graph_definition / confirm_finalized_graph_    *)
-(*                    definition, node/src/utils/graph_store.rs:208,400     *)
-(*   ChainReconcile - Graph aggregate apply_chain_scan of a ChainScan event *)
-(*                    gathered earlier by gather_chain_scan                 *)
-(*                    (node/src/aggregates/graph_pegout.rs:551,             *)
-(*                    node/src/aggregates/graph_scan.rs:303); refresh_graph *)
-(*                    after a graph is finalized                            *)
-(*                    (node/src/utils/graph_chain_state.rs:22)              *)
-(*   GoatEvent      - gateway event watcher, apply_gateway_graph_status     *)
-(*                    (node/src/scheduled_tasks/event_watch/gateway.rs:305) *)
-(*   Obsoleted      - obsolete_graph (node/src/utils/graph_store.rs:646)    *)
-(*                    from a sibling's withdrawal event (gateway.rs:395),   *)
-(*                    the instance entering failure (Instance aggregate     *)
-(*                    enter_failure, node/src/aggregates/instance.rs:826),  *)
-(*                    the pegout RPC (bitvm_handler.rs:1490); and the       *)
-(*                    Graph aggregate abandon_setup (graph.rs:823).         *)
-(* An aggregate apply runs in one BEGIN IMMEDIATE transaction               *)
-(* (crates/engine/src/worker.rs:177), so each apply and each               *)
-(* transition_graph_status call is one atomic step here. What is NOT        *)
-(* atomic is a chain scan: its facts are read before the ChainScan event is *)
-(* applied, so ApplyChainScan may act on stale facts.                       *)
-(*                                                                         *)
-(* Deliberate simplifications:                                             *)
-(*   - One pending ChainScan. The engine applies a graph's events in order  *)
-(*     and the chain facts only grow, so later scans never carry an older   *)
-(*     stage than earlier ones; the race that matters is one stale scan     *)
-(*     against the other writers.                                           *)
-(*   - refresh_graph reads the chain and writes in one step (its read/write *)
-(*     gap is the same kind of staleness the pending ChainScan exercises).  *)
-(*   - No Bitcoin reorg: confirmed facts only grow. The branch transactions *)
-(*     (Kickoff/Skip-Kickoff, Take-1/Challenge/guardian Disprove,          *)
-(*     Take-2/Disprove) spend the same outputs, so one branch wins.         *)
-(*   - The four Challenge-state disprove detectors collapse into Disprove;  *)
-(*     they differ only in sub_status bookkeeping, which gates nothing.     *)
-(*                                                                         *)
-(* Configs (audit/tla/checks.txt):                                         *)
-(*   GraphLifecycle/CoreOnly.cfg - pass: the chain-reconcile scanners alone  *)
-(*                                (OtherWriters = {}).                      *)
-(*   GraphLifecycle/Fixed.cfg    - pass: every writer of the current code.   *)
+(*   racing each other and the two chains. Each write is one               *)
+(*   transition_graph_status call (Transition in GraphTopology). Each      *)
+(*   aggregate apply is one BEGIN IMMEDIATE transaction                    *)
+(*   (crates/engine/src/worker.rs:177), so one step here. A chain scan is  *)
+(*   not atomic: ApplyChainScan may act on stale facts.                    *)
+(* Writers: Definition (node/src/utils/graph_store.rs:400); ChainReconcile *)
+(*   (graph_scan.rs gather_chain_scan, graph_pegout.rs apply_chain_scan,   *)
+(*   graph_chain_state.rs refresh_graph); GoatEvent                        *)
+(*   (node/src/scheduled_tasks/event_watch/gateway.rs:305); four Obsoleted *)
+(*   writers (sibling withdrawal, instance failure, pegout RPC,            *)
+(*   abandon_setup).                                                       *)
+(* Finding 1: a writer that bypasses the guard lets a stale event move the *)
+(*   status back or off a closed status. Checked: every writer is guarded. *)
+(* Parameter: OtherWriters - writers enabled besides the chain-reconcile   *)
+(*   scanners (CoreOnly: none; Fixed: all).                                *)
+(* Simplifications: one pending ChainScan (events of a graph apply in      *)
+(*   order and chain facts only grow, so a later scan never carries an     *)
+(*   older stage); refresh_graph reads and writes in one step; no Bitcoin  *)
+(*   reorg; the four Challenge-state disprove detectors are one Disprove   *)
+(*   (they differ only in sub_status).                                     *)
+(* Configs: configs/node/aggregates/graph/GraphLifecycle/, tiers in        *)
+(*   audit/tla/checks.txt.                                                 *)
 (***************************************************************************)
 EXTENDS Naturals, GraphTopology
 
 CONSTANTS
-    OtherWriters    \* writers besides the chain-reconcile scanners that are enabled, a subset of AllOtherWriters
+    OtherWriters    \* enabled writers besides the chain-reconcile scanners (subset of AllOtherWriters)
 
 \* Writers that can be switched off to isolate the chain-reconcile scanners.
 WriterDefinition      == "Definition"       \* confirm_finalized_graph_definition
@@ -72,28 +41,28 @@ AllOtherWriters == {WriterDefinition, WriterGoatEvent, WriterSiblingObsolete,
 
 ASSUME OtherWriters \subseteq AllOtherWriters
 
-\* Bitcoin progress of the graph: NoBitcoin while its Pre-Kickoff is unconfirmed.
+\* Confirmed Bitcoin progress of the graph; NoBitcoin before its Pre-Kickoff.
 NoBitcoin == "NoBitcoin"
 BitcoinStages == {NoBitcoin, PreKickoff, OperatorKickOff, Skipped, Challenge,
                   OperatorTake1, OperatorTake2, Disprove}
 
-\* Stages scan_graph_chain_state can report.
+\* Stages scan_graph_chain_state (node/src/utils/graph_chain_state.rs:222) can report.
 ChainStages == {OperatorPresigned, CommitteePresigned, OperatorDataPushed} \cup
                (BitcoinStages \ {NoBitcoin})
 
-\* Goat gateway events that carry a graph status (gateway.rs:351-512, 657-696).
+\* Goat gateway events that carry a graph status (gateway.rs:351-513, 657-696).
 GoatTargets == {OperatorDataPushed, OperatorTake1, OperatorTake2, Disprove}
 
-\* Life cycle of a one-shot event.
+\* States of a one-shot event.
 NotEmitted == "NotEmitted"
 Pending    == "Pending"
 Handled    == "Handled"
 EventStates == {NotEmitted, Pending, Handled}
 
-\* decide_status returns None.
+\* decide_status returned None (no write).
 NoTarget == "NoTarget"
 
-\* The pending-scan slot is empty.
+\* Empty pending-scan slot.
 NoScan == [stage |-> NoTarget, unusable |-> FALSE]
 ScanRecords == [stage : ChainStages, unusable : BOOLEAN] \cup {NoScan}
 
@@ -108,7 +77,7 @@ VARIABLES
     abandoned,        \* the operator retired the unfinished setup at the abandon height
     pendingScan,      \* a gathered ChainScan event not yet applied, or NoScan
     refreshPending,   \* a finalize job will run refresh_graph
-    goatEvents,       \* per Goat status event: NotEmitted, Pending (indexed, unhandled) or Handled
+    goatEvents,       \* per Goat status event: NotEmitted, Pending (indexed, not handled) or Handled
     siblingObsolete   \* the sibling's withdrawal event that obsoletes this graph
 
 vars == <<status, finalized, posted, bitcoinStage, prekickoffDead, siblingSettled,
@@ -134,18 +103,18 @@ TypeOk ==
 
 InstanceFailed == failureEntries > 0
 
-\* The stage scan_graph_chain_state derives (graph_chain_state.rs:222-300).
+\* The stage scan_graph_chain_state derives (graph_chain_state.rs:222-455).
 ChainStage ==
     IF bitcoinStage # NoBitcoin THEN bitcoinStage
     ELSE IF posted THEN OperatorDataPushed
     ELSE IF finalized THEN CommitteePresigned
     ELSE OperatorPresigned
 
-\* unusable_fact (graph_scan.rs:374): EarlierSlotDead, PrekickoffInputSpent or
-\* ConnectorZeroTaken; only computed while the Pre-Kickoff is unconfirmed.
+\* unusable_fact (graph_scan.rs:374): a lower slot is dead, a Pre-Kickoff input is
+\* spent, or Connector-0 is taken. Read only before the Pre-Kickoff confirms.
 Unusable == prekickoffDead \/ siblingSettled
 
-\* decide_status (graph_pegout.rs:291).
+\* Target of apply_chain_scan (decide_status, node/src/aggregates/graph_pegout.rs:291).
 DecideStatus(stage, unusable, instanceFailed) ==
     IF stage \in BitcoinStages \ {NoBitcoin} THEN stage
     ELSE IF unusable THEN Obsoleted
@@ -153,7 +122,7 @@ DecideStatus(stage, unusable, instanceFailed) ==
     ELSE IF instanceFailed THEN Obsoleted
     ELSE NoTarget
 
-\* What the column should settle to once the chains stop moving.
+\* The status the column must settle on once the chains stop moving.
 ExpectedStatus ==
     IF bitcoinStage # NoBitcoin THEN bitcoinStage
     ELSE IF Unusable THEN Obsoleted
@@ -179,12 +148,9 @@ Init ==
 --------------------------------------------------------------------------
 (* Environment: the two chains and the instance. *)
 
-\* Action: the committee's pre-signatures for the graph are stored locally; in
-\* the same transaction the Definition writer moves OperatorPresigned to
-\* CommitteePresigned, and the finalize job then runs refresh_graph.
-\* Source: store_finalized_graph_if_needed() in node/src/utils/graph_store.rs:177
-\* Source: confirm_finalized_graph_definition() in node/src/utils/graph_store.rs:400
-\* Source: finalize jobs calling try_refresh_graph() in node/src/aggregates/graph_jobs.rs:1164,2201
+\* Action: committee pre-signatures are stored; Definition writes CommitteePresigned and queues refresh_graph.
+\* Source: node/src/utils/graph_store.rs:177, 400 (store_finalized_graph_if_needed, confirm_finalized_graph_definition)
+\* Source: node/src/aggregates/graph_jobs.rs:1164, 2201 (try_refresh_graph)
 StoreFinalizedDefinition ==
     /\ ~finalized
     /\ finalized' = TRUE
@@ -195,10 +161,8 @@ StoreFinalizedDefinition ==
     /\ UNCHANGED <<posted, bitcoinStage, prekickoffDead, siblingSettled, failureEntries,
                    abandoned, pendingScan, goatEvents, siblingObsolete>>
 
-\* Action: the relayer posts GraphData on Goat; the gateway emits PostGraphData.
-\* The relayer posts only for a live instance whose peg-in is Withdrawable,
-\* so never for a failed instance or once a sibling claimed the peg-in.
-\* Source: post_graph_data() in node/src/aggregates/graph_jobs.rs:2221
+\* Action: the relayer posts GraphData on Goat (live, unclaimed instance only).
+\* Source: node/src/aggregates/graph_jobs.rs:2221 (post_graph_data)
 PostGraphData ==
     /\ ~posted /\ ~InstanceFailed /\ ~siblingSettled
     /\ posted' = TRUE
@@ -217,8 +181,7 @@ PrekickoffConfirms ==
                    failureEntries, abandoned, pendingScan, refreshPending, goatEvents,
                    siblingObsolete>>
 
-\* Action: an input of the Pre-Kickoff (or of a lower slot's) is spent by
-\* another confirmed transaction, so the Pre-Kickoff can never confirm.
+\* Action: an input of this (or a lower slot's) Pre-Kickoff is spent elsewhere.
 \* Source: Bitcoin consensus
 PrekickoffInputSpent ==
     /\ bitcoinStage = NoBitcoin /\ ~prekickoffDead
@@ -227,10 +190,7 @@ PrekickoffInputSpent ==
                    failureEntries, abandoned, pendingScan, refreshPending, goatEvents,
                    siblingObsolete>>
 
-\* Action: a confirmed Bitcoin transaction moves the graph along its branch:
-\* Kickoff or Skip-Kickoff after Pre-Kickoff; Take-1, Challenge or a guardian
-\* disprove after Kickoff; Take-2 or Disprove after Challenge. A Take needs
-\* Connector-0, so none follows a sibling's settlement.
+\* Action: the next branch transaction confirms; no Take once a sibling took Connector-0.
 \* Source: Bitcoin consensus
 BitcoinAdvances ==
     /\ \/ bitcoinStage = PreKickoff /\ bitcoinStage' \in {OperatorKickOff, Skipped}
@@ -242,8 +202,7 @@ BitcoinAdvances ==
                    failureEntries, abandoned, pendingScan, refreshPending, goatEvents,
                    siblingObsolete>>
 
-\* Action: the gateway records this graph's settlement (WithdrawHappy,
-\* WithdrawUnhappy or WithdrawDisproved) after its Bitcoin proof.
+\* Action: the gateway emits this graph's settlement event after the Take-1, Take-2 or Disprove.
 \* Source: Gateway.sol finishWithdrawHappyPath / finishWithdrawUnhappyPath / finishWithdrawDisproved
 GoatSettlementEmitted(t) ==
     /\ WriterGoatEvent \in OtherWriters
@@ -253,9 +212,7 @@ GoatSettlementEmitted(t) ==
     /\ UNCHANGED <<status, finalized, posted, bitcoinStage, prekickoffDead, siblingSettled,
                    failureEntries, abandoned, pendingScan, refreshPending, siblingObsolete>>
 
-\* Action: another graph of the instance completes its withdrawal: its Take
-\* spends Connector-0 and the gateway marks the peg-in Claimed and emits the
-\* sibling's withdraw event.
+\* Action: a sibling graph takes Connector-0; the gateway emits its withdraw event.
 \* Source: Bitcoin consensus; Gateway.sol finishWithdrawHappyPath / finishWithdrawUnhappyPath
 SiblingSettles ==
     /\ ~siblingSettled
@@ -266,12 +223,9 @@ SiblingSettles ==
     /\ UNCHANGED <<status, finalized, posted, bitcoinStage, prekickoffDead,
                    failureEntries, abandoned, pendingScan, refreshPending, goatEvents>>
 
-\* Action: the instance enters a failure status (the second entry is
-\* Timeout -> UserCanceled, which repeats the cleanup). In the same apply
-\* enter_failure obsoletes every graph of the instance. A failed instance
-\* never had its GraphData posted (post_graph_data refuses it).
-\* Source: decide_btc_snapshot() / decide_answer_window() in node/src/aggregates/instance.rs:442,526
-\* Source: enter_failure() in node/src/aggregates/instance.rs:826
+\* Action: the instance fails (at most twice); enter_failure obsoletes its graphs in the same apply.
+\* Source: node/src/aggregates/instance.rs:442, 526 (decide_btc_snapshot, decide_answer_window)
+\* Source: node/src/aggregates/instance.rs:826 (enter_failure)
 InstanceEntersFailure ==
     /\ failureEntries < 2 /\ ~posted
     /\ failureEntries' = failureEntries + 1
@@ -292,15 +246,10 @@ Environment ==
     \/ InstanceEntersFailure
 
 --------------------------------------------------------------------------
-(* Chain-reconcile scanners: the only writers in the CoreOnly config. *)
+(* Chain-reconcile scanners: the only writers in CoreOnly.cfg. *)
 
-\* Action: the maintenance tick reads both chains for a monitored (not closed)
-\* graph and submits a ChainScan event carrying the stage and, before the
-\* Pre-Kickoff, whether the graph is unusable. Obsoleted graphs are probed
-\* for their Pre-Kickoff and fully scanned every OBSOLETED_FULL_SCAN_EVERY
-\* heights.
-\* Source: scan_graphs_on_chain() in node/src/aggregates/graph_scan.rs:131
-\* Source: gather_chain_scan() in node/src/aggregates/graph_scan.rs:303
+\* Action: the maintenance tick reads both chains and submits a ChainScan for a monitored graph.
+\* Source: node/src/aggregates/graph_scan.rs:131, 303 (scan_graphs_on_chain, gather_chain_scan)
 GatherChainScan ==
     /\ status \notin TerminalStatuses
     /\ pendingScan = NoScan
@@ -309,11 +258,8 @@ GatherChainScan ==
     /\ UNCHANGED <<status, finalized, posted, bitcoinStage, prekickoffDead, siblingSettled,
                    failureEntries, abandoned, refreshPending, goatEvents, siblingObsolete>>
 
-\* Action: the Graph aggregate applies the (possibly stale) ChainScan:
-\* decide_status picks the target, reading instance failure at apply time,
-\* and transition_graph_status writes it under the ChainReconcile guard.
-\* Source: apply_chain_scan() in node/src/aggregates/graph_pegout.rs:551
-\* Source: decide_status() in node/src/aggregates/graph_pegout.rs:291
+\* Action: the Graph aggregate applies a possibly stale ChainScan under the ChainReconcile guard.
+\* Source: node/src/aggregates/graph_pegout.rs:551, 291 (apply_chain_scan, decide_status)
 ApplyChainScan ==
     /\ pendingScan # NoScan
     /\ LET target == DecideStatus(pendingScan.stage, pendingScan.unusable, InstanceFailed)
@@ -323,10 +269,9 @@ ApplyChainScan ==
     /\ UNCHANGED <<finalized, posted, bitcoinStage, prekickoffDead, siblingSettled,
                    failureEntries, abandoned, refreshPending, goatEvents, siblingObsolete>>
 
-\* Action: after storing a finalized graph, the finalize job re-derives the
-\* stage and writes it as-is (no decide_status) under the ChainReconcile guard.
-\* Source: refresh_graph() in node/src/utils/graph_chain_state.rs:22
-\* Source: update_graph_status() in node/src/utils/graph_store.rs:626
+\* Action: the finalize job writes the current chain stage under the ChainReconcile guard.
+\* Source: node/src/utils/graph_chain_state.rs:22 (refresh_graph)
+\* Source: node/src/utils/graph_store.rs:626 (update_graph_status)
 RefreshGraph ==
     /\ refreshPending
     /\ status' = Transition(status, ChainStage, SourceChainReconcile)
@@ -339,11 +284,8 @@ ChainReconcile == GatherChainScan \/ ApplyChainScan \/ RefreshGraph
 --------------------------------------------------------------------------
 (* The other writers. *)
 
-\* Action: the gateway event watcher handles an indexed Goat status event
-\* (PostGraphData, WithdrawHappy, WithdrawUnhappy, WithdrawDisproved) under
-\* the GoatEvent guard.
-\* Source: apply_gateway_graph_status() in node/src/scheduled_tasks/event_watch/gateway.rs:305
-\* Source: handle_withdraw_paths_events() / handle_withdraw_disproved_events() / handle_post_graph_data_events() in gateway.rs:351,431,657
+\* Action: the gateway watcher applies an indexed Goat status event under the GoatEvent guard.
+\* Source: node/src/scheduled_tasks/event_watch/gateway.rs:305, 351, 431, 657
 HandleGoatEvent(t) ==
     /\ goatEvents[t] = Pending
     /\ status' = Transition(status, t, SourceGoatEvent)
@@ -351,11 +293,9 @@ HandleGoatEvent(t) ==
     /\ UNCHANGED <<finalized, posted, bitcoinStage, prekickoffDead, siblingSettled,
                    failureEntries, abandoned, pendingScan, refreshPending, siblingObsolete>>
 
-\* Action: handling the sibling's withdraw event obsoletes every other graph of
-\* the instance under the ChainReconcile guard (which admits OperatorKickOff
-\* and Challenge).
-\* Source: handle_withdraw_paths_events() in node/src/scheduled_tasks/event_watch/gateway.rs:395
-\* Source: obsolete_instance_graphs_except() / obsolete_graph() in node/src/utils/graph_store.rs:671,646
+\* Action: the sibling's withdraw event obsoletes this graph under the ChainReconcile guard.
+\* Source: node/src/scheduled_tasks/event_watch/gateway.rs:395
+\* Source: node/src/utils/graph_store.rs:671, 646 (obsolete_instance_graphs_except, obsolete_graph)
 HandleSiblingWithdrawal ==
     /\ siblingObsolete = Pending
     /\ status' = Transition(status, Obsoleted, SourceChainReconcile)
@@ -363,9 +303,8 @@ HandleSiblingWithdrawal ==
     /\ UNCHANGED <<finalized, posted, bitcoinStage, prekickoffDead, siblingSettled,
                    failureEntries, abandoned, pendingScan, refreshPending, goatEvents>>
 
-\* Action: the pegout RPC, selecting an OperatorDataPushed graph whose peg-in
-\* is Claimed and whose own withdrawal never started, obsoletes it.
-\* Source: pegout() in node/src/rpc_service/handler/bitvm_handler.rs:1384,1490
+\* Action: the pegout RPC obsoletes an OperatorDataPushed graph whose peg-in is Claimed.
+\* Source: node/src/rpc_service/handler/bitvm_handler.rs:1384, 1490
 PegoutRpcObsoletes ==
     /\ WriterPegoutRpc \in OtherWriters
     /\ siblingSettled /\ status = OperatorDataPushed
@@ -374,10 +313,9 @@ PegoutRpcObsoletes ==
                    failureEntries, abandoned, pendingScan, refreshPending, goatEvents,
                    siblingObsolete>>
 
-\* Action: at the abandon height the operator retires its own graph that is
-\* still OperatorPresigned (no committee signatures) of a live instance.
-\* Source: abandon_unfinished_setups() in node/src/aggregates/graph_scan.rs:256
-\* Source: abandon_setup() in node/src/aggregates/graph.rs:823
+\* Action: at the abandon height the operator obsoletes its own OperatorPresigned graph.
+\* Source: node/src/aggregates/graph_scan.rs:256 (abandon_unfinished_setups)
+\* Source: node/src/aggregates/graph.rs:823 (abandon_setup)
 AbandonSetup ==
     /\ WriterSetupAbandon \in OtherWriters
     /\ ~abandoned /\ ~InstanceFailed /\ status = OperatorPresigned
@@ -395,12 +333,10 @@ OtherWriterSteps ==
 --------------------------------------------------------------------------
 Next == Environment \/ ChainReconcile \/ OtherWriterSteps
 
-\* Fairness: no fairness on the environment (the chains may stop anywhere).
-\* WF on the scanners: the maintenance tick runs scan_graphs_on_chain every
-\* tick and rescans a graph whenever the height or its status changed
-\* (SCAN_MARKS), and blocks keep coming; the engine worker applies queued
-\* events; a finalize job runs refresh_graph right after storing the graph.
-\* WF on the event handlers: the gateway watcher handles every indexed event.
+\* No fairness on the environment (the chains may stop anywhere). WF on the
+\* scanners (every tick rescans a graph whose height or status changed, the
+\* engine applies queued events, a finalize job runs refresh_graph) and on the
+\* event handlers (the gateway watcher handles every indexed event).
 Spec ==
     /\ Init /\ [][Next]_vars
     /\ WF_vars(GatherChainScan)
@@ -412,8 +348,7 @@ Spec ==
 --------------------------------------------------------------------------
 (* Safety invariants *)
 
-\* A recorded status never claims progress the chains have not made, and a
-\* closed status is exactly the branch Bitcoin settled on.
+\* The status never claims progress the chains lack; a closed status is the settled Bitcoin branch.
 StatusBackedByChain ==
     /\ status \in TerminalStatuses => status = bitcoinStage
     /\ status # Obsoleted => status \in StagesBefore(ChainStage) \cup {ChainStage}
@@ -421,8 +356,7 @@ StatusBackedByChain ==
 --------------------------------------------------------------------------
 (* Safety properties *)
 
-\* Outside Obsoleted (a side state any live stage may enter and leave), the
-\* status only moves forward along the protocol order; it may skip stages.
+\* Outside Obsoleted, the status only moves forward in protocol order (it may skip stages).
 NoStatusRegression ==
     [][(status # status' /\ status # Obsoleted /\ status' # Obsoleted)
          => status \in StagesBefore(status')]_vars
@@ -430,20 +364,18 @@ NoStatusRegression ==
 \* A closed status is never left.
 TerminalStatusesAreAbsorbing == [][(status \in TerminalStatuses => status' = status)]_vars
 
-\* The two payout paths are never both recorded for one graph.
+\* Take-1 and Take-2 are never both recorded for one graph.
 NoConflictingWithdrawal ==
     /\ [][(status = OperatorTake1 => status' # OperatorTake2)]_vars
     /\ [][(status = OperatorTake2 => status' # OperatorTake1)]_vars
 
-\* A recorded Disprove (evidence the operator cheated) is never lost.
+\* A recorded Disprove is never lost.
 DisproveIsSticky == [][(status = Disprove => status' = Disprove)]_vars
 
 --------------------------------------------------------------------------
 (* Liveness *)
 
-\* Once the chains stop moving, the column settles on what they say: the
-\* Bitcoin stage, Obsoleted for an unusable, failed-instance or abandoned
-\* graph, otherwise the Goat/definition stage.
+\* Once the chains stop moving, the status settles on ExpectedStatus.
 StatusConvergesToChain == <>[](status = ExpectedStatus)
 
 ====

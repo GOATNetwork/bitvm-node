@@ -1,49 +1,46 @@
 ---- MODULE InstanceLifecycle ----
 (***************************************************************************)
-(* Bridge-in lifecycle of one instance as decided by the Instance          *)
-(* aggregate, against the chain facts it reads: Bitcoin height, the Goat    *)
-(* committee-answer window, Peg-In-Prepare / Confirm / Cancel visibility,   *)
-(* graph endorsement and the Goat mint. Checks the T0 signing gate, when    *)
-(* the committee instance key may be deleted, and that failure states are   *)
-(* terminal except Timeout -> UserCanceled.                                *)
+(* One instance's bridge-in lifecycle as the Instance aggregate decides it *)
+(* (node/src/aggregates/instance.rs decide_* and commit, fed by the scans  *)
+(* in instance_scan.rs), against the chain facts it reads. Each apply is   *)
+(* one atomic step (BEGIN IMMEDIATE, crates/engine/src/worker.rs:177). The *)
+(* Peg-In-Confirm signing job (instance_jobs.rs pegin_confirm_sign) is two *)
+(* steps: GateCheck reads the tip through the T0 gate, Sign signs.         *)
+(* Also checks: key deletion only when safe, failure states terminal       *)
+(* except Timeout -> UserCanceled, Timeout only on an invisible Confirm.   *)
 (*                                                                         *)
-(* Code scope (dev after #476):                                            *)
-(*   - Instance aggregate decisions, node/src/aggregates/instance.rs:       *)
-(*     decide_btc_snapshot (442), decide_answer_window (526),               *)
-(*     decide_graph_endorsed (550), decide_l2_minted (561),                 *)
-(*     signing_gate_for (602), PeginDeadlines (156-192), commit (696).      *)
-(*   - Scans feeding them, node/src/aggregates/instance_scan.rs:            *)
-(*     scanned_statuses (182), scan_instances_on_bitcoin (193),             *)
-(*     gather_snapshot (270).                                               *)
-(*   - Committee signing steps behind the T0 gate,                          *)
-(*     node/src/aggregates/instance_jobs.rs: pegin_confirm_sign (659).      *)
-(* Each aggregate apply is one atomic step (BEGIN IMMEDIATE,                *)
-(* crates/engine/src/worker.rs:177).                                        *)
+(* Finding (sign-gate race): a block can arrive between GateCheck and      *)
+(*   Sign, so a signature is made at tip >= H_p + T0                       *)
+(*   (NoSignatureAtOrAfterT0).                                             *)
 (*                                                                         *)
-(* Deliberate simplifications:                                             *)
-(*   - A snapshot is gathered and applied in one step (ScanBitcoin). In the *)
-(*     code it is an engine event applied later, so its facts can be stale; *)
-(*     that only widens the window of the Peg-In-Confirm-after-Timeout      *)
-(*     alert, which this model already reaches.                             *)
-(*   - The T0 gate is evaluated in the same step that signs (Sign). In the  *)
-(*     code the job reads the tip height, then signs; a block arriving in   *)
-(*     between is not modeled.                                              *)
-(*   - No Bitcoin reorg (the "Prepare reorged out" UserDiscarded branch of  *)
-(*     decide_btc_snapshot is not reachable).                               *)
-(*   - decide_btc_snapshot's UserInited branch is unreachable: UserInited   *)
-(*     is never scanned (gather_snapshot returns None).                     *)
-(*                                                                         *)
-(* Config (audit/tla/checks.txt): InstanceLifecycle/Baseline.cfg - pass.             *)
+(* Parameters: T0Blocks, BufferBlocks, KeyDeleteBlocks (PeginDeadlines);   *)
+(*   GateMargin: the gate closes at H_p + T0 - GateMargin (0 = the code);  *)
+(*   MaxSignLag: most blocks between GateCheck and Sign (>= MaxHeight = no *)
+(*   bound, as in the code); MaxHeight: bound on the tip.                  *)
+(* Fix (close the gate GateMargin blocks early): ParamsOK, exact while     *)
+(*   GateMargin < T0Blocks.                                                *)
+(* Exhaustiveness: the race compares only the GateCheck tip plus the lag   *)
+(*   with H_p + T0; T0, B and the key-delete depth translate heights. So   *)
+(*   margin 0 with no lag bound (race) and margin = lag = 1 (fix) are the  *)
+(*   two classes; T0 = 4 > GateMargin keeps the gate reachable.            *)
+(* Not modeled: stale snapshots (gather and apply are one step), reorgs.   *)
+(* Configs: configs/node/aggregates/instance/InstanceLifecycle/, tiers in  *)
+(*   audit/tla/checks.txt.                                                 *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets
 
 CONSTANTS
-    T0Blocks,         \* PeginDeadlines.t0_blocks: Connector-Z timelock; Peg-In-Cancel is minable from H_p + T0
+    T0Blocks,         \* PeginDeadlines.t0_blocks: Peg-In-Cancel is minable from H_p + T0
     BufferBlocks,     \* PeginDeadlines.buffer_blocks: B, abandon height is H_p + T0 + B
     KeyDeleteBlocks,  \* PeginDeadlines.key_delete_blocks: success-side key deletion depth
-    MaxHeight         \* bound on the Bitcoin height for model checking
+    GateMargin,       \* the gate closes this many blocks before H_p + T0 (0 = current code)
+    MaxSignLag,       \* most blocks between GateCheck and Sign (>= MaxHeight: unbounded)
+    MaxHeight         \* bound on the Bitcoin tip
 
-\* Instance.status values (InstanceBridgeInStatus, crates/store/src/schema.rs:205).
+\* The fix holds iff no more blocks arrive during the job than the margin.
+ParamsOK == MaxSignLag <= GateMargin
+
+\* InstanceBridgeInStatus (crates/store/src/schema.rs:205).
 UserInited                 == "UserInited"
 CommitteesAnswered         == "CommitteesAnswered"
 UserBroadcastPeginPrepare  == "UserBroadcastPeginPrepare"
@@ -65,11 +62,11 @@ Failed == {NoEnoughCommitteesAnswered, UserDiscarded, UserCanceled, Timeout}
 \* deletes_key_on_entry (schema.rs:242): Timeout keeps the key.
 DeletesKey == {NoEnoughCommitteesAnswered, UserDiscarded, UserCanceled}
 
-\* scanned_statuses (instance_scan.rs:182), with committee key deletion on.
+\* scanned_statuses (instance_scan.rs:182) with committee key deletion on.
 ScannedStatuses == {CommitteesAnswered, UserBroadcastPeginPrepare, Presigned, Timeout,
                     RelayerL1Broadcasted, RelayerL2Minted}
 
-\* Goat committee-answer window outcome.
+\* Goat committee-answer window.
 AnswersNone   == "none"     \* window still open
 AnswersShort  == "short"    \* closed without a quorum
 AnswersQuorum == "quorum"   \* closed with a quorum
@@ -79,26 +76,34 @@ ConfirmNone      == "none"
 ConfirmMempool   == "mempool"
 ConfirmConfirmed == "confirmed"
 
+\* Steps of the committee member's pegin_confirm_sign job.
+SignIdle  == "idle"    \* not past the gate yet
+SignGated == "gated"   \* gate passed at tip gateH; the signature is not made yet
+SignDone  == "done"    \* signature produced
+SignSteps == {SignIdle, SignGated, SignDone}
+
 VARIABLES
     status,          \* Instance.status of the local row
-    keyDeleted,      \* Instance.key_deleted: the committee instance key is gone
-    h,               \* Bitcoin tip height
-    answered,        \* the Goat response window: AnswersNone, AnswersShort or AnswersQuorum
+    keyDeleted,      \* Instance.key_deleted
+    h,               \* Bitcoin tip
+    answered,        \* Goat answer window: AnswersNone, AnswersShort or AnswersQuorum
     prepareH,        \* H_p, the Peg-In-Prepare confirmation height; 0 while unconfirmed
     inputsSpent,     \* an input of Peg-In-Prepare was spent elsewhere
     endorsed,        \* enough graphs of the instance are finalized and endorsed
+    signPc,          \* step of the signing job (SignSteps)
+    gateH,           \* tip the signing job read at GateCheck
     signed,          \* a committee member produced a Peg-In-Confirm signature
-    signedAt,        \* heights at which signatures were produced
+    signedAt,        \* tips at which signatures were produced
     confirm,         \* Peg-In-Confirm: ConfirmNone, ConfirmMempool or ConfirmConfirmed
     confirmH,        \* confirmation height of Peg-In-Confirm
     cancelConfirmed, \* Peg-In-Cancel confirmed
     minted           \* Goat BridgeIn emitted
 
 vars == <<status, keyDeleted, h, answered, prepareH, inputsSpent, endorsed,
-          signed, signedAt, confirm, confirmH, cancelConfirmed, minted>>
+          signPc, gateH, signed, signedAt, confirm, confirmH, cancelConfirmed, minted>>
 
-\* The variables only the environment changes.
-env == <<h, answered, prepareH, inputsSpent, endorsed, signed, signedAt,
+\* The variables the Instance aggregate does not write.
+env == <<h, answered, prepareH, inputsSpent, endorsed, signPc, gateH, signed, signedAt,
          confirm, confirmH, cancelConfirmed, minted>>
 
 TypeOk ==
@@ -109,6 +114,8 @@ TypeOk ==
     /\ prepareH \in 0..MaxHeight
     /\ inputsSpent \in BOOLEAN
     /\ endorsed \in BOOLEAN
+    /\ signPc \in SignSteps
+    /\ gateH \in 0..MaxHeight
     /\ signed \in BOOLEAN
     /\ signedAt \subseteq 0..MaxHeight
     /\ confirm \in {ConfirmNone, ConfirmMempool, ConfirmConfirmed}
@@ -123,8 +130,8 @@ CancelFromHeight == prepareH + T0Blocks
 AbandonHeight == prepareH + T0Blocks + BufferBlocks
 
 \* signing_gate_for (instance.rs:602): closed for a failed instance and from
-\* H_p + T0; open while H_p is unknown.
-SigningOpen == status \notin Failed /\ (prepareH = 0 \/ h < CancelFromHeight)
+\* H_p + T0 - GateMargin; open while H_p is unknown.
+SigningOpen == status \notin Failed /\ (prepareH = 0 \/ h + GateMargin < CancelFromHeight)
 
 Init ==
     /\ status = UserInited
@@ -134,6 +141,8 @@ Init ==
     /\ prepareH = 0
     /\ inputsSpent = FALSE
     /\ endorsed = FALSE
+    /\ signPc = SignIdle
+    /\ gateH = 0
     /\ signed = FALSE
     /\ signedAt = {}
     /\ confirm = ConfirmNone
@@ -142,33 +151,34 @@ Init ==
     /\ minted = FALSE
 
 --------------------------------------------------------------------------
-(* Environment *)
+(* Environment and committee signing job *)
 
-\* Action: a new Bitcoin block.
+\* Action: a new Bitcoin block; at most MaxSignLag of them while the signing
+\* job is between GateCheck and Sign.
 \* Source: Bitcoin consensus
 Tick ==
     /\ h < MaxHeight
+    /\ signPc = SignGated => h + 1 - gateH <= MaxSignLag
     /\ h' = h + 1
     /\ UNCHANGED <<status, keyDeleted, answered, prepareH, inputsSpent,
-                   endorsed, signed, signedAt, confirm, confirmH,
+                   endorsed, signPc, gateH, signed, signedAt, confirm, confirmH,
                    cancelConfirmed, minted>>
 
-\* Action: the Goat committee-answer window closes, with or without a quorum.
-\* Source: Gateway.sol answerPeginRequest (response window)
+\* Action: the Goat answer window closes, with or without a quorum.
+\* Source: Gateway.sol answerPeginRequest
 WindowCloses ==
     /\ answered = AnswersNone
     /\ answered' \in {AnswersShort, AnswersQuorum}
     /\ UNCHANGED <<status, keyDeleted, h, prepareH, inputsSpent, endorsed,
-                   signed, signedAt, confirm, confirmH, cancelConfirmed, minted>>
+                   signPc, gateH, signed, signedAt, confirm, confirmH, cancelConfirmed, minted>>
 
-\* Action: Peg-In-Prepare confirms; the user can only build it from a quorum
-\* of answers.
+\* Action: Peg-In-Prepare confirms (the user builds it from a quorum of answers).
 \* Source: Bitcoin consensus
 PrepareConfirms ==
     /\ answered = AnswersQuorum /\ prepareH = 0 /\ ~inputsSpent /\ h > 0
     /\ prepareH' = h
     /\ UNCHANGED <<status, keyDeleted, h, answered, inputsSpent, endorsed,
-                   signed, signedAt, confirm, confirmH, cancelConfirmed, minted>>
+                   signPc, gateH, signed, signedAt, confirm, confirmH, cancelConfirmed, minted>>
 
 \* Action: an input of Peg-In-Prepare is spent by another transaction.
 \* Source: Bitcoin consensus
@@ -176,7 +186,7 @@ InputSpentElsewhere ==
     /\ prepareH = 0 /\ ~inputsSpent
     /\ inputsSpent' = TRUE
     /\ UNCHANGED <<status, keyDeleted, h, answered, prepareH, endorsed,
-                   signed, signedAt, confirm, confirmH, cancelConfirmed, minted>>
+                   signPc, gateH, signed, signedAt, confirm, confirmH, cancelConfirmed, minted>>
 
 \* Action: enough graphs of the instance are finalized and endorsed.
 \* Source: environment (operators and committee finishing graph setup)
@@ -184,29 +194,36 @@ GraphEndorsed ==
     /\ prepareH > 0 /\ ~endorsed
     /\ endorsed' = TRUE
     /\ UNCHANGED <<status, keyDeleted, h, answered, prepareH, inputsSpent,
-                   signed, signedAt, confirm, confirmH, cancelConfirmed, minted>>
+                   signPc, gateH, signed, signedAt, confirm, confirmH, cancelConfirmed, minted>>
 
-\* Action: a committee member signs Peg-In-Confirm: only in the Confirm phase
-\* (the round starts on entering Presigned and stops once the round is over)
-\* and only through the T0 gate.
-\* Source: pegin_confirm_sign() in node/src/aggregates/instance_jobs.rs:659,711
-\* Source: on_entered() Presigned arm in node/src/aggregates/instance.rs:785
+\* Action: the committee member's signing job, in the Confirm phase, reads the
+\* instance row and the tip and passes the T0 gate.
+\* Source: pegin_confirm_sign() in node/src/aggregates/instance_jobs.rs:659-713
+\* Source: signing_gate() in node/src/aggregates/instance.rs:620-640
+GateCheck ==
+    /\ signPc = SignIdle /\ status = Presigned /\ SigningOpen
+    /\ signPc' = SignGated /\ gateH' = h
+    /\ UNCHANGED <<status, keyDeleted, h, answered, prepareH, inputsSpent,
+                   endorsed, signed, signedAt, confirm, confirmH, cancelConfirmed, minted>>
+
+\* Action: the job signs Peg-In-Confirm without reading the tip again.
+\* Source: pegin_confirm_sign() in node/src/aggregates/instance_jobs.rs:714-776
 Sign ==
-    /\ status = Presigned /\ SigningOpen /\ ~signed
+    /\ signPc = SignGated
+    /\ signPc' = SignDone
     /\ signed' = TRUE
     /\ signedAt' = signedAt \cup {h}
     /\ UNCHANGED <<status, keyDeleted, h, answered, prepareH, inputsSpent,
-                   endorsed, confirm, confirmH, cancelConfirmed, minted>>
+                   endorsed, gateH, confirm, confirmH, cancelConfirmed, minted>>
 
-\* Action: Peg-In-Confirm enters the mempool. Anyone holding the signed
-\* transaction may broadcast it at any time, including after this node
-\* abandoned the instance.
+\* Action: Peg-In-Confirm enters the mempool; anyone holding the signed tx may
+\* broadcast it at any time, also after this node abandoned the instance.
 \* Source: environment
 ConfirmEntersMempool ==
     /\ signed /\ confirm = ConfirmNone /\ ~cancelConfirmed
     /\ confirm' = ConfirmMempool
     /\ UNCHANGED <<status, keyDeleted, h, answered, prepareH, inputsSpent,
-                   endorsed, signed, signedAt, confirmH, cancelConfirmed, minted>>
+                   endorsed, signPc, gateH, signed, signedAt, confirmH, cancelConfirmed, minted>>
 
 \* Action: Peg-In-Confirm confirms.
 \* Source: Bitcoin consensus
@@ -214,16 +231,16 @@ ConfirmConfirms ==
     /\ confirm = ConfirmMempool /\ ~cancelConfirmed
     /\ confirm' = ConfirmConfirmed /\ confirmH' = h
     /\ UNCHANGED <<status, keyDeleted, h, answered, prepareH, inputsSpent,
-                   endorsed, signed, signedAt, cancelConfirmed, minted>>
+                   endorsed, signPc, gateH, signed, signedAt, cancelConfirmed, minted>>
 
-\* Action: Peg-In-Cancel confirms. BIP68 makes it minable from H_p + T0; it
-\* conflicts with an unconfirmed Peg-In-Confirm, which is then evicted.
+\* Action: Peg-In-Cancel confirms (BIP68: from H_p + T0) and evicts an
+\* unconfirmed Peg-In-Confirm.
 \* Source: Bitcoin consensus
 CancelConfirms ==
     /\ prepareH > 0 /\ h >= CancelFromHeight /\ confirm # ConfirmConfirmed /\ ~cancelConfirmed
     /\ cancelConfirmed' = TRUE /\ confirm' = ConfirmNone
     /\ UNCHANGED <<status, keyDeleted, h, answered, prepareH, inputsSpent,
-                   endorsed, signed, signedAt, confirmH, minted>>
+                   endorsed, signPc, gateH, signed, signedAt, confirmH, minted>>
 
 \* Action: Goat mints for the confirmed Peg-In-Confirm and emits BridgeIn.
 \* Source: Gateway.sol postPeginData
@@ -231,18 +248,18 @@ Mint ==
     /\ confirm = ConfirmConfirmed /\ ~minted
     /\ minted' = TRUE
     /\ UNCHANGED <<status, keyDeleted, h, answered, prepareH, inputsSpent,
-                   endorsed, signed, signedAt, confirm, confirmH, cancelConfirmed>>
+                   endorsed, signPc, gateH, signed, signedAt, confirm, confirmH, cancelConfirmed>>
 
 Environment ==
     \/ Tick \/ WindowCloses \/ PrepareConfirms \/ InputSpentElsewhere
-    \/ GraphEndorsed \/ Sign \/ ConfirmEntersMempool \/ ConfirmConfirms
-    \/ CancelConfirms \/ Mint
+    \/ GraphEndorsed \/ GateCheck \/ Sign \/ ConfirmEntersMempool
+    \/ ConfirmConfirms \/ CancelConfirms \/ Mint
 
 --------------------------------------------------------------------------
 (* The Instance aggregate *)
 
-\* Action: the answer window closed: CommitteesAnswered with a quorum,
-\* otherwise NoEnoughCommitteesAnswered, which deletes the key on entry.
+\* Action: the answer window closed: CommitteesAnswered with a quorum, else
+\* NoEnoughCommitteesAnswered, which deletes the key on entry.
 \* Source: scan_answer_windows() in node/src/aggregates/instance_scan.rs:113
 \* Source: decide_answer_window() in node/src/aggregates/instance.rs:526
 ScanAnswers ==
@@ -252,14 +269,13 @@ ScanAnswers ==
     /\ keyDeleted' = (keyDeleted \/ answered = AnswersShort)
     /\ UNCHANGED env
 
-\* Action: a Bitcoin snapshot of a scanned instance is decided on the facts
-\* as they are now: Prepare confirmed or a conflicting spend; then Confirm
-\* confirmed, Cancel confirmed or Timeout past the abandon height while the
-\* Confirm is invisible; Timeout -> UserCanceled on a confirmed Cancel; and
-\* success-side key deletion once the Confirm is KeyDeleteBlocks deep.
-\* Entering a key-deleting failure status deletes the key.
+\* Action: a Bitcoin snapshot decided on the current facts: Prepare confirmed
+\* or a conflicting spend; then Confirm confirmed, Cancel confirmed, or Timeout
+\* past the abandon height with the Confirm invisible; Timeout -> UserCanceled
+\* on a confirmed Cancel; key deletion on entering a deleting failure status
+\* or once the Confirm is KeyDeleteBlocks deep.
 \* Source: scan_instances_on_bitcoin() / gather_snapshot() in node/src/aggregates/instance_scan.rs:193,270
-\* Source: decide_btc_snapshot() in node/src/aggregates/instance.rs:442
+\* Source: decide_btc_snapshot() in node/src/aggregates/instance.rs:442-521
 \* Source: commit() / enter_failure() in node/src/aggregates/instance.rs:696,826
 ScanBitcoin ==
     /\ status \in ScannedStatuses
@@ -283,7 +299,7 @@ ScanBitcoin ==
           /\ keyDeleted' = (keyDeleted \/ failureDelete \/ successDelete)
     /\ UNCHANGED env
 
-\* Action: enough graphs are endorsed: UserBroadcastPeginPrepare -> Presigned.
+\* Action: enough graphs endorsed: UserBroadcastPeginPrepare -> Presigned.
 \* Source: decide_graph_endorsed() in node/src/aggregates/instance.rs:550
 ScanEndorsed ==
     /\ status = UserBroadcastPeginPrepare /\ endorsed
@@ -291,8 +307,8 @@ ScanEndorsed ==
     /\ UNCHANGED keyDeleted
     /\ UNCHANGED env
 
-\* Action: the Goat mint: RelayerL2Minted from any live status; for a failed
-\* instance only an alert.
+\* Action: the Goat mint: RelayerL2Minted from any live status; a failed
+\* instance only alerts.
 \* Source: decide_l2_minted() in node/src/aggregates/instance.rs:561
 ScanMint ==
     /\ minted /\ status \notin Failed /\ status # RelayerL2Minted
@@ -305,18 +321,18 @@ Node == ScanAnswers \/ ScanBitcoin \/ ScanEndorsed \/ ScanMint
 --------------------------------------------------------------------------
 Next == Environment \/ Node
 
-\* No fairness: only safety is checked.
+\* Safety only: no fairness.
 Spec == Init /\ [][Next]_vars
 
 --------------------------------------------------------------------------
 (* Safety invariants *)
 
-\* The T0 gate: no protocol signature at or after H_p + T0.
+\* The T0 gate: no Peg-In-Confirm signature at or after H_p + T0.
 NoSignatureAtOrAfterT0 ==
     \A x \in signedAt : prepareH > 0 /\ x < CancelFromHeight
 
-\* The key is deleted only in the three failure states that delete it, or on
-\* the success side once the Peg-In-Confirm is KeyDeleteBlocks deep.
+\* The key is deleted only in a deleting failure status, or on the success
+\* side once the Peg-In-Confirm is KeyDeleteBlocks deep.
 KeyDeletedOnlyWhenSafe ==
     keyDeleted =>
         \/ status \in DeletesKey
@@ -326,7 +342,7 @@ KeyDeletedOnlyWhenSafe ==
 \* Timeout keeps the committee key for manual handling.
 TimeoutKeepsKey == status = Timeout => ~keyDeleted
 
-\* The success statuses are only recorded for a confirmed Peg-In-Confirm.
+\* The success statuses imply a confirmed Peg-In-Confirm.
 BroadcastedMeansConfirmed ==
     status \in {RelayerL1Broadcasted, RelayerL2Minted} => confirm = ConfirmConfirmed
 
@@ -338,18 +354,13 @@ FailureAbsorbing ==
     [][(status \in Failed =>
         status' \in (IF status = Timeout THEN {Timeout, UserCanceled} ELSE {status}))]_vars
 
-\* Timeout is only entered past the abandon height while the Peg-In-Confirm
-\* is neither confirmed nor in the mempool.
+\* Timeout is entered only past the abandon height with the Confirm neither
+\* confirmed nor in the mempool.
 NoTimeoutWhileVisible ==
     [][((status' = Timeout /\ status # Timeout) =>
         (prepareH > 0 /\ h >= AbandonHeight /\ confirm = ConfirmNone))]_vars
 
 \* A minted instance stays minted.
 MintedIsFinal == [][(status = RelayerL2Minted => status' = RelayerL2Minted)]_vars
-
---------------------------------------------------------------------------
-(* Liveness *)
-
-\* (none)
 
 ====

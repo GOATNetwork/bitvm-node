@@ -1,107 +1,38 @@
 ---- MODULE RoundPenalty ----
 (***************************************************************************)
-(* Out-of-slot ("late") kickoffs escape every on-chain penalty because the *)
-(* penalty txs hang off operator-key-only connectors (audit M5).           *)
-(*                                                                         *)
-(* Ground truth: external goat crate, checkout bab46c2, plus bitvm-gc:     *)
-(*  - Prekickoff_{i+1} (transactions/prekickoff.rs:93-181) spends          *)
-(*    PrekickoffConn_i and outputs [ForceSkipConn_{i+1} (DUST),            *)
-(*    KickoffConn_{i+1}, PrekickoffConn_{i+1}, P2A]; it is signed by the   *)
-(*    operator alone (sign_input_0, :183-196).                             *)
-(*  - ForceSkipConnector, KickoffConnector, PrekickoffConnector and        *)
-(*    GuardianConnector are ALL `<operator_pk> OP_CHECKSIG` leaves with    *)
-(*    the operator key as taproot internal key                             *)
-(*    (connectors/kickoff_connectors.rs:14-227) - the operator alone can   *)
-(*    spend each of them, with ANY tx, at ANY time.                        *)
-(*  - Penalties for graph/slot i (wired in crates/bitvm-gc/src/operator/   *)
-(*    api.rs:87-167), all presigned by the operator with SIGHASH_NONE so   *)
-(*    any verifier can add outputs and broadcast:                          *)
-(*      ForceSkipKickoff_i  = KickoffConn_i + ForceSkipConn_{i+1}          *)
-(*                            (prekickoff.rs:274-311)                      *)
-(*      QuickChallenge_i    = Guardian_i    + ForceSkipConn_{i+1}          *)
-(*                            (prekickoff.rs:407-445)                      *)
-(*      ChallengeIncompleteKickoff_i = Guardian_i + PrekickoffConn_{i+1}   *)
-(*                            (prekickoff.rs:542-578)                      *)
-(*    Guardian_i is an input of both Take1 (take1.rs:82-83) and Take2      *)
-(*    (take2.rs:76-77), so spending it kills the slot's payout.            *)
-(*  - Node: enforce_previous_slot (node/src/aggregates/graph_pegout_jobs.  *)
-(*    rs:506-592), run once Pre-Kickoff-N confirms: Force-Skip slot N-1 if *)
-(*    its kickoff never appeared (:569-579), else Quick-Challenge it if    *)
-(*    unsettled (:584-591). ChallengeIncompleteKickoff is only DETECTED    *)
-(*    (node/src/utils/graph_chain_state.rs:152-158), never broadcast by    *)
-(*    node code. One-graph-per-slot / continuity is checked off-chain only *)
-(*    (node/src/aggregates/graph.rs:597-632).                              *)
-(*                                                                         *)
-(* Attack: in the block where Prekickoff_{i+1} confirms (same package even)*)
-(* the operator spends ForceSkipConn_{i+1} to itself. ForceSkipKickoff_i   *)
-(* and QuickChallenge_i become permanently invalid (missing input). It     *)
-(* then broadcasts Prekickoff_{i+2} (consuming PrekickoffConn_{i+1}, so    *)
-(* ChallengeIncompleteKickoff_i is dead too). Kickoff_i - still spendable, *)
-(* since nothing could Force-Skip it - can now be fired at any later time  *)
-(* and runs to Take1/Take2 with no Guardian penalty.                       *)
-(*                                                                         *)
-(* Fix design (ForceSkipNofN = TRUE): ForceSkipConnector becomes an        *)
-(* n-of-n (committee) key spend; the committee co-presigns input 1 of      *)
-(* ForceSkipKickoff_i and QuickChallenge_i (SIGHASH_NONE, as today). This  *)
-(* is the minimal change: the honest operator never spends ForceSkipConn   *)
-(* (the node skips a slot via operator_skip_graph(), node/src/utils/       *)
-(* graph_tx.rs:263-326, signing SkipKickoff on KickoffConn with            *)
-(* operator_sign_skip_kickoff(), crates/bitvm-gc/src/operator/api.rs:453), *)
-(* so nothing else needs that key.                                         *)
-(* A relative timelock on an operator leaf is NOT enough: once the CSV     *)
-(* expires the operator can still burn the connector and every slot it     *)
-(* kicks off after that is again penalty-free. With the n-of-n connector   *)
-(* QuickChallenge_i stays valid forever once round i+1 exists, so a late   *)
-(* Kickoff_i is always answerable before its Take timelock.                *)
-(* (The operator can still abandon its chain by spending PrekickoffConn_i  *)
-(* with a non-canonical tx; then round i+1 never exists, nothing is        *)
-(* "late", and the off-chain continuity check rejects follow-up graphs.)   *)
-(*                                                                         *)
-(* Generosity to the current design: watchers here DO broadcast            *)
-(* ChallengeIncompleteKickoff (node code does not), so the counterexample  *)
-(* must also advance to round i+2, as stated in the finding.               *)
-(* Abstractions: one slot i = 0; the operator may chain several txs into   *)
-(* one block (no Mine between its steps).                                  *)
-(*                                                                         *)
-(* Timing (no instant reaction). An action at tip `now` lands in block     *)
-(* now+1. A penalty can only be sent once its inputs are confirmed (the    *)
-(* node acts on confirmed txs: enforce_previous_slot waits for Pre-Kickoff *)
-(* N, :516-518, and sees the kickoff via tx_visible); from the block E in  *)
-(* which its last input confirmed, watchers land it in block <= E + react  *)
-(* + incl (react >= 1 counts the next block, ReactionBlocks; incl =        *)
-(* InclusionBlocks); the reaction restarts on every new event (a late      *)
-(* kickoff that out-bids a pending Force-Skip). takecsv is the Take1 CSV   *)
-(* after Kickoff_0 (connector_a; Take2 is later, so Take1 is the binding   *)
-(* race); Take lands in block >= kickoffAt + takecsv and wins a same-block *)
-(* tie.                                                                    *)
-(* ParamsOK (fix design, exact - RoundPenalty/Boundary.cfg, and the         *)
-(* margin-0 class is in the pass sweep): react + incl + 1 <= takecsv: a    *)
-(* late Kickoff_0 confirmed in block K is Quick-Challenged in block <=     *)
-(* K + react + incl < K + takecsv. (validate_timelock_config only demands  *)
-(* connector_a >= react + incl + safety, which implies ParamsOK only when  *)
-(* safety >= 1; the shipped values all satisfy ParamsOK.)                  *)
-(* The bug does not depend on timing: ForceSkipConn_1 is burnt in the same *)
-(* block that creates it and Prekickoff_2 follows in that block, so no     *)
-(* penalty is ever enabled at a confirmed tip.                             *)
-(* Frozen parameters chosen in Init, from the sweep ranges or (UseShipped) *)
-(* ShippedTimelockValues per net in NetSet (takecsv = ConnectorA, react /  *)
-(* incl = Reaction/InclusionBlocks). Why the sweep is exhaustive: the only *)
-(* timing relation is the watcher's latest landing (event + react + incl)  *)
-(* vs the Take maturity (kickoff + takecsv); react 1..2, incl 0..2 (sum    *)
-(* 1..4) with takecsv 1..6 realise margin <= -1, 0 and >= +1 for every     *)
-(* split.                                                                  *)
-(*                                                                         *)
-(* Code scope (current tree): node/src/aggregates/graph_pegout_jobs.rs     *)
-(* (kickoff, enforce_previous_slot, take1), node/src/utils/graph_tx.rs     *)
-(* (operator_kickoff, operator_skip_graph, verifier_force_skip_kickoff,    *)
-(* verifier_quick_challenge), crates/bitvm-gc/src/operator/api.rs          *)
-(* (penalty wiring), goat bab46c2 kickoff connectors as cited above.       *)
-(*                                                                         *)
-(* Configs and tiers (checks.txt):                                         *)
-(*  live     RoundPenalty(.cfg|Shipped)  operator-key ForceSkipConnector   *)
-(*  design   RoundPenaltyFixed, ...FixedShipped (n-of-n ForceSkipConnector *)
-(*           over ParamsOK / all four shipped networks)                    *)
-(*  boundary RoundPenaltyBoundary (n-of-n, outside ParamsOK)               *)
+(* Late kickoffs escape every on-chain penalty because the penalty txs     *)
+(*   spend operator-key-only connectors (audit M5).                        *)
+(* Code: goat bab46c2: Prekickoff_{i+1}                                    *)
+(*   (goat/src/transactions/prekickoff.rs:93-181, operator-signed) creates *)
+(*   ForceSkipConn_{i+1}, KickoffConn_{i+1} and PrekickoffConn_{i+1};      *)
+(*   every kickoff connector is <operator_pk> OP_CHECKSIG                  *)
+(*   (connectors/kickoff_connectors.rs:14-227). The SIGHASH_NONE penalties *)
+(*   of slot i (wired in crates/bitvm-gc/src/operator/api.rs:150-167):     *)
+(*   ForceSkipKickoff_i = KickoffConn_i + ForceSkipConn_{i+1},             *)
+(*   QuickChallenge_i = Guardian_i + ForceSkipConn_{i+1},                  *)
+(*   ChallengeIncompleteKickoff_i = Guardian_i + PrekickoffConn_{i+1};     *)
+(*   Guardian_i is a Take1/Take2 input. Node: enforce_previous_slot        *)
+(*   (node/src/aggregates/graph_pegout_jobs.rs:506-592) sends ForceSkip or *)
+(*   QuickChallenge; ChallengeIncompleteKickoff is only detected.          *)
+(* M5: the operator burns ForceSkipConn_1 in the block that creates it and *)
+(*   advances to round 2 in the same block, so no penalty is ever enabled  *)
+(*   at a confirmed tip; it then kicks off slot 0 late and takes.          *)
+(*   Timing-independent. The model lets watchers send                      *)
+(*   ChallengeIncompleteKickoff (the node does not).                       *)
+(* Fix: ForceSkipConnector becomes n-of-n, so QuickChallenge_i stays valid *)
+(*   once round i+1 exists. A CSV on the operator leaf is not enough: the  *)
+(*   operator burns the connector after it expires.                        *)
+(* Parameters: see CONSTANTS. One slot (i = 0); the operator may chain     *)
+(*   several txs into one block.                                           *)
+(* ParamsOK (fix, exact - Boundary.cfg): react + incl + 1 <= takecsv.      *)
+(*   validate_timelock_config (connector_a >= react + incl + safety)       *)
+(*   implies it only when safety >= 1; all shipped values satisfy it.      *)
+(* Exhaustive: the only timing relation is a watcher's latest landing      *)
+(*   (event + react + incl) vs the Take maturity (kickoff + takecsv);      *)
+(*   react 1..2, incl 0..2, takecsv 1..6 give margin <= -1, 0 and >= +1    *)
+(*   for every split.                                                      *)
+(* Configs: configs/crates/bitvm-gc/RoundPenalty/, tiers in                *)
+(*   audit/tla/checks.txt.                                                 *)
 (***************************************************************************)
 EXTENDS Naturals, ShippedTimelockValues
 
@@ -109,7 +40,7 @@ CONSTANTS
     ForceSkipNofN,  \* FIX: ForceSkipConnector is n-of-n instead of operator-only
     UseShipped,     \* parameters from ShippedTimelockValues (per net in NetSet)
     NetSet,         \* subset of Networks swept when UseShipped
-    TakeCSVRange,   \* blocks after Kickoff_0 before the operator can Take (connector_a)
+    TakeCSVRange,   \* blocks after Kickoff_0 before Take1 (connector_a; Take2 is later)
     ReactionRange,  \* reaction blocks (>= 1)
     InclusionRange, \* extra blocks for a penalty to be mined
     ParamSel        \* Init filter: "all" | "ok" | "notOK"
@@ -132,6 +63,7 @@ VARIABLES
 params == <<net, takecsv, react, incl>>
 vars == <<params, now, prek1, prek1At, kc0, fs1, pc1, g0, kickoffAt, late>>
 
+\* Every event of interest has happened by then.
 Horizon == takecsv + react + incl + 3
 Done == now = Horizon
 
@@ -183,12 +115,8 @@ Init ==
 ---------------------------------------------------------------------------
 (* Operator (possibly malicious; operator-key spends are unconstrained).   *)
 
-\* Action: the operator's Kickoff_0 lands (spends KickoffConn_0, creates
-\* Guardian_0); it is "late" if round 1 was already confirmed in an earlier
-\* block.
-\* Source: kickoff() in node/src/aggregates/graph_pegout_jobs.rs:261-303
-\* via operator_kickoff() in node/src/utils/graph_tx.rs:328; a malicious
-\* operator may send it at any time (operator key only).
+\* Action: Kickoff_0 confirms (spends KickoffConn_0, creates Guardian_0); "late" if round 1 confirmed earlier.
+\* Source: kickoff(), node/src/aggregates/graph_pegout_jobs.rs:261-303, via operator_kickoff(), node/src/utils/graph_tx.rs:328-396.
 OpKickoff ==
     /\ kc0 = "unspent"
     /\ kc0' = "kickoff"
@@ -197,19 +125,15 @@ OpKickoff ==
     /\ late' = (prek1 /\ now + 1 > prek1At)
     /\ UNCHANGED <<params, now, prek1, prek1At, fs1, pc1>>
 
-\* Action: the honest way to skip slot 0 (SkipKickoff on KickoffConn_0).
-\* Source: operator_skip_graph() in node/src/utils/graph_tx.rs:263-326
-\* (operator_sign_skip_kickoff(), crates/bitvm-gc/src/operator/api.rs:453).
+\* Action: the operator skips slot 0 honestly (SkipKickoff spends KickoffConn_0).
+\* Source: operator_skip_graph(), node/src/utils/graph_tx.rs:263-326; crates/bitvm-gc/src/operator/api.rs:453-491.
 OpSkip ==
     /\ kc0 = "unspent"
     /\ kc0' = "skipped"
     /\ UNCHANGED <<params, now, prek1, prek1At, fs1, pc1, g0, kickoffAt, late>>
 
-\* Action: Prekickoff_1 lands (spends PrekickoffConn_0, creates
-\* ForceSkipConn_1 and PrekickoffConn_1).
-\* Source: operator_sign_prekickoff_input_0() used by operator_kickoff() /
-\* operator_skip_graph() in node/src/utils/graph_tx.rs:270, :332; goat
-\* transactions/prekickoff.rs:93-181 (operator signature only).
+\* Action: Prekickoff_1 confirms (spends PrekickoffConn_0, creates ForceSkipConn_1 and PrekickoffConn_1).
+\* Source: node/src/utils/graph_tx.rs:270, :332 (operator_sign_prekickoff_input_0); goat transactions/prekickoff.rs:93-181.
 OpPrekickoff1 ==
     /\ ~prek1
     /\ prek1' = TRUE
@@ -218,29 +142,23 @@ OpPrekickoff1 ==
     /\ pc1' = "unspent"
     /\ UNCHANGED <<params, now, kc0, g0, kickoffAt, late>>
 
-\* Action: Prekickoff_2 lands, consuming PrekickoffConn_1 (kills
-\* ChallengeIncompleteKickoff_0).
-\* Source: same as OpPrekickoff1 for the next round.
+\* Action: Prekickoff_2 confirms, spending PrekickoffConn_1 (kills ChallengeIncompleteKickoff_0).
+\* Source: as OpPrekickoff1, for the next round.
 OpPrekickoff2 ==
     /\ pc1 = "unspent"
     /\ pc1' = "prek2"
     /\ UNCHANGED <<params, now, prek1, prek1At, kc0, fs1, g0, kickoffAt, late>>
 
-\* Action: THE BUG - the operator spends ForceSkipConn_1 to itself, killing
-\* ForceSkipKickoff_0 and QuickChallenge_0.
-\* Source: environment (operator key); ForceSkipConnector is
-\* <operator_pk> OP_CHECKSIG, goat connectors/kickoff_connectors.rs:14-227.
+\* Action: M5 - the operator spends ForceSkipConn_1 to itself, killing ForceSkipKickoff_0 and QuickChallenge_0.
+\* Source: environment (operator key); ForceSkipConnector is <operator_pk> OP_CHECKSIG, goat kickoff_connectors.rs:176-196.
 OpBurnForceSkipConn ==
     /\ ~ForceSkipNofN
     /\ fs1 = "unspent"
     /\ fs1' = "operator"
     /\ UNCHANGED <<params, now, prek1, prek1At, kc0, pc1, g0, kickoffAt, late>>
 
-\* Action: Take1 / Take2 (both consume Guardian_0) land from block
-\* kickoffAt + takecsv on.
-\* Source: take1() in node/src/aggregates/graph_pegout_jobs.rs:1470
-\* (is_take1_timelock_expired, node/src/utils/btc.rs:24-32); goat
-\* take1.rs:82-83 / take2.rs:76-77 spend the Guardian.
+\* Action: Take1 or Take2 (both spend Guardian_0) confirms, from block kickoffAt + takecsv on.
+\* Source: take1(), node/src/aggregates/graph_pegout_jobs.rs:1470-1497; goat take1.rs:82-83, take2.rs:76-77.
 OpTake ==
     /\ g0 = "unspent"
     /\ now + 1 >= kickoffAt + takecsv
@@ -249,7 +167,7 @@ OpTake ==
 
 ---------------------------------------------------------------------------
 (* Watchers (anyone holding the presigned SIGHASH_NONE penalties). A       *)
-(* penalty needs its inputs confirmed (tip >= the block they landed in).   *)
+(* penalty needs its inputs confirmed and lands by event + react + incl.   *)
 
 Max2(a, b) == IF a >= b THEN a ELSE b
 
@@ -257,41 +175,31 @@ ForceSkipEnabled == kc0 = "unspent" /\ fs1 = "unspent" /\ now >= prek1At
 QCEnabled        == g0 = "unspent" /\ fs1 = "unspent" /\ now >= Max2(kickoffAt, prek1At)
 CIKEnabled       == g0 = "unspent" /\ pc1 = "unspent" /\ now >= Max2(kickoffAt, prek1At)
 
-\* Block whose confirmation enabled the penalty (the reaction restarts on
-\* each new event); a watcher's penalty lands by that + react + incl.
+\* Block whose confirmation enabled the penalty; the reaction restarts on each new event.
 ForceSkipFrom == prek1At
 QCFrom        == Max2(kickoffAt, prek1At)
 PenaltyDue ==
     \/ ForceSkipEnabled /\ now + 1 >= ForceSkipFrom + react + incl
     \/ (QCEnabled \/ CIKEnabled) /\ now + 1 >= QCFrom + react + incl
 
-\* Action: ForceSkipKickoff_0 lands (KickoffConn_0 + ForceSkipConn_1):
-\* slot 0 can no longer be kicked off.
-\* Source: enforce_previous_slot() in node/src/aggregates/
-\* graph_pegout_jobs.rs:506-592 (kickoff not visible, :570-579) via
-\* verifier_force_skip_kickoff() in node/src/utils/graph_tx.rs:41-70.
+\* Action: ForceSkipKickoff_0 confirms (KickoffConn_0 + ForceSkipConn_1): slot 0 can no longer kick off.
+\* Source: enforce_previous_slot(), node/src/aggregates/graph_pegout_jobs.rs:570-579; node/src/utils/graph_tx.rs:41-70.
 ForceSkipKickoff ==
     /\ ForceSkipEnabled
     /\ kc0' = "forceSkipped"
     /\ fs1' = "forceSkip"
     /\ UNCHANGED <<params, now, prek1, prek1At, pc1, g0, kickoffAt, late>>
 
-\* Action: QuickChallenge_0 lands (Guardian_0 + ForceSkipConn_1): the slot's
-\* payout is dead.
-\* Source: enforce_previous_slot() in node/src/aggregates/
-\* graph_pegout_jobs.rs:506-592 (kickoff visible and unsettled, :580-591)
-\* via verifier_quick_challenge() in node/src/utils/graph_tx.rs:72-99.
+\* Action: QuickChallenge_0 confirms (Guardian_0 + ForceSkipConn_1): the slot's payout is dead.
+\* Source: enforce_previous_slot(), node/src/aggregates/graph_pegout_jobs.rs:584-591; node/src/utils/graph_tx.rs:72-99.
 QuickChallenge ==
     /\ QCEnabled
     /\ g0' = "quickChallenge"
     /\ fs1' = "quickChallenge"
     /\ UNCHANGED <<params, now, prek1, prek1At, kc0, pc1, kickoffAt, late>>
 
-\* Action: ChallengeIncompleteKickoff_0 lands (Guardian_0 +
-\* PrekickoffConn_1). Generous to the current design: node code only
-\* DETECTS it, it never broadcasts it.
-\* Source: environment (any holder of the presigned tx); detection only in
-\* node/src/utils/graph_chain_state.rs:152-158.
+\* Action: ChallengeIncompleteKickoff_0 confirms (Guardian_0 + PrekickoffConn_1); the node never sends it.
+\* Source: environment (any holder of the presigned tx); node detection only, node/src/utils/graph_chain_state.rs:152-158.
 ChallengeIncompleteKickoff ==
     /\ CIKEnabled
     /\ g0' = "cik"
@@ -308,8 +216,8 @@ Mine ==
     /\ now' = now + 1
     /\ UNCHANGED <<params, prek1, prek1At, kc0, fs1, pc1, g0, kickoffAt, late>>
 
-\* Action: end of the horizon - stutter (not a deadlock).
-\* Source: model bound (no code).
+\* Action: stutter at the horizon (not a deadlock).
+\* Source: model bound.
 Halt == Done /\ UNCHANGED vars
 
 Next ==
@@ -325,18 +233,13 @@ Next ==
     \/ Mine
     \/ Halt
 
-\* No fairness: the only property is a safety invariant; watcher progress
-\* is forced by PenaltyDue on Mine, not by WF/SF.
+\* No fairness: watcher progress is forced by PenaltyDue on Mine.
 Spec == Init /\ [][Next]_vars
 
 ---------------------------------------------------------------------------
 (* Safety invariants.                                                      *)
 
-\* A kickoff broadcast after the next round started loses its Guardian to
-\* a penalty, i.e. never reaches Take1/Take2.
+\* A late kickoff never reaches Take1/Take2.
 LateKickoffPenalized == ~(late /\ g0 = "take")
-
-(* Safety properties (temporal): none.                                     *)
-(* Liveness: none (bounded horizon).                                       *)
 
 ====

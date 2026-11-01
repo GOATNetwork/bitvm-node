@@ -69,7 +69,8 @@ matched=0
 # assert), anything else = TLC did not finish. TLC names its state directory by
 # the current second, so each config gets its own parent under states/run/.
 # java.io.tmpdir is private: TLC unpacks its standard modules there, and a
-# shared /tmp breaks parallel runs.
+# shared /tmp breaks parallel runs. Keep the spec path relative: with an
+# absolute spec path TLC 2.19 fails to find the -config file.
 run_tlc() {
   local rc=0
   # shellcheck disable=SC2086

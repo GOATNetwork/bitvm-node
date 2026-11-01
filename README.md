@@ -102,7 +102,7 @@ file must be listed in `checks.txt`.
 | `node/aggregates/graph/KickoffScanCoverage.tla` | `graph_scan.rs` `scan_graphs_on_chain` | #431 | 1 |  |  | 1 |
 | `node/aggregates/graph/VerifierKickoffFailOpen.tla` | `graph_pegout_jobs.rs` `challenge_kickoff` | #429 | 1 |  |  |  |
 | `node/aggregates/instance/CommitteeKeyDeletion.tla` | `instance_jobs.rs` key deletion, `env.rs` | H2 |  | 4 | 2 | 1 |
-| `node/aggregates/instance/InstanceLifecycle.tla` | `instance.rs`, `instance_scan.rs` | baseline | 1 |  |  |  |
+| `node/aggregates/instance/InstanceLifecycle.tla` | `instance.rs`, `instance_scan.rs`, `pegin_confirm_sign` | baseline; sign-gate race | 1 | 1 | 1 |  |
 | `node/aggregates/instance/InstancePresigned.tla` | `instance.rs` `decide_graph_endorsed` | Finding 2 | 1 |  |  |  |
 | `node/aggregates/instance/PeginConfirmCancelReorg.tla` | SPV writer, `post_pegin_data` | H6 |  | 3 | 2 | 4 |
 | `node/aggregates/instance/PeginPostRetry.tla` | `instance_jobs.rs` `post_pegin_data` | M4 |  | 1 | 1 |  |
@@ -111,7 +111,7 @@ file must be listed in `checks.txt`.
 | `node/scheduled_tasks/InstanceBridgeOutRace.tla` | `event_watch/bridge_out.rs`, `swap_maintenance_tasks.rs` | Finding 6 | 1 |  |  |  |
 | `contracts/GatewayWithdrawLifecycle.tla` | `Gateway.sol`, `graph_pegout_jobs.rs`, `event_watch/gateway.rs` | H1, M1, C5, F4, econ |  | 8 | 6 |  |
 | `contracts/MultiSigReplay.tla` | `MultiSigVerifier.sol` | multisig replay |  | 1 | 1 |  |
-| **total** | | | **16** | **53** | **37** | **21** |
+| **total** | | | **16** | **54** | **38** | **21** |
 
 **What the parameter sweeps found** (beyond the round-2 findings themselves):
 
@@ -127,8 +127,12 @@ file must be listed in `checks.txt`.
   peg-out on those three networks unless `connector_a >= BTC_BLOCK_CONFIRMS + lag + 2r + incl + 3`.
 - H5 reproduces on Testnet4, Signet and Regtest, not on Bitcoin; its per-graph fix is insufficient
   when several graphs are challenged at once. GC evaluation time is not part of the timing budget.
-- H6 needs an SPV feeder that lags less than the reorg depth: with the node's own writer
-  (`BTC_BLOCK_CONFIRMS` behind the tip) it takes a reorg one block deeper than the evidence depth.
+- H6: the header relay feeds the GOAT SPV at the tip and the contract does not enforce depth, so a
+  1-deep reorg after the 1-conf post mints unbacked pegBTC; via the node's own writer
+  (`BTC_BLOCK_CONFIRMS` behind the tip) it takes a reorg of depth `BTC_BLOCK_CONFIRMS + 1`.
+- `pegin_confirm_sign` reads the tip at the signing gate, then signs; a block in between yields a
+  Peg-In-Confirm signature at `tip >= H_p + T0`, when the user's Cancel is already valid. Fix design:
+  close the gate one block early.
 
 **Setup** (once): install a JRE (11+), then download the official TLA+ tools jar:
 
@@ -150,7 +154,8 @@ make tla-values                                   # regenerate ShippedTimelockVa
 
 TLC only resolves `EXTENDS` in the spec's own directory, so `check.sh` copies
 every module into `audit/tla/states/lib` and runs from there. To run TLC by
-hand, do the same: `java -jar tla2tools.jar -config <abs path to cfg> states/lib/<Spec>.tla`.
+hand, do the same: `java -jar tla2tools.jar -config <path to cfg> states/lib/<Spec>.tla`
+(keep the spec path relative; TLC 2.19 does not find the config when it is absolute).
 SANY (parser) is `java -cp tla2tools.jar tla2sany.SANY <Spec>.tla`.
 
 ## Contributing

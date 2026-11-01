@@ -1,200 +1,49 @@
 ---- MODULE DisputeObligations ----
 (***************************************************************************)
-(* PURPOSE. Challenge-path obligations of the honest nodes after a         *)
-(* Challenge: can an operator reach Take-2 with an invalid proof, or       *)
-(* without committing its pubin, and does every honest watchtower's        *)
-(* challenge land? Findings C1 (the watchtower branches and the            *)
-(* commit-pubin gate block every honest response) and C2 (an early Assert  *)
-(* cancels every watchtower's challenge job), and the timing margins their *)
-(* fix needs - over EVERY timelock / delay combination and over the        *)
-(* shipped per-network values.                                             *)
-(*                                                                         *)
-(* CODE SCOPE: dev @ 60562f8 (node = #476 event-sourced aggregates on      *)
-(* crates/engine); chain scripts = goat crate @ bab46c2 (goat/src/).       *)
-(*                                                                         *)
-(* CHAIN. Take-2 (transactions/take2.rs:56-90) spends ConnectorD leaf0     *)
-(* (operator + CSV connector_d from the Assert, connectors/connector_d.rs: *)
-(* 61) AND ConnectorF leaf0 (operator + CSV connector_f from WCI =         *)
-(* Watchtower-Challenge-Init, connectors/connector_f.rs:38). It is stopped *)
-(* only if an honest tx spends D or F first:                               *)
-(*  F leaf1 (n-of-n, no CSV, connector_f.rs:49) is spent by                *)
-(*   - Operator-Challenge-NACK_i = Ack_i leaf2 (n-of-n + CSV operator_ack  *)
-(*     from WCI, connectors/watchtower_connectors.rs:156) + F leaf1        *)
-(*     (transactions/watchtower_challenge.rs:544-575). Fully pre-signed,   *)
-(*     so it is valid for ANY unspent Ack_i, whether or not watchtower i   *)
-(*     challenged;                                                         *)
-(*   - Operator-Commit-Timeout = E leaf1 (n-of-n + CSV operator_commit     *)
-(*     from WCI, connectors/connector_e.rs:56) + F leaf1                   *)
-(*     (watchtower_challenge.rs:715-746). Fully pre-signed.                *)
-(*  D leaf1 (n-of-n) is spent by Disprove = D leaf1 + ProverConnector leaf1*)
-(*   (n-of-n + CSV prover_connector from the verifier's ChallengeAssert),  *)
-(*   transactions/assert.rs:317-357. The operator answers a ChallengeAssert*)
-(*   of a VALID proof with Wrongly-Challenged (ProverConnector leaf0,      *)
-(*   assert.rs:599-626), which an invalid proof cannot produce.            *)
-(* The operator alone controls: WCI (ConnectorB, operator key, no CSV,     *)
-(* connector_b.rs:27); the Assert (ConnectorC leaf1, WOTS only, no CSV and *)
-(* no ordering w.r.t. WCI, assert.rs:68-74, connector_c.rs:45); ACK_i      *)
-(* (Ack_i leaf1: hashlock only, no signature or CSV,                       *)
-(* watchtower_connectors.rs:128 - so it can be spent BEFORE any challenge);*)
-(* Commit-Pubin (E leaf0, WOTS only, connector_e.rs:48); and               *)
-(* WC-Timeout_i = WC_i leaf1 (OPERATOR key + CSV watchtower_challenge,     *)
-(* watchtower_connectors.rs:49) + Ack_i leaf0 (watchtower_challenge.rs:    *)
-(* 359-393): only the operator can time a watchtower out. A watchtower     *)
-(* challenge spends WC_i leaf0 (watchtower key, NO CSV,                    *)
-(* watchtower_connectors.rs:40): valid until WC_i is spent, in particular  *)
-(* after the Assert has spent ConnectorC.                                  *)
-(*                                                                         *)
-(* NODE (current code; re-checked against 60562f8, every line below holds):*)
-(*  node/src/aggregates/graph_scan.rs watchtower_flow (573-697):           *)
-(*   - an unchallenged WC_i (`None =>`, 659-670) sets all_resolved = false *)
-(*     and raises only WatchtowerChallengeTimeout, routed to the OWNING    *)
-(*     OPERATOR (graph_pegout.rs:269); a malicious operator ignores it;    *)
-(*   - NackReady (654) is pushed only in the `Some(_) if !timed_out` arm   *)
-(*     (642-657), i.e. only for watchtowers that DID challenge;            *)
-(*   - OperatorCommitPubinTimeout (679-687) requires all_resolved.         *)
-(*  node/src/aggregates/graph_pegout_jobs.rs verifier_assert (736-884):    *)
-(*   767-779 waits ("operator commit-pubin is not on chain yet") until     *)
-(*   connector-E is spent, BEFORE the proof is even checked (861). This is *)
-(*   not a data dependency: when E is spent by Commit-Timeout the same job *)
-(*   builds the ChallengeAssert from the assert witness alone.             *)
-(*  node/src/aggregates/graph_pegout.rs apply_chain_scan (606-622): every  *)
-(*   scan that carries AssertSent makes the watchtower role cancel its     *)
-(*   JOB_WATCHTOWER_CHALLENGE. crates/engine/src/worker.rs:313-365 inserts *)
-(*   a scan's jobs (INSERT OR IGNORE, crates/store/src/engine/mod.rs:1282) *)
-(*   and THEN applies its cancels; a Cancelled job id is never run again   *)
-(*   (worker.rs:336-342; rows are purged only after 15 days,               *)
-(*   crates/engine/src/config.rs:101). assert_flow (graph_scan.rs:700-738) *)
-(*   re-emits AssertSent on every scan, so once the Assert is confirmed    *)
-(*   every (re-)enqueued watchtower challenge job is cancelled in the same *)
-(*   transaction that inserts it. The same AssertSent also starts          *)
-(*   JOB_WATCHTOWER_PROOF_TIMEOUT for the watchtower (graph_pegout.rs:267, *)
-(*   watchtower_proof_timeout graph_pegout_jobs.rs:1591-1597 ->            *)
-(*   notify_watchtower_proof_timeout node/src/utils/proof_client.rs:560),  *)
-(*   which tells the proof builder to stop that watchtower's proof: a      *)
-(*   second way the Assert silences it (subsumed here by the job cancel).  *)
-(*  Low: graph_scan.rs:474 is_timelock_ready(c, n, tip) = c + n <= tip, so *)
-(*   an honest CSV-gated tx lands in block c+n+1 at the earliest, one block*)
-(*   after the operator's (ScanLag, swept as sl in {0, 1}).                *)
-(*                                                                         *)
-(* FINDINGS (live cfgs; each reproduces on ALL FOUR networks with the      *)
-(* shipped timelocks and r = action_window - ReproducesOnEveryCase):       *)
-(*  C1 (C1.cfg): one watchtower that never challenges (offline or          *)
-(*   colluding) and that the operator never times out keeps all_resolved   *)
-(*   false forever: no NACK, no Commit-Timeout, and verifier_assert never  *)
-(*   gets past the connector-E gate -> Take-2 with an invalid proof. No    *)
-(*   defender action is ever enabled, so this holds for every parameter.   *)
-(*  C1 (a) (C1LateCommit.cfg): the connector-E gate alone, with every      *)
-(*   branch resolved and the shipped margins repaired: the operator        *)
-(*   commits pubin just before Commit-Timeout lands, the ChallengeAssert   *)
-(*   starts only then, and the Disprove lands at the earliest by           *)
-(*   commit + 2 sl + 3 r + pc + 1 >= cf on every network (even with        *)
-(*   r = sl = 0: commit + pc + 1 >= cf, e.g. mainnet 432 + 144 + 1 > 576). *)
-(*  C1 (b) (C1NoPubin.cfg): ChallengeAssert ungated but Commit-Timeout     *)
-(*   still gated on all_resolved: a VALID proof reaches Take-2 without any *)
-(*   commit-pubin (the operator spends Ack_i through its hashlock leaf, so *)
-(*   NACK-every-Ack does not close it). Parameter independent.             *)
-(*  C2 (C2.cfg): an Assert confirmed before the watchtowers' proofs are    *)
-(*   ready (e.g. in WCI's block) cancels every honest watchtower's job:    *)
-(*   C1 with every watchtower honest. Parameter independent (the cancel is *)
-(*   immediate; with wtp = 0 the adversary orders it first).               *)
-(*  C2 alone (C2Silenced.cfg, C1 fixed, margins repaired): still keeps     *)
-(*   every honest watchtower's evidence off chain.                         *)
-(*                                                                         *)
-(* FIX DESIGN (design cfgs; each flag switchable on its own):              *)
-(*  FixCommitTimeout: OperatorCommitPubinTimeout at operator_commit        *)
-(*   whenever E and F are unspent, whatever the watchtower branches;       *)
-(*  FixNackAll: NackReady for EVERY unspent Ack_i after operator_ack;      *)
-(*  FixUngateAssert: an invalid proof is challenged as soon as the Assert  *)
-(*   is seen; only the "valid proof, skip" decision waits for commit-pubin *)
-(*   (an inconsistent pubin is then answered by Pubin-Disprove, D leaf2,   *)
-(*   which has no CSV);                                                    *)
-(*  FixNoCancel: AssertSent neither cancels JOB_WATCHTOWER_CHALLENGE nor   *)
-(*   stops the watchtower's proof (JOB_WATCHTOWER_PROOF_TIMEOUT).          *)
-(* Without FixCommitTimeout NoTake2WithoutPubin fails, without             *)
-(* FixUngateAssert NoTake2WithInvalidProof fails, without FixNoCancel      *)
-(* OnlineWatchtowerChallengeLands fails; FixNackAll is defence in depth.   *)
-(* ParamsOK (exact; each conjunct is necessary and sufficient for its      *)
-(* property, Boundary cfg):                                                *)
-(*   wc >= wtp + r + 2           (OnlineWatchtowerChallengeLands)          *)
-(*   cf >= commit + sl + r + 1   (NoTake2WithoutPubin)                     *)
-(*   cd >= 2 r + pc + sl + 2     (NoTake2WithInvalidProof)                 *)
-(* The node's validate_timelock_config (crates/bitvm-gc/src/timelocks.rs:  *)
-(* 173-241) checks only wc >= wtp + action_window, cf - commit >=          *)
-(* confirmed_action_window, cd - pc >= action_window: it is off by 2 for   *)
-(* the watchtower window and by r + sl + 2 for the Disprove race. As       *)
-(* shipped (r = action_window, sl = 1) ParamsOK holds on Bitcoin and       *)
-(* Testnet4, NOT on Signet (wc 6 < 7) nor Regtest (wc 1 < 3, cf 4 < 6,     *)
-(* cd 3 < 6): the fix needs those timelocks raised (FixedShipped.cfg with  *)
-(* RepairTimelocks; FixedShippedBoundary.cfg shows the shipped values      *)
-(* fail).                                                                  *)
-(*                                                                         *)
-(* TIME is Bitcoin block height; h is the block being built. The operator's*)
-(* CSV-n spend of an output confirmed at c can be in block c+n. An honest  *)
-(* node sees the tip h-1: it sees a tx confirmed at c from block c+1 (the  *)
-(* physical minimum - the block must exist before anyone reacts to it),    *)
-(* and its is_timelock_ready guard holds from block c+n+sl. An honest      *)
-(* action whose code guard holds from block s lands in SOME block of       *)
-(* s..s+r, chosen by the adversary (r = honest delay beyond the first      *)
-(* possible block: reaction + inclusion (+ safety)); Tick is disabled while*)
-(* one is overdue. Only the sum matters (the model's honest actions are    *)
-(* atomic), so reaction and inclusion are one parameter. The job cancel is *)
-(* a local DB effect of the first scan that sees the Assert, so it happens *)
-(* in the block it becomes enabled (the adversary may still order it       *)
-(* before a same-block challenge). WCI confirms at height 0; the Assert    *)
-(* (no on-chain ordering w.r.t. WCI) may confirm from height               *)
-(* -max(0, cd - cf) on: an earlier Assert is equivalent for Take-2 (gated  *)
-(* by cf anyway) and only lets the verifier react earlier; an Assert after *)
-(* AssertMax (every WCI-rooted deadline passed) is a time shift of one at  *)
-(* AssertMax. One honest online verifier stands for the 1-of-M verifier    *)
-(* set (every response above is pre-signed n-of-n or is that verifier's    *)
-(* own ChallengeAssert). The operator's pubin is consistent with its       *)
-(* Assert (an inconsistent one only adds Pubin-Disprove). Blocks stop once *)
-(* a defender has spent D or F and the watchtower window is over. Not      *)
-(* modelled: the 1-block visibility lag of the branch-resolving txs before *)
-(* all_resolved holds (it can only delay the current-code Commit-Timeout). *)
-(*                                                                         *)
-(* PARAMETERS are frozen variables (record params, chosen in Init, never   *)
-(* changed except by NextCase): wc, ack, commit, cf (CSV from WCI), cd     *)
-(* (from the Assert), pc (from the ChallengeAssert), wtp (watchtower proof *)
-(* blocks), r (honest delay), sl (ScanLag). UseShipped takes them from     *)
-(* ShippedTimelockValues for each network in NetSet (sl = 1 as shipped);   *)
-(* otherwise every combination of the *Range sets inside Region.           *)
-(* UseValidator: every tuple validate_timelock_config accepts (Validated)  *)
-(* for budgets from the Reaction/Inclusion/Safety/Evidence ranges.         *)
-(* EXHAUSTIVENESS of the sweep (Fixed.cfg, Region "ok_zero": every margin  *)
-(* exactly 0, wtp in 0..1, r in 0..2, sl in 0..1, pc in 1..2, commit in    *)
-(* {1, 3}, ack = 2): (1) wc, cf and cd appear only in OPERATOR guards      *)
-(* (WC-Timeout, Take-2) and in the horizon, so lowering one only adds      *)
-(* operator behaviours - margin 0 dominates every margin > 0; (2) r only   *)
-(* widens the honest landing window (behaviours(r) include behaviours of   *)
-(* every smaller r); (3) ack and commit set when NACK / Commit-Timeout,    *)
-(* pure defender actions that spend only F, E, Ack_i, become due - they    *)
-(* can only remove Take-2 / WC-Timeout options; commit enters a property   *)
-(* only through the cf margin; (4) pc and sl enter the Disprove race only  *)
-(* as pc + sl; (5) the sweep contains every ordering of cd vs cf (so the   *)
-(* pre-WCI Assert window), of the challenge readiness 1 + wtp vs the       *)
-(* other WCI-rooted heights, and the r classes 0 (instant), 1, 2 (two      *)
-(* chained honest actions straddle). The Boundary cfg covers margin -1 of  *)
-(* each conjunct with the others at 0 or 1 (by (1)/(2) every lower margin  *)
-(* fails too).                                                             *)
-(*                                                                         *)
-(* CONFIGS -> TIERS (audit/tla/checks.txt):                                *)
-(*  live:     C1, C1LateCommit, C1NoPubin, C2, C2Silenced (shipped values, *)
-(*            all networks, EveryCase - fail iff the bug reproduces on     *)
-(*            every network);                                              *)
-(*  design:   Fixed (sweep over ParamsOK), FixedShipped (shipped values,   *)
-(*            Testnet4/Signet/Regtest, RepairTimelocks);                   *)
-(*  boundary: FixedBoundary (margin -1 sweep, EveryCase - fails iff EVERY  *)
-(*            point fails), FixedShippedBoundary (fix on the as-shipped    *)
-(*            Signet/Regtest timelocks).                                   *)
-(*  live:     ValidateGap (fix design over every tuple the CURRENT         *)
-(*            validate_timelock_config accepts at its minimum for budgets  *)
-(*            reaction 1..2, inclusion/safety/evidence/wtp 0..2, restricted*)
-(*            to ~ParamsOK: the validator admits graphs the fixed protocol *)
-(*            loses; becomes pass once the validator requires ParamsOK).   *)
-(* Mainnet is in the bug cfgs (CoarseTime) but not in FixedShipped: its    *)
-(* full state space at 576-block scale is too large for the CI budget; its *)
-(* margins are 100 / 124 / 249 (all >= 0), covered by the sweep argument.  *)
+(* After a Challenge: can the operator reach Take-2 with an invalid proof  *)
+(*   or without committing its pubin, and does every honest watchtower's   *)
+(*   challenge land? Chain (goat crate @ bab46c2): Take-2 needs ConnectorD *)
+(*   (CSV cd from the Assert) and ConnectorF (CSV cf from WCI). Defenders  *)
+(*   stop it with a NACK_i or Commit-Timeout on F, or a Disprove on D      *)
+(*   after the verifier's ChallengeAssert. The operator alone sends the    *)
+(*   Assert (any time), ACK_i (hashlock, before any challenge),            *)
+(*   Commit-Pubin and WC-Timeout_i.                                        *)
+(* Code: watchtower_flow (node/src/aggregates/graph_scan.rs:573-697),      *)
+(*   verifier_assert (graph_pegout_jobs.rs:736-884), the AssertSent job    *)
+(*   cancel (graph_pegout.rs:608-621).                                     *)
+(* C1: a watchtower that never challenges and is never timed out keeps     *)
+(*   all_resolved false: no NACK for it, no Commit-Timeout, and            *)
+(*   verifier_assert waits for connector-E; an invalid proof reaches       *)
+(*   Take-2. C1LateCommit and C1NoPubin isolate the connector-E gate and   *)
+(*   the all_resolved gate.                                                *)
+(* C2: an Assert before the watchtowers' proofs are ready cancels every    *)
+(*   JOB_WATCHTOWER_CHALLENGE for good and silences every honest           *)
+(*   watchtower.                                                           *)
+(* Fix (design): FixCommitTimeout, FixNackAll, FixUngateAssert,            *)
+(*   FixNoCancel (see CONSTANTS). Each property needs its flag; FixNackAll *)
+(*   is defence in depth.                                                  *)
+(* Parameters (record params): wc, ack, commit, cf = CSVs from WCI; cd     *)
+(*   from the Assert; pc from the ChallengeAssert; wtp = watchtower proof  *)
+(*   blocks; r = honest delay; sl = is_timelock_ready lag (1 as shipped).  *)
+(* ParamsOK (exact; one conjunct per property):                            *)
+(*    wc >= wtp + r + 2           (OnlineWatchtowerChallengeLands)         *)
+(*    cf >= commit + sl + r + 1   (NoTake2WithoutPubin)                    *)
+(*    cd >= 2r + pc + sl + 2      (NoTake2WithInvalidProof)                *)
+(* Shipped values meet ParamsOK on Bitcoin and Testnet4, not on Signet     *)
+(*   (wc) or Regtest (wc, cf, cd). validate_timelock_config                *)
+(*   (crates/bitvm-gc/src/timelocks.rs:173-239) accepts tuples outside it. *)
+(* Exhaustive (Fixed.cfg, every margin 0): wc, cf, cd appear only in       *)
+(*   operator guards, so margin 0 dominates every larger margin; a larger  *)
+(*   r only widens the honest landing window; ack and commit only time     *)
+(*   defender actions; pc and sl enter only as pc + sl; the ranges cover   *)
+(*   every order of cd vs cf and of 1 + wtp vs the WCI-rooted heights.     *)
+(*   FixedBoundary.cfg: margin -1.                                         *)
+(* Time: h is the block being built and nodes see h - 1; an honest action  *)
+(*   due from block s lands in s..s+r (adversary's choice); WCI confirms   *)
+(*   at 0; one honest verifier stands for the 1-of-M set; the operator's   *)
+(*   pubin matches its Assert (a mismatch only adds a Pubin-Disprove).     *)
+(* Configs: configs/node/aggregates/graph/DisputeObligations/, tiers in    *)
+(*   audit/tla/checks.txt.                                                 *)
 (***************************************************************************)
 EXTENDS Integers, FiniteSets, TLC, ShippedTimelockValues
 
@@ -206,10 +55,10 @@ CONSTANTS
 
 \* ---- design switches (all FALSE = the current code)
 CONSTANTS
-    FixCommitTimeout, \* Commit-Timeout at operator_commit whatever the branches
+    FixCommitTimeout, \* Commit-Timeout at operator_commit whatever the watchtower branches
     FixNackAll,       \* NACK every unspent Ack_i after operator_ack
-    FixUngateAssert,  \* challenge an invalid proof without waiting for connector-E
-    FixNoCancel       \* AssertSent no longer stops the watchtower's challenge
+    FixUngateAssert,  \* challenge an invalid proof at once; only "valid, skip" waits for commit-pubin
+    FixNoCancel       \* AssertSent cancels neither the watchtower's challenge job nor its proof
 
 \* ---- parameter source
 CONSTANTS
@@ -227,8 +76,7 @@ CONSTANTS
     RRange,           \* swept honest delay
     ScanLagRange,     \* swept is_timelock_ready lag (1 as shipped, 0 = one block earlier)
     Region,           \* parameter region explored (see InRegion)
-    UseValidator,     \* TRUE: every tuple validate_timelock_config accepts for
-                      \*   a budget from the four ranges below (ValidatorParams)
+    UseValidator,     \* TRUE: the tuples validate_timelock_config accepts (ValidatorParams)
     ReactionRange,    \* swept budget reaction_blocks
     InclusionRange,   \* swept budget inclusion_blocks
     SafetyRange,      \* swept budget safety_blocks
@@ -239,10 +87,8 @@ CONSTANTS
 CONSTANTS
     EveryCase,        \* run the parameter cases one after another (see NextCase)
     BugProp,          \* EveryCase: "invalid" | "nopubin" | "wtlands" | "any"
-    CoarseTime,       \* Tick jumps to the next height where a guard or deadline changes
-                      \*   (restricts the adversary: only for cfgs that must FAIL)
-    AssertAtWCIOnly   \* the Assert only in WCI's block (restricts the adversary:
-                      \*   only for cfgs that must FAIL)
+    CoarseTime,       \* Tick jumps to the next relevant height (restricts the adversary: failing cfgs only)
+    AssertAtWCIOnly   \* the Assert only in WCI's block (restricts the adversary: failing cfgs only)
 
 --------------------------------------------------------------------------
 \* State names.
@@ -272,27 +118,25 @@ Max2(a, b) == IF a >= b THEN a ELSE b
 --------------------------------------------------------------------------
 \* Parameters, margins and regions.
 
-\* Margins of the fix design (ParamsOK = all >= 0; exact, see header).
-\* Watchtower challenge ready at 1 + wtp, lands by 1 + wtp + r, must be in a
-\* block before WC-Timeout can be (wc).
+\* Margins of the fix design (ParamsOK = all >= 0). The watchtower challenge
+\* lands by 1 + wtp + r and must precede the earliest WC-Timeout (wc).
 MarginWt(q)       == q.wc - (q.wtp + q.r + 2)
 \* Commit-Timeout lands by commit + sl + r; Take-2 can be in block cf.
 MarginCommit(q)   == q.cf - (q.commit + q.sl + q.r + 1)
-\* ChallengeAssert by Assert + 1 + r, Disprove by that + pc + sl + r; Take-2
-\* can be in block Assert + cd.
+\* ChallengeAssert by Assert + 1 + r, Disprove by that + pc + sl + r; Take-2 can
+\* be in block Assert + cd.
 MarginDisprove(q) == q.cd - (2 * q.r + q.pc + q.sl + 2)
 ParamsOK(q) == MarginWt(q) >= 0 /\ MarginCommit(q) >= 0 /\ MarginDisprove(q) >= 0
 Margins(q)  == {MarginWt(q), MarginCommit(q), MarginDisprove(q)}
 
-\* That margin exactly -1 (the first failing class), the other two in Others.
+\* That margin exactly -1, the other two in Others.
 BadWt(q, Others)       == MarginWt(q) = -1 /\ {MarginCommit(q), MarginDisprove(q)} \subseteq Others
 BadCommit(q, Others)   == MarginCommit(q) = -1 /\ {MarginWt(q), MarginDisprove(q)} \subseteq Others
 BadDisprove(q, Others) == MarginDisprove(q) = -1 /\ {MarginWt(q), MarginCommit(q)} \subseteq Others
 
-\* "all" every combination; "ok" / "notok" ParamsOK or not; "ok_edge" every
-\* margin 0 or 1; "ok_zero" every margin 0; "boundary" one margin -1, the
-\* others 0; "bad_wt" / "bad_commit" / "bad_disprove" that margin -1, the
-\* others 0 or 1.
+\* Parameter points a config explores: "ok_edge" = every margin 0 or 1, "ok_zero"
+\* = every margin 0, "boundary" = one margin -1 and the others 0, "bad_*" = that
+\* margin -1 and the others 0 or 1.
 InRegion(q) ==
     CASE Region = "all"          -> TRUE
       [] Region = "ok"           -> ParamsOK(q)
@@ -306,15 +150,14 @@ InRegion(q) ==
       [] Region = "bad_commit"   -> BadCommit(q, {0, 1})
       [] Region = "bad_disprove" -> BadDisprove(q, {0, 1})
 
-\* Budget fields (rx reaction, inc inclusion, saf safety, ev evidence) are
-\* only meaningful for UseShipped / UseValidator; 0 for the plain sweep.
+\* Plain sweep. Budget fields (rx reaction, inc inclusion, saf safety, ev
+\* evidence) matter only for UseShipped / UseValidator.
 SweptParams ==
     [net: {"swept"}, wc: WCRange, ack: ACKRange, commit: COMMITRange, cf: CFRange,
      cd: CDRange, pc: PCRange, wtp: WtProofRange, r: RRange, sl: ScanLagRange,
      rx: {0}, inc: {0}, saf: {0}, ev: {0}]
 
-\* "zero" (honest nodes always in the first possible block) is a subset of
-\* the behaviours of any larger r: a counterexample with it is one for every r.
+\* Honest delay r of a shipped network ("zero" is a subset of every larger r).
 DelayOf(n, d) == CASE d = "action_window"      -> ActionWindow[n]
                    [] d = "reaction_inclusion" -> ReactionBlocks[n] + InclusionBlocks[n]
                    [] d = "zero"               -> 0
@@ -327,10 +170,9 @@ AsShipped(n, d) ==
      rx |-> ReactionBlocks[n], inc |-> InclusionBlocks[n], saf |-> SafetyBlocks[n],
      ev |-> EvidenceConfirmations[n]]
 
-\* validate_timelock_config() in crates/bitvm-gc/src/timelocks.rs:173-241 as
-\* shipped, for budget q.rx / q.inc / q.saf / q.ev / q.wtp (connector_a and
-\* connector_z are not in this model). ensure_gap_at_least uses
-\* saturating_sub: right - left >= req, which always holds when req = 0.
+\* validate_timelock_config (crates/bitvm-gc/src/timelocks.rs:173-239) for budget
+\* q.rx / q.inc / q.saf / q.ev / q.wtp, without connector_a and connector_z.
+\* ensure_gap_at_least (saturating_sub) always holds when req = 0.
 ActionWindowOf(q)    == q.rx + q.inc + q.saf
 ConfirmedWindowOf(q) == q.ev + q.inc + q.saf
 GapOK(left, right, req) == req = 0 \/ right >= left + req
@@ -343,12 +185,11 @@ Validated(q) ==
     /\ GapOK(q.pc, q.cd, ActionWindowOf(q))
     /\ GapOK(q.commit, q.cf, ConfirmedWindowOf(q))
 
-\* Least value the validator accepts for `right` after `left` (gap req),
-\* never below reaction_blocks.
+\* Least value the validator accepts after `left` with gap req (>= reaction_blocks).
 MinAfter(left, req, rx) == Max2(rx, IF req = 0 THEN 0 ELSE left + req)
 
-\* Every tuple the validator accepts within SlackRange of its minimum, for
-\* every budget of the ranges; honest delay r = action_window, sl = 1.
+\* Every tuple the validator accepts within SlackRange of its minimum, for every
+\* budget in the ranges; r = action_window, sl = 1.
 ValidatorParams ==
     {q \in
       {LET aw  == rx + inc + saf
@@ -367,7 +208,7 @@ ValidatorParams ==
          s4 \in SlackRange, s5 \in SlackRange, s6 \in SlackRange} :
      Validated(q)}
 
-\* The least change to the shipped timelocks that meets ParamsOK.
+\* Least raise of wc / cf / cd that meets ParamsOK.
 Repair(q) ==
     [q EXCEPT !.wc = Max2(@, q.wtp + q.r + 2),
               !.cf = Max2(@, q.commit + q.sl + q.r + 1),
@@ -380,7 +221,7 @@ ShippedParams ==
 Params == {q \in (IF UseValidator THEN ValidatorParams
                   ELSE IF UseShipped THEN ShippedParams ELSE SweptParams) : InRegion(q)}
 
-\* EveryCase: the cases in lexicographic order (constant, evaluated once).
+\* EveryCase: the parameter cases in a fixed (lexicographic) order.
 NetIdx(n) == CASE n = "swept" -> 0 [] n = "Regtest" -> 1 [] n = "Signet" -> 2
                [] n = "Testnet4" -> 3 [] n = "Bitcoin" -> 4 [] n = "validator" -> 5
 Tup(q) == <<NetIdx(q.net), q.r, q.sl, q.wtp, q.pc, q.commit, q.ack, q.wc, q.cf, q.cd,
@@ -393,8 +234,7 @@ NCases == Cardinality(Params)
 RankOf == [q \in Params |-> Cardinality({o \in Params : LexLT(Tup(o), Tup(q), 1)}) + 1]
 Cases  == [i \in 1 .. NCases |-> CHOOSE q \in Params : RankOf[q] = i]
 
-\* First height explored (an Assert this early already matures connector_d
-\* by cf, header).
+\* First height explored: an Assert this early already matures connector_d by cf.
 Start(q) == -Max2(0, q.cd - q.cf)
 
 --------------------------------------------------------------------------
@@ -436,8 +276,8 @@ WtProof == params.wtp      \* watchtower proof preparation blocks
 R       == params.r        \* honest delay
 ScanLag == params.sl       \* is_timelock_ready lag
 
-\* Last height an Assert is explored at: every WCI-rooted guard and deadline
-\* has passed; a later Assert is a time shift of this one.
+\* Latest Assert height explored: every WCI-rooted guard and deadline has passed,
+\* so a later Assert is a time shift of this one.
 AssertMax == Max2(Max2(Max2(WC, ACK + ScanLag + R), Max2(COMMIT + ScanLag + R, CF)),
                   WtProof + 1 + R) + 1
 MaxH == AssertMax + CD
@@ -447,8 +287,8 @@ Heights == {NONE} \cup (Start(params) .. MaxH)
 ParamFields == {"wc", "ack", "commit", "cf", "cd", "pc", "wtp", "r", "sl",
                 "rx", "inc", "saf", "ev"}
 
-\* (params is typed field by field: membership in the large Params set would
-\* dominate the run time; it never changes within a case, ParamsFrozen.)
+\* params is typed field by field (membership in Params is slow); ParamsFrozen
+\* checks it does not change within a case.
 TypeOk ==
     /\ params.net \in Networks \cup {"swept", "validator"}
     /\ \A fld \in ParamFields : params[fld] \in Nat
@@ -474,26 +314,26 @@ TypeOk ==
 --------------------------------------------------------------------------
 \* Helpers.
 
-\* What an honest node can see / its is_timelock_ready guard.
+\* An honest node sees a tx confirmed at c from block c + 1; is_timelock_ready
+\* (graph_scan.rs:474) holds from block c + n + sl.
 Seen(c)     == c # NONE /\ h >= c + 1
 Ready(c, n) == c # NONE /\ h >= c + n + ScanLag
 
-\* graph_scan.rs:617-670: a branch is resolved iff WC_i was timed out, or it
-\* was challenged and Ack_i is spent (ACK and NACK both spend it).
+\* all_resolved (graph_scan.rs:617-671): each WC_i is timed out, or challenged
+\* with Ack_i spent (by ACK or NACK).
 AllResolved == \A i \in Watchtowers :
                   \/ wc[i] = TimedOut
                   \/ wc[i] = Challenged /\ ack[i] # Unspent
 
-\* verifier_assert's decision to send a ChallengeAssert. Current code
-\* (767-866): only once connector-E is spent and seen; then always after a
-\* Commit-Timeout (pubin_consistent = false), else iff the proof is invalid.
-\* Fix: an invalid proof at once; a valid one only after a Commit-Timeout.
+\* verifier_assert (graph_pegout_jobs.rs:766-866) sends a ChallengeAssert once
+\* connector-E is spent and seen, after a Commit-Timeout or for an invalid proof.
+\* Fix: an invalid proof at once.
 WantsChallenge ==
     IF FixUngateAssert
     THEN ~proofValid \/ E = TimedOut
     ELSE eSeen /\ (~proofValid \/ E = TimedOut)
 
-\* Honest guards (current code; Fix* flags switch to the fix design).
+\* Guards of the honest actions (Fix* flags select the fix design).
 GChal(i)   == /\ i \in online /\ wc[i] = Unspent /\ job[i] = JobLive
               /\ h >= WCI + 1 + WtProof
 GCancel(i) == /\ ~FixNoCancel /\ i \in online /\ job[i] = JobLive /\ Seen(assertH)
@@ -504,7 +344,7 @@ GCT        == /\ E = Unspent /\ F = Unspent /\ Ready(WCI, COMMIT)
 GCA        == /\ D = Unspent /\ vaH = NONE /\ Seen(assertH) /\ WantsChallenge
 GDP        == /\ D = Unspent /\ ~answered /\ Ready(vaH, PC)
 
-\* Start of an obligation after a step: gNext is its guard in the new state.
+\* First block an obligation's guard held, after a step (gNext = guard in the new state).
 Since(gNext, s) == IF gNext THEN (IF s = NONE THEN h' ELSE s) ELSE NONE
 
 \* Recompute every obligation's start after a step.
@@ -519,8 +359,8 @@ UpdateSince ==
 Overdue(s)    == s # NONE /\ h >= s + R
 OverdueNow(s) == s # NONE /\ h >= s
 
-\* CoarseTime: the next height at which some guard or deadline can change.
-\* While an obligation is pending, time still moves one block at a time.
+\* CoarseTime: the next height at which a guard or deadline can change; one block
+\* at a time while an obligation is pending.
 Pending == \E s \in {sinceCT, sinceCA, sinceDP} \cup
                    {sinceChal[i] : i \in Watchtowers} \cup
                    {sinceNack[i] : i \in Watchtowers} : s # NONE
@@ -552,7 +392,7 @@ BugHolds ==
       [] BugProp = "any"     -> InvalidProofTake2 \/ UnboundTake2 \/ SilencedWatchtower
 LastCase == ~EveryCase \/ casesDone + 1 = NCases
 
-\* The per-case state every run of the protocol starts from (unprimed).
+\* Initial protocol state of a case.
 CaseInit(q) ==
     /\ h = Start(q)
     /\ proofValid \in ProofValidity
@@ -577,12 +417,8 @@ Init ==
 --------------------------------------------------------------------------
 \* Actions: environment.
 
-\* Action: a block is mined; nodes see the previous one. Disabled while an
-\*   honest obligation is at its deadline (the adversary picks the landing
-\*   block inside the window, never past it) and once Take-2 is impossible
-\*   and the watchtower window is over (nothing left to check).
-\* Source: Bitcoin consensus; honest delay = protocol_timing_budget() in
-\*   crates/bitvm-gc/src/timelocks.rs:142 (reaction + inclusion + safety).
+\* Action: a block is mined; disabled while an honest obligation is at its deadline, and once Take-2 is impossible and the watchtower window is over.
+\* Source: Bitcoin consensus; r = protocol_timing_budget() in crates/bitvm-gc/src/timelocks.rs:142
 Tick ==
     /\ h < MaxH
     /\ ~(Settled /\ h >= WCI + WC)
@@ -595,10 +431,8 @@ Tick ==
                    answered, job>>
     /\ UpdateSince
 
-\* Action: EveryCase only - once the outcome BugProp names holds for the
-\*   current case, start over with the next case (fixed order), so
-\*   ReproducesOnEveryCase fails iff it holds for EVERY case.
-\* Source: environment (model-checking harness, no code).
+\* Action: EveryCase only: once BugHolds, start the next parameter case, so ReproducesOnEveryCase fails iff every case reproduces.
+\* Source: environment (model-checking harness)
 NextCase ==
     /\ EveryCase /\ BugHolds /\ ~LastCase
     /\ casesDone' = casesDone + 1
@@ -619,13 +453,11 @@ NextCase ==
     /\ sinceCT' = NONE /\ sinceCA' = NONE /\ sinceDP' = NONE
 
 --------------------------------------------------------------------------
-\* Actions: operator (adversary) - any transaction the scripts allow, at any
-\* time. Outputs of WCI (Ack_i, E, F, WC_i) exist from block WCI on.
+\* Actions: operator (adversary), any transaction the scripts allow. The outputs
+\* of WCI (Ack_i, E, F, WC_i) exist from block WCI on.
 
-\* Action: the operator's Assert confirms (any block, even WCI's or before).
-\* Source: environment; ConnectorC leaf1 (goat connectors/connector_c.rs:45,
-\*   WOTS only, no CSV); honest path prover_assert() in
-\*   node/src/aggregates/graph_pegout_jobs.rs:1237.
+\* Action: the operator's Assert confirms, at any height up to AssertMax (even before WCI).
+\* Source: environment; goat connectors/connector_c.rs:45 (leaf 1: WOTS only, no CSV)
 OpAssert ==
     /\ assertH = NONE /\ h <= AssertMax
     /\ AssertAtWCIOnly => h = WCI
@@ -634,10 +466,8 @@ OpAssert ==
                    answered, job>>
     /\ UpdateSince
 
-\* Action: Operator-Challenge-ACK_i spends Ack_i through its hashlock leaf -
-\*   possible before (or without) any challenge.
-\* Source: environment; Ack_i leaf1 (goat watchtower_connectors.rs:128);
-\*   honest path challenge_ack() in graph_pegout_jobs.rs:1065.
+\* Action: the operator's ACK_i spends Ack_i through its hashlock leaf, possible before any challenge.
+\* Source: environment; goat connectors/watchtower_connectors.rs:128 (leaf 1: hashlock, no signature or CSV)
 OpAck(i) ==
     /\ h >= WCI /\ ack[i] = Unspent
     /\ ack' = [ack EXCEPT ![i] = Acked]
@@ -645,10 +475,8 @@ OpAck(i) ==
                    vaH, answered, job>>
     /\ UpdateSince
 
-\* Action: Watchtower-Challenge-Timeout_i (operator key + CSV
-\*   watchtower_challenge) spends WC_i and Ack_i.
-\* Source: environment; goat watchtower_challenge.rs:359-393; honest path
-\*   watchtower_timeout() in graph_pegout_jobs.rs:1127.
+\* Action: the operator's WC-Timeout_i (operator key + CSV wc) spends WC_i and Ack_i.
+\* Source: environment; goat transactions/watchtower_challenge.rs:359-393
 OpWCTimeout(i) ==
     /\ wc[i] = Unspent /\ ack[i] = Unspent
     /\ h >= WCI + WC
@@ -658,9 +486,8 @@ OpWCTimeout(i) ==
                    answered, job>>
     /\ UpdateSince
 
-\* Action: Operator-Commit-Pubin spends connector E (WOTS only, any time).
-\* Source: environment; E leaf0 (goat connector_e.rs:48); honest path
-\*   commit_pubin() in graph_pegout_jobs.rs:1177.
+\* Action: the operator's Commit-Pubin spends connector E (WOTS only, any time).
+\* Source: environment; goat connectors/connector_e.rs:48
 OpCommitPubin ==
     /\ h >= WCI /\ E = Unspent
     /\ E' = PubinCommitted
@@ -668,9 +495,8 @@ OpCommitPubin ==
                    vaH, answered, job>>
     /\ UpdateSince
 
-\* Action: Wrongly-Challenged answers a ChallengeAssert; needs a valid proof.
-\* Source: environment; ProverConnector leaf0 (goat assert.rs:599-626);
-\*   honest path wrongly_challenged() in graph_pegout_jobs.rs:1327.
+\* Action: the operator answers the ChallengeAssert with Wrongly-Challenged; needs a valid proof.
+\* Source: environment; goat transactions/assert.rs:599-626
 OpWronglyChallenged ==
     /\ proofValid /\ vaH # NONE /\ ~answered /\ D # Disproved
     /\ answered' = TRUE
@@ -678,10 +504,8 @@ OpWronglyChallenged ==
                    D, vaH, job>>
     /\ UpdateSince
 
-\* Action: Take-2 spends D leaf0 (CSV connector_d after the Assert) AND
-\*   F leaf0 (CSV connector_f after WCI): the operator is reimbursed.
-\* Source: environment; goat take2.rs:56-90; honest path take2() in
-\*   graph_pegout_jobs.rs:1500 (take2_ready() graph_scan.rs:792).
+\* Action: Take-2 spends D (CSV cd after the Assert) and F (CSV cf after WCI): the operator is paid.
+\* Source: environment; goat transactions/take2.rs:56-90
 OpTake2 ==
     /\ D = Unspent /\ F = Unspent /\ assertH # NONE
     /\ h >= assertH + CD /\ h >= WCI + CF /\ h >= WCI
@@ -691,13 +515,10 @@ OpTake2 ==
     /\ UpdateSince
 
 --------------------------------------------------------------------------
-\* Actions: honest nodes - exactly what the code does (Fix* = fix design).
+\* Actions: honest nodes, as the code does them (Fix* = fix design).
 
-\* Action: an online watchtower whose proof commitment is ready broadcasts
-\*   its Watchtower-Challenge (WC_i leaf0, no CSV), unless its job was
-\*   cancelled.
-\* Source: watchtower_challenge() in node/src/aggregates/graph_pegout_jobs.rs:1548-1589
-\*   (job from WatchtowerChallengeInitSent, graph_pegout.rs:266).
+\* Action: an online watchtower with its proof ready sends its Watchtower-Challenge (WC_i leaf 0, no CSV), unless its job was cancelled.
+\* Source: node/src/aggregates/graph_pegout_jobs.rs:1548-1588 (watchtower_challenge); job from graph_pegout.rs:266
 WtChallenge(i) ==
     /\ GChal(i)
     /\ wc' = [wc EXCEPT ![i] = Challenged]
@@ -705,10 +526,8 @@ WtChallenge(i) ==
                    vaH, answered, job>>
     /\ UpdateSince
 
-\* Action: the first scan that sees the Assert cancels the watchtower's
-\*   JOB_WATCHTOWER_CHALLENGE for good (C2; FixNoCancel removes it).
-\* Source: apply_chain_scan() in node/src/aggregates/graph_pegout.rs:606-622;
-\*   commit order in crates/engine/src/worker.rs:313-365.
+\* Action: the first scan that sees the Assert cancels the watchtower's JOB_WATCHTOWER_CHALLENGE for good (C2).
+\* Source: node/src/aggregates/graph_pegout.rs:608-621; crates/engine/src/worker.rs:313-365 (inserts, then cancels)
 WtJobCancelled(i) ==
     /\ GCancel(i)
     /\ job' = [job EXCEPT ![i] = JobCancelled]
@@ -716,11 +535,8 @@ WtJobCancelled(i) ==
                    D, vaH, answered>>
     /\ UpdateSince
 
-\* Action: a verifier broadcasts the pre-signed Operator-Challenge-NACK_i
-\*   (Ack_i leaf2 + F leaf1), burning connector F. Current code: only for a
-\*   watchtower that challenged (FixNackAll: every unspent Ack_i).
-\* Source: challenge_nack() in graph_pegout_jobs.rs:654-709; NackReady in
-\*   watchtower_flow() node/src/aggregates/graph_scan.rs:642-657.
+\* Action: a verifier sends the pre-signed NACK_i (Ack_i leaf 2 + F leaf 1); current code only for a watchtower that challenged.
+\* Source: node/src/aggregates/graph_pegout_jobs.rs:654-709 (challenge_nack); graph_scan.rs:642-657 (NackReady)
 Nack(i) ==
     /\ GNack(i)
     /\ ack' = [ack EXCEPT ![i] = Nacked]
@@ -729,11 +545,8 @@ Nack(i) ==
                    answered, job>>
     /\ UpdateSince
 
-\* Action: a verifier broadcasts the pre-signed Operator-Commit-Timeout
-\*   (E leaf1 + F leaf1), burning connector F. Current code: only once every
-\*   branch is resolved (FixCommitTimeout: always).
-\* Source: commit_timeout() in graph_pegout_jobs.rs:712-733;
-\*   OperatorCommitPubinTimeout in watchtower_flow() graph_scan.rs:679-687.
+\* Action: a verifier sends the pre-signed Commit-Timeout (E leaf 1 + F leaf 1); current code only once all_resolved.
+\* Source: node/src/aggregates/graph_pegout_jobs.rs:712-732 (commit_timeout); graph_scan.rs:679-687
 CommitTimeout ==
     /\ GCT
     /\ E' = TimedOut /\ F' = TimedOut
@@ -741,11 +554,8 @@ CommitTimeout ==
                    vaH, answered, job>>
     /\ UpdateSince
 
-\* Action: the honest verifier's ChallengeAssert confirms. Current code:
-\*   only after connector-E is spent and seen (FixUngateAssert: an invalid
-\*   proof at once).
-\* Source: verifier_assert() in graph_pegout_jobs.rs:736-884 (gate 767-779,
-\*   proof check 861).
+\* Action: the verifier's ChallengeAssert confirms; current code only after connector-E is spent and seen.
+\* Source: node/src/aggregates/graph_pegout_jobs.rs:736-884 (verifier_assert; gate 766-779, proof check 861)
 ChallengeAssert ==
     /\ GCA
     /\ vaH' = h
@@ -753,10 +563,8 @@ ChallengeAssert ==
                    D, answered, job>>
     /\ UpdateSince
 
-\* Action: a verifier's Disprove (D leaf1 + ProverConnector leaf1) confirms
-\*   once prover_connector has passed unanswered: Take-2 is stopped.
-\* Source: disprove() in graph_pegout_jobs.rs:983-1023;
-\*   wrongly_challenge_timeout() in graph_scan.rs:742-790.
+\* Action: a verifier's Disprove (D leaf 1 + ProverConnector leaf 1) confirms after an unanswered prover_connector CSV.
+\* Source: node/src/aggregates/graph_pegout_jobs.rs:983-1023 (disprove); graph_scan.rs:742-788 (wrongly_challenge_timeout)
 Disprove ==
     /\ GDP
     /\ D' = Disproved
@@ -781,8 +589,7 @@ Next ==
     \/ ChallengeAssert
     \/ Disprove
 
-\* No fairness: every property is safety. Honest progress is forced by the
-\* obligation deadlines (Tick is disabled while one is overdue), not by WF.
+\* No fairness: every property is safety; Tick waits for overdue honest obligations.
 Spec == Init /\ [][Next]_vars
 
 WatchtowerSymmetry == Permutations(Watchtowers)
@@ -790,28 +597,22 @@ WatchtowerSymmetry == Permutations(Watchtowers)
 --------------------------------------------------------------------------
 \* Safety invariants.
 
-\* Every state is well typed.
-\* (TypeOk above.)
-
 \* With an honest online verifier, an invalid proof never reaches Take-2.
 NoTake2WithInvalidProof == ~InvalidProofTake2
 
-\* Take-2 only after the operator committed its pubin (the commitment that
-\* binds the proof to the watchtowers' evidence).
+\* Take-2 only after the operator committed its pubin.
 NoTake2WithoutPubin == ~UnboundTake2
 
-\* Every honest online watchtower's challenge lands before the operator may
-\* time it out.
+\* Every honest online watchtower's challenge lands before WC-Timeout is possible.
 OnlineWatchtowerChallengeLands == ~SilencedWatchtower
 
-\* EveryCase cfgs: violated iff BugHolds is reached on EVERY case, i.e. the
-\* finding reproduces for every network / parameter point of Params.
+\* EveryCase cfgs: violated iff BugHolds is reached on every case of Params.
 ReproducesOnEveryCase == ~(BugHolds /\ LastCase)
 
 --------------------------------------------------------------------------
 \* Safety properties.
 
-\* The parameters stay frozen within a case.
+\* The parameters do not change within a case.
 ParamsFrozen == [][params' = params \/ casesDone' # casesDone]_vars
 
 --------------------------------------------------------------------------

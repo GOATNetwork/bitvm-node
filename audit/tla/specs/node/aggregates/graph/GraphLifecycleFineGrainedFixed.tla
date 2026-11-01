@@ -1,33 +1,26 @@
 ---- MODULE GraphLifecycleFineGrainedFixed ----
 (***************************************************************************)
-(* Finding 1b (fixed in 991faaa): a guard checked by one statement and a   *)
-(* write by a later one (SELECT, then UPDATE) leaves a gap in which another *)
-(* writer's statement lands, even with correct guard logic on both sides.   *)
-(* The fix moved the guard into the UPDATE itself.                          *)
-(*                                                                         *)
-(* Code scope (dev after #476): StorageProcessor::transition_graph_status, *)
-(* crates/store/src/localdb/graph.rs:450-529, statement by statement:      *)
-(*   1. UPDATE graph SET status = target [, sub_status] ... WHERE status IN *)
-(*      allowed_transition_from(target, source)            -> Applied      *)
-(*   2. if no row changed: read the row to tell AlreadyCurrent (status =    *)
-(*      target) from Rejected; this read never authorizes a write           *)
-(*   3. AlreadyCurrent with a sub_status: UPDATE graph SET sub_status ...    *)
-(*      WHERE status = target                                               *)
-(*   4. if that changed no row: read the row again to report the outcome.   *)
-(* Each statement is one atomic step here; two writers, one per source that *)
-(* races in production, interleave between any two statements:            *)
-(*   ChainReconcile - apply_chain_scan / refresh_graph / obsolete_graph,     *)
-(*                    always with a sub_status here (the chain scan's       *)
-(*                    ChallengeSubStatus), node/src/aggregates/             *)
-(*                    graph_pegout.rs:572, node/src/utils/graph_store.rs:626 *)
-(*   GoatEvent      - apply_gateway_graph_status, no sub_status,            *)
-(*                    node/src/scheduled_tasks/event_watch/gateway.rs:305   *)
-(* Each writer picks any target its source can write, at any time: stale   *)
-(* and replayed events included, so the check covers every interleaving    *)
-(* the guard must survive, independent of the chain facts that              *)
-(* GraphLifecycle.tla models.                                               *)
-(*                                                                         *)
-(* Config (audit/tla/checks.txt): GraphLifecycleFineGrainedFixed/Fixed.cfg - pass. *)
+(* transition_graph_status (crates/store/src/localdb/graph.rs:450-529),    *)
+(*   one SQL statement per step:                                           *)
+(*    1. UPDATE status [, sub_status] WHERE status IN                      *)
+(*       allowed_transition_from -> Applied (462-494; an empty allowed set *)
+(*       writes nothing and is left out);                                  *)
+(*    2. no row changed: read the row, AlreadyCurrent or Rejected          *)
+(*       (500-507);                                                        *)
+(*    3. AlreadyCurrent with a sub_status: UPDATE sub_status WHERE status  *)
+(*       = target (509-523);                                               *)
+(*    4. that changed no row: read the row again (528).                    *)
+(* Two writers interleave between any two statements: ChainReconcile,      *)
+(*   always with a sub_status (node/src/aggregates/graph_pegout.rs:572),   *)
+(*   and GoatEvent, without                                                *)
+(*   (node/src/scheduled_tasks/event_watch/gateway.rs:312).                *)
+(* Finding 1b: a guard read by one statement and a write by a later one    *)
+(*   leave a gap in which another writer lands. Checked: the guard is part *)
+(*   of the UPDATE and the sub_status write is status-guarded.             *)
+(* Each writer picks any target its source can write, at any time, so      *)
+(*   stale and replayed events are covered without modelling the chains.   *)
+(* Configs: configs/node/aggregates/graph/GraphLifecycleFineGrainedFixed/, *)
+(*   tiers in audit/tla/checks.txt.                                        *)
 (***************************************************************************)
 EXTENDS GraphTopology
 
@@ -36,13 +29,13 @@ WriterChainReconcile == "ChainReconcile"
 WriterGoatEvent      == "GoatEvent"
 Writers == {WriterChainReconcile, WriterGoatEvent}
 
-\* The evidence source each writer passes to transition_graph_status.
+\* The source each writer passes to transition_graph_status.
 SourceOf(w) == IF w = WriterChainReconcile THEN SourceChainReconcile ELSE SourceGoatEvent
 
-\* Whether the writer passes a sub_status.
+\* The writer passes a sub_status.
 HasSubStatus(w) == w = WriterChainReconcile
 
-\* Program counter of one transition_graph_status call.
+\* Next statement of a transition_graph_status call.
 PcIdle            == "Idle"             \* between calls; statement 1 is next
 PcReadOutcome     == "ReadOutcome"      \* statement 2
 PcUpdateSubStatus == "UpdateSubStatus"  \* statement 3
@@ -75,13 +68,8 @@ Init ==
 --------------------------------------------------------------------------
 (* Actions *)
 
-\* Action: statement 1, the conditional UPDATE. Writes the target (and the
-\* sub_status) iff the current status is in the allowed set; the call then
-\* returns Applied. Otherwise no row changes and the call goes on to read the
-\* outcome. A target with an empty allowed set (ChainReconcile observing
-\* OperatorPresigned) only reads the outcome and writes nothing, so it is a
-\* stuttering step and is left out.
-\* Source: transition_graph_status() in crates/store/src/localdb/graph.rs:462-495
+\* Action: statement 1, writes target (and sub_status) iff the status is in the allowed set; else goes on to read the outcome.
+\* Source: crates/store/src/localdb/graph.rs:462-494
 ConditionalUpdate(w) ==
     /\ pc[w] = PcIdle
     /\ \E t \in TargetsOf(SourceOf(w)) :
@@ -93,10 +81,8 @@ ConditionalUpdate(w) ==
                 /\ target' = [target EXCEPT ![w] = t]
                 /\ UNCHANGED <<status, subFor>>
 
-\* Action: statement 2, the outcome read. Rejected, or AlreadyCurrent without
-\* a sub_status, ends the call; AlreadyCurrent with a sub_status goes on to
-\* the guarded sub_status update. Writes nothing.
-\* Source: transition_graph_status() in crates/store/src/localdb/graph.rs:496-508
+\* Action: statement 2, reads the row; ends the call unless AlreadyCurrent with a sub_status. Writes nothing.
+\* Source: crates/store/src/localdb/graph.rs:500-507
 ReadOutcome(w) ==
     /\ pc[w] = PcReadOutcome
     /\ IF status = target[w] /\ HasSubStatus(w)
@@ -106,10 +92,8 @@ ReadOutcome(w) ==
               /\ target' = [target EXCEPT ![w] = None]
     /\ UNCHANGED <<status, subFor>>
 
-\* Action: statement 3, UPDATE graph SET sub_status ... WHERE status = target.
-\* If another writer moved the row since statement 2, no row changes and the
-\* call re-reads the outcome.
-\* Source: transition_graph_status() in crates/store/src/localdb/graph.rs:510-524
+\* Action: statement 3, writes sub_status iff the status is still the target; else goes on to re-read.
+\* Source: crates/store/src/localdb/graph.rs:509-523
 UpdateSubStatus(w) ==
     /\ pc[w] = PcUpdateSubStatus
     /\ IF status = target[w]
@@ -120,9 +104,8 @@ UpdateSubStatus(w) ==
               /\ UNCHANGED <<subFor, target>>
     /\ UNCHANGED status
 
-\* Action: statement 4, the final outcome read after a lost sub_status race.
-\* Writes nothing.
-\* Source: transition_graph_status() in crates/store/src/localdb/graph.rs:525-528
+\* Action: statement 4, re-reads the row after a lost sub_status race. Writes nothing.
+\* Source: crates/store/src/localdb/graph.rs:528
 ReReadOutcome(w) ==
     /\ pc[w] = PcReReadOutcome
     /\ pc' = [pc EXCEPT ![w] = PcIdle]
@@ -142,27 +125,25 @@ Spec == Init /\ [][Next]_vars
 --------------------------------------------------------------------------
 (* Safety invariants *)
 
-\* (none beyond TypeOk)
+\* None beyond TypeOk.
 
 --------------------------------------------------------------------------
 (* Safety properties *)
 
-\* A closed status is never left, whatever the interleaving of statements.
+\* A closed status is never left, under any interleaving of statements.
 TerminalStatusesAreAbsorbing == [][(status \in TerminalStatuses => status' = status)]_status
 
-\* The two payout paths are never both recorded for one graph.
+\* Take-1 and Take-2 are never both recorded for one graph.
 NoConflictingWithdrawal ==
     /\ [][(status = OperatorTake1 => status' # OperatorTake2)]_status
     /\ [][(status = OperatorTake2 => status' # OperatorTake1)]_status
 
-\* A sub_status is only ever written onto the status it describes: the
-\* second UPDATE's `WHERE status = target` closes the read/write gap after
-\* statement 2.
+\* A sub_status is only written onto the status it describes.
 SubStatusWrittenWithItsStatus == [][(subFor' # subFor => subFor' = status')]_vars
 
 --------------------------------------------------------------------------
 (* Liveness *)
 
-\* (none)
+\* None.
 
 ====

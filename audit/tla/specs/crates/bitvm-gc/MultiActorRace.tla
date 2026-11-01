@@ -1,94 +1,50 @@
 ---- MODULE MultiActorRace ----
 (***************************************************************************)
-(* Purpose: Take2DisproveRace.tla treats "the watchtower" and "the         *)
-(* verifier" as single actors. The protocol has N watchtowers and M        *)
-(* verifiers, and any ONE honest actor must suffice. This module checks    *)
-(* N = M = 2 on the timing axis: can independent actors' timing open a gap *)
-(* the single-actor abstraction cannot see? Findings 5/10. Init-only       *)
-(* arithmetic over the shipped per-network timelocks (ShippedTimelocks).   *)
-(*                                                                         *)
-(* Code scope (current tree):                                              *)
-(*   goat crate bab46c2 (Cargo.lock), goat/src:                            *)
-(*     transactions/watchtower_challenge.rs:209-222  every watchtower's    *)
-(*       WatchtowerChallengeConnector[i] / AckConnector[i] pair is an      *)
-(*       output of the ONE WatchtowerChallengeInit, as are ConnectorE      *)
-(*       (:228-231) and ConnectorF (:234-237): all watchtower clocks start *)
-(*       at the same height.                                               *)
-(*     connectors/watchtower_connectors.rs:40-59  challenge leaf 0         *)
-(*       (watchtower key, no CSV); timeout leaf 1 = operator +             *)
-(*       CSV(watchtower_challenge).                                        *)
-(*     connectors/watchtower_connectors.rs:156-163  AckConnector leaf 2 =  *)
-(*       n-of-n + CSV(operator_ack), spent by OperatorChallengeNack        *)
-(*       together with ConnectorF leaf 1 (watchtower_challenge.rs:550-554).*)
-(*     connectors/connector_e.rs:56-65  ConnectorE leaf 1 = n-of-n +       *)
-(*       CSV(operator_commit), spent by OperatorCommitTimeout together     *)
-(*       with ConnectorF leaf 1 (watchtower_challenge.rs:721-725).         *)
-(*     connectors/connector_f.rs:38-55  leaf 0 = operator +                *)
-(*       CSV(connector_f) (Take2), leaf 1 = n-of-n, no CSV (NACK /         *)
-(*       CommitTimeout): first confirmed spend wins the output.            *)
-(*     Verifier side: VerifierAssert[i] confirms at verifier i's own pace  *)
-(*       and roots ProverConnector[i] (assert.rs:210-245); Disprove[i]     *)
-(*       spends it with ConnectorD leaf 1 (assert.rs:316-327). The one     *)
-(*       place where M independent clocks exist.                           *)
-(*   node:                                                                 *)
-(*     node/src/aggregates/graph_scan.rs:573-700 watchtower_flow: NACK is  *)
-(*       ready per watchtower slot (:648-656, :677), CommitTimeout at       *)
-(*       wci + operator_commit (:681-686).                                 *)
-(*     node/src/utils/graph_chain_state.rs:195-220                         *)
-(*       detect_watchtower_flow_disprove: the FIRST confirmed NACK settles *)
-(*       the graph as disproved, no counting or quorum (true 1-of-N).      *)
-(*     node/src/aggregates/graph_scan.rs:742-790 (Disprove), :792-843      *)
-(*       (Take2 readiness, both clocks).                                   *)
-(*   crates/bitvm-gc/src/timelocks.rs:173-239 validate_timelock_config.    *)
-(*     Comparisons it enforces on these races:                             *)
-(*       :186      every value >= reaction_blocks                          *)
-(*       :203-207  watchtower_challenge >= action_window + proof_blocks    *)
-(*       :208-214  operator_ack - watchtower_challenge >= action_window    *)
-(*       :215-221  operator_commit - max(watchtower_challenge,             *)
-(*                 operator_ack) >= confirmed_action_window                *)
-(*       :222      prover_connector >= action_window                       *)
-(*       :223-229  connector_d - prover_connector >= action_window         *)
-(*       :230-236  connector_f - operator_commit >= confirmed_action_window*)
-(*     (action_window = reaction + inclusion + safety, :91-95;             *)
-(*      confirmed_action_window = evidence + inclusion + safety, :103-107).*)
-(*   What the validator implies for EVERY config it accepts, vs. what      *)
-(*   holds only because the shipped values have slack:                     *)
-(*     WatchtowerAckWindowAlwaysPositive, OperatorAckWindowMeetsActionWindow*)
-(*       - implied (:208-214, action_window >= 1 on every network).        *)
-(*     NackAlwaysBeatsTake2ViaF, CommitTimeoutAlwaysBeatsTake2ViaF -       *)
-(*       implied only where confirmed_action_window > 0 (then              *)
-(*       connector_f - operator_ack >= 2 * confirmed_action_window). On    *)
-(*       Regtest it is 0 and ensure_gap_at_least uses saturating_sub       *)
-(*       (:252-266), so the validator puts NO order between operator_ack,  *)
-(*       operator_commit and connector_f there.                            *)
-(*     DisproveAlwaysBeatsTake2ViaD - NOT implied: at the :223-229 floor a *)
-(*       verifier one action window late only ties Take2 (reproduced by    *)
-(*       Take2DisproveRace/Validated.cfg).                                  *)
-(*   Every shipped config passes all of them.                              *)
-(*                                                                         *)
-(* Config / tier: MultiActorRace/Shipped.cfg (pass), shipped values; the validator *)
-(* floors on the shipped configs are an ASSUME (constant-level).          *)
+(* 1-of-N timing margins with two watchtowers and two verifiers acting     *)
+(* independently (Findings 5, 10). Init-only arithmetic over the shipped   *)
+(* values. Take2DisproveRace.tla is the single-actor view.                 *)
+(* Code (goat bab46c2, goat/src): the one WatchtowerChallengeInit creates  *)
+(*   every watchtower's challenge/Ack connector pair, ConnectorE and       *)
+(*   ConnectorF (transactions/watchtower_challenge.rs:209-237), so all     *)
+(*   watchtower clocks share one root. A watchtower challenges via leaf 0  *)
+(*   before leaf 1's CSV(watchtower_challenge)                             *)
+(*   (watchtower_connectors.rs:40-59). NACK = AckConnector leaf 2,         *)
+(*   CSV(operator_ack), + ConnectorF leaf 1                                *)
+(*   (watchtower_connectors.rs:156-163, watchtower_challenge.rs:550-554);  *)
+(*   CommitTimeout = ConnectorE leaf 1, CSV(operator_commit), + ConnectorF *)
+(*   leaf 1 (connector_e.rs:56-65, watchtower_challenge.rs:721-725); Take2 *)
+(*   = ConnectorF leaf 0, CSV(connector_f) (connector_f.rs:38-47). Each    *)
+(*   VerifierAssert[i] roots its own ProverConnector[i]                    *)
+(*   (assert.rs:210-245). Node: watchtower_flow                            *)
+(*   (node/src/aggregates/graph_scan.rs:573-697); the first confirmed NACK *)
+(*   disproves the graph (node/src/utils/graph_chain_state.rs:195-220).    *)
+(* Findings: all margins hold on the shipped values.                       *)
+(*   validate_timelock_config (timelocks.rs:173-239) implies the two       *)
+(*   Ack-window properties for any config, the two "beats Take2 via F"     *)
+(*   properties only where confirmed_action_window > 0 (not Regtest), and  *)
+(*   not DisproveAlwaysBeatsTake2ViaD (Take2DisproveRace/Validated.cfg).   *)
+(* Parameters: each watchtower's challenge height (0..watchtower_challenge *)
+(*   or never), each verifier's assert delay (0..action_window or never).  *)
+(* Exhaustive: every height in each window, independently per actor.       *)
+(* Configs: configs/crates/bitvm-gc/MultiActorRace/, tiers in              *)
+(*   audit/tla/checks.txt.                                                 *)
 (***************************************************************************)
 EXTENDS Integers, ShippedTimelocks
 
 \* A watchtower that never challenges / a verifier that never asserts.
 NEVER == -1
 
-\* confirmed_action_window() and watchtower_proof_window() of
-\* timelocks.rs:97-107 (ShippedTimelockValues carries the components).
+\* confirmed_action_window() and watchtower_proof_window(), timelocks.rs:97-107.
 ConfirmedActionWindow == [n \in Networks |->
     EvidenceConfirmations[n] + InclusionBlocks[n] + SafetyBlocks[n]]
 WatchtowerProofWindow == [n \in Networks |-> ActionWindow[n] + WatchtowerProofBlocks[n]]
 
 Max(a, b) == IF a >= b THEN a ELSE b
 
-\* ensure_gap_at_least(left, right, required) of timelocks.rs:252-266: the
-\* gap is right.saturating_sub(left), so a required gap of 0 accepts any order.
+\* ensure_gap_at_least (timelocks.rs:252-266): a required gap of 0 accepts any order.
 GapAtLeast(left, right, required) == Max(right - left, 0) >= required
 
-\* Assumption: each shipped config passes every validator comparison on these races
-\* (timelocks.rs:186,203-236). Constant-level, so checked once as an ASSUME
-\* instead of on each of the ~8.5M states.
+\* validate_timelock_config's checks on these races (timelocks.rs:186, :203-236).
 MeetsValidatorFloors(n) ==
     /\ \A v \in {ProverConnector[n], ConnectorD[n], WatchtowerChallenge[n],
                  OperatorAck[n], OperatorCommit[n], ConnectorF[n]} :
@@ -101,6 +57,7 @@ MeetsValidatorFloors(n) ==
     /\ GapAtLeast(ProverConnector[n], ConnectorD[n], ActionWindow[n])
     /\ GapAtLeast(OperatorCommit[n], ConnectorF[n], ConfirmedActionWindow[n])
 
+\* Every shipped config passes them (constant-level, checked once).
 ASSUME ShippedConfigsMeetValidatorFloors == \A n \in Networks : MeetsValidatorFloors(n)
 
 VARIABLES
@@ -115,8 +72,7 @@ vars == <<net, wtChallengeHeight1, wtChallengeHeight2, verifierDelta1, verifierD
 WatchtowerHeights(n) == {NEVER} \cup 0..WatchtowerChallenge[n]
 VerifierDeltas(n)    == {NEVER} \cup 0..MinReactionBlocks[n]
 
-\* Written as disjunctions: x \in {NEVER} \cup 0..k would make TLC build the
-\* union set on every state.
+\* Disjunctions, so TLC does not build {NEVER} \cup 0..k on every state.
 TypeOk ==
     /\ net \in Networks
     /\ wtChallengeHeight1 = NEVER \/ wtChallengeHeight1 \in 0..WatchtowerChallenge[net]
@@ -124,13 +80,9 @@ TypeOk ==
     /\ verifierDelta1 = NEVER \/ verifierDelta1 \in 0..MinReactionBlocks[net]
     /\ verifierDelta2 = NEVER \/ verifierDelta2 \in 0..MinReactionBlocks[net]
 
-\* Action: the only "step": pick a network and, independently for each of two
-\* watchtowers, a challenge height inside its window (or no challenge), and
-\* for each of two verifiers an assert delay within one action window (or no
-\* assert). WatchtowerChallengeInit and OperatorAssert are each at height 0
-\* of their own clock.
-\* Source: environment (actor timing); windows from default_timelock_config()
-\*   in crates/bitvm-gc/src/timelocks.rs:54-61 via ShippedTimelockValues.tla.
+\* Action: pick a network, each watchtower's challenge height and each
+\* verifier's assert delay (or none); WCI and OperatorAssert are each at 0.
+\* Source: environment (actor timing); windows from crates/bitvm-gc/src/timelocks.rs:54-61.
 Init ==
     /\ net \in Networks
     /\ wtChallengeHeight1 \in WatchtowerHeights(net)
@@ -138,7 +90,7 @@ Init ==
     /\ verifierDelta1 \in VerifierDeltas(net)
     /\ verifierDelta2 \in VerifierDeltas(net)
 
-\* No transitions: an exhaustive check over Init, not a process model.
+\* No steps: TLC checks the invariants on every initial state.
 Next == FALSE
 
 Spec == Init /\ [][Next]_vars
@@ -149,37 +101,31 @@ NackDeadline                == OperatorAck[net]       \* AckConnector leaf 2 CSV
 CommitTimeoutDeadline       == OperatorCommit[net]    \* ConnectorE leaf 1 CSV, same clock root
 Take2ReadyHeightViaF        == ConnectorF[net]        \* ConnectorF leaf 0 CSV, same clock root
 OperatorAckWindow(h)        == NackDeadline - h       \* blocks the operator has to get its Ack in
-DisproveDeadline(d)         == d + ProverConnector[net]
-Take2ReadyHeightViaD        == ConnectorD[net]
+DisproveDeadline(d)         == d + ProverConnector[net]  \* ProverConnector leaf 1 CSV, own clock
+Take2ReadyHeightViaD        == ConnectorD[net]        \* ConnectorD leaf 0 CSV
 
 --------------------------------------------------------------------------
 (* Safety invariants                                                       *)
 
-\* Whenever each watchtower challenges (even in the last block of its
-\* window), the operator still has a positive number of blocks to Ack it
-\* before the shared NACK deadline.
+\* A challenge even in the last block of its window leaves the operator time to Ack.
 WatchtowerAckWindowAlwaysPositive ==
     /\ (Challenged(wtChallengeHeight1) => OperatorAckWindow(wtChallengeHeight1) > 0)
     /\ (Challenged(wtChallengeHeight2) => OperatorAckWindow(wtChallengeHeight2) > 0)
 
-\* The operator's Ack window is at least the action window the validator
-\* budgets (timelocks.rs:208-214), for every challenge timing.
+\* ... and at least one action window (timelocks.rs:208-214).
 OperatorAckWindowMeetsActionWindow ==
     /\ (Challenged(wtChallengeHeight1) => OperatorAckWindow(wtChallengeHeight1) >= ActionWindow[net])
     /\ (Challenged(wtChallengeHeight2) => OperatorAckWindow(wtChallengeHeight2) >= ActionWindow[net])
 
-\* If a challenged watchtower is not acked, its NACK becomes valid strictly
-\* before Take2 via ConnectorF, independent of the other watchtower.
+\* An unacked challenge's NACK becomes valid strictly before Take2 via ConnectorF.
 NackAlwaysBeatsTake2ViaF ==
     /\ (Challenged(wtChallengeHeight1) => NackDeadline < Take2ReadyHeightViaF)
     /\ (Challenged(wtChallengeHeight2) => NackDeadline < Take2ReadyHeightViaF)
 
-\* The second ConnectorF leaf-1 spender, OperatorCommitTimeout, also becomes
-\* valid strictly before Take2 via ConnectorF.
+\* OperatorCommitTimeout becomes valid strictly before Take2 via ConnectorF.
 CommitTimeoutAlwaysBeatsTake2ViaF == CommitTimeoutDeadline < Take2ReadyHeightViaF
 
-\* Each verifier's Disprove, rooted at its OWN assert height, becomes valid
-\* strictly before Take2's ConnectorD leaf, whatever the other verifier does.
+\* Each verifier's Disprove becomes valid strictly before Take2's ConnectorD leaf.
 DisproveAlwaysBeatsTake2ViaD ==
     /\ (verifierDelta1 # NEVER => DisproveDeadline(verifierDelta1) < Take2ReadyHeightViaD)
     /\ (verifierDelta2 # NEVER => DisproveDeadline(verifierDelta2) < Take2ReadyHeightViaD)

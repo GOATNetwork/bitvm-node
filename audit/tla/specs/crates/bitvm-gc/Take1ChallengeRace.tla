@@ -1,35 +1,25 @@
 ---- MODULE Take1ChallengeRace ----
 (***************************************************************************)
-(* Purpose: Take1 vs Challenge on kickoff connector A (Finding 9). Both    *)
-(* leaves of ConnectorA have their clock at the Kickoff's confirmation:    *)
-(* Challenge is spendable at once, Take1 after CSV(connector_a). The whole *)
-(* margin a challenger has to notice a bad kickoff and get Challenge       *)
-(* confirmed is therefore connector_a itself. Init-only arithmetic over    *)
-(* the shipped per-network values (ShippedTimelocks).                      *)
-(*                                                                         *)
-(* Code scope (current tree):                                              *)
-(*   goat crate bab46c2 (Cargo.lock), goat/src:                            *)
-(*     transactions/kickoff.rs:68-71  Kickoff output 0 = ConnectorA.       *)
-(*     connectors/connector_a.rs:38-47  leaf 0 = operator +                *)
-(*       CSV(connector_a), spent by Take1 (transactions/take1.rs:73-74).   *)
-(*     connectors/connector_a.rs:49-55  leaf 1 = n-of-n, no CSV, spent by  *)
-(*       Challenge (transactions/challenge.rs:56-57) signed                *)
-(*       SinglePlusAnyoneCanPay (:93), so any challenger adds its own fee  *)
-(*       input. First confirmed spend wins the output.                     *)
-(*   node: node/src/aggregates/graph_scan.rs:520-551 take1_ready (kickoff  *)
-(*     height + connector_a); node/src/aggregates/graph_pegout_jobs.rs:    *)
-(*     594-647 challenge_kickoff (the verifier's Challenge).               *)
-(*   crates/bitvm-gc/src/timelocks.rs:202 validate_timelock_config:        *)
-(*     ensure_at_least("connector_a", connector_a, action_window), with    *)
-(*     action_window = reaction + inclusion + safety blocks (:91-95). The  *)
-(*     property below is exactly that comparison, so it holds for every    *)
-(*     config the validator accepts; this spec checks the shipped values   *)
-(*     against it (the validator itself is unit-tested on them,            *)
-(*     timelocks.rs:320-332). Whether the node's challenge_kickoff fits    *)
-(*     into that window is ChallengeKickoffGate.tla's subject (C6).        *)
-(*                                                                         *)
-(* Config / tier: Take1ChallengeRace/Fixed.cfg (pass). The name is kept     *)
-(* from when connector_a had no floor (fixed in 991faaa).                  *)
+(* Take1 vs Challenge on Kickoff connector A (Finding 9). Init-only        *)
+(* arithmetic over the shipped values of every network.                    *)
+(* Code (goat bab46c2, goat/src): Kickoff output 0 is ConnectorA           *)
+(*   (transactions/kickoff.rs:68-71). Leaf 0 = operator +                  *)
+(*   CSV(connector_a), spent by Take1 (connectors/connector_a.rs:38-47,    *)
+(*   take1.rs:73-74). Leaf 1 = n-of-n, no CSV, spent by Challenge          *)
+(*   (connector_a.rs:49-55, challenge.rs:56-57, SinglePlusAnyoneCanPay     *)
+(*   :93). Both clocks start at the Kickoff's confirmation; the first      *)
+(*   confirmed spend wins. Node: take1_ready                               *)
+(*   (node/src/aggregates/graph_scan.rs:520-551) and challenge_kickoff     *)
+(*   (node/src/aggregates/graph_pegout_jobs.rs:595-647).                   *)
+(* Finding 9: a challenger's whole margin is connector_a. The code's floor *)
+(*   is connector_a >= action_window (validate_timelock_config,            *)
+(*   crates/bitvm-gc/src/timelocks.rs:202); the invariant is that exact    *)
+(*   comparison, checked on the shipped values. Whether challenge_kickoff  *)
+(*   fits that window is ChallengeKickoffGate.tla's subject.               *)
+(* Parameters: none besides the network.                                   *)
+(* Exhaustive: Init enumerates all four networks; there are no steps.      *)
+(* Configs: configs/crates/bitvm-gc/Take1ChallengeRace/, tiers in          *)
+(*   audit/tla/checks.txt.                                                 *)
 (***************************************************************************)
 EXTENDS Integers, ShippedTimelocks
 
@@ -40,12 +30,11 @@ vars == <<net>>
 
 TypeOk == net \in Networks
 
-\* Action: the only "step": pick a network; the Kickoff confirms at height 0.
-\* Source: default_timelock_config() in crates/bitvm-gc/src/timelocks.rs:54-61
-\*   via ShippedTimelockValues.tla (generated).
+\* Action: pick a network; the Kickoff confirms at height 0.
+\* Source: default_timelock_config(), crates/bitvm-gc/src/timelocks.rs:54-61.
 Init == net \in Networks
 
-\* No transitions: an exhaustive check over Init, not a process model.
+\* No steps: TLC checks the invariants on every initial state.
 Next == FALSE
 
 Spec == Init /\ [][Next]_vars
@@ -53,9 +42,8 @@ Spec == Init /\ [][Next]_vars
 --------------------------------------------------------------------------
 (* Safety invariants                                                       *)
 
-\* A challenger has the code's full action window (reaction + inclusion +
-\* safety), from the Kickoff's confirmation, to get Challenge confirmed
-\* before Take1's CSV elapses (timelocks.rs:202).
+\* Challenge has at least one action window after the Kickoff confirms
+\* before Take1's CSV elapses.
 ChallengeHasSufficientReactionMarginFixed ==
     ConnectorA[net] >= MinReactionBlocks[net]
 
