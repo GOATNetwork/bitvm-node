@@ -18,12 +18,12 @@ GOAT Network's BitVM bridge implementation. See [GOAT BitVM Whitepaper](https://
 `audit/tla/` contains TLA+ specs that model the bridge protocol as the Rust
 code implements it: the graph/instance status state machines, the Bitcoin
 transaction graph and its timelocks, the node's challenge/dispute reactions,
-the job engine, and the GOAT Gateway contract. **Only the current code is
+the job engine, and the GOAT Gateway contracts. **Only the current code is
 checked**: every config models the code as it is now (or a proposed fix for a
 bug still in it); none models old, pre-fix code. A fixed bug is covered by a
 config of the current code that must verify, so CI fails if the bug returns;
-an unfixed bug is a config of the current code that must not reproduce, so CI
-fails until it is fixed.
+an unfixed bug is a config of the current code that reproduces, so CI fails
+until it is fixed.
 
 - **Round 1** (`audit/TLAPlus-20260710.md`): 8 findings, **all fixed** in
   [`991faaa`](https://github.com/GOATNetwork/bitvm-node/commit/991faaabdb56c747103e8f1c6d6477c638ccfc4c);
@@ -34,10 +34,34 @@ fails until it is fixed.
   fixed yet**: their configs are `live`, so the `tla-plus` job **stays red until
   the code is fixed** - by design.
 
-`audit/tla/specs.txt` is the single list of what runs and what each result
-must be (`tier | config | spec | description`). CI (`tla-plus` job, every pull
-request, in parallel with fmt/clippy/test) and `make tla` run the same list
-through `audit/tla/check.sh`:
+**Layout** - specs and configs live in separate trees that mirror the code they model:
+
+```
+audit/tla/
+  checks.txt        every TLC run: tier | config | description
+  check.sh          runs checks.txt (make tla, CI job tla-plus)
+  specs/<area>/<Spec>.tla              modules; <area> = crates/bitvm-gc, crates/engine,
+                                       node/aggregates/{graph,instance}, node/scheduled_tasks, contracts
+  configs/<area>/<Spec>/<Name>.cfg     configs of <Spec>; runs specs/<area>/<Spec>.tla
+```
+
+The specs follow the [TLA+ agent skills](https://github.com/tlaplus/AgentSkills)
+conventions: each action carries `\* Action:` and `\* Source:` comments pointing
+at the current code, every config checks `TypeOk`, and properties are grouped
+into safety invariants, safety properties and liveness.
+
+**Timing parameters are swept, not fixed.** Every timelock, timing-budget value,
+delay, reorg depth or capacity a verdict depends on is a frozen variable chosen
+in `Init` from a range that covers every ordering class (equal, margin 0,
+margin 1), so one run covers all combinations. Honest actors react within
+explicit reaction/inclusion/evaluation delays, never "before the next block".
+A fix states the margin it needs as `ParamsOK` (exact unless its header says
+otherwise). `*Shipped.cfg` configs take the real per-network values from
+`specs/crates/bitvm-gc/ShippedTimelockValues.tla`, which is **generated** from
+`crates/bitvm-gc/src/timelocks.rs` by `crates/bitvm-gc/tests/tla_shipped_values.rs`;
+that test fails in CI when the two drift (`make tla-values` regenerates it).
+
+**Tiers** (`checks.txt`, judged by `check.sh`):
 
 - **pass** - models the current code; must verify. This is where a fixed
   bug's regression check lives.
@@ -48,12 +72,63 @@ through `audit/tla/check.sh`:
   reproducing without that also fails: the model drifted from the code.
 - **design** - a proposed fix for a `live` bug, not in the code yet; must
   verify. It becomes the `pass` row once the fix lands.
-- **boundary** - a parameter sweep just outside a fix's margin condition
-  (`ParamsOK`); must find a counterexample, which shows the condition is
-  necessary.
+- **boundary** - a fix design outside its `ParamsOK`, or an insufficient
+  fix; must find a counterexample, which shows the condition is necessary.
 
 The outcome is taken from TLC's exit status, so a config on which TLC does
-not finish (parse error, missing file) fails in every tier.
+not finish (parse error, missing file) fails in every tier, and every config
+file must be listed in `checks.txt`.
+
+**Specs** (row counts per tier; `checks.txt` has one line per config):
+
+| Spec (`audit/tla/specs/...`) | Models | Findings | pass | live | design | boundary |
+|---|---|---|---|---|---|---|
+| `crates/bitvm-gc/AssertFrontRun.tla` | assert connectors, `graph_scan.rs`, `graph_pegout_jobs.rs` | C3, C4, pi2/pi3 malleability; validator gap (live) | 1 | 7 | 4 | 2 |
+| `crates/bitvm-gc/DefenderTxPinning.tla` | presigned NACK/Commit-Timeout/Disprove policy | M3 |  | 2 | 2 | 2 |
+| `crates/bitvm-gc/MultiActorRace.tla` | `timelocks.rs`, `graph_scan.rs` | Findings 5/10 | 1 |  |  |  |
+| `crates/bitvm-gc/RoundPenalty.tla` | `utils/graph_tx.rs`, `operator/api.rs` | M5 |  | 2 | 2 | 1 |
+| `crates/bitvm-gc/ShippedTimelockValues.tla` | generated from `timelocks.rs` | shared module |  |  |  |  |
+| `crates/bitvm-gc/ShippedTimelocks.tla` | `timelocks.rs` `action_window` | shared module |  |  |  |  |
+| `crates/bitvm-gc/Take1ChallengeRace.tla` | `timelocks.rs` | Finding 9 | 1 |  |  |  |
+| `crates/bitvm-gc/Take2DisproveRace.tla` | `timelocks.rs` `validate_timelock_config`, goat connectors | Finding 4; validator floor (live) | 1 | 1 |  |  |
+| `crates/engine/JobObligationPersistence.tla` | `crates/engine`, graph jobs | H3 |  | 3 | 2 | 1 |
+| `crates/engine/MessageStateRace.tla` | `engine_job` (`crates/store/src/engine`, `crates/engine`) | Finding 7 | 1 |  |  |  |
+| `crates/engine/PegoutPoolCapacity.tla` | `crates/engine` pools, `graph_pegout_jobs.rs` | H5 |  | 2 | 2 | 2 |
+| `node/aggregates/graph/ChallengeKickoffGate.tla` | `challenge_kickoff`, SPV maintenance, `Gateway.sol` | C5, C6, H4 | 2 | 5 | 4 | 4 |
+| `node/aggregates/graph/DisputeObligations.tla` | `graph_scan.rs`, `graph_pegout.rs`, `graph_pegout_jobs.rs` | C1, C2; validator gap (live) |  | 6 | 2 | 2 |
+| `node/aggregates/graph/GraphLifecycle.tla` | `transition_graph_status`, `graph_pegout.rs`, `event_watch/gateway.rs` | Finding 1 | 2 |  |  |  |
+| `node/aggregates/graph/GraphLifecycleFineGrainedFixed.tla` | `localdb/graph.rs` `transition_graph_status` | Finding 1b | 1 |  |  |  |
+| `node/aggregates/graph/GraphTopology.tla` | `schema.rs` `allowed_transition_from` | shared module |  |  |  |  |
+| `node/aggregates/graph/KickoffScanCoverage.tla` | `graph_scan.rs` `scan_graphs_on_chain` | #431 | 1 |  |  | 1 |
+| `node/aggregates/graph/VerifierKickoffFailOpen.tla` | `graph_pegout_jobs.rs` `challenge_kickoff` | #429 | 1 |  |  |  |
+| `node/aggregates/instance/CommitteeKeyDeletion.tla` | `instance_jobs.rs` key deletion, `env.rs` | H2 |  | 4 | 2 | 1 |
+| `node/aggregates/instance/InstanceLifecycle.tla` | `instance.rs`, `instance_scan.rs` | baseline | 1 |  |  |  |
+| `node/aggregates/instance/InstancePresigned.tla` | `instance.rs` `decide_graph_endorsed` | Finding 2 | 1 |  |  |  |
+| `node/aggregates/instance/PeginConfirmCancelReorg.tla` | SPV writer, `post_pegin_data` | H6 |  | 3 | 2 | 4 |
+| `node/aggregates/instance/PeginPostRetry.tla` | `instance_jobs.rs` `post_pegin_data` | M4 |  | 1 | 1 |  |
+| `node/aggregates/instance/PeginRequestLiveness.tla` | `instance_scan.rs`, pegin requests | F1, F6, F7 |  | 5 | 4 | 1 |
+| `node/aggregates/instance/PeginTimeoutAgreement.tla` | `instance_scan.rs` Timeout, relayer | M2 | 1 | 3 | 3 |  |
+| `node/scheduled_tasks/InstanceBridgeOutRace.tla` | `event_watch/bridge_out.rs`, `swap_maintenance_tasks.rs` | Finding 6 | 1 |  |  |  |
+| `contracts/GatewayWithdrawLifecycle.tla` | `Gateway.sol`, `graph_pegout_jobs.rs`, `event_watch/gateway.rs` | H1, M1, C5, F4, econ |  | 8 | 6 |  |
+| `contracts/MultiSigReplay.tla` | `MultiSigVerifier.sol` | multisig replay |  | 1 | 1 |  |
+| **total** | | | **16** | **53** | **37** | **21** |
+
+**What the parameter sweeps found** (beyond the round-2 findings themselves):
+
+- `validate_timelock_config` accepts unsafe timelocks (all `live`): `connector_d - prover_connector`
+  counts one action window where ChallengeAssert + Disprove need `2(reaction+inclusion)+1`, and
+  `>= action_window` only lets a late verifier tie Take2; `watchtower_challenge >= wtp + action_window`
+  leaves the watchtower 2 blocks short; with a zero `confirmed_action_window` (Regtest) the
+  `saturating_sub` gap checks admit any order of `operator_ack`, `operator_commit`, `connector_f`.
+- The shipped Regtest timelocks are too short for the fix designs (C3/C4, M3, C6, C1/C2), and
+  Signet's `watchtower_challenge` is one block short for the C1/C2 fix.
+- C6 reproduces with a healthy SPV on Testnet4, Signet and Regtest (`connector_a` <= SPV lag);
+  on Bitcoin only after ~118 blocks of SPV lag. The C6 fix would also challenge every honest
+  peg-out on those three networks unless `connector_a >= BTC_BLOCK_CONFIRMS + lag + 2r + incl + 3`.
+- H5 reproduces on Testnet4, Signet and Regtest, not on Bitcoin; its per-graph fix is insufficient
+  when several graphs are challenged at once. GC evaluation time is not part of the timing budget.
+- H6 needs an SPV feeder that lags less than the reorg depth: with the node's own writer
+  (`BTC_BLOCK_CONFIRMS` behind the tip) it takes a reorg one block deeper than the evidence depth.
 
 **Setup** (once): install a JRE (11+), then download the official TLA+ tools jar:
 
@@ -65,107 +140,18 @@ make tla-setup                                    # -> ~/.local/share/tlaplus/tl
 **Run**:
 
 ```bash
-make tla                                  # the whole table; exit 1 while any live bug reproduces
-make tla SPEC=ChallengeKickoffGateC6.cfg  # one config
-make tla SPEC=ChallengeKickoffGate.tla    # every config of one spec
-make tla TLC_OPTS="-workers auto"         # extra TLC flags
-
-# or TLC directly
-cd audit/tla && java -jar ~/.local/share/tlaplus/tla2tools.jar -config <Config>.cfg <Spec>.tla
+make tla                                          # the whole table; exit 1 while any live bug reproduces
+make tla SPEC=node/aggregates/graph               # every config under a code area
+make tla SPEC=ChallengeKickoffGate                # every config of one spec
+make tla SPEC=ChallengeKickoffGate/C6Shipped.cfg  # one config
+make tla TLC_OPTS="-workers auto"                 # extra TLC flags
+make tla-values                                   # regenerate ShippedTimelockValues.tla after a timelocks.rs change
 ```
 
-### Round 1 and issues #429 / #431 (fixed - current code must pass)
-
-| Spec | Config | Models | Result |
-|---|---|---|---|
-| `GraphLifecycle.tla` | `GraphLifecycleCoreOnly.cfg` | **current code** (baseline) | pass - chain-scan state machine alone is sound |
-| `GraphLifecycle.tla` | `GraphLifecycleFixed.cfg` | **current code** (fixed in `991faaa`) | pass - atomic guard design closes the race |
-| `GraphLifecycleFineGrainedFixed.tla` | `GraphLifecycleFineGrainedFixed.cfg` | **current code** (fixed in `991faaa`) | pass - single-statement atomic CAS design closes the gap |
-| `InstancePresigned.tla` | `InstancePresignedFixed.cfg` | **current code** (fixed in `991faaa`) | pass - guard design closes the regression |
-| `Take2DisproveRace.tla` | `Take2DisproveRace.cfg` | **current code** (fixed in `991faaa`) | pass - Take2 vs. Disprove UTXO race has strict margin on all networks with the shipped values (generated `ShippedTimelockValues.tla`), for every verifier delay up to the code's `action_window`; the pre-fix Testnet4 `connector_d` (34) did **not** have this margin - that boundary case is how this spec found the bug in the first place |
-| `MultiActorRace.tla` | `MultiActorRace.cfg` | **current code** (fixed in `991faaa`) | pass - the 1-of-N watchtower/verifier security property holds under the shipped timelock values (generated), checked against 2 independent actors per role rather than 1; also confirms `operator_commit`'s margin against the shared `ConnectorF` UTXO (the `OperatorCommitTimeoutTransaction` path, `ConnectorF` leaf 1's second spender) holds, closing a gap where only a scalar Rust check existed |
-| `InstanceBridgeOutRace.tla` | `InstanceBridgeOutRaceFixed.cfg` | **current code** (fixed in `991faaa`) | pass - atomic guard design (write only if not already terminal) closes the resurrection |
-| `MessageStateRace.tla` | `MessageStateRaceFixed.cfg` | **current code** (fixed in `991faaa`) | pass - guarding the resurrect-to-Pending write against terminal status closes the race |
-| `Take1ChallengeRace.tla` | `Take1ChallengeRaceFixed.cfg` | **current code** (fixed in `991faaa`) | pass - the shipped `connector_a` is `>= action_window` on every network (`validate_timelock_config`); Testnet4 sits exactly on the floor (6 = 2 + 2 + 2) |
-| `VerifierKickoffFailOpen.tla` | `VerifierKickoffFailOpenFixed.cfg` | **current code** (fixed in #455) | pass - deferring the message until SPV catches up makes the Challenge fire before Take1, provided SPV catches up before `connector_a` expires (a fairness assumption of the model; a SPV lag longer than `connector_a` is not modeled) |
-| `KickoffScanCoverage.tla` | `KickoffScanCoverageFixed.cfg` | **current code** (fixed by #451, #476) | pass - every graph on the confirmed pre-kickoff chain is reached, with no depth cap (since #476: a round-robin over all monitored graphs, `node/src/aggregates/graph_scan.rs`) |
-
-### Round 2: protocol review (live until fixed)
-
-C/H/M/F are the review's severity labels (critical, high, medium, low). Each spec's header quotes the code it
-models with file:line.
-
-| Spec | Config | Models | Result |
-|---|---|---|---|
-| `DisputeObligations.tla` | `DisputeObligationsC1.cfg` | **current code (live)** | **fails** `NoTake2WithInvalidProof`: C1 - one watchtower never challenged nor timed out keeps `all_resolved` false (`graph_scan.rs`): no NACK, no Commit-Timeout, and `verifier_assert` waits for connector-E -> Take-2 with an invalid proof |
-| `DisputeObligations.tla` | `DisputeObligationsC1LateCommit.cfg` | **current code (live)** | **fails** `NoTake2WithInvalidProof`: all branches resolved, commit-pubin just before Commit-Timeout; ChallengeAssert only starts then and `operator_commit + prover_connector >= connector_f` on every network |
-| `DisputeObligations.tla` | `DisputeObligationsC1NoPubin.cfg` | **current code (live)** | **fails** `NoTake2WithoutPubin`: Commit-Timeout gated on `all_resolved`; ACK via the hashlock leaf without a challenge -> Take-2 never bound to watchtower evidence |
-| `DisputeObligations.tla` | `DisputeObligationsC2.cfg` | **current code (live)** | **fails** `NoTake2WithInvalidProof`: C2 - an early Assert cancels every `JOB_WATCHTOWER_CHALLENGE` (`graph_pegout.rs`, terminal) although the challenge is still valid on chain |
-| `DisputeObligations.tla` | `DisputeObligationsC2Silenced.cfg` | **current code (live)** | **fails** `OnlineWatchtowerChallengeLands`: with C1 fixed, an early Assert still keeps every honest watchtower's challenge off chain |
-| `DisputeObligations.tla` | `DisputeObligationsFixed.cfg` | fix design | pass - Commit-Timeout at `operator_commit` regardless of branches, NACK every unspent Ack, invalid proof challenged without waiting for commit-pubin, no cancel on Assert |
-| `AssertFrontRun.tla` | `AssertFrontRun.cfg` | **current code (live)** | **fails** `NoTake2AfterValidChallenge`: C3 - VerifierConnector leaf 0 has no CHECKSIG; the operator copies the ChallengeAssert witness, `ProverConn_j` never exists, the presigned Disprove is invalid |
-| `AssertFrontRun.tla` | `AssertFrontRunC4.cfg` | **current code (live)** | **fails** `HonestOperatorCanSettle`: C4 - ConnectorC leaf 1 is OP_2DROP + WOTS only; any watcher redirects the OperatorAssert, ConnectorD never exists, Take1 and Take2 both dead |
-| `AssertFrontRun.tla` | `AssertFrontRunPiMalleable.cfg` | **current code (live)** | **fails** `HonestOperatorCanSettle`: pi2/pi3 sit under OP_2DROP, so a swap keeps the txid; verifier and operator both read them from the chain -> honest operator Disproved, even with both CHECKSIGs |
-| `AssertFrontRun.tla` | `AssertFrontRunFixed.cfg` | fix design | pass - n-of-n SIGHASH_ALL presignature binds the VerifierAssert |
-| `AssertFrontRun.tla` | `AssertFrontRunC4Fixed.cfg` | fix design | pass - operator CHECKSIG ALL on C leaf 1 + n-of-n CHECKSIG on VerifierConnector + pi2/pi3 in signed data |
-| `DefenderTxPinning.tla` | `DefenderTxPinning.cfg` | **current code (live)** | **fails** `DefenderConfirmsBeforeDeadline`: M3 - v2 NACK/CommitTimeout/Disprove at ~1.2 sat/vB with a keyless P2A; a large sub-market child forces a BIP125 rule-3 overpay beyond the defender's budget |
-| `DefenderTxPinning.tla` | `DefenderTxPinningFixed.cfg` | fix design | pass - v3/TRUC bounds the pin (VerifierAssert, ~60 kvB, stays a residual) |
-| `RoundPenalty.tla` | `RoundPenalty.cfg` | **current code (live)** | **fails** `LateKickoffPenalized`: M5 - operator-key ForceSkipConn_{i+1} is burned at round i+1; a late Kickoff_i reaches Take with no penalty |
-| `RoundPenalty.tla` | `RoundPenaltyFixed.cfg` | fix design | pass - n-of-n ForceSkipConnector keeps QuickChallenge_i valid |
-| `ChallengeKickoffGate.tla` | `ChallengeKickoffGateC5.cfg` | **current code (live)** | **fails** `NoDoublePayment`: C5 - kickoff first, `initWithdraw` once SPV covers it -> `proceedWithdraw` reverts `KickoffHeightLow` forever; `challenge_kickoff` waits on `Initialized` forever; Take1 + a manual cancel pays twice |
-| `ChallengeKickoffGate.tla` | `ChallengeKickoffGateC6.cfg` | **current code (live)** | **fails** `NoUnauthorizedTake1`: C6 - the gate waits for GOAT SPV with no `connector_a` deadline; drops the SPV-catches-up fairness assumption of `VerifierKickoffFailOpenFixed.cfg` |
-| `ChallengeKickoffGate.tla` | `ChallengeKickoffGateC6Testnet4.cfg` | **current code (live)** | **fails** `NoUnauthorizedTake1`: shipped Testnet4 values - SPV posts up to tip - `BTC_BLOCK_CONFIRMS` (10) while `connector_a` is 6, so the gate can never fire before Take1, even with a healthy SPV (Signet and Regtest likewise) |
-| `ChallengeKickoffGate.tla` | `ChallengeKickoffGateH4.cfg` | **current code (live)** | **fails** `NoUnauthorizedTake1`: H4 - maintenance skips `scan_graphs_on_chain` during the Goat history sync, so `challenge_kickoff` is never queued |
-| `ChallengeKickoffGate.tla` | `ChallengeKickoffGateFixed.cfg` | fix design | pass - challenge a poisoned `Initialized`, contest at the `connector_a` deadline unless `Processing`, scan not gated on history sync, cancel rejected once the kickoff is provable |
-| `GatewayWithdrawLifecycle.tla` | `GatewayWithdrawLifecycleH1.cfg` | **current code (live)** | **fails** `DisprovedOperatorSlashed`: H1 - kickoff without `initWithdraw`, disproved; the relayer gives up on withdraw status None |
-| `GatewayWithdrawLifecycle.tla` | `GatewayWithdrawLifecycleH1Node.cfg` | **current code (live)** | **fails** `NodeTracksDisprove`: the event carries instanceId 0 and the watcher drops it |
-| `GatewayWithdrawLifecycle.tla` | `GatewayWithdrawLifecycleH1Fixed.cfg` | fix design | pass - relay None, key `WithdrawDisproved` by graph |
-| `GatewayWithdrawLifecycle.tla` | `GatewayWithdrawLifecycleM1.cfg` | **current code (live)** | **fails** `PegInRecoverable`: M1 - `finishWithdrawDisproved` never resets the pegin, the instance stays Locked |
-| `GatewayWithdrawLifecycle.tla` | `GatewayWithdrawLifecycleM1Escrow.cfg` | **current code (live)** | **fails** `EscrowAccounted`: a disprove while Initialized strands `lockAmount` |
-| `GatewayWithdrawLifecycle.tla` | `GatewayWithdrawLifecycleM1Fixed.cfg` | fix design | pass - disprove of the lock holder reopens the pegin and releases the escrow |
-| `GatewayWithdrawLifecycle.tla` | `GatewayWithdrawLifecycleC5.cfg` | **current code (live)** | **fails** `NoDoublePayment`: `committeeCancelWithdraw` after kickoff + Take1 refunds the pegBTC |
-| `GatewayWithdrawLifecycle.tla` | `GatewayWithdrawLifecycleC5Stale.cfg` | **current code (live)** | **fails** `CancelBoundToAttempt`: an attempt-1 cancel signature cancels attempt 2 |
-| `GatewayWithdrawLifecycle.tla` | `GatewayWithdrawLifecycleC5Fixed.cfg` | fix design | pass - cancel needs a kickoff-impossible proof and an attempt-bound digest |
-| `GatewayWithdrawLifecycle.tla` | `GatewayWithdrawLifecycleF4.cfg` | **current code (live)** | **fails** `OnlyGraphOperatorLocks`: F4 - permissionless `initWithdraw` |
-| `GatewayWithdrawLifecycle.tla` | `GatewayWithdrawLifecycleF4Fixed.cfg` | fix design | pass - `msg.sender` must be the graph operator |
-| `GatewayWithdrawLifecycle.tla` | `GatewayWithdrawLifecycleEcon.cfg` | **current code (live)** | **fails** `RewardsCoveredBySlash`: one stake backs every graph; a disprove that slashes 0 still pays the reward from the pool |
-| `GatewayWithdrawLifecycle.tla` | `GatewayWithdrawLifecycleEconFixed.cfg` | fix design | pass - per-graph stake reservation, rewards capped by the slash |
-| `GatewayWithdrawLifecycle.tla` | `GatewayWithdrawLifecycleAllFixed.cfg` | fix design | pass - every Gateway fix together, all invariants and both liveness properties |
-| `MultiSigReplay.tla` | `MultiSigReplay.cfg` | **current code (live)** | **fails** `NoCrossDeploymentReplay`: the `updateOwners` digest has no contract address or chain id |
-| `MultiSigReplay.tla` | `MultiSigReplayFixed.cfg` | fix design | pass - domain-separated digest |
-| `JobObligationPersistence.tla` | `JobObligationPersistence.cfg` | **current code (live)** | **fails** `DefenceEventuallyRuns`: H3 - a defence job that panics once is Poisoned; scans re-request the same stable job id and `INSERT OR IGNORE` never re-runs it |
-| `JobObligationPersistence.tla` | `JobObligationPersistenceRejected.cfg` | **current code (live)** | **fails** `DefenceEventuallyRuns`: any error containing "revert" is Permanent, so a Goat-calling peg-out job ends `Done("rejected")` for good |
-| `JobObligationPersistence.tla` | `JobObligationPersistenceReorg.cfg` | **current code (live)** | **fails** `NoFalseClosure`: Take1/Take2/Disprove/Skipped are decided at 1 confirmation, absorbing and never rescanned; a 1-block reorg leaves the graph falsely closed |
-| `JobObligationPersistence.tla` | `JobObligationPersistenceFixed.cfg` | fix design | pass - obligations re-derived each scan, unbroadcast terminal jobs re-armed under a new generation, closure only at depth > max reorg |
-| `PeginPostRetry.tla` | `PeginPostRetry.cfg` | **current code (live)** | **fails** `PostTerminates`: M4 - "cannot cover fee" is not a permanent post rejection, so the post retries forever with no alert while the BTC is locked |
-| `PeginPostRetry.tla` | `PeginPostRetryFixed.cfg` | fix design | pass - a typed FeeTooHigh rejection fails the job and raises the alert |
-| `PegoutPoolCapacity.tla` | `PegoutPoolCapacity.cfg` | **current code (live)** | **fails** `HonestOperatorAnswersAll`: H5 - one Pegout slot and one running job per graph serialize N Wrongly-Challenged evaluations; with N=5, E=3 the last misses Testnet4 `prover_connector` (16) |
-| `PegoutPoolCapacity.tla` | `PegoutPoolCapacitySlotsOnly.cfg` | **current code (live)** | **fails** `HonestOperatorAnswersAll`: raising `pegout_pool_slots` alone does not help (per-aggregate claim gate) |
-| `PegoutPoolCapacity.tla` | `PegoutPoolCapacityFixed.cfg` | fix design | pass - graph validation requires `prover_connector >= Reaction + N*E_max + Incl` |
-| `PeginConfirmCancelReorg.tla` | `PeginConfirmCancelReorg.cfg` | **current code (live)** | **fails** `NoUnbackedMint`: H6 - the post mints at 1 confirmation and the Gateway checks only `blockHash(height)`; a reorg swapping the Confirm for the user's Cancel pays refund **and** pegBTC (SPV at the tip: depth 1) |
-| `PeginConfirmCancelReorg.tla` | `PeginConfirmCancelReorgNodeSpv.cfg` | **current code (live)** | **fails** `NoUnbackedMint`: with the node's append-only SPV writer a reorg of `BTC_BLOCK_CONFIRMS` + 1 suffices (mainnet 7) |
-| `PeginConfirmCancelReorg.tla` | `PeginConfirmCancelReorgGateOnly.cfg` | insufficient fix (not in `specs.txt`) | **fails**: closing signing one block earlier does not stop an adversarial reorg |
-| `PeginConfirmCancelReorg.tla` | `PeginConfirmCancelReorgPostWaitOnly.cfg` | insufficient fix (not in `specs.txt`) | **fails**: waiting k confirmations in the node is not enough - a colluding committee member posts with the stale SPV header |
-| `PeginConfirmCancelReorg.tla` | `PeginConfirmCancelReorgFixed.cfg` | fix design | pass - the SPV records only headers at least max-reorg deep |
-| `PeginTimeoutAgreement.tla` | `PeginTimeoutAgreement.cfg` | **current code (live)** | **fails** `Agreement`: M2 - Timeout is decided from each node's own mempool and B; a later-confirmed Confirm leaves nodes in different terminal states |
-| `PeginTimeoutAgreement.tla` | `PeginTimeoutAgreementMint.cfg` | **current code (live)** | **fails** `MintAfterConfirm`: the timed-out relayer's post job is cancelled and never re-queued; the BTC sits in C0 with no pegBTC |
-| `PeginTimeoutAgreement.tla` | `PeginTimeoutAgreementFixed.cfg` | fix design | pass - a confirmed Confirm takes Timeout back to `RelayerL1Broadcasted` |
-| `PeginTimeoutAgreement.tla` | `PeginTimeoutAgreementRelayerPosts.cfg` | partial fix | pass `MintAfterConfirm` only - the relayer posting regardless of Timeout makes the mint live, agreement still fails |
-| `CommitteeKeyDeletion.tla` | `CommitteeKeyDeletion.cfg` | **current code (live)** | **fails** `NoSweepAfterSettlement`: H2 - `ENABLE_COMMITTEE_INSTANCE_KEY_DELETE` defaults to false; a later compromise of all keys sweeps settled C0 |
-| `CommitteeKeyDeletion.tla` | `CommitteeKeyDeletionTimeout.cfg` | **current code (live)** | **fails** `NoSweepAfterSettlement`: with deletion on, Timeout never deletes |
-| `CommitteeKeyDeletion.tla` | `CommitteeKeyDeletionFixed.cfg` | fix design | pass - deletion on by default and on every terminal state including Timeout |
-| `PeginRequestLiveness.tla` | `PeginRequestLivenessSpam.cfg` | **current code (live)** | **fails** `GenuinePeginProgresses`: F1 - free requests stay `CommitteesAnswered` forever; batch-paged scans find a genuine Prepare after the operator's graph cutoff |
-| `PeginRequestLiveness.tla` | `PeginRequestLivenessSpamFixed.cfg` | fix design | pass - request fee or minimum amount + `CommitteesAnswered` expiry |
-| `PeginRequestLiveness.tla` | `PeginRequestLivenessBadKey.cfg` | **current code (live)** | **fails** `NoStuckInstance`: F6 - one answer with an off-curve x (only parity checked) stalls the instance in `CommitteesAnswered` |
-| `PeginRequestLiveness.tla` | `PeginRequestLivenessBadKeyFixed.cfg` | fix design | pass - on-curve check on answers |
-| `PeginRequestLiveness.tla` | `PeginRequestLivenessNoHeight.cfg` | **current code (live)**, latent | **fails** `NoStuckInstance`: F7 - a confirmed Prepare without `block_height` stores height 0 and Timeout never fires (Esplora always returns a height) |
-| `PeginRequestLiveness.tla` | `PeginRequestLivenessNoHeightGate.cfg` | **current code (live)**, latent | **fails** `NoSignatureAtOrAfterT0`: same - the T0 gate never closes |
-| `PeginRequestLiveness.tla` | `PeginRequestLivenessNoHeightFixed.cfg` | fix design | pass - a confirmed Prepare is acted on only with its height |
-
-Additional standalone tools available in the jar if needed: SANY (parser/type-checker)
-via `java -cp tla2tools.jar tla2sany.SANY <Spec>.tla`, and the PlusCal translator
-(used to generate `GraphLifecycleFineGrained*.tla`'s TLA+ body from its PlusCal
-algorithm block) via `java -cp tla2tools.jar pcal.trans <Spec>.tla`.
+TLC only resolves `EXTENDS` in the spec's own directory, so `check.sh` copies
+every module into `audit/tla/states/lib` and runs from there. To run TLC by
+hand, do the same: `java -jar tla2tools.jar -config <abs path to cfg> states/lib/<Spec>.tla`.
+SANY (parser) is `java -cp tla2tools.jar tla2sany.SANY <Spec>.tla`.
 
 ## Contributing
 

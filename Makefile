@@ -35,8 +35,8 @@ tla-setup:             ## download tla2tools.jar to $(TLA2TOOLS) (needs a JRE 11
 	@mkdir -p $(dir $(TLA2TOOLS))
 	curl -fsSL -o $(TLA2TOOLS) $(TLA2TOOLS_URL)
 
-tla:                   ## run audit/tla/specs.txt through TLC; fails while a live bug reproduces (SPEC=<cfg|tla> for one)
+tla:                   ## run audit/tla/checks.txt through TLC; fails while a live bug reproduces (SPEC=<area|Spec|Spec/Name.cfg> to filter)
 	audit/tla/check.sh $(SPEC)
 
-tla-values:            ## regenerate audit/tla/ShippedTimelockValues.tla from the shipped Rust timing constants
+tla-values:            ## regenerate audit/tla/specs/crates/bitvm-gc/ShippedTimelockValues.tla from the shipped Rust timing constants
 	UPDATE_TLA_VALUES=1 cargo test -p bitvm-gc --test tla_shipped_values

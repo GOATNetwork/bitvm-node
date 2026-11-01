@@ -1,4 +1,4 @@
-//! Keeps `audit/tla/ShippedTimelockValues.tla` in sync with the shipped timing
+//! Keeps `audit/tla/specs/crates/bitvm-gc/ShippedTimelockValues.tla` in sync with the shipped timing
 //! constants. The TLA+ specs read every per-network timelock, timing-budget and
 //! SPV-depth value from that module, so a spec can never check a stale number.
 //!
@@ -82,7 +82,7 @@ fn render() -> String {
 #[test]
 fn shipped_timelock_values_tla_is_in_sync() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../audit/tla/ShippedTimelockValues.tla");
+        .join("../../audit/tla/specs/crates/bitvm-gc/ShippedTimelockValues.tla");
     let rendered = render();
     if std::env::var_os("UPDATE_TLA_VALUES").is_some() {
         std::fs::write(&path, &rendered).expect("write ShippedTimelockValues.tla");

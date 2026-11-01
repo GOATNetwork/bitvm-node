@@ -1,0 +1,154 @@
+# TLA+ check table, run by check.sh (`make tla`, CI job `tla-plus`).
+# One row per TLC run:  tier | config | description
+# The config path is relative to configs/; configs/<area>/<Spec>/<Name>.cfg runs specs/<area>/<Spec>.tla,
+# where <area> mirrors the code the spec models (crates/bitvm-gc, crates/engine, node/aggregates/graph, ...).
+# Only the current code is checked - no row models old, pre-fix code.
+#   pass       - models the current code; must verify (a fixed bug's regression check)
+#   live       - models the current code with a known unfixed bug; fails the run until fixed,
+#                then model the fix in the config and make it pass
+#   design     - proposed fix for a live bug, not in the code yet; must verify
+#   boundary   - a fix design outside its ParamsOK, or an insufficient fix; must find a counterexample
+# See check.sh for how each tier is judged and README.md "Formal verification (TLA+)".
+
+# ---- round 1 (audit/TLAPlus-20260710.md, all fixed in 991faaa) ---------------------------------------------
+pass       | node/aggregates/graph/GraphLifecycle/CoreOnly.cfg              | chain-reconcile scanners alone (stale ChainScan apply + refresh_graph) keep Graph.status backed by the chains and converging
+pass       | node/aggregates/graph/GraphLifecycle/Fixed.cfg                 | Finding 1 - every Graph.status writer goes through the transition_graph_status guard; no stale write regresses or reopens a graph
+pass       | node/aggregates/graph/GraphLifecycleFineGrainedFixed/Fixed.cfg | Finding 1b - transition_graph_status per SQL statement: guard is one conditional UPDATE, sub_status write is status-guarded
+pass       | node/aggregates/instance/InstancePresigned/Fixed.cfg           | Finding 2 - Instance.status never regresses past Presigned (written only from UserBroadcastPeginPrepare)
+pass       | node/aggregates/instance/InstanceLifecycle/Baseline.cfg        | baseline instance lifecycle is sound
+pass       | crates/bitvm-gc/Take2DisproveRace/Shipped.cfg                  | Finding 4 - Take2 vs Disprove margin holds (generated shipped values, delay <= action_window)
+live       | crates/bitvm-gc/Take2DisproveRace/Validated.cfg                | Finding 4 floor: validate_timelock_config connector_d - prover_connector >= action_window lets a verifier late by a full window only tie Take2 (fix: strict >)
+pass       | crates/bitvm-gc/MultiActorRace/Shipped.cfg                     | Finding 5/10 - 1-of-N watchtower/verifier margins + validator floors on shipped values
+pass       | node/scheduled_tasks/InstanceBridgeOutRace/Fixed.cfg           | Finding 6 - swap_escrow: Claim/Refund final, Timeout only replaced by an on-chain outcome, no resurrection to Initialize
+pass       | crates/engine/MessageStateRace/Fixed.cfg                       | Finding 7 - engine_job (successor of local messages): cancelled job never dispatchable again, terminal rows never rewritten, fenced single writer
+pass       | crates/bitvm-gc/Take1ChallengeRace/Fixed.cfg                   | Finding 9 - shipped connector_a >= action_window on every network
+
+# ---- issues #429 / #431 (fixed) ---------------------------------------------------------------------
+pass       | node/aggregates/graph/VerifierKickoffFailOpen/Fixed.cfg        | Issue #429 - challenge_kickoff retries until its Challenge confirms, never finishes with the connector unspent (assumes SPV catches up; see ChallengeKickoffGateC6Shipped)
+pass       | node/aggregates/graph/KickoffScanCoverage/Fixed.cfg            | Issue #431 - graph_scan round-robin reaches every monitored graph before Take1 when NumGraphs <= ScanBatch * Take1Ticks (#476)
+boundary   | node/aggregates/graph/KickoffScanCoverage/Boundary.cfg         | #431: one lap of the rotation longer than the Take1 window misses the kicked graph - ParamsOK is necessary
+
+# ---- round 2: dispute defences (C1, C2) -------------------------------------------------------------
+live       | node/aggregates/graph/DisputeObligations/C1.cfg                | C1: unresolved watchtower keeps all_resolved false -> no NACK, no Commit-Timeout, ChallengeAssert gated on connector-E -> Take-2 with invalid proof (reproduces on all 4 networks, shipped values)
+live       | node/aggregates/graph/DisputeObligations/C1LateCommit.cfg      | C1: ChallengeAssert gate alone - late commit-pubin, commit + 2sl + 3r + pc + 1 >= cf on every network -> Disprove loses to Take-2 (all 4 networks)
+live       | node/aggregates/graph/DisputeObligations/C1NoPubin.cfg         | C1: Commit-Timeout gated on all_resolved + hashlock ACK without challenge -> Take-2 without commit-pubin (all 4 networks)
+live       | node/aggregates/graph/DisputeObligations/C2.cfg                | C2: early Assert cancels every JOB_WATCHTOWER_CHALLENGE -> all watchtowers honest yet Take-2 with invalid proof (all 4 networks)
+live       | node/aggregates/graph/DisputeObligations/C2Silenced.cfg        | C2 alone (C1 fixed, margins repaired): early Assert still silences every honest watchtower (all 4 networks)
+design     | node/aggregates/graph/DisputeObligations/Fixed.cfg             | C1/C2 fix design over the ParamsOK sweep (wc >= wtp+r+2, cf >= commit+sl+r+1, cd >= 2r+pc+sl+2)
+design     | node/aggregates/graph/DisputeObligations/FixedShipped.cfg      | C1/C2 fix on shipped Testnet4/Signet/Regtest values, timelocks raised to ParamsOK (Signet wc 7; Regtest wc 3, cf 6, cd 6)
+boundary   | node/aggregates/graph/DisputeObligations/FixedBoundary.cfg     | C1/C2 fix with one ParamsOK margin at -1: fails on every point (each conjunct necessary)
+boundary   | node/aggregates/graph/DisputeObligations/FixedShippedBoundary.cfg | C1/C2 fix on as-shipped Signet/Regtest timelocks: fails (they need raising)
+live       | node/aggregates/graph/DisputeObligations/ValidateGap.cfg       | validate_timelock_config gap: fixed C1/C2 protocol over every tuple the current validator accepts outside ParamsOK fails (wc = wtp + action_window leaves the watchtower 2 blocks short; zero confirmed window admits cf = commit)
+
+# ---- round 2: assert scripts and presigned tx policy (C3, C4, M3, M5) -------------------------------
+live       | crates/bitvm-gc/AssertFrontRun/C3.cfg                          | C3: VerifierConnector leaf 0 has no CHECKSIG - operator copies the ChallengeAssert witness, Disprove dies, Take2 follows (swept over ParamsOK)
+live       | crates/bitvm-gc/AssertFrontRun/Shipped.cfg                     | C3 with shipped timelocks/budget of all four networks
+live       | crates/bitvm-gc/AssertFrontRun/C4.cfg                          | C4: ConnectorC leaf 1 has no CHECKSIG - watcher redirects OperatorAssert, honest operator cannot settle (swept over ParamsOK)
+live       | crates/bitvm-gc/AssertFrontRun/C4Shipped.cfg                   | C4 with shipped values of all four networks
+live       | crates/bitvm-gc/AssertFrontRun/PiMalleable.cfg                 | pi2/pi3 OP_2DROP malleability survives both CHECKSIG fixes - honest operator Disproved (swept over ParamsOK)
+live       | crates/bitvm-gc/AssertFrontRun/PiMalleableShipped.cfg          | pi2/pi3 malleability with shipped values of all four networks
+pass       | crates/bitvm-gc/AssertFrontRun/AllParams.cfg                   | current scripts: worst-case C3/C4 attack wins for EVERY swept timelock/delay tuple (timing-independent)
+design     | crates/bitvm-gc/AssertFrontRun/Fixed.cfg                       | C3 fix - n-of-n SIGHASH_ALL presig on VerifierAssert, Disprove in time over all of ParamsOK
+design     | crates/bitvm-gc/AssertFrontRun/C4Fixed.cfg                     | C3/C4/pi fix - both CHECKSIGs + pi bound to signed data, valid and invalid proofs, over all of ParamsOK
+design     | crates/bitvm-gc/AssertFrontRun/C4FixedShipped.cfg              | C3/C4/pi fix with shipped Bitcoin/Testnet4/Signet values
+design     | crates/bitvm-gc/AssertFrontRun/Exact.cfg                       | fix margin exact: Take2 iff CondDisprove fails, Disproved iff CondWC fails, every swept tuple
+boundary   | crates/bitvm-gc/AssertFrontRun/Boundary.cfg                    | full fix outside ParamsOK (CondWC/CondDisprove) - must fail
+boundary   | crates/bitvm-gc/AssertFrontRun/Regtest.cfg                     | full fix with shipped Regtest prover_connector 1 / connector_d 3 - outside ParamsOK, must fail
+live       | crates/bitvm-gc/AssertFrontRun/ValidateGap.cfg                 | validate_timelock_config (timelocks.rs:213-226) accepts connector_d - prover_connector = one action window; ChallengeAssert + Disprove need 2(r+i)+1 - Take2 wins even with the script fixes
+live       | crates/bitvm-gc/DefenderTxPinning/M3.cfg                       | M3: v2 + keyless P2A - absolute-fee pin keeps the defender tx unconfirmed until Take2 (swept over ParamsOK)
+live       | crates/bitvm-gc/DefenderTxPinning/Shipped.cfg                  | M3 with shipped NACK/Commit-Timeout/Disprove deadlines of all four networks (Regtest fails even without a pin)
+design     | crates/bitvm-gc/DefenderTxPinning/Fixed.cfg                    | M3 fix - v3/TRUC 1p1c, defender always evicts the pin, over ParamsOK (reaction+inclusion+1 <= deadline)
+design     | crates/bitvm-gc/DefenderTxPinning/FixedShipped.cfg             | M3 TRUC fix with shipped Bitcoin/Testnet4/Signet deadlines
+boundary   | crates/bitvm-gc/DefenderTxPinning/Boundary.cfg                 | TRUC fix outside ParamsOK - must fail
+boundary   | crates/bitvm-gc/DefenderTxPinning/Regtest.cfg                  | TRUC fix with shipped Regtest deadlines (1 block) - outside ParamsOK, must fail
+live       | crates/bitvm-gc/RoundPenalty/M5.cfg                            | M5: operator burns ForceSkipConn_{i+1}, late Kickoff_i escapes QuickChallenge/ForceSkip/CIK (swept over ParamsOK)
+live       | crates/bitvm-gc/RoundPenalty/Shipped.cfg                       | M5 with shipped values of all four networks
+design     | crates/bitvm-gc/RoundPenalty/Fixed.cfg                         | M5 fix - n-of-n ForceSkipConnector, late kickoff always QuickChallenged, over ParamsOK (reaction+inclusion+1 <= connector_a)
+design     | crates/bitvm-gc/RoundPenalty/FixedShipped.cfg                  | M5 fix with shipped values of all four networks
+boundary   | crates/bitvm-gc/RoundPenalty/Boundary.cfg                      | M5 fix outside ParamsOK - must fail
+
+# ---- round 2: kickoff challenge gate (C5, C6, H4) ---------------------------------------------------
+live       | node/aggregates/graph/ChallengeKickoffGate/C5.cfg              | C5: late initWithdraw poisons proceedWithdraw (KickoffHeightLow); gate waits on Initialized forever, Take1 + manual cancel = double payment (inside C6Safe; every network)
+live       | node/aggregates/graph/ChallengeKickoffGate/C6.cfg              | C6: challenge_kickoff waits for GOAT SPV with no connector_a deadline; full parameter sweep, fails exactly outside C6Safe (ca >= sc+lag+2r+incl+3)
+live       | node/aggregates/graph/ChallengeKickoffGate/C6Shipped.cfg       | C6 shipped: Testnet4 (6 vs 10), Signet (6 vs 6), Regtest (2 vs 1) - Take1 lands unchallenged with a healthy SPV, even r=0
+live       | node/aggregates/graph/ChallengeKickoffGate/C6Bitcoin.cfg       | C6 shipped Bitcoin: reproduces once the SPV lags >= 118 blocks beyond its 6 confirms (~20 h)
+pass       | node/aggregates/graph/ChallengeKickoffGate/C6Exact.cfg         | current gate always challenges in time inside C6Safe (no late init, no stall)
+pass       | node/aggregates/graph/ChallengeKickoffGate/C6BitcoinHealthy.cfg | current gate safe on shipped Bitcoin with a healthy SPV (lag 0)
+live       | node/aggregates/graph/ChallengeKickoffGate/H4.cfg              | H4: Goat history-sync stall skips the chain scan that queues challenge_kickoff; Take1 lands unchallenged (inside C6Safe)
+design     | node/aggregates/graph/ChallengeKickoffGate/Fixed.cfg           | C5/C6/H4 fix design over the sweep restricted to ParamsOK (ca >= r+incl+1)
+design     | node/aggregates/graph/ChallengeKickoffGate/FixedShipped.cfg    | fix design with shipped Bitcoin/Testnet4/Signet values and budget
+boundary   | node/aggregates/graph/ChallengeKickoffGate/Boundary.cfg        | fix design outside ParamsOK fails (condition exact)
+boundary   | node/aggregates/graph/ChallengeKickoffGate/FixedRegtest.cfg    | fix design fails on shipped regtest (connector_a 2 < r+incl+1 at r=1); needs connector_a >= 3
+design     | node/aggregates/graph/ChallengeKickoffGate/FixedHonest.cfg     | fix design leaves honest withdraws unchallenged under ParamsLive (ca >= sc+lag+2r+incl+3)
+design     | node/aggregates/graph/ChallengeKickoffGate/FixedHonestBitcoin.cfg | fix design leaves honest peg-outs unchallenged on shipped Bitcoin
+boundary   | node/aggregates/graph/ChallengeKickoffGate/FixedHonestBoundary.cfg | fix design challenges honest withdraws outside ParamsLive (condition exact)
+boundary   | node/aggregates/graph/ChallengeKickoffGate/FixedHonestShipped.cfg | fix design would challenge every honest peg-out on shipped Testnet4/Signet/Regtest
+
+# ---- round 2: Gateway withdraw lifecycle and committee multisig (H1, M1, C5, F4, econ) ---------------
+live       | contracts/GatewayWithdrawLifecycle/H1.cfg                      | H1: finish_disproved gives up on withdraw None -> disproved operator never slashed
+live       | contracts/GatewayWithdrawLifecycle/H1Node.cfg                  | H1: WithdrawDisproved of an un-initialised graph has instanceId 0, watcher drops it
+design     | contracts/GatewayWithdrawLifecycle/H1Fixed.cfg                 | H1 fix design - relay None + key event by graph
+live       | contracts/GatewayWithdrawLifecycle/M1.cfg                      | M1: disprove of lock holder leaves pegin Locked forever (liveness)
+live       | contracts/GatewayWithdrawLifecycle/M1Escrow.cfg                | M1: disprove while Initialized strands the escrowed pegBTC
+design     | contracts/GatewayWithdrawLifecycle/M1Fixed.cfg                 | M1 fix design - disprove of lock holder reopens pegin + releases escrow
+live       | contracts/GatewayWithdrawLifecycle/C5.cfg                      | C5: committeeCancelWithdraw after kickoff+Take1 refunds pegBTC (double payment)
+live       | contracts/GatewayWithdrawLifecycle/C5Stale.cfg                 | C5: cancel digest not bound to attempt, old signature cancels a re-init
+design     | contracts/GatewayWithdrawLifecycle/C5Fixed.cfg                 | C5 fix design - cancel needs kickoff-impossible proof + attempt-bound digest
+live       | contracts/GatewayWithdrawLifecycle/F4.cfg                      | F4: initWithdraw not restricted to the graph's operator
+design     | contracts/GatewayWithdrawLifecycle/F4Fixed.cfg                 | F4 fix design - initWithdraw only from the graph operator
+live       | contracts/GatewayWithdrawLifecycle/Econ.cfg                    | Econ: one stake backs N graphs, rewards paid when slash is 0
+design     | contracts/GatewayWithdrawLifecycle/EconFixed.cfg               | Econ fix design - per-graph stake reservation, rewards capped by slash
+design     | contracts/GatewayWithdrawLifecycle/AllFixed.cfg                | all Gateway withdraw fixes together, safety + liveness
+live       | contracts/MultiSigReplay/Replay.cfg                            | updateOwners digest lacks contract/chain id, cross-deployment replay
+design     | contracts/MultiSigReplay/Fixed.cfg                             | domain-separated updateOwners digest
+
+# ---- round 2: engine job persistence and capacity (H3, M4, H5) --------------------------------------
+live       | crates/engine/JobObligationPersistence/H3Panic.cfg             | H3: one panic Poisons a stable-id defence job, INSERT OR IGNORE never re-runs it (shipped windows, all networks)
+live       | crates/engine/JobObligationPersistence/Rejected.cfg            | H3: transient Goat revert classified Permanent ends challenge_kickoff Done("rejected"), never re-run (shipped, all networks)
+live       | crates/engine/JobObligationPersistence/Reorg.cfg               | H3: closing stages decided at 1 conf, never rescanned; reorg < BtcBlockConfirms leaves false closure (Bitcoin/Testnet4/Signet)
+design     | crates/engine/JobObligationPersistence/Fixed.cfg               | H3 fix design - re-arm unbroadcast obligations per scan + close at depth > max reorg; full timing sweep, ParamsOK exact
+design     | crates/engine/JobObligationPersistence/FixedShipped.cfg        | H3 fix design, shipped windows all networks - close at BtcBlockConfirms; faults+reorg within safety_blocks
+boundary   | crates/engine/JobObligationPersistence/Boundary.cfg            | H3 fix just outside ParamsOK (closeDepth = maxReorg, or timing one block short) - must fail
+live       | node/aggregates/instance/PeginPostRetry/M4.cfg                 | M4: post_pegin_data "cannot cover fee" retried forever, no alert, BTC locked with no mint
+design     | node/aggregates/instance/PeginPostRetry/Fixed.cfg              | M4 fix design - FeeTooHigh classified as rejection -> Failed -> PostPeginDataRejected alert
+live       | crates/engine/PegoutPoolCapacity/H5.cfg                        | H5: 1 Pegout slot + 1 running job per graph serialize answers past prover_connector (shipped; Testnet4/Signet/Regtest, not Bitcoin)
+live       | crates/engine/PegoutPoolCapacity/SlotsOnly.cfg                 | H5: raising pegout_pool_slots alone does not help (per-aggregate claim gate), shipped
+design     | crates/engine/PegoutPoolCapacity/Fixed.cfg                     | H5 fix design - prover_connector >= React + W(G,N,E,Slots) + Incl, multi-graph, full sweep, exact
+design     | crates/engine/PegoutPoolCapacity/FixedShipped.cfg              | H5 fix design, shipped prover_connector all networks - accepted graphs answer in time (regtest accepts none)
+boundary   | crates/engine/PegoutPoolCapacity/Boundary.cfg                  | H5 fix with prover_connector one block short of React+W+Incl - must fail
+boundary   | crates/engine/PegoutPoolCapacity/PerGraphOnly.cfg              | original per-graph H5 budget (N*E) - G>=2 graphs share the Pegout slot, fails
+
+# ---- round 2: peg-in safety and liveness (H2, H6, M2, F1, F6, F7) -----------------------------------
+live       | node/aggregates/instance/PeginConfirmCancelReorg/H6.cfg        | H6: tip-recording SPV feeder (lag 0) + 1-conf post - 1-deep reorg mints unbacked (sweep T0 1..11, reorg 1..4)
+live       | node/aggregates/instance/PeginConfirmCancelReorg/NodeSpv.cfg   | H6: node SPV writer lag k 1..3 -> reorg of depth k+1 mints unbacked (no depth check of its own)
+live       | node/aggregates/instance/PeginConfirmCancelReorg/Shipped.cfg   | H6 shipped values, all 4 networks: tip feeder -> 1-deep reorg mints unbacked
+design     | node/aggregates/instance/PeginConfirmCancelReorg/Fixed.cfg     | H6 fix design - usable header depth >= max reorg (ParamsOK spvLag >= maxReorg, exact), colluding poster, full sweep
+design     | node/aggregates/instance/PeginConfirmCancelReorg/FixedShipped.cfg | H6 shipped: node writer k=BtcBlockConfirms vs reorgs <= EvidenceConfirmations holds on all 4 networks (margin 0 Bitcoin/Testnet4)
+boundary   | node/aggregates/instance/PeginConfirmCancelReorg/FixedBoundary.cfg | H6 fix outside ParamsOK (spvLag < maxReorg) - unbacked mint
+boundary   | node/aggregates/instance/PeginConfirmCancelReorg/NodeSpvShipped.cfg | H6 shipped node writer k, reorg k+1 (7/11/7/2) - unbacked mint on all 4 networks
+boundary   | node/aggregates/instance/PeginConfirmCancelReorg/GateOnly.cfg  | H6 insufficient fix - close signing one block earlier without the SPV depth margin: still unbacked
+boundary   | node/aggregates/instance/PeginConfirmCancelReorg/PostWaitOnly.cfg | H6 insufficient fix - post_pegin_data waits past every reorg but the SPV depth is short: colluding poster still mints unbacked
+live       | node/aggregates/instance/PeginTimeoutAgreement/M2.cfg          | M2: Confirm held >= B+2 blocks (fixed fee) - a node times out, nodes disagree (sweep T0, B1/B2 1..3, incl 1..6)
+live       | node/aggregates/instance/PeginTimeoutAgreement/Mint.cfg        | M2: same sweep - Timeout relayer never posts, confirmed Confirm never minted
+live       | node/aggregates/instance/PeginTimeoutAgreement/Shipped.cfg     | M2 shipped values, all 4 networks: late Byzantine broadcast after Timeout - nodes disagree
+pass       | node/aggregates/instance/PeginTimeoutAgreement/ShippedHonest.cfg | M2 baseline, shipped: honest broadcasters, Confirm within InclusionBlocks (<= B+1) - agreement and mint hold
+design     | node/aggregates/instance/PeginTimeoutAgreement/Fixed.cfg       | M2 fix design - confirmed Confirm reverts Timeout to RelayerL1Broadcasted (no timing margin; full sweep, Byzantine broadcaster)
+design     | node/aggregates/instance/PeginTimeoutAgreement/FixedShipped.cfg | M2 fix, shipped values, Confirm held up to B+2, Byzantine broadcaster - holds on all 4 networks
+design     | node/aggregates/instance/PeginTimeoutAgreement/RelayerPosts.cfg | M2 partial fix - relayer posts despite Timeout (mint live; agreement not)
+live       | node/aggregates/instance/CommitteeKeyDeletion/H2.cfg           | H2: key deletion off by default - settled C0/deposit sweepable (sweep kd, react, window)
+live       | node/aggregates/instance/CommitteeKeyDeletion/Timeout.cfg      | H2: deletion on but never on Timeout - deposit/C0 sweepable (sweep)
+live       | node/aggregates/instance/CommitteeKeyDeletion/Shipped.cfg      | H2 shipped (kd 32, ReactionBlocks), all 4 networks: deletion off by default - sweepable
+live       | node/aggregates/instance/CommitteeKeyDeletion/TimeoutShipped.cfg | H2 shipped, all 4 networks: deletion on, never on Timeout - sweepable
+design     | node/aggregates/instance/CommitteeKeyDeletion/Fixed.cfg        | H2 fix design - delete by default, on every terminal state incl. Timeout; ParamsOK kd+react<=W, tdelay+react<=W (exact)
+design     | node/aggregates/instance/CommitteeKeyDeletion/FixedShipped.cfg | H2 fix, shipped (kd = tdelay = 32, W = kd + ReactionBlocks) - holds on all 4 networks
+boundary   | node/aggregates/instance/CommitteeKeyDeletion/FixedBoundary.cfg | H2 fix outside ParamsOK - the node deletes after the compromise
+live       | node/aggregates/instance/PeginRequestLiveness/Spam.cfg         | F1: free never-expiring spam delays Prepare detection past graph cutoff (sweep spam, batch, ticks/block, T0, gd, cd)
+live       | node/aggregates/instance/PeginRequestLiveness/SpamShipped.cfg  | F1 shipped, all 4 networks: 145,500/50,250/750/6,150 spam rows -> genuine peg-in times out
+design     | node/aggregates/instance/PeginRequestLiveness/SpamFixed.cfg    | F1 fix design - bounded live spam; ParamsOK scan lag <= cutoff /\ lag+gd+cd <= T0-1 (exact)
+design     | node/aggregates/instance/PeginRequestLiveness/SpamFixedShipped.cfg | F1 fix, shipped: live spam <= one block of scanning, gd = cd = ReactionBlocks - holds on all 4 networks
+boundary   | node/aggregates/instance/PeginRequestLiveness/SpamBoundary.cfg | F1 fix outside ParamsOK - genuine peg-in fails
+live       | node/aggregates/instance/PeginRequestLiveness/BadKey.cfg       | F6: one off-curve answer wedges the instance in CommitteesAnswered
+design     | node/aggregates/instance/PeginRequestLiveness/BadKeyFixed.cfg  | F6 fix design - on-curve check on answers
+live       | node/aggregates/instance/PeginRequestLiveness/NoHeight.cfg     | F7 (latent, non-conforming backend): btc_height 0 - Timeout never fires
+live       | node/aggregates/instance/PeginRequestLiveness/NoHeightGate.cfg | F7 (latent): btc_height 0 - T0 gate never closes, signature after T0
+design     | node/aggregates/instance/PeginRequestLiveness/NoHeightFixed.cfg | F7 fix design - confirmed Prepare needs a height
