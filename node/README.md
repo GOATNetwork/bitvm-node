@@ -494,7 +494,7 @@ pub enum DisproveTxType { Disprove, QuickChallenge, ChallengeIncompleteKickoff, 
 
 Both currently go through a raw `UPDATE graph SET status = ?` (`crates/store/src/localdb.rs`) with no guard preventing a closed/terminal status (`GraphStatus::is_closed()`: `OperatorTake1`, `OperatorTake2`, `Skipped`, `Disprove`) from being overwritten by a later, differently-ordered write from the other subsystem — e.g. a `Disprove` status can be silently reverted by a stale `PostGraphDataEvent` replay. This was fixed in `991faaa`: the writes now go through a guarded update.
 
-`audit/tla/GraphLifecycle.tla` / `GraphLifecycleFixed.cfg` checks the current code: with the atomic guard (the check folded into the `UPDATE`'s `WHERE status IN (...)` clause rather than a separate read-then-decide-then-write) all safety and liveness properties hold, and `GraphLifecycleFineGrainedFixed.tla` confirms the guard is a single atomic statement. Before the fix TLC found `OperatorTake1 -> OperatorTake2` in 2 steps.
+`audit/tla/specs/node/aggregates/graph/GraphLifecycle.tla` / `node/aggregates/graph/GraphLifecycle/Fixed.cfg` checks the current code: with the atomic guard (the check folded into the `UPDATE`'s `WHERE status IN (...)` clause rather than a separate read-then-decide-then-write) all safety and liveness properties hold, and `GraphLifecycleFineGrainedFixed.tla` confirms the guard is a single atomic statement. Before the fix TLC found `OperatorTake1 -> OperatorTake2` in 2 steps.
 
 ---
 
