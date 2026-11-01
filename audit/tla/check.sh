@@ -6,14 +6,20 @@
 #   audit/tla/check.sh Foo.cfg         only that config
 #   audit/tla/check.sh Foo.tla         every config of that spec
 #
-# Tiers (specs.txt):
-#   pass       - a fix/baseline design; must verify, else the design regressed.
-#   historical - a bug already fixed in the code; the frozen spec must still
-#                reproduce its counterexample. An unexpected pass means the
-#                spec drifted or the fix was reverted.
-#   live       - a known, unfixed bug; while it reproduces it fails the run
-#                (and blocks merge in CI). Fix the code, then move the row to
-#                `historical` - the frozen spec cannot see the code fix itself.
+# Tiers (specs.txt). Only the current code is checked: no row models old,
+# pre-fix code.
+#   pass       - models the current code; must verify. A fixed bug's check
+#                lives here, so a regression fails the run.
+#   live       - models the current code with a known, unfixed bug; fails the
+#                run (and blocks merge in CI) while it reproduces. When the code
+#                is fixed, change the config to model the fix and make it `pass`.
+#                A live row that stops reproducing without that is an error too
+#                (the model drifted from the code).
+#   design     - a proposed fix for a live bug, not in the code yet; must
+#                verify. Becomes the `pass` row once the fix lands.
+#   boundary   - a parameter sweep outside a fix design's `ParamsOK` condition;
+#                must find a counterexample, showing the condition is necessary.
+#                An unexpected pass means the condition is looser than modeled.
 # A run on which TLC does not finish (parse error, missing file, JVM problem)
 # fails in every tier: the outcome is TLC's exit status, so a broken spec can
 # never pass as "reproduces".
@@ -34,9 +40,10 @@ matched=0
 {
   echo "## TLA+ formal verification"
   echo
-  echo "Every spec is run and its live TLC result reported below. Tiers:"
-  echo "**pass** must verify; **historical** (fixed bug) must still reproduce"
-  echo "its counterexample; **live** (unfixed bug) blocks merge while it does."
+  echo "Every spec models the current code (or a proposed fix) and is run here."
+  echo "Tiers: **pass** (current code) and **design** (proposed fix) must verify;"
+  echo "**live** (unfixed bug in the current code) blocks merge while it reproduces;"
+  echo "**boundary** must be violated outside the fix's parameter condition."
   echo "A run on which TLC does not finish fails whatever the tier."
   echo
   echo "| Spec | Tier | TLC result | Status |"
@@ -79,25 +86,26 @@ while IFS='|' read -r tier cfg tla desc; do
     tail -n 20 tlc.log
   else
     case "$tier" in
-      pass)
+      pass|design)
         if [ "$ok" = 1 ]; then status="OK"; else
-          status="REGRESSED - fix/baseline no longer verifies"; hard_fail=$((hard_fail+1))
-          annotate error "[pass] $cfg / $tla did NOT verify ($desc). Repro: $repro"
+          status="REGRESSED - no longer verifies"; hard_fail=$((hard_fail+1))
+          annotate error "[$tier] $cfg / $tla did NOT verify ($desc). Repro: $repro"
         fi ;;
-      historical)
-        if [ "$ok" = 0 ]; then status="OK - reproduces (regression record)"; else
-          status="DRIFT - no longer reproduces (spec edited or fix reverted)"; hard_fail=$((hard_fail+1))
-          annotate error "[historical] $cfg / $tla unexpectedly verified ($desc) - investigate drift/revert. Repro: $repro"
+      boundary)
+        if [ "$ok" = 0 ]; then status="OK - violated outside ParamsOK (condition is necessary)"; else
+          status="LOOSE - holds outside ParamsOK; tighten the condition"; hard_fail=$((hard_fail+1))
+          annotate error "[boundary] $cfg / $tla verified outside its ParamsOK ($desc) - the parameter condition is looser than modeled. Repro: $repro"
         fi ;;
       live)
         if [ "$ok" = 0 ]; then
           status="OPEN - blocks merge"; live_open=$((live_open+1)); hard_fail=$((hard_fail+1))
           annotate error "OPEN BUG (blocks merge): $desc. Repro: $repro"
         else
-          status="review - no longer reproduces; if fixed, move tier to historical"
-          annotate warning "[live] $cfg / $tla no longer reproduces ($desc) - move its tier to 'historical' if the code is fixed. Repro: $repro"
+          status="DRIFT - no longer reproduces; if the code is fixed, model the fix and make it pass"
+          hard_fail=$((hard_fail+1))
+          annotate error "[live] $cfg / $tla no longer reproduces ($desc) - if the code is fixed, change the config to model the fix and move the row to 'pass'; otherwise the model drifted. Repro: $repro"
         fi ;;
-      *) status="UNKNOWN TIER"; hard_fail=$((hard_fail+1)); annotate error "unknown tier '$tier' for $cfg (use pass|historical|live)" ;;
+      *) status="UNKNOWN TIER"; hard_fail=$((hard_fail+1)); annotate error "unknown tier '$tier' for $cfg (use pass|live|design|boundary)" ;;
     esac
   fi
   printf '%-10s %-44s %-24s %s\n' "$tier" "$cfg" "$tlc" "$status"

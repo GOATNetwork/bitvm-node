@@ -8,7 +8,7 @@ TLA2TOOLS ?= $(HOME)/.local/share/tlaplus/tla2tools.jar
 TLA2TOOLS_URL := https://github.com/tlaplus/tlaplus/releases/latest/download/tla2tools.jar
 export TLA2TOOLS TLC_OPTS
 
-.PHONY: localnet-build localnet-up localnet-down localnet-reset localnet-status e2e-smoke e2e tla-setup tla
+.PHONY: localnet-build localnet-up localnet-down localnet-reset localnet-status e2e-smoke e2e tla-setup tla tla-values
 
 localnet-build:        ## build the mock-gc node + helper binaries into the repo target
 	$(LOCALNET)/build.sh
@@ -37,3 +37,6 @@ tla-setup:             ## download tla2tools.jar to $(TLA2TOOLS) (needs a JRE 11
 
 tla:                   ## run audit/tla/specs.txt through TLC; fails while a live bug reproduces (SPEC=<cfg|tla> for one)
 	audit/tla/check.sh $(SPEC)
+
+tla-values:            ## regenerate audit/tla/ShippedTimelockValues.tla from the shipped Rust timing constants
+	UPDATE_TLA_VALUES=1 cargo test -p bitvm-gc --test tla_shipped_values

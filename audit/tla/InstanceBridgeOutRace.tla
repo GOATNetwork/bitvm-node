@@ -1,80 +1,135 @@
 ---- MODULE InstanceBridgeOutRace ----
 (***************************************************************************)
-(* Formal model of a race found while auditing every remaining stateful    *)
-(* enum after GraphStatus/InstanceBridgeInStatus (see audit/TLAPlus-*.md). *)
+(* Round-1 Finding 6 (audit/TLAPlus-20260710.md): the bridge-out status    *)
+(* had several uncoordinated writers with no status precondition, so a     *)
+(* stale write could resurrect or overwrite a final outcome (e.g. a        *)
+(* maintenance Timeout clobbering a Claim).                                *)
 (*                                                                         *)
-(* `InstanceBridgeOutStatus` (crates/store/src/schema.rs:223-229) is       *)
-(* written from three independently-scheduled, uncoordinated tasks with   *)
-(* no shared transaction spanning read+decide+write in any of them:       *)
-(*   - the RPC-service task (node/src/rpc_service/handler/bitvm_handler.rs, *)
-(*     `bridge_out_init_tag`) - stale-read-then-full-row-upsert, sets      *)
-(*     Initialize.                                                        *)
-(*   - the GoatChain L2-event watcher (node/src/scheduled_tasks/          *)
-(*     event_watch_task.rs), 5s tokio task - unconditional targeted        *)
-(*     `update_instance` on SwapClaimEvent/SwapRefundEvent, sets           *)
-(*     Claim/Refund with NO status precondition (`InstanceUpdate`'s WHERE  *)
-(*     clause is only `hex(instance_id)=?`, confirmed via                  *)
-(*     crates/store/src/localdb.rs - no `with_only_if_status_in` exists    *)
-(*     anywhere in the codebase for this entity).                         *)
-(*   - the maintenance task (node/src/scheduled_tasks/                    *)
-(*     instance_maintenance_tasks.rs, `instance_bridge_out_monitor`), 10s  *)
-(*     tokio task - batch-reads a stale snapshot, then per-row does an     *)
-(*     unconditional targeted `update_instance` to Timeout with no re-     *)
-(*     check at write time.                                                *)
+(* CODE SCOPE (dev @ 60562f8, after #476). The old InstanceBridgeOutStatus *)
+(* on the instance row is gone; the bridge-out (swap) lifecycle is now the *)
+(* `swap_escrow` row, status SwapEscrowStatus (crates/store/src/schema.rs  *)
+(* 252-264):                                                               *)
+(*   Initialize, Claim, Refund  mirror the swap contract's events;         *)
+(*   Timeout                    is derived locally when refund_deadline    *)
+(*                              passes, and a later on-chain Claim/Refund  *)
+(*                              event still overrides it (schema.rs 255).  *)
+(* Writers (the old RPC full-row upsert no longer exists; rpc_service only *)
+(* reads swap_escrow):                                                     *)
+(*   - GOAT event watcher, node/src/scheduled_tasks/event_watch/          *)
+(*     bridge_out.rs: Initialize via insert_swap_escrow_if_absent (INSERT  *)
+(*     .. ON CONFLICT DO NOTHING), Claim / Refund via update_swap_escrow   *)
+(*     with_only_if_status_in([Initialize, Timeout]) - the guard is folded *)
+(*     into the UPDATE's WHERE clause (crates/store/src/localdb/swap.rs    *)
+(*     109-112, 159-166, 250-257).                                         *)
+(*   - maintenance, node/src/scheduled_tasks/swap_maintenance_tasks.rs     *)
+(*     swap_escrow_timeout_monitor -> timeout_expired_swap_escrows         *)
+(*     (swap.rs 261-276): one UPDATE .. WHERE status = 'Initialize'.       *)
+(* Every write is a single guarded SQL statement, so each is one atomic    *)
+(* action with its guard on the CURRENT status (no read-then-write gap).   *)
 (*                                                                         *)
-(* Modeled the same way GraphLifecycle.tla models its GoatRace actions:    *)
-(* every writer is unconditional on the CURRENT status - that's the        *)
-(* verified real behavior, not a simplification of it.                    *)
+(* PROPERTY, re-derived for the current design: Claim and Refund are the   *)
+(* final outcomes (absorbing); Timeout is provisional and can only be      *)
+(* replaced by an on-chain Claim/Refund; nothing ever returns a row to     *)
+(* Initialize. The old property also treated Timeout as absorbing; the     *)
+(* current code deliberately lets the chain event override it, so that     *)
+(* reading no longer applies (not a bug: the contract event is            *)
+(* authoritative).                                                         *)
+(*                                                                         *)
+(* CONFIGS: InstanceBridgeOutRaceFixed.cfg (tier pass) - the current code. *)
+(* Abstractions: one escrow; the refund deadline is not modeled (the       *)
+(* Timeout write may fire whenever the row is Initialize, a superset of    *)
+(* the real behaviour, which is sound for the safety properties).          *)
 (***************************************************************************)
-Statuses == {"Initialize", "Claim", "Timeout", "Refund"}
 
-\* Once a bridge-out instance is claimed, timed out, or refunded, that is
-\* meant to be the final outcome - Initialize is the only non-terminal
-\* status.
-TerminalStatuses == {"Claim", "Timeout", "Refund"}
+\* Row states. EscrowAbsent = no swap_escrow row for this escrow_hash yet.
+EscrowAbsent     == "Absent"
+EscrowInitialize == "Initialize"
+EscrowClaim      == "Claim"
+EscrowTimeout    == "Timeout"
+EscrowRefund     == "Refund"
 
-VARIABLE status
+EscrowStates == {EscrowAbsent, EscrowInitialize, EscrowClaim, EscrowTimeout, EscrowRefund}
+
+\* Outcomes reported by the swap contract: final once recorded.
+TerminalStatuses == {EscrowClaim, EscrowRefund}
+
+\* Statuses the Claim/Refund UPDATE accepts (with_only_if_status_in).
+ChainOverridable == {EscrowInitialize, EscrowTimeout}
+
+VARIABLES
+    status      \* swap_escrow.status of the modeled escrow
+
 vars == <<status>>
 
-TypeOK == status \in Statuses
+TypeOk == status \in EscrowStates
 
-Init == status = "Initialize"
+Init == status = EscrowAbsent
 
 --------------------------------------------------------------------------
-(* Every action below is unconditional on the current status - confirmed  *)
-(* real behavior for all three writers, not a modeling simplification.    *)
+\* Action: the watcher sees the swap Initialize event and creates the row in
+\* Initialize. A replayed Initialize hits ON CONFLICT DO NOTHING (a no-op,
+\* so it is not a separate step), whatever status the row has reached.
+\* Source: handle_swap_init_events() in node/src/scheduled_tasks/event_watch/bridge_out.rs:88-130;
+\*         insert_swap_escrow_if_absent() in crates/store/src/localdb/swap.rs:177-213 (ON CONFLICT DO NOTHING, 187)
+WatchEventInitialize ==
+    /\ status = EscrowAbsent
+    /\ status' = EscrowInitialize
 
-RpcStaleInit ==      status' = "Initialize" \* bitvm_handler.rs bridge_out_init_tag, stale full-row upsert
-WatchEventClaim ==   status' = "Claim"      \* event_watch_task.rs handle_swap_claim_events
-WatchEventRefund ==  status' = "Refund"     \* event_watch_task.rs handle_swap_refund_events
-MaintenanceTimeout == status' = "Timeout"   \* instance_maintenance_tasks.rs instance_bridge_out_monitor
+\* Action: the watcher sees the swap Claim event. The UPDATE only matches a
+\* row in Initialize or Timeout; otherwise zero rows change (an event for an
+\* unknown escrow is skipped before the UPDATE).
+\* Source: handle_swap_claim_events() in node/src/scheduled_tasks/event_watch/bridge_out.rs:158-223;
+\*         update_swap_escrow() / with_only_if_status_in() in crates/store/src/localdb/swap.rs:109-112,159-166,250-257
+WatchEventClaim ==
+    /\ status \in ChainOverridable
+    /\ status' = EscrowClaim
+
+\* Action: the watcher sees the swap Refund event; same guard as Claim.
+\* Source: handle_swap_refund_events() in node/src/scheduled_tasks/event_watch/bridge_out.rs:247-280
+WatchEventRefund ==
+    /\ status \in ChainOverridable
+    /\ status' = EscrowRefund
+
+\* Action: the maintenance tick marks a still-Initialize escrow whose
+\* refund_deadline has passed as Timeout (single UPDATE .. WHERE status =
+\* 'Initialize'; the deadline condition is abstracted away).
+\* Source: swap_escrow_timeout_monitor() in node/src/scheduled_tasks/swap_maintenance_tasks.rs:10-17
+\*         (run() in node/src/scheduled_tasks/mod.rs:277-281);
+\*         timeout_expired_swap_escrows() in crates/store/src/localdb/swap.rs:261-276
+MaintenanceTimeout ==
+    /\ status = EscrowInitialize
+    /\ status' = EscrowTimeout
 
 Next ==
-    \/ RpcStaleInit
+    \/ WatchEventInitialize
     \/ WatchEventClaim
     \/ WatchEventRefund
     \/ MaintenanceTimeout
 
+\* No fairness: only safety is checked.
 Spec == Init /\ [][Next]_vars
-FairSpec == Spec /\ WF_vars(Next)
-
-\* Proposed fix design (not applied to code - same atomic-CAS pattern as
-\* the GraphStatus/InstanceBridgeInStatus fixes: only write if the row
-\* isn't already in a terminal status, folded into the UPDATE's WHERE
-\* clause so there's no read-then-write gap).
-NextFixed ==
-    \/ (status \notin TerminalStatuses /\ RpcStaleInit)
-    \/ (status \notin TerminalStatuses /\ WatchEventClaim)
-    \/ (status \notin TerminalStatuses /\ WatchEventRefund)
-    \/ (status \notin TerminalStatuses /\ MaintenanceTimeout)
-
-SpecFixed == Init /\ [][NextFixed]_vars
-FairSpecFixed == SpecFixed /\ WF_vars(NextFixed)
 
 --------------------------------------------------------------------------
-(* Safety property: once a bridge-out instance reaches a final outcome,   *)
-(* it never changes again - e.g. a successfully Claimed instance must     *)
-(* never be silently reset by a stale maintenance-task Timeout write.     *)
-TerminalStatusesAreAbsorbing == [][(status \in TerminalStatuses => status' = status)]_status
+\* ---- Safety invariants ----
+\* (TypeOk above.)
+
+\* ---- Safety properties ----
+
+\* A recorded Claim or Refund is final: no later write changes it (e.g. a
+\* stale maintenance Timeout never clobbers a Claim).
+TerminalStatusesAreAbsorbing ==
+    [][(status \in TerminalStatuses => status' = status)]_status
+
+\* A locally derived Timeout is only ever replaced by an on-chain outcome.
+TimeoutOnlyResolvedOnChain ==
+    [][(status = EscrowTimeout => status' \in {EscrowTimeout} \cup TerminalStatuses)]_status
+
+\* No writer resurrects a row to Initialize: it is entered only on creation.
+NoResurrectionToInitialize ==
+    [][(status' = EscrowInitialize => status \in {EscrowAbsent, EscrowInitialize})]_status
+
+\* ---- Liveness ----
+\* None: resolution depends on the refund deadline and the contract events,
+\* which this safety model does not constrain.
 
 ====

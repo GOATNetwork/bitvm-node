@@ -1,33 +1,26 @@
 ---- MODULE ShippedTimelocks ----
 (***************************************************************************)
-(* Real per-network timelock values, transcribed from                      *)
-(* crates/bitvm-gc/src/timelocks.rs, shared by every margin-arithmetic     *)
-(* spec in this directory (Take2DisproveRace.tla, MultiActorRace.tla,      *)
-(* Take1ChallengeRace.tla) - single source of truth instead of each spec   *)
-(* re-transcribing its own copy.                                          *)
+(* Per-network timing values for the round-1 margin-arithmetic specs       *)
+(* (Take2DisproveRace.tla, MultiActorRace.tla, Take1ChallengeRace.tla).    *)
 (*                                                                         *)
-(* As of commit 991faaa ("Dev fix #418"), Finding 4's fix has actually been *)
-(* applied to crates/bitvm-gc/src/timelocks.rs - these are now the REAL     *)
-(* shipped values (re-verified via TLC against these exact numbers, not     *)
-(* just the originally-proposed 35/testnet4 figure this file used to hold  *)
-(* before the real fix landed with a wider margin than proposed).          *)
-(* connector_a is NOT here - Take1ChallengeRace.tla defines its own        *)
-(* ConnectorA/ConnectorAFixed locally, since that value pair is the        *)
-(* historical subject under test in that spec, not a settled shared        *)
-(* constant.                                                               *)
+(* Every number comes from ShippedTimelockValues.tla, which is GENERATED   *)
+(* from crates/bitvm-gc/src/timelocks.rs by                                *)
+(* crates/bitvm-gc/tests/tla_shipped_values.rs and checked for drift in    *)
+(* CI (`make tla-values` regenerates it). This module used to carry a      *)
+(* hand-transcribed copy, which went stale (testnet4 prover_connector,     *)
+(* connector_d, operator_ack, operator_commit and connector_f all changed  *)
+(* after it was written).                                                  *)
+(*                                                                         *)
+(* MinReactionBlocks used to be a policy floor invented by these specs     *)
+(* (6/12/1/1). The code now has its own: validate_timelock_config          *)
+(* requires connector_a and prover_connector >= action_window and          *)
+(* connector_d - prover_connector >= action_window, where action_window =  *)
+(* reaction_blocks + inclusion_blocks + safety_blocks                      *)
+(* (ProtocolTimingBudget). The specs check against that floor, so a        *)
+(* budget change in Rust changes what they check.                          *)
 (***************************************************************************)
+EXTENDS ShippedTimelockValues
 
-Networks == {"Bitcoin", "Testnet4", "Signet", "Regtest"}
-
-ProverConnector     == [Bitcoin |-> 144, Testnet4 |-> 20, Signet |-> 6, Regtest |-> 1]
-ConnectorD          == [Bitcoin |-> 432, Testnet4 |-> 40, Signet |-> 18, Regtest |-> 3]
-WatchtowerChallenge == [Bitcoin |-> 144, Testnet4 |-> 20, Signet |-> 6, Regtest |-> 1]
-OperatorAck         == [Bitcoin |-> 288, Testnet4 |-> 32, Signet |-> 12, Regtest |-> 2]
-OperatorCommit      == [Bitcoin |-> 432, Testnet4 |-> 40, Signet |-> 18, Regtest |-> 3]
-ConnectorF          == [Bitcoin |-> 576, Testnet4 |-> 52, Signet |-> 24, Regtest |-> 4]
-
-\* Policy floor, not itself a timelocks.rs field: the assumed real-world
-\* reaction-time bound (~1 hour) used across every margin-race spec.
-MinReactionBlocks == [Bitcoin |-> 6, Testnet4 |-> 12, Signet |-> 1, Regtest |-> 1]
+MinReactionBlocks == ActionWindow
 
 ====

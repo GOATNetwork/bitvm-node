@@ -1,133 +1,178 @@
 ---- MODULE VerifierKickoffFailOpen ----
 (***************************************************************************)
-(* Model of GOATNetwork/bitvm-node issue #429:                             *)
-(*   "[Security] Verifier KickoffSent challenge is one-shot and fail-open  *)
-(*    (unauthorized Take1)"  - checked on gc-v2 @ f2f0285e.                 *)
+(* Issue #429: "[Security] Verifier KickoffSent challenge is one-shot and  *)
+(* fail-open (unauthorized Take1)". An operator broadcasts a kickoff with  *)
+(* NO L2 initWithdraw (no pegBTC burned); the verifier must answer with a  *)
+(* Challenge. The bug: while GOAT SPV had not passed the kickoff height,   *)
+(* handle_kickoff_sent_verifier returned Ok(()) without deferring, the     *)
+(* KickoffSent message was marked Processed and never retried, so no       *)
+(* Challenge was ever sent and the operator's Take1 went through. Fixed by *)
+(* #455 (defer), and #476 replaced the message handler by an engine job.   *)
 (*                                                                         *)
-(* STATUS: FIXED on dev by #455 (978f4201) - handle_kickoff_sent_verifier  *)
-(* now defers the SPV-lag case via push_local_unhandled_messages_with_     *)
-(* reason(GoatSpvPending), mirroring the committee handler (the design     *)
-(* checked by VerifierKickoffFailOpenFixed.cfg). This module is frozen as  *)
-(* the regression record of the ORIGINAL bug, described below as it stood  *)
-(* at c15f1714.                                                            *)
+(* CODE SCOPE (dev @ 60562f8): the verifier's JOB_CHALLENGE_KICKOFF,       *)
+(* queued by the Graph aggregate for every chain scan that reports         *)
+(* KickoffSent (route_signal, node/src/aggregates/graph_pegout.rs 264;     *)
+(* coverage of that scan: KickoffScanCoverage.tla) and run by              *)
+(* challenge_kickoff, node/src/aggregates/graph_pegout_jobs.rs 595-647:    *)
+(*   599-601  kickoff not confirmed          -> after_blocks(1)  (retry)   *)
+(*   605-621  challenge connector spent: unconfirmed -> retry; confirmed   *)
+(*            (by Take-1 or a Challenge)     -> Step::ignore     (done)    *)
+(*   622-634  withdraw None/Canceled -> go on; Initialized -> retry;       *)
+(*            other (Processing, ...)        -> Step::ignore     (done)    *)
+(*   635-642  kickoff_height >= spv_height   -> after_blocks     (retry)   *)
+(*   644-646  send_challenge_tx, broadcast_pending -> retry next block,    *)
+(*            so an evicted Challenge is sent again and a confirmed one    *)
+(*            ends the job.                                                *)
+(* after_blocks / broadcast_pending (171-173, 230-232) are Step::retry ->  *)
+(* JobOutcome::Transient -> engine_job back to Pending (MessageStateRace). *)
+(* A closed graph ends the job (settlement_step 84-97), but a graph with a *)
+(* pending kickoff and no Take1 is not closed.                             *)
 (*                                                                         *)
-(* Threat: an operator broadcasts a kickoff with NO L2 initWithdraw (no    *)
-(* pegBTC burned). The automated defense is the verifier's                 *)
-(* handle_kickoff_sent_verifier (node/src/handle.rs): if the L2 withdraw   *)
-(* status for the graph is None/Canceled, it must broadcast a Challenge,   *)
-(* forcing the operator off the uncontested Take1 fast-exit.               *)
+(* SCOPE OF THIS MODEL: withdraw status None (the unauthorized case) and   *)
+(* an open graph; the job's lease/claim mechanics are abstracted (one run  *)
+(* = one atomic step). The ConnectorA CSV margin is ASSUMED adequate: Take1 *)
+(* becomes spendable only after the verifier's job has reached its final  *)
+(* decision (OperatorTake1 guard), and GOAT SPV catches up (fairness).     *)
+(* ChallengeKickoffGate.tla drops both assumptions and models heights (C6).*)
+(* Not modeled: a Goat read error classified Permanent (contains "revert", *)
+(* node/src/error.rs 45-77) would end the job as "rejected" (graph_jobs.rs *)
+(* 130-135) - the reads here are public getters, which do not revert.      *)
 (*                                                                         *)
-(* THE BUG (node/src/handle.rs handle_kickoff_sent_verifier):              *)
-(*                                                                         *)
-(*   if [None, Canceled].contains(&withdraw_status) {                      *)
-(*       if kickoff_height >= goat_confirmed_btc_height {                  *)
-(*           tracing::warn!(...); return Ok(());  // <-- NO defer/retry    *)
-(*       } else { send_challenge_tx(...); }                                *)
-(*   }                                                                     *)
-(*                                                                         *)
-(* At first confirmation GOAT's SPV view lags the Bitcoin tip, so          *)
-(* `kickoff_height >= goat_confirmed_btc_height` is the COMMON case (and,  *)
-(* because the check is a strict `>` on the send side, it also skips when  *)
-(* SPV == kickoff_height). On that branch the handler returns Ok(())       *)
-(* WITHOUT push_local_unhandled_messages_with_reason, so node/src/action.rs*)
-(* marks the KickoffSent message `Processed`. Nothing re-enqueues it:      *)
-(* detect_kickoff (graph_maintenance_tasks.rs) only scans OperatorDataPushed*)
-(* graphs, and upsert_message(is_update=false) will not recreate           *)
-(* `{graph_id}_KickoffSent`. So every online honest verifier processes     *)
-(* once, skips, and is done. After the ConnectorA CSV the operator signs   *)
-(* Take1 (n-of-n pre-signed on connector_0) and exits - pegBTC never       *)
-(* burned. handle_kickoff_sent_committee DOES defer the same SPV lag; the  *)
-(* verifier does not.                                                      *)
-(*                                                                         *)
-(* This is the classic "consume-without-retry on a transient guard" fail-  *)
-(* open, the same shape as MessageStateRace but on the Challenge defense.   *)
-(* NOT #418 (the Take1/Challenge CSV margin) - per the issue, the scripts   *)
-(* are fine IF a Challenge is actually sent; the defect is that it is       *)
-(* never sent. So this spec abstracts the CSV margin as adequate and       *)
-(* checks only the control-flow question: does the Challenge ever fire      *)
-(* before the operator's uncontested Take1?                                *)
+(* CONFIGS: VerifierKickoffFailOpenFixed.cfg (tier pass) - the current     *)
+(* code.                                                                   *)
 (***************************************************************************)
 
-MsgStates == {"Pending", "Processed"}
+\* engine_job state of the verifier's challenge_kickoff job (Running is
+\* folded into the atomic run step).
+JobPending == "Pending"
+JobDone    == "Done"
+JobStates  == {JobPending, JobDone}
+
+\* The verifier's Challenge transaction on Bitcoin.
+ChallengeNone      == "None"
+ChallengeMempool   == "Mempool"
+ChallengeConfirmed == "Confirmed"
+ChallengeStates    == {ChallengeNone, ChallengeMempool, ChallengeConfirmed}
 
 VARIABLES
-    msg,            \* local-queue state of the {graph_id}_KickoffSent message
-    spvLags,        \* kickoff_height >= goat_confirmed_btc_height (GOAT SPV not strictly past the kickoff)
-    challengeSent,  \* verifier broadcast send_challenge_tx for this unauthorized kickoff
-    take1           \* operator completed the uncontested Take1 (unauthorized withdrawal)
+    job,         \* engine_job.state of JOB_CHALLENGE_KICKOFF for this graph
+    spvLags,     \* kickoff_height >= btc_spv_latest_height (GOAT SPV not strictly past the kickoff)
+    challenge,   \* where the verifier's Challenge transaction is
+    take1        \* the operator's Take1 confirmed (spent the challenge connector)
 
-vars == <<msg, spvLags, challengeSent, take1>>
+vars == <<job, spvLags, challenge, take1>>
 
-TypeOK ==
-    /\ msg \in MsgStates
+TypeOk ==
+    /\ job \in JobStates
     /\ spvLags \in BOOLEAN
-    /\ challengeSent \in BOOLEAN
+    /\ challenge \in ChallengeStates
     /\ take1 \in BOOLEAN
 
-\* detect_kickoff enqueued KickoffSent to Actor::All; at first confirm GOAT
-\* SPV lags the Bitcoin tip (the common case, and the == case the strict `>`
-\* also skips); withdraw status for this graph is the unauthorized None.
+\* The kickoff is confirmed and the scan queued the job; at first
+\* confirmation GOAT SPV lags the Bitcoin tip (the common case).
 Init ==
-    /\ msg = "Pending"
+    /\ job = JobPending
     /\ spvLags = TRUE
-    /\ challengeSent = FALSE
+    /\ challenge = ChallengeNone
     /\ take1 = FALSE
 
+\* The challenge connector is spent by a confirmed transaction.
+ConnectorSpentConfirmed == challenge = ChallengeConfirmed \/ take1
+
 --------------------------------------------------------------------------
-\* GOAT SPV eventually catches up to the already-confirmed kickoff (the lag
-\* always closes with time).
+\* Action: GOAT's SPV light client is updated past the kickoff height.
+\* Source: spv_header_hash_update() in node/src/scheduled_tasks/spv_maintenance_tasks.rs:9
+\*         (called from run() in node/src/scheduled_tasks/mod.rs:220-227); environment (GOAT)
 SpvCatchesUp ==
     /\ spvLags
     /\ spvLags' = FALSE
-    /\ UNCHANGED <<msg, challengeSent, take1>>
+    /\ UNCHANGED <<job, challenge, take1>>
 
-\* BUGGY handle_kickoff_sent_verifier: consumes the message either way. When
-\* SPV still lags it returns Ok(()) with no defer -> Processed, NO challenge;
-\* only when SPV is strictly past does it send the Challenge.
-VerifierProcessBuggy ==
-    /\ msg = "Pending"
-    /\ msg' = "Processed"
-    /\ challengeSent' = (IF spvLags THEN challengeSent ELSE TRUE)
+\* Action: one run of the verifier's challenge_kickoff job. A confirmed spend
+\* of the connector ends it (Done); a Challenge still in the mempool, or SPV
+\* not past the kickoff, is a retry (the job stays Pending - the #429 fix);
+\* otherwise the Challenge is broadcast and the job retries next block.
+\* Source: challenge_kickoff() in node/src/aggregates/graph_pegout_jobs.rs:595-647;
+\*         after_blocks()/broadcast_pending() in node/src/aggregates/graph_pegout_jobs.rs:171-173,230-232;
+\*         Step::into_outcome() in node/src/aggregates/jobs.rs:70-77
+ChallengeKickoffRun ==
+    /\ job = JobPending
+    /\ CASE ConnectorSpentConfirmed ->
+                /\ job' = JobDone
+                /\ UNCHANGED challenge
+         [] challenge = ChallengeMempool \/ spvLags ->
+                UNCHANGED <<job, challenge>>
+         [] OTHER ->
+                /\ challenge' = ChallengeMempool
+                /\ UNCHANGED job
     /\ UNCHANGED <<spvLags, take1>>
 
-\* FIXED (issue's suggested fix): on None/Canceled while SPV is not strictly
-\* past the kickoff, push_local_unhandled_messages_with_reason - i.e. DEFER,
-\* leaving the message Pending to be retried - so the verifier only finalises
-\* the message once SPV has caught up and the Challenge is actually sent.
-VerifierProcessFixed ==
-    /\ msg = "Pending"
-    /\ ~spvLags
-    /\ msg' = "Processed"
-    /\ challengeSent' = TRUE
-    /\ UNCHANGED <<spvLags, take1>>
+\* Action: the broadcast Challenge is mined.
+\* Source: Bitcoin consensus
+ChallengeConfirms ==
+    /\ challenge = ChallengeMempool
+    /\ ~take1
+    /\ challenge' = ChallengeConfirmed
+    /\ UNCHANGED <<job, spvLags, take1>>
 
-\* After the ConnectorA CSV the operator broadcasts Take1. It is an
-\* unauthorized withdrawal only if no Challenge was ever sent (a sent
-\* Challenge forces the long dispute path; per the issue the CSV margin is
-\* adequate once the Challenge fires). The verifier's one-shot handling has
-\* run to a final decision by the time Take1 is spendable (msg = Processed).
+\* Action: the Challenge drops out of the mempool (fee pressure, restart);
+\* the next run sees the connector unspent and sends it again.
+\* Source: environment (Bitcoin mempool)
+ChallengeEvicted ==
+    /\ challenge = ChallengeMempool
+    /\ challenge' = ChallengeNone
+    /\ UNCHANGED <<job, spvLags, take1>>
+
+\* Action: after the ConnectorA CSV the operator spends the connector with
+\* Take1. Under the adequate-margin assumption that is only possible once
+\* the verifier's job has reached its final decision; it is an unauthorized
+\* withdrawal unless a Challenge confirmed first (which would spend the
+\* same connector).
+\* Source: Bitcoin consensus (Take1, n-of-n pre-signed, connector_a CSV)
 OperatorTake1 ==
-    /\ msg = "Processed"
-    /\ ~challengeSent
+    /\ job = JobDone
+    /\ challenge # ChallengeConfirmed
     /\ ~take1
     /\ take1' = TRUE
-    /\ UNCHANGED <<msg, spvLags, challengeSent>>
+    /\ UNCHANGED <<job, spvLags, challenge>>
 
-Next        == SpvCatchesUp \/ VerifierProcessBuggy \/ OperatorTake1
-NextFixed   == SpvCatchesUp \/ VerifierProcessFixed \/ OperatorTake1
+Next ==
+    \/ SpvCatchesUp
+    \/ ChallengeKickoffRun
+    \/ ChallengeConfirms
+    \/ ChallengeEvicted
+    \/ OperatorTake1
 
-Spec        == Init /\ [][Next]_vars
-FairSpec    == Spec /\ WF_vars(Next)
-SpecFixed   == Init /\ [][NextFixed]_vars
-FairSpecFixed == SpecFixed /\ WF_vars(NextFixed)
+\* Fairness:
+\*  - SpvCatchesUp (WF): assumption - the SPV updater keeps posting headers
+\*    (ChallengeKickoffGate C6 is what happens without a deadline on it).
+\*  - ChallengeKickoffRun (WF): a Pending job is retried every block
+\*    (after_blocks waits at least one block, jobs.rs claim loop).
+\*  - ChallengeConfirms (SF): a re-broadcast Challenge is enabled again
+\*    after every eviction; an honest fee eventually gets it mined (pinning
+\*    is DefenderTxPinning.tla).
+Spec ==
+    /\ Init /\ [][Next]_vars
+    /\ WF_vars(SpvCatchesUp)
+    /\ WF_vars(ChallengeKickoffRun)
+    /\ SF_vars(ChallengeConfirms)
 
 --------------------------------------------------------------------------
-\* Safety (fail-open check): an unauthorized kickoff must never reach a
-\* completed Take1 without the verifier's Challenge defense having fired.
-\* Buggy: violated - process while SPV lags -> Processed, no Challenge,
-\* never retried -> Take1. Fixed: holds - the message is deferred until the
-\* Challenge is sent, so Take1's guard (Processed /\ ~challengeSent) is
-\* never reachable.
-NoUnauthorizedTake1 == take1 => challengeSent
+\* ---- Safety invariants ----
+
+\* No fail-open: the job is never finished while the connector is unspent.
+JobDoneOnlyWhenConnectorSpent == job = JobDone => ConnectorSpentConfirmed
+
+\* An unauthorized kickoff never reaches Take1 without the verifier's
+\* Challenge (the #429 property).
+NoUnauthorizedTake1 == take1 => challenge # ChallengeNone
+
+\* ---- Safety properties ----
+\* None beyond the invariants.
+
+\* ---- Liveness ----
+
+\* The verifier's Challenge eventually confirms.
+ChallengeEventuallyConfirmed == <>(challenge = ChallengeConfirmed)
 
 ====

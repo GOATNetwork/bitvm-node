@@ -18,9 +18,12 @@ GOAT Network's BitVM bridge implementation. See [GOAT BitVM Whitepaper](https://
 `audit/tla/` contains TLA+ specs that model the bridge protocol as the Rust
 code implements it: the graph/instance status state machines, the Bitcoin
 transaction graph and its timelocks, the node's challenge/dispute reactions,
-the job engine, and the GOAT Gateway contract. Each finding has a **pair** of
-configs - one modeling the current (or pre-fix) code, **expected to fail** with
-a TLC counterexample, and one modeling a fix design, **expected to pass**.
+the job engine, and the GOAT Gateway contract. **Only the current code is
+checked**: every config models the code as it is now (or a proposed fix for a
+bug still in it); none models old, pre-fix code. A fixed bug is covered by a
+config of the current code that must verify, so CI fails if the bug returns;
+an unfixed bug is a config of the current code that must not reproduce, so CI
+fails until it is fixed.
 
 - **Round 1** (`audit/TLAPlus-20260710.md`): 8 findings, **all fixed** in
   [`991faaa`](https://github.com/GOATNetwork/bitvm-node/commit/991faaabdb56c747103e8f1c6d6477c638ccfc4c);
@@ -36,15 +39,18 @@ must be (`tier | config | spec | description`). CI (`tla-plus` job, every pull
 request, in parallel with fmt/clippy/test) and `make tla` run the same list
 through `audit/tla/check.sh`:
 
-- **pass** - a fix or baseline design; must verify clean, otherwise the
-  design regressed.
-- **historical** - a bug already fixed in the code. The config deliberately
-  still models the pre-fix code and is kept as a **permanent regression
-  record**: it must still reproduce its counterexample. An unexpected pass
-  means the spec stopped demonstrating the bug, or the fix was reverted.
-- **live** - a known, still-unfixed bug; while its config reproduces the
-  counterexample it fails the run and blocks merge. Fix the code, then move
-  the row to `historical` (a frozen spec cannot see the code fix by itself).
+- **pass** - models the current code; must verify. This is where a fixed
+  bug's regression check lives.
+- **live** - models the current code with a known, unfixed bug; while it
+  reproduces the counterexample it fails the run and blocks merge. When the
+  code is fixed, change the config to model the fix (usually: take the
+  `design` row's settings) and make it `pass`. A `live` row that stops
+  reproducing without that also fails: the model drifted from the code.
+- **design** - a proposed fix for a `live` bug, not in the code yet; must
+  verify. It becomes the `pass` row once the fix lands.
+- **boundary** - a parameter sweep just outside a fix's margin condition
+  (`ParamsOK`); must find a counterexample, which shows the condition is
+  necessary.
 
 The outcome is taken from TLC's exit status, so a config on which TLC does
 not finish (parse error, missing file) fails in every tier.
@@ -68,31 +74,21 @@ make tla TLC_OPTS="-workers auto"         # extra TLC flags
 cd audit/tla && java -jar ~/.local/share/tlaplus/tla2tools.jar -config <Config>.cfg <Spec>.tla
 ```
 
-### Round 1 and issues #429 / #431
+### Round 1 and issues #429 / #431 (fixed - current code must pass)
 
 | Spec | Config | Models | Result |
 |---|---|---|---|
-| `GraphLifecycle.tla` | `GraphLifecycleCoreOnly.cfg` | code baseline | pass - chain-scan state machine alone is sound |
-| `GraphLifecycle.tla` | `GraphLifecycle.cfg` | **pre-fix code (historical)** | **fails, by design**: unguarded race between the Bitcoin-chain-scan and GoatChain-event writers of `Graph.status` - fixed in `991faaa`, kept failing as a permanent regression check |
-| `GraphLifecycle.tla` | `GraphLifecycleFixed.cfg` | fix design (**applied in `991faaa`**) | pass - atomic guard design closes the race |
-| `GraphLifecycleFineGrained.tla` | `GraphLifecycleFineGrained.cfg` | pre-fix code (historical) | **fails, by design**: the read/write gap a naive (non-atomic) guard would still have - fixed in `991faaa` |
-| `GraphLifecycleFineGrainedFixed.tla` | `GraphLifecycleFineGrainedFixed.cfg` | fix design (**applied in `991faaa`**) | pass - single-statement atomic CAS design closes the gap |
-| `InstancePresigned.tla` | `InstancePresignedBug.cfg` | **pre-fix code (historical)** | **fails, by design**: `Instance.status` can regress past `Presigned` - fixed in `991faaa` |
-| `InstancePresigned.tla` | `InstancePresignedFixed.cfg` | fix design (**applied in `991faaa`**) | pass - guard design closes the regression |
-| `Take2DisproveRace.tla` | `Take2DisproveRace.cfg` | fix design (**applied in `991faaa`**, values updated to match) | pass - Take2 vs. Disprove UTXO race has strict margin on all networks with the real shipped `crates/bitvm-gc/src/timelocks.rs` values (Testnet4 `connector_d` now 40, shipped with more margin than originally proposed); the pre-fix shipped value (34) did **not** have this margin - that boundary case is how this spec found the bug in the first place |
-| `MultiActorRace.tla` | `MultiActorRace.cfg` | fix design (**applied in `991faaa`**, values updated to match) | pass - the 1-of-N watchtower/verifier security property holds under the real shipped timelock values, checked against 2 independent actors per role rather than 1 |
-| `InstanceBridgeOutRace.tla` | `InstanceBridgeOutRace.cfg` | **pre-fix code (historical)** | **fails, by design**: `InstanceBridgeOutStatus` can be resurrected to `Initialize` after reaching `Claim`/`Timeout`/`Refund` by a stale RPC upsert or maintenance-task write - fixed in `991faaa` |
-| `InstanceBridgeOutRace.tla` | `InstanceBridgeOutRaceFixed.cfg` | fix design (**applied in `991faaa`**) | pass - atomic guard design (write only if not already terminal) closes the resurrection |
-| `MessageStateRace.tla` | `MessageStateRace.cfg` | **pre-fix code (historical)** | **fails, by design**: `MessageState::Cancelled` could be resurrected to `Pending` by `upsert_message`'s unconditional `ON CONFLICT DO UPDATE` - fixed in `991faaa` |
-| `MessageStateRace.tla` | `MessageStateRaceFixed.cfg` | fix design (**applied in `991faaa`**) | pass - guarding the resurrect-to-Pending write against terminal status closes the race |
-| `Take1ChallengeRace.tla` | `Take1ChallengeRace.cfg` | **pre-fix code (historical)** | **fails, by design**: `connector_a` (Take1 vs. Challenge) had *no* margin check anywhere in `validate_timelock_config`; on Regtest the pre-fix shipped value gave a challenger exactly zero reaction margin - fixed in `991faaa` |
-| `Take1ChallengeRace.tla` | `Take1ChallengeRaceFixed.cfg` | fix design (**applied in `991faaa`**) | pass - the missing margin check (mirroring Finding 4's floor) was added, closing the gap |
-| `VerifierKickoffFailOpen.tla` | `VerifierKickoffFailOpen.cfg` | **pre-fix code (historical)** | **fails, by design**: issue #429 - the verifier consumed `KickoffSent` while GOAT SPV lagged the kickoff and never retried, so no Challenge was sent - fixed in #455 |
-| `VerifierKickoffFailOpen.tla` | `VerifierKickoffFailOpenFixed.cfg` | fix design (**applied in #455**) | pass - deferring the message until SPV catches up makes the Challenge fire before Take1, provided SPV catches up before `connector_a` expires (a fairness assumption of the model; a SPV lag longer than `connector_a` is not modeled) |
-| `KickoffScanCoverage.tla` | `KickoffScanCoverage.cfg` | **pre-fix code (historical)** | **fails, by design**: issue #431 - `detect_kickoff` watched only the lowest-nonce graph per operator, so a kickoff on a later graph was never observed - fixed in #451 |
-| `KickoffScanCoverage.tla` | `KickoffScanCoverageResidual.cfg` | **pre-fix code (historical)** | **fails, by design**: #451's chain walk was capped at 32 successors, so a kickoff deeper than that escaped a single round - fixed by #476, whose `scan_graphs_on_chain` visits every monitored graph |
-| `KickoffScanCoverage.tla` | `KickoffScanCoverageFixed.cfg` | fix design (**current code**) | pass - every graph on the confirmed pre-kickoff chain is reached, with no depth cap (since #476: a round-robin over all monitored graphs, `node/src/aggregates/graph_scan.rs`) |
-| `MultiActorRace.tla` | `MultiActorRace.cfg` | verification (no bug; still holds under real shipped values) | pass - also confirms `operator_commit`'s margin against the shared `ConnectorF` UTXO (the `OperatorCommitTimeoutTransaction` path, `ConnectorF` leaf 1's second spender) holds, closing a gap where only a scalar Rust check existed |
+| `GraphLifecycle.tla` | `GraphLifecycleCoreOnly.cfg` | **current code** (baseline) | pass - chain-scan state machine alone is sound |
+| `GraphLifecycle.tla` | `GraphLifecycleFixed.cfg` | **current code** (fixed in `991faaa`) | pass - atomic guard design closes the race |
+| `GraphLifecycleFineGrainedFixed.tla` | `GraphLifecycleFineGrainedFixed.cfg` | **current code** (fixed in `991faaa`) | pass - single-statement atomic CAS design closes the gap |
+| `InstancePresigned.tla` | `InstancePresignedFixed.cfg` | **current code** (fixed in `991faaa`) | pass - guard design closes the regression |
+| `Take2DisproveRace.tla` | `Take2DisproveRace.cfg` | **current code** (fixed in `991faaa`) | pass - Take2 vs. Disprove UTXO race has strict margin on all networks with the shipped values (generated `ShippedTimelockValues.tla`), for every verifier delay up to the code's `action_window`; the pre-fix Testnet4 `connector_d` (34) did **not** have this margin - that boundary case is how this spec found the bug in the first place |
+| `MultiActorRace.tla` | `MultiActorRace.cfg` | **current code** (fixed in `991faaa`) | pass - the 1-of-N watchtower/verifier security property holds under the shipped timelock values (generated), checked against 2 independent actors per role rather than 1; also confirms `operator_commit`'s margin against the shared `ConnectorF` UTXO (the `OperatorCommitTimeoutTransaction` path, `ConnectorF` leaf 1's second spender) holds, closing a gap where only a scalar Rust check existed |
+| `InstanceBridgeOutRace.tla` | `InstanceBridgeOutRaceFixed.cfg` | **current code** (fixed in `991faaa`) | pass - atomic guard design (write only if not already terminal) closes the resurrection |
+| `MessageStateRace.tla` | `MessageStateRaceFixed.cfg` | **current code** (fixed in `991faaa`) | pass - guarding the resurrect-to-Pending write against terminal status closes the race |
+| `Take1ChallengeRace.tla` | `Take1ChallengeRaceFixed.cfg` | **current code** (fixed in `991faaa`) | pass - the shipped `connector_a` is `>= action_window` on every network (`validate_timelock_config`); Testnet4 sits exactly on the floor (6 = 2 + 2 + 2) |
+| `VerifierKickoffFailOpen.tla` | `VerifierKickoffFailOpenFixed.cfg` | **current code** (fixed in #455) | pass - deferring the message until SPV catches up makes the Challenge fire before Take1, provided SPV catches up before `connector_a` expires (a fairness assumption of the model; a SPV lag longer than `connector_a` is not modeled) |
+| `KickoffScanCoverage.tla` | `KickoffScanCoverageFixed.cfg` | **current code** (fixed by #451, #476) | pass - every graph on the confirmed pre-kickoff chain is reached, with no depth cap (since #476: a round-robin over all monitored graphs, `node/src/aggregates/graph_scan.rs`) |
 
 ### Round 2: protocol review (live until fixed)
 
