@@ -56,6 +56,33 @@ pub struct OperatorPublicOutputs {
 pub struct IndexedWatchtowerChallenge {
     pub node_index: u16,
     pub spv: SPV,
+    /// One full previous transaction per challenge input, in input order.
+    pub previous_transactions: Vec<Transaction>,
+}
+
+/// Bind every sighash prevout to the txid/vout committed by the spending transaction.
+pub fn checked_transaction_prevouts(
+    transaction: &Transaction,
+    previous_transactions: &[Transaction],
+) -> Result<Vec<bitcoin::TxOut>, &'static str> {
+    if previous_transactions.len() != transaction.input.len() {
+        return Err("previous transaction count does not match input count");
+    }
+    transaction
+        .input
+        .iter()
+        .zip(previous_transactions)
+        .map(|(input, previous)| {
+            if previous.compute_txid() != input.previous_output.txid {
+                return Err("previous transaction txid mismatch");
+            }
+            previous
+                .output
+                .get(input.previous_output.vout as usize)
+                .cloned()
+                .ok_or("previous transaction output is missing")
+        })
+        .collect()
 }
 
 /// Verifies that a proof identity matches both its output and Publisher authorization.
@@ -434,10 +461,18 @@ pub fn propose_longest_chain(
         );
 
         let tx = &challenge.spv.transaction.0;
-        let input = tx.input.first().expect("watchtower challenge must have input 0");
         let expected_vout = u32::from(challenge.node_index) * 2;
-        assert_eq!(input.previous_output.txid.to_byte_array(), watchtower_challenge_init_txid);
-        assert_eq!(input.previous_output.vout, expected_vout);
+        let expected_outpoint = bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_byte_array(watchtower_challenge_init_txid),
+            vout: expected_vout,
+        };
+        let input_index = tx
+            .input
+            .iter()
+            .position(|input| input.previous_output == expected_outpoint)
+            .expect("watchtower challenge must spend its connector");
+        let prev_outs = checked_transaction_prevouts(tx, &challenge.previous_transactions)
+            .expect("invalid watchtower challenge previous transactions");
 
         let prev_out = watchtower_challenge_init_txn
             .expect("watchtower challenge init transaction is required")
@@ -450,7 +485,8 @@ pub fn propose_longest_chain(
             .push_x_only_key(&xonly)
             .push_opcode(bitcoin::opcodes::all::OP_CHECKSIG)
             .into_script();
-        verify_taproot_leaf_schnorr_signature(&script, tx, 0, prev_out, &xonly)
+        assert_eq!(&prev_outs[input_index], prev_out, "watchtower challenge prevout mismatch");
+        verify_taproot_leaf_schnorr_signature(&script, tx, input_index, &prev_outs, &xonly)
             .expect("watchtower challenge signature verification failed");
 
         let Ok(commitment) = extract_data_from_commitment_outputs(&tx.output) else {
@@ -724,6 +760,37 @@ pub fn parse_watchtower_commitment(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn challenge_prevouts_are_bound_to_each_input_txid_and_vout() {
+        use bitcoin::{Amount, OutPoint, ScriptBuf, TxIn, TxOut};
+        let previous = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let mut spending = Transaction {
+            input: vec![TxIn {
+                previous_output: OutPoint { txid: previous.compute_txid(), vout: 0 },
+                ..Default::default()
+            }],
+            ..previous.clone()
+        };
+        assert_eq!(
+            checked_transaction_prevouts(&spending, std::slice::from_ref(&previous)).unwrap(),
+            previous.output
+        );
+        assert!(checked_transaction_prevouts(&spending, &[]).is_err());
+        let mut forged = previous.clone();
+        forged.output[0].value += Amount::from_sat(1);
+        assert!(checked_transaction_prevouts(&spending, &[forged]).is_err());
+        spending.input[0].previous_output.vout = 1;
+        assert!(checked_transaction_prevouts(&spending, &[previous]).is_err());
+    }
 
     use bitcoin::Transaction;
     const PROOF: &[u8] = include_bytes!("../../../data/watchtower/output3.bin.proof.bin");
