@@ -1033,6 +1033,14 @@ async fn disprove(
 
 // ---------------------------------------------------------------- operator
 
+// SINGLE|ANYONECANPAY permits moving the connector input and its paired output.
+fn challenge_spends_connector_a(
+    transaction: &bitcoin::Transaction,
+    connector_a: bitcoin::OutPoint,
+) -> bool {
+    transaction.input.iter().any(|input| input.previous_output == connector_a)
+}
+
 /// Challenge on Connector-A: Watchtower-Challenge-Init.
 async fn watchtower_challenge_init(
     deps: &JobDeps,
@@ -1055,7 +1063,7 @@ async fn watchtower_challenge_init(
         .connector_a_input()
         .map_err(|e| anyhow!("failed to get connector-a input: {e}"))?
         .outpoint;
-    if challenge_tx.input.first().map(|input| input.previous_output) != Some(connector_a) {
+    if !challenge_spends_connector_a(&challenge_tx, connector_a) {
         return Step::ignore("challenge does not spend connector-A");
     }
     let (master, _) = local_operator()?;
@@ -1907,6 +1915,47 @@ async fn collect_ack_txins(
 mod tests {
     use super::*;
     use bitcoin::hashes::Hash;
+
+    #[test]
+    fn challenge_connector_a_is_recognized_at_any_input_index() {
+        use bitcoin::{OutPoint, TxIn, TxOut};
+        let connector_a = OutPoint { txid: make_txid(1), vout: 2 };
+        let fee_input = TxIn {
+            previous_output: OutPoint { txid: make_txid(2), vout: 0 },
+            ..Default::default()
+        };
+        let mut challenge = bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![
+                TxIn { previous_output: connector_a, ..Default::default() },
+                fee_input.clone(),
+                TxIn { previous_output: OutPoint { txid: make_txid(4), vout: 1 }, ..fee_input },
+            ],
+            output: vec![
+                TxOut {
+                    value: Amount::from_sat(1_000),
+                    script_pubkey: bitcoin::ScriptBuf::new()
+                };
+                3
+            ],
+        };
+        for index in 0..3 {
+            assert!(challenge_spends_connector_a(&challenge, connector_a), "input {index}");
+            // Move the SINGLE-signed input/output pair behind a fee input.
+            challenge.input.rotate_right(1);
+            challenge.output.rotate_right(1);
+        }
+        assert!(!challenge_spends_connector_a(
+            &challenge,
+            OutPoint { txid: make_txid(3), ..connector_a }
+        ));
+        assert!(!challenge_spends_connector_a(&challenge, OutPoint { vout: 3, ..connector_a }));
+        challenge.input.remove(0);
+        assert!(!challenge_spends_connector_a(&challenge, connector_a));
+        challenge.input.clear();
+        assert!(!challenge_spends_connector_a(&challenge, connector_a));
+    }
 
     #[tokio::test]
     async fn kickoff_challenge_does_not_wait_for_spv_and_preserves_other_gates() {
