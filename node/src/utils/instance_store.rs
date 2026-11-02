@@ -46,8 +46,18 @@ pub async fn generate_instance(
     let from_addr = if !params.user_info.inputs.is_empty()
         && let Some(tx) = btc_client.get_tx(&params.user_info.inputs[0].outpoint.txid).await?
     {
-        let tx_scripts =
-            tx.output[params.user_info.inputs[0].outpoint.vout as usize].script_pubkey.clone();
+        let outpoint = params.user_info.inputs[0].outpoint;
+        let tx_scripts = tx
+            .output
+            .get(outpoint.vout as usize)
+            .ok_or_else(|| {
+                SpecialError::InvalidPeginRequest(format!(
+                    "input {outpoint} references an output beyond transaction output count {}",
+                    tx.output.len()
+                ))
+            })?
+            .script_pubkey
+            .clone();
         Address::from_script(&tx_scripts, env::get_network())
             .map(|addr| addr.to_string())
             .unwrap_or_default()

@@ -32,10 +32,15 @@ pub struct MockAdaptor {
     tx_receipts: Arc<Mutex<HashMap<String, TransactionReceipt>>>,
     gateway_contract_config: Arc<Mutex<GatewayContractConfig>>,
     withdraw_data: Arc<Mutex<HashMap<[u8; 16], WithdrawData>>>,
+    pegin_data: Arc<Mutex<HashMap<[u8; 16], Result<PeginData, String>>>>,
     spv_height: Arc<Mutex<Result<u64, String>>>,
 }
 
 impl MockAdaptor {
+    pub fn set_pegin_data(&self, instance_id: [u8; 16], data: Result<PeginData, String>) {
+        self.pegin_data.lock().unwrap().insert(instance_id, data);
+    }
+
     pub fn set_withdraw_data(&self, graph_id: [u8; 16], data: WithdrawData) {
         self.withdraw_data.lock().unwrap().insert(graph_id, data);
     }
@@ -190,10 +195,14 @@ impl ChainAdaptor for MockAdaptor {
         Ok([0_u8; 20])
     }
 
-    async fn gateway_get_pegin_data(&self, _instance_id: &[u8; 16]) -> anyhow::Result<PeginData> {
-        info!("call get_pegin_data");
-
-        bail!("not find pegin data")
+    async fn gateway_get_pegin_data(&self, instance_id: &[u8; 16]) -> anyhow::Result<PeginData> {
+        self.pegin_data
+            .lock()
+            .unwrap()
+            .get(instance_id)
+            .cloned()
+            .unwrap_or_else(|| Err("not find pegin data".into()))
+            .map_err(anyhow::Error::msg)
     }
 
     async fn gateway_get_withdraw_data(&self, graph_id: &[u8; 16]) -> anyhow::Result<WithdrawData> {
@@ -543,6 +552,7 @@ impl MockAdaptor {
             tx_receipts: Arc::new(Mutex::new(HashMap::new())),
             gateway_contract_config: Arc::new(Mutex::new(Default::default())),
             withdraw_data: Arc::new(Mutex::new(HashMap::new())),
+            pegin_data: Arc::new(Mutex::new(HashMap::new())),
             spv_height: Arc::new(Mutex::new(Ok(0))),
         }
     }
