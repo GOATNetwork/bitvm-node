@@ -31,9 +31,19 @@ pub struct MockAdaptor {
     latest_block_number: Arc<Mutex<i64>>,
     tx_receipts: Arc<Mutex<HashMap<String, TransactionReceipt>>>,
     gateway_contract_config: Arc<Mutex<GatewayContractConfig>>,
+    withdraw_data: Arc<Mutex<HashMap<[u8; 16], WithdrawData>>>,
+    spv_height: Arc<Mutex<Result<u64, String>>>,
 }
 
 impl MockAdaptor {
+    pub fn set_withdraw_data(&self, graph_id: [u8; 16], data: WithdrawData) {
+        self.withdraw_data.lock().unwrap().insert(graph_id, data);
+    }
+
+    pub fn set_spv_height(&self, height: Result<u64, String>) {
+        *self.spv_height.lock().unwrap() = height;
+    }
+
     pub fn set_finalized_block_number(&self, block_number: i64) {
         if let Ok(mut h) = self.finalized_block_number.lock() {
             *h = block_number
@@ -186,12 +196,14 @@ impl ChainAdaptor for MockAdaptor {
         bail!("not find pegin data")
     }
 
-    async fn gateway_get_withdraw_data(
-        &self,
-        _graph_id: &[u8; 16],
-    ) -> anyhow::Result<WithdrawData> {
+    async fn gateway_get_withdraw_data(&self, graph_id: &[u8; 16]) -> anyhow::Result<WithdrawData> {
         info!("call get_withdraw_data");
-        bail!("not find withdraw data")
+        self.withdraw_data
+            .lock()
+            .unwrap()
+            .get(graph_id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("not find withdraw data"))
     }
 
     async fn gateway_get_graph_data(&self, _graph_id: &[u8; 16]) -> anyhow::Result<GraphData> {
@@ -362,7 +374,7 @@ impl ChainAdaptor for MockAdaptor {
     }
 
     async fn btc_spv_latest_height(&self) -> anyhow::Result<u64> {
-        Ok(0)
+        self.spv_height.lock().unwrap().clone().map_err(anyhow::Error::msg)
     }
 
     async fn btc_spv_post_block_hash(
@@ -530,6 +542,8 @@ impl MockAdaptor {
             latest_block_number: Arc::new(Mutex::new(0)),
             tx_receipts: Arc::new(Mutex::new(HashMap::new())),
             gateway_contract_config: Arc::new(Mutex::new(Default::default())),
+            withdraw_data: Arc::new(Mutex::new(HashMap::new())),
+            spv_height: Arc::new(Mutex::new(Ok(0))),
         }
     }
 }
