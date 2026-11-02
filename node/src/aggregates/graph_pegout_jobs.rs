@@ -718,8 +718,9 @@ async fn commit_timeout(deps: &JobDeps, row: &Graph, graph: &BitvmGcGraph) -> Re
     let connector_f =
         output_topology::watchtower_challenge_init::connector_f(watchtower_num) as u64;
     for (vout, what) in [(connector_e, "connector-E"), (connector_f, "connector-F")] {
-        if let Some(step) = settled_by(deps, &spend_of(btc, &wci_txid, vout).await?, what) {
-            return step;
+        // A pending commit must not prevent attempting the competing timeout.
+        if let Spend::Confirmed(by) = spend_of(btc, &wci_txid, vout).await? {
+            return Step::ignore(format!("{what} already spent by {by}"));
         }
     }
     let timeout_tx = graph.operator_commit_timeout.tx().clone();
@@ -765,7 +766,7 @@ async fn verifier_assert(deps: &JobDeps, graph: &BitvmGcGraph, assert_txid: Txid
     }
 
     // ChallengeAssert may only be skipped after this graph's commit-pubin is
-    // on-chain and proves consistent with the assert witness. OperatorAssert
+    // available and proves consistent with the assert witness. OperatorAssert
     // can otherwise be broadcast before connector-E is spent.
     let connector_e = graph
         .watchtower_challenge_init
@@ -775,14 +776,11 @@ async fn verifier_assert(deps: &JobDeps, graph: &BitvmGcGraph, assert_txid: Txid
     let Some(connector_e_spent) =
         outpoint_spent_txid(btc, &connector_e.txid, u64::from(connector_e.vout)).await?
     else {
-        return after_blocks(deps, "operator commit-pubin is not on chain yet", 1);
+        return after_blocks(deps, "operator commit-pubin is not available yet", 1);
     };
 
     let mut pubin_consistent = false;
     if connector_e_spent != graph.operator_commit_timeout.tx().compute_txid() {
-        if !btc.get_tx_status(&connector_e_spent).await?.confirmed {
-            return after_blocks(deps, "operator commit-pubin is not confirmed yet", 1);
-        }
         let Some(commit_pubin_tx) = btc.get_tx(&connector_e_spent).await? else {
             return after_blocks(deps, "operator commit-pubin is not available yet", 1);
         };
