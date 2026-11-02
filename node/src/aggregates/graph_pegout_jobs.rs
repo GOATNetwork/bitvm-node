@@ -732,11 +732,10 @@ async fn commit_timeout(deps: &JobDeps, row: &Graph, graph: &BitvmGcGraph) -> Re
     broadcast_pending(deps, &format!("Operator-Commit-Timeout {timeout_txid}"))
 }
 
-/// Prover-Assert confirmed: Pubin-Disprove if the committed pubin and the
-/// asserted one disagree, otherwise Verifier-Assert unless the proof is valid.
+/// Challenge an invalid Prover-Assert immediately; only a valid proof needs
+/// commit-pubin evidence to decide whether Pubin-Disprove is required.
 async fn verifier_assert(deps: &JobDeps, graph: &BitvmGcGraph, assert_txid: Txid) -> Result<Step> {
     let btc = &deps.btc_client;
-    let instance_id = graph.parameters.instance_parameters.instance_id;
     let graph_id = graph.parameters.graph_id;
     let Some(assert_tx) = btc.get_tx(&assert_txid).await? else {
         return after_blocks(deps, format!("assert tx {assert_txid} is not available"), 1);
@@ -765,9 +764,20 @@ async fn verifier_assert(deps: &JobDeps, graph: &BitvmGcGraph, assert_txid: Txid
         }
     }
 
-    // ChallengeAssert may only be skipped after this graph's commit-pubin is
-    // available and proves consistent with the assert witness. OperatorAssert
-    // can otherwise be broadcast before connector-E is spent.
+    let assert_txin = assert_tx
+        .input
+        .first()
+        .ok_or_else(|| anyhow!("operator assert transaction has no input"))?;
+    let assert_witness = extract_operator_assert_witness_for_challenge(graph, assert_txin)
+        .map_err(|e| anyhow!("failed to extract operator assert witness: {e}"))?;
+    let vk = crate::vk::get_vk().await.context("load Groth16 verifying key for operator assert")?;
+    let static_input = derive_operator_static_input()?;
+    if !bitvm_lib::babe_adapter::verify_operator_assert_proof(&assert_witness, &vk, static_input) {
+        return challenge_invalid_assert(deps, graph, &assert_tx).await;
+    }
+
+    // A valid proof may only be accepted once its pubin agrees with the commit.
+    // Invalid proofs above never wait for Connector-E or ACK evidence.
     let connector_e = graph
         .watchtower_challenge_init
         .connector_e_input()
@@ -779,95 +789,85 @@ async fn verifier_assert(deps: &JobDeps, graph: &BitvmGcGraph, assert_txid: Txid
         return after_blocks(deps, "operator commit-pubin is not available yet", 1);
     };
 
-    let mut pubin_consistent = false;
-    if connector_e_spent != graph.operator_commit_timeout.tx().compute_txid() {
-        let Some(commit_pubin_tx) = btc.get_tx(&connector_e_spent).await? else {
-            return after_blocks(deps, "operator commit-pubin is not available yet", 1);
-        };
-        let assert_txin = assert_tx
-            .input
-            .first()
-            .ok_or_else(|| anyhow!("operator assert transaction has no input"))?;
-        let commit_pubin_txin = commit_pubin_tx
-            .input
-            .first()
-            .ok_or_else(|| anyhow!("operator commit-pubin transaction has no input"))?;
-        let wci_txid = graph.watchtower_challenge_init.tx().compute_txid();
-        let timeout_txids = graph
-            .watchtower_challenge_timeouts
-            .iter()
-            .map(|tx| tx.tx().compute_txid())
-            .collect::<Vec<_>>();
-        let ack_txins = match collect_ack_txins(btc, &wci_txid, &timeout_txids).await {
-            Ok(txins) => txins,
-            Err(error) => {
-                return after_blocks(
-                    deps,
-                    format!("operator ACK inputs are not ready: {error}"),
-                    1,
-                );
-            }
-        };
-        match validate_pubin_disprove(graph, commit_pubin_txin, assert_txin, &ack_txins) {
-            Ok(Some((witness_data, _))) => {
-                // PubinDisprove is not pre-signed, so fund it directly rather
-                // than relying on CPFP.
-                let input_amount = graph
-                    .operator_assert
-                    .connector_d_input()
-                    .map_err(|e| anyhow!("failed to get connector-d input: {e}"))?
-                    .amount;
-                let txin = build_pubin_disprove_txin(graph, witness_data)?;
-                let outputs = vec![
-                    goat::scripts::p2a_output(),
-                    // Keep the transaction above Bitcoin Core's minimum
-                    // non-witness relay size.
-                    bitcoin::TxOut {
-                        value: Amount::ZERO,
-                        script_pubkey: goat::scripts::generate_opreturn_script(
-                            PUBIN_DISPROVE_OP_RETURN_DATA.to_vec(),
-                        ),
-                    },
-                ];
-                let verifier_keypair = VerifierMasterKey::new(get_bitvm_key()?).master_keypair();
-                let txid = build_sign_and_broadcast_tx(
-                    btc,
-                    verifier_keypair,
-                    vec![txin],
-                    input_amount,
-                    outputs,
-                )
-                .await?;
-                info!(event = "graph_challenge", graph_id = %graph_id, txid = %txid, "Pubin-Disprove broadcast");
-                return broadcast_pending(deps, &format!("Pubin-Disprove {txid}"));
-            }
-            Ok(None) => pubin_consistent = true,
-            Err(error) => warn!(
-                "PubinDisprove validation failed for {instance_id}:{graph_id}: {error}; proceeding to ChallengeAssert"
-            ),
+    if connector_e_spent == graph.operator_commit_timeout.tx().compute_txid() {
+        if btc.get_tx_status(&connector_e_spent).await?.confirmed {
+            return Step::ignore("operator commit-timeout is confirmed");
         }
+        return after_blocks(deps, "operator commit-timeout is not confirmed yet", 1);
     }
-
-    let assert_txin = assert_tx
+    let Some(commit_pubin_tx) = btc.get_tx(&connector_e_spent).await? else {
+        return after_blocks(deps, "operator commit-pubin is not available yet", 1);
+    };
+    let commit_pubin_txin = commit_pubin_tx
         .input
         .first()
-        .ok_or_else(|| anyhow!("operator assert transaction has no input"))?;
-    let assert_witness = extract_operator_assert_witness_for_challenge(graph, assert_txin)
-        .map_err(|e| anyhow!("failed to extract operator assert witness: {e}"))?;
-    let vk = crate::vk::get_vk().await.context("load Groth16 verifying key for operator assert")?;
-    let static_input = derive_operator_static_input()?;
-    if pubin_consistent
-        && bitvm_lib::babe_adapter::verify_operator_assert_proof(&assert_witness, &vk, static_input)
-    {
-        return Step::ignore("operator assert proof is valid");
+        .ok_or_else(|| anyhow!("operator commit-pubin transaction has no input"))?;
+    let wci_txid = graph.watchtower_challenge_init.tx().compute_txid();
+    let timeout_txids = graph
+        .watchtower_challenge_timeouts
+        .iter()
+        .map(|tx| tx.tx().compute_txid())
+        .collect::<Vec<_>>();
+    let ack_txins = match collect_ack_txins(btc, &wci_txid, &timeout_txids).await {
+        Ok(txins) => txins,
+        Err(error) => {
+            return after_blocks(deps, format!("operator ACK inputs are not ready: {error}"), 1);
+        }
+    };
+    match validate_pubin_disprove(graph, commit_pubin_txin, assert_txin, &ack_txins) {
+        Ok(Some((witness_data, _))) => {
+            // PubinDisprove is not pre-signed, so fund it directly rather
+            // than relying on CPFP.
+            let input_amount = graph
+                .operator_assert
+                .connector_d_input()
+                .map_err(|e| anyhow!("failed to get connector-d input: {e}"))?
+                .amount;
+            let txin = build_pubin_disprove_txin(graph, witness_data)?;
+            let outputs = vec![
+                goat::scripts::p2a_output(),
+                // Keep the transaction above Bitcoin Core's minimum
+                // non-witness relay size.
+                bitcoin::TxOut {
+                    value: Amount::ZERO,
+                    script_pubkey: goat::scripts::generate_opreturn_script(
+                        PUBIN_DISPROVE_OP_RETURN_DATA.to_vec(),
+                    ),
+                },
+            ];
+            let verifier_keypair = VerifierMasterKey::new(get_bitvm_key()?).master_keypair();
+            let txid = build_sign_and_broadcast_tx(
+                btc,
+                verifier_keypair,
+                vec![txin],
+                input_amount,
+                outputs,
+            )
+            .await?;
+            info!(event = "graph_challenge", graph_id = %graph_id, txid = %txid, "Pubin-Disprove broadcast");
+            broadcast_pending(deps, &format!("Pubin-Disprove {txid}"))
+        }
+        Ok(None) => Step::ignore("operator assert proof and committed pubin are valid"),
+        Err(error) => {
+            after_blocks(deps, format!("PubinDisprove validation is not ready: {error}"), 1)
+        }
     }
+}
+
+async fn challenge_invalid_assert(
+    deps: &JobDeps,
+    graph: &BitvmGcGraph,
+    assert_tx: &bitcoin::Transaction,
+) -> Result<Step> {
+    let instance_id = graph.parameters.instance_parameters.instance_id;
+    let graph_id = graph.parameters.graph_id;
     let broadcast = broadcast_verifier_challenge_assert_tx(
         &deps.local_db,
-        btc,
+        &deps.btc_client,
         graph,
         instance_id,
         graph_id,
-        &assert_tx,
+        assert_tx,
         false,
     )
     .await?;
