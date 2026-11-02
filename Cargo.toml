@@ -101,8 +101,8 @@ zkm-zkvm = { git = "https://github.com/ProjectZKM/Ziren", features = ["verify"] 
 zkm-recursion-core = { git = "https://github.com/ProjectZKM/Ziren" }
 zkm-pcs = { git = "https://github.com/ProjectZKM/Ziren" }
 # Must match Ziren's own Plonky3 spec exactly, or the field types differ from Ziren's.
-p3-bn254-fr = { git = "https://github.com/ProjectZKM/Plonky3", rev = "4dd0d47a8176503fbaa7293c9f0e3b20004e16b2", package = "p3-bn254" }
-p3-field = { git = "https://github.com/ProjectZKM/Plonky3", rev = "4dd0d47a8176503fbaa7293c9f0e3b20004e16b2" }
+p3-bn254-fr = { git = "https://github.com/ProjectZKM/Plonky3", package = "p3-bn254" }
+p3-field = { git = "https://github.com/ProjectZKM/Plonky3" }
 
 #zkm-build = { path = "../Ziren/crates/build" }
 #zkm-core-executor = { path = "../Ziren/crates/core/executor" }
