@@ -1,8 +1,10 @@
 #![feature(trim_prefix_suffix)]
-use alloy_consensus::transaction::Transaction;
-use alloy_primitives::{Address, U256};
+use alloy_primitives::{Address, B256, U256, keccak256};
 use alloy_provider::Provider;
-use alloy_provider::{RootProvider, network::Ethereum};
+use alloy_provider::{
+    RootProvider,
+    network::{Ethereum, Network},
+};
 use anyhow::Context;
 use bitcoin_light_client_circuit::EthClientExecutorInput;
 use cbft_rpc::{
@@ -14,7 +16,10 @@ use proof_builder::ProofRequest;
 use proof_builder::{LongRunning, ProofBuilder};
 use reth_chainspec::ChainSpec;
 use state_chain::*;
-use std::sync::Arc;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 use url::Url;
 use zkm_sdk::{
     HashableKey, ProverClient, ZKM_CIRCUIT_VERSION, ZKMProofKind, ZKMProofWithPublicValues,
@@ -23,7 +28,6 @@ use zkm_sdk::{
 
 use sha2::{Digest, Sha256};
 use std::sync::OnceLock;
-use util::hex_parse;
 static ELF_ID: OnceLock<String> = OnceLock::new();
 
 /// A program that aggregates the proofs of the simple program.
@@ -79,16 +83,6 @@ pub struct Args {
         default_value_if("print_program_id", "true", Some(""))
     )]
     pub l2_contract_addresses: String,
-
-    // https://explorer.testnet3.goat.network/address/0x9F0A61ce47678F43A326dB9F8964C56a924cd3D0?tab=read_write_contract
-    #[clap(
-        long,
-        env,
-        required = false,
-        required_unless_present = "print_program_id",
-        default_value_if("print_program_id", "true", Some(""))
-    )]
-    pub proceed_withdraw_method_ids: String,
 }
 
 impl LongRunning for Args {
@@ -108,56 +102,157 @@ impl LongRunning for Args {
     }
 }
 
+type RpcReceipt = <Ethereum as Network>::ReceiptResponse;
+type RpcBlock = <Ethereum as Network>::BlockResponse;
+type Withdrawal = (Address, [u8; 32], Vec<[u8; 16]>);
+
+#[derive(Debug, PartialEq, Eq)]
+struct BlockWithdrawals {
+    block_hash: B256,
+    withdrawals: Vec<Withdrawal>,
+}
+
+fn input_not_ready(message: impl std::fmt::Display) -> anyhow::Error {
+    let message = message.to_string();
+    tracing::warn!(error = %message, "withdrawal inputs not ready; retrying the entire batch");
+    anyhow::Error::new(proof_builder::ProofError::InputNotReady(3)).context(message)
+}
+
+fn parse_gateway_addresses(value: &str) -> anyhow::Result<Vec<Address>> {
+    let mut seen = BTreeSet::new();
+    value
+        .split(',')
+        .map(|part| {
+            let address: Address = part.trim().parse().context("invalid Gateway address")?;
+            anyhow::ensure!(address != Address::ZERO, "Gateway address must not be zero");
+            anyhow::ensure!(seen.insert(address), "duplicate Gateway address {address}");
+            Ok(address)
+        })
+        .collect()
+}
+
+/// Decode ProceedWithdraw(bytes16 indexed instanceId, bytes16 indexed graphId, bytes32 kickoffTxid).
+fn decode_proceed_withdraw(topics: &[B256], data: &[u8]) -> anyhow::Result<[u8; 16]> {
+    if topics.len() != 3
+        || data.len() != 32
+        || topics.first() != Some(&keccak256(b"ProceedWithdraw(bytes16,bytes16,bytes32)"))
+        || topics[1].as_slice()[16..].iter().any(|byte| *byte != 0)
+        || topics[2].as_slice()[16..].iter().any(|byte| *byte != 0)
+    {
+        return Err(input_not_ready("malformed ProceedWithdraw event"));
+    }
+    Ok(topics[2].as_slice()[..16].try_into().unwrap())
+}
+
+fn collect_receipt_withdrawals(
+    receipt: &RpcReceipt,
+    gateways: &[Address],
+    block_number: u64,
+    block_hash: B256,
+    txid: B256,
+    tx_index: u64,
+    withdrawals: &mut Vec<Withdrawal>,
+) -> anyhow::Result<()> {
+    if receipt.block_number != Some(block_number)
+        || receipt.block_hash != Some(block_hash)
+        || receipt.transaction_hash != txid
+        || receipt.transaction_index != Some(tx_index)
+    {
+        return Err(input_not_ready("receipt does not match its block/transaction"));
+    }
+    if !receipt.status() {
+        return Ok(());
+    }
+    for log in receipt.inner.logs() {
+        if !gateways.contains(&log.address())
+            || log.topics().first() != Some(&keccak256(b"ProceedWithdraw(bytes16,bytes16,bytes32)"))
+        {
+            continue;
+        }
+        if log.removed
+            || log.block_hash != Some(block_hash)
+            || log.block_number != Some(block_number)
+            || log.transaction_hash != Some(txid)
+            || log.transaction_index != Some(tx_index)
+        {
+            return Err(input_not_ready("withdrawal log does not match its receipt"));
+        }
+        let graph_id = decode_proceed_withdraw(log.topics(), &log.data().data)?;
+        if let Some((_, _, graph_ids)) =
+            withdrawals.iter_mut().find(|(address, _, _)| *address == log.address())
+        {
+            if !graph_ids.contains(&graph_id) {
+                graph_ids.push(graph_id);
+            }
+        } else {
+            withdrawals.push((log.address(), U256::from(16).to_be_bytes(), vec![graph_id]));
+        }
+    }
+    Ok(())
+}
+
 async fn fetch_withdrawal_events(
     execution_layer_rpc: &str,
     l2_contract_addresses: &[Address],
-    proceed_withdraw_method_ids: &[[u8; 4]],
     start: u64,
     batch_size: u64,
-) -> anyhow::Result<Vec<(u64, [u8; 16], Address)>> {
-    let rpc_url = Url::parse(execution_layer_rpc)?;
-    let provider = RootProvider::<Ethereum>::new_http(rpc_url);
-    let mut withdrawals = vec![];
-    for i in start..start + batch_size {
-        let block = match provider.get_block(i.into()).await {
-            Ok(Some(x)) => x,
-            Ok(None) => {
-                tracing::error!("get block {i} returns none");
-                continue;
-            }
-            Err(e) => {
-                tracing::error!("get block {i} error, {e}");
-                continue;
-            }
-        };
-        for txid in block.transactions.hashes() {
-            let txn = match provider.get_transaction_by_hash(txid).await {
-                Ok(Some(x)) => x,
-                Ok(None) => {
-                    tracing::error!("get transaction by hash {txid} returns none");
-                    continue;
-                }
-                Err(e) => {
-                    tracing::error!("get transaction by hash {txid} error, {e}");
-                    continue;
-                }
-            };
-            let to = txn.to();
-            let input = txn.input();
-            l2_contract_addresses.iter().zip(proceed_withdraw_method_ids.iter()).for_each(
-                |(l2_contract_address, proceed_withdraw_method_id)| {
-                    if to == Some(*l2_contract_address)
-                        && &input[0..4] == proceed_withdraw_method_id
-                    {
-                        let graph_id: [u8; 16] = input[4..16 + 4].try_into().unwrap();
-                        withdrawals.push((i, graph_id, *l2_contract_address));
-                        println!("block: {i}, graph_id: {:?}", hex::encode(graph_id));
-                    }
-                },
-            );
+) -> anyhow::Result<BTreeMap<u64, BlockWithdrawals>> {
+    let provider = RootProvider::<Ethereum>::new_http(Url::parse(execution_layer_rpc)?);
+    let end = start.checked_add(batch_size).context("state-chain block range overflows")?;
+    let mut batches = BTreeMap::new();
+    for height in start..end {
+        // EthGetBlock normalizes a missing transaction list into empty hashes.
+        // Read the typed RPC response directly so missing data remains distinguishable.
+        let block = provider
+            .client()
+            .request::<_, Option<RpcBlock>>(
+                "eth_getBlockByNumber",
+                (format!("0x{height:x}"), false),
+            )
+            .await
+            .map_err(|error| input_not_ready(format!("get block {height}: {error}")))?
+            .ok_or_else(|| input_not_ready(format!("block {height} is missing")))?;
+        if block.header.number != height {
+            return Err(input_not_ready(format!("wrong block number returned for {height}")));
         }
+        if block.transactions.is_uncle() {
+            return Err(input_not_ready(format!("block {height} has no transaction list")));
+        }
+        let block_hash = block.header.hash;
+        let mut withdrawals = Vec::new();
+        for (index, txid) in block.transactions.hashes().enumerate() {
+            let receipt = provider
+                .get_transaction_receipt(txid)
+                .await
+                .map_err(|error| input_not_ready(format!("get receipt {txid}: {error}")))?
+                .ok_or_else(|| input_not_ready(format!("receipt {txid} is missing")))?;
+            collect_receipt_withdrawals(
+                &receipt,
+                l2_contract_addresses,
+                height,
+                block_hash,
+                txid,
+                index as u64,
+                &mut withdrawals,
+            )?;
+        }
+        batches.insert(height, BlockWithdrawals { block_hash, withdrawals });
     }
-    Ok(withdrawals)
+    Ok(batches)
+}
+
+fn check_execution_block(
+    expected_height: u64,
+    expected_hash: B256,
+    actual_height: u64,
+    actual_hash: B256,
+) -> anyhow::Result<()> {
+    if expected_height != actual_height || expected_hash != actual_hash {
+        return Err(input_not_ready(
+            "withdrawal receipts and EVM execution refer to different blocks",
+        ));
+    }
+    Ok(())
 }
 
 // https://github.com/ProjectZKM/reth-processor/blob/stateless/crates/executor/host/tests/integration.rs#L69
@@ -190,7 +285,6 @@ async fn fetch_exection_layer_block(
 #[allow(clippy::too_many_arguments)]
 pub async fn fetch_state_chain(
     l2_contract_addresses: &str,
-    proceed_withdraw_method_ids: &str,
     start: u64,
     batch_size: u64,
     execution_layer_rpc: &str,
@@ -198,45 +292,41 @@ pub async fn fetch_state_chain(
     genesis: &str,
     cosmos_rpc_url: &str,
 ) -> anyhow::Result<Vec<CircuitStateBlock>> {
-    let l2_contract_addresses: Vec<Address> = l2_contract_addresses
-        .split(',')
-        .map(|s| {
-            let addr = s.trim().trim_start_matches("0x");
-            let bytes: [u8; 20] = hex::decode(addr).unwrap().try_into().unwrap();
-            Address::from(bytes)
-        })
-        .collect();
-    let proceed_withdraw_method_ids: Vec<[u8; 4]> =
-        proceed_withdraw_method_ids.split(',').map(|s| hex_parse::<4>(s).unwrap()).collect();
-
+    let l2_contract_addresses = parse_gateway_addresses(l2_contract_addresses)?;
+    anyhow::ensure!(start > 0, "Don't get genesis block from the consensus layer");
+    anyhow::ensure!(batch_size > 0, "batch_size must be positive");
+    let end = start.checked_add(batch_size).context("state-chain block range overflows")?;
     let genesis = if genesis == "goattest" { Genesis::GoatTestnet } else { Genesis::GOAT };
-    assert!(start > 0, "Don't get genesis block from the consensus layer.");
-    let mut blocks: Vec<_> = Vec::new();
-    let base_slot: [u8; 32] = U256::from(16).to_be_bytes();
+    let mut blocks = Vec::new();
     // fetch graph_block_numbers and graph_ids between in goat block(start, start + batch_size)
-    let withdrawal_events = fetch_withdrawal_events(
-        execution_layer_rpc,
-        &l2_contract_addresses,
-        &proceed_withdraw_method_ids,
-        start,
-        batch_size,
-    )
-    .await?;
+    let withdrawal_events =
+        fetch_withdrawal_events(execution_layer_rpc, &l2_contract_addresses, start, batch_size)
+            .await?;
 
-    for i in start..(start + batch_size) {
+    for i in start..end {
         let evm_block =
             fetch_exection_layer_block(execution_layer_rpc, i, &genesis).await.map_err(|e| {
                 tracing::error!("fetch_exection_layer_block: {e:?}");
                 proof_builder::ProofError::InputNotReady((batch_size + start - i) * 3)
             })?;
 
+        let withdrawal_block = withdrawal_events
+            .get(&i)
+            .ok_or_else(|| input_not_ready(format!("withdrawal block {i} is missing")))?;
+        check_execution_block(
+            i,
+            withdrawal_block.block_hash,
+            evm_block.current_block.header.number,
+            evm_block.current_block.header.hash_slow(),
+        )?;
         let parent_beacon_block_root =
-            evm_block.current_block.header.parent_beacon_block_root.unwrap();
-
+            evm_block.current_block.header.parent_beacon_block_root.ok_or_else(|| {
+                input_not_ready(format!("block {i} has no parent beacon block root"))
+            })?;
         let parent_cosmos_block_height =
-            get_cosmos_block_height_at(cosmos_rpc_url, *parent_beacon_block_root)
-                .await
-                .unwrap_or_default();
+            get_cosmos_block_height_at(cosmos_rpc_url, *parent_beacon_block_root).await.map_err(
+                |error| input_not_ready(format!("get parent cosmos block for {i}: {error}")),
+            )?;
 
         let (_, cl_block_number) =
             fetch_cbft_validator_info(cosmos_rpc_url, i, parent_cosmos_block_height, 1000)
@@ -262,20 +352,7 @@ pub async fn fetch_state_chain(
             cosmos_txns.len()
         );
 
-        // for block i, find the contract call with graph_id in its input
-        let mut withdrawals: Vec<(Address, [u8; 32], Vec<[u8; 16]>)> = Vec::new();
-        withdrawal_events.iter().enumerate().filter(|&(_, &val)| val.0 == i).for_each(|(i, _)| {
-            let graph_id = withdrawal_events[i].1;
-            let l2_contract_address = withdrawal_events[i].2;
-            let graph_ids = withdrawals
-                .iter()
-                .find(|(addr, _, _)| *addr == l2_contract_address)
-                .map(|(_, _, graph_ids)| graph_ids.clone())
-                .unwrap_or(vec![graph_id]);
-            withdrawals.push((l2_contract_address, base_slot, graph_ids));
-        });
-
-        // merge the graph ids of a same contract into one
+        let withdrawals = withdrawal_block.withdrawals.clone();
 
         let cosmos_block = serde_json::to_vec(&cosmos_block)?;
         tracing::info!("[push] block: {}, withdrawals: {:?}", i, withdrawals);
@@ -441,5 +518,277 @@ impl ProofBuilder for StateChainProofBuilder {
 
         tracing::info!("Generate proof successfully, proof: {:?}", proof);
         Ok((public_value_hex, proof_size))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{Value, json};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn hash(byte: u8) -> B256 {
+        B256::repeat_byte(byte)
+    }
+    fn gateway(byte: u8) -> Address {
+        Address::repeat_byte(byte)
+    }
+    fn log(graph: u8, address: Address, txid: B256, index: u64) -> Value {
+        json!({
+            "address": address,
+            "topics": [keccak256(b"ProceedWithdraw(bytes16,bytes16,bytes32)"),
+                format!("0x{}{}", "22".repeat(16), "00".repeat(16)),
+                format!("0x{}{}", hex::encode([graph; 16]), "00".repeat(16))],
+            "data": format!("0x{}", "00".repeat(32)),
+            "blockHash": hash(10), "blockNumber": "0xa", "transactionHash": txid,
+            "transactionIndex": format!("0x{index:x}"), "logIndex": "0x0", "removed": false
+        })
+    }
+    fn receipt(txid: B256, index: u64, success: bool, logs: Vec<Value>) -> Value {
+        json!({
+            "type": "0x0", "status": if success {"0x1"} else {"0x0"},
+            "cumulativeGasUsed": "0x1", "gasUsed": "0x1", "effectiveGasPrice": "0x1",
+            "logsBloom": format!("0x{}", "00".repeat(256)), "logs": logs,
+            "transactionHash": txid, "transactionIndex": format!("0x{index:x}"),
+            "blockHash": hash(10), "blockNumber": "0xa", "from": gateway(9),
+            "to": gateway(8), "contractAddress": null
+        })
+    }
+    fn block(height: u64, transactions: Vec<B256>) -> Value {
+        json!({
+            "hash": hash(height as u8), "number": format!("0x{height:x}"),
+            "parentHash": hash(0), "sha3Uncles": hash(0), "miner": gateway(0),
+            "stateRoot": hash(0), "transactionsRoot": hash(0), "receiptsRoot": hash(0),
+            "logsBloom": format!("0x{}", "00".repeat(256)), "difficulty": "0x0",
+            "gasLimit": "0xffffff", "gasUsed": "0x1", "timestamp": "0x1",
+            "extraData": "0x", "mixHash": hash(0), "nonce": "0x0000000000000000",
+            "transactions": transactions, "uncles": [], "size": "0x1"
+        })
+    }
+    fn assert_retry(error: &anyhow::Error) {
+        assert!(
+            matches!(
+                error.downcast_ref::<proof_builder::ProofError>(),
+                Some(proof_builder::ProofError::InputNotReady(3))
+            ),
+            "{error:#}"
+        );
+    }
+
+    /// Serve real JSON-RPC requests, asserting the extractor never fetches calldata.
+    async fn rpc(steps: Vec<(&'static str, Value)>) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for (method, response) in steps {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let (body_offset, content_length) = loop {
+                    let mut buffer = [0; 4096];
+                    let count = stream.read(&mut buffer).await.unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&buffer[..count]);
+                    if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&bytes[..end]).to_lowercase();
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.strip_prefix("content-length:")
+                                    .map(|value| value.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap();
+                        break (end + 4, length);
+                    }
+                };
+                while bytes.len() < body_offset + content_length {
+                    let mut buffer = [0; 4096];
+                    let count = stream.read(&mut buffer).await.unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&buffer[..count]);
+                }
+                let request: Value =
+                    serde_json::from_slice(&bytes[body_offset..body_offset + content_length])
+                        .unwrap();
+                assert_eq!(request["method"], method);
+                let mut reply = json!({"jsonrpc": "2.0", "id": request["id"]});
+                reply.as_object_mut().unwrap().extend(response.as_object().unwrap().clone());
+                let body = serde_json::to_vec(&reply).unwrap();
+                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes()).await.unwrap();
+                stream.write_all(&body).await.unwrap();
+                stream.shutdown().await.unwrap();
+            }
+        });
+        (url, server)
+    }
+    async fn finish(server: tokio::task::JoinHandle<()>) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), server).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn extracts_successful_logs_from_internal_calls_and_merges_all_gateways() {
+        let tx1 = hash(1);
+        let tx2 = hash(2);
+        let tx3 = hash(3);
+        let (url, server) = rpc(vec![
+            ("eth_getBlockByNumber", json!({"result": block(10, vec![tx1, tx2, tx3])})),
+            ("eth_getTransactionReceipt", json!({"result": receipt(tx1, 0, true, vec![log(1, gateway(1), tx1, 0), log(9, gateway(3), tx1, 0)])})),
+            ("eth_getTransactionReceipt", json!({"result": receipt(tx2, 1, true, vec![log(2, gateway(1), tx2, 1), log(1, gateway(1), tx2, 1), log(3, gateway(2), tx2, 1)])})),
+            ("eth_getTransactionReceipt", json!({"result": receipt(tx3, 2, false, vec![log(99, gateway(1), tx3, 2)])})),
+        ]).await;
+        let result = fetch_withdrawal_events(&url, &[gateway(1), gateway(2)], 10, 1).await.unwrap();
+        let batch = &result[&10];
+        assert_eq!(batch.block_hash, hash(10));
+        assert_eq!(
+            batch.withdrawals,
+            vec![
+                (gateway(1), U256::from(16).to_be_bytes(), vec![[1; 16], [2; 16]]),
+                (gateway(2), U256::from(16).to_be_bytes(), vec![[3; 16]]),
+            ]
+        );
+        finish(server).await;
+    }
+
+    #[tokio::test]
+    async fn missing_or_failed_receipts_never_return_a_partial_batch() {
+        for response in [
+            json!({"result": null}),
+            json!({"error": {"code": -32000, "message": "backend unavailable"}}),
+        ] {
+            let (url, server) = rpc(vec![
+                ("eth_getBlockByNumber", json!({"result": block(10, vec![hash(1), hash(2)])})),
+                ("eth_getTransactionReceipt", json!({"result": receipt(hash(1), 0, true, vec![log(1, gateway(1), hash(1), 0)])})),
+                ("eth_getTransactionReceipt", response),
+            ]).await;
+            assert_retry(&fetch_withdrawal_events(&url, &[gateway(1)], 10, 1).await.unwrap_err());
+            finish(server).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_or_failed_blocks_retry_without_overwriting_existing_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("blocks.json");
+        std::fs::write(&file, b"previous complete batch").unwrap();
+        for response in [
+            json!({"result": null}),
+            json!({"error": {"code": -32000, "message": "backend unavailable"}}),
+        ] {
+            let (url, server) = rpc(vec![
+                ("eth_getBlockByNumber", json!({"result": block(10, vec![])})),
+                ("eth_getBlockByNumber", response),
+            ])
+            .await;
+            let error = fetch_state_chain(
+                &gateway(1).to_string(),
+                10,
+                2,
+                &url,
+                file.to_str().unwrap(),
+                "goattest",
+                "http://127.0.0.1:1",
+            )
+            .await
+            .unwrap_err();
+            assert_retry(&error);
+            assert_eq!(std::fs::read(&file).unwrap(), b"previous complete batch");
+            finish(server).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn omitted_transaction_list_is_not_treated_as_an_empty_block() {
+        let mut value = block(10, vec![hash(1)]);
+        value.as_object_mut().unwrap().remove("transactions");
+        let (url, server) = rpc(vec![("eth_getBlockByNumber", json!({"result": value}))]).await;
+        assert_retry(&fetch_withdrawal_events(&url, &[gateway(1)], 10, 1).await.unwrap_err());
+        finish(server).await;
+    }
+
+    #[test]
+    fn event_decoder_checks_topic_count_and_fixed_bytes_padding() {
+        let value = log(1, gateway(1), hash(1), 0);
+        let topics: Vec<B256> = serde_json::from_value(value["topics"].clone()).unwrap();
+        assert_eq!(decode_proceed_withdraw(&topics, &[0; 32]).unwrap(), [1; 16]);
+        for length in 0..3 {
+            assert_retry(&decode_proceed_withdraw(&topics[..length], &[0; 32]).unwrap_err());
+        }
+        let mut padded = topics.clone();
+        let mut bytes = padded[2].0;
+        bytes[31] = 1;
+        padded[2] = B256::from(bytes);
+        assert_retry(&decode_proceed_withdraw(&padded, &[0; 32]).unwrap_err());
+        assert_retry(&decode_proceed_withdraw(&topics, &[0; 31]).unwrap_err());
+    }
+
+    #[test]
+    fn mismatched_receipts_and_removed_or_malformed_logs_retry() {
+        let original = receipt(hash(1), 0, true, vec![log(1, gateway(1), hash(1), 0)]);
+        for (field, wrong) in [
+            ("blockHash", json!(hash(99))),
+            ("blockNumber", json!("0xb")),
+            ("transactionHash", json!(hash(99))),
+            ("transactionIndex", json!("0x1")),
+        ] {
+            let mut value = original.clone();
+            value[field] = wrong;
+            let decoded: RpcReceipt = serde_json::from_value(value).unwrap();
+            assert_retry(
+                &collect_receipt_withdrawals(
+                    &decoded,
+                    &[gateway(1)],
+                    10,
+                    hash(10),
+                    hash(1),
+                    0,
+                    &mut vec![],
+                )
+                .unwrap_err(),
+            );
+        }
+        for (field, wrong) in [
+            ("removed", json!(true)),
+            ("blockHash", json!(hash(99))),
+            ("blockNumber", json!("0xb")),
+            ("transactionHash", json!(hash(99))),
+            ("transactionIndex", json!("0x1")),
+            ("data", json!("0x")),
+            ("topics", json!([keccak256(b"ProceedWithdraw(bytes16,bytes16,bytes32)")])),
+        ] {
+            let mut value = original.clone();
+            value["logs"][0][field] = wrong;
+            let decoded: RpcReceipt = serde_json::from_value(value).unwrap();
+            assert_retry(
+                &collect_receipt_withdrawals(
+                    &decoded,
+                    &[gateway(1)],
+                    10,
+                    hash(10),
+                    hash(1),
+                    0,
+                    &mut vec![],
+                )
+                .unwrap_err(),
+            );
+        }
+    }
+
+    #[test]
+    fn execution_block_must_match_receipts_and_configuration_is_validated() {
+        check_execution_block(10, hash(10), 10, hash(10)).unwrap();
+        assert_retry(&check_execution_block(10, hash(10), 11, hash(10)).unwrap_err());
+        assert_retry(&check_execution_block(10, hash(10), 10, hash(11)).unwrap_err());
+        assert_eq!(
+            parse_gateway_addresses(&format!(" {}, {} ", gateway(1), gateway(2))).unwrap(),
+            vec![gateway(1), gateway(2)]
+        );
+        for invalid in [
+            "".into(),
+            "invalid".into(),
+            Address::ZERO.to_string(),
+            format!("{},{}", gateway(1), gateway(1)),
+            format!("{},", gateway(1)),
+        ] {
+            assert!(parse_gateway_addresses(&invalid).is_err(), "{invalid}");
+        }
     }
 }
