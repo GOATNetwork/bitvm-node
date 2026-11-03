@@ -256,6 +256,7 @@ pub fn get_meta_data_query() -> String {
     let tag = "_meta".to_string();
     builder = builder.add_query(&tag);
     builder = builder.add_field(&tag, "block { number }");
+    builder = builder.add_field(&tag, "hasIndexingErrors");
     builder.build()
 }
 
