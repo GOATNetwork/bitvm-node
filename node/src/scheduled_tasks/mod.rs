@@ -198,8 +198,7 @@ async fn run_maintenance_subtask<T>(
 enum MaintenanceRunOutcome {
     Completed,
     DeferredHistorySync,
-    /// The history-sync check itself failed (Goat read): protocol work is
-    /// deferred to the next tick, not reported as a tick error.
+    /// History metadata is unavailable; only L2/history-dependent work is deferred.
     DeferredHistorySyncUnknown,
 }
 
@@ -211,8 +210,63 @@ async fn run(
     metrics_state: &MetricsState,
     engine: &EngineHandle,
 ) -> anyhow::Result<MaintenanceRunOutcome> {
+    run_with_history_check(
+        actor,
+        local_db,
+        btc_client,
+        goat_client,
+        metrics_state,
+        engine,
+        is_processing_gateway_history_events(local_db),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_with_history_check(
+    actor: Actor,
+    local_db: &LocalDB,
+    btc_client: Arc<BTCClient>,
+    goat_client: Arc<GOATClient>,
+    metrics_state: &MetricsState,
+    engine: &EngineHandle,
+    history_check: impl Future<Output = anyhow::Result<bool>>,
+) -> anyhow::Result<MaintenanceRunOutcome> {
     let btc_client = btc_client.as_ref();
     let goat_client = goat_client.as_ref();
+    // These safety scans run before a history/indexer/GOAT health check can defer work.
+    run_maintenance_subtask(
+        metrics_state,
+        "graph_chain_scan",
+        scan_graphs_on_chain(local_db, btc_client, goat_client, engine),
+    )
+    .await;
+    run_maintenance_subtask(
+        metrics_state,
+        "instance_btc_scan",
+        scan_instances_on_bitcoin(local_db, btc_client, engine, &actor),
+    )
+    .await;
+    run_maintenance_subtask(
+        metrics_state,
+        "swap_escrow_timeout_monitor",
+        swap_escrow_timeout_monitor(local_db),
+    )
+    .await;
+    run_maintenance_subtask(
+        metrics_state,
+        "inbox_quota_purge",
+        crate::p2p_admission::purge_stale_network_events(local_db),
+    )
+    .await;
+    if actor == Actor::Operator {
+        run_maintenance_subtask(
+            metrics_state,
+            "graph_setup_abandon_scan",
+            abandon_unfinished_setups(local_db, btc_client, engine),
+        )
+        .await;
+    }
 
     if is_enable_babe_setup_state_cleanup() && actor_runs_babe_setup_state_cleanup(&actor) {
         run_maintenance_subtask(
@@ -241,83 +295,53 @@ async fn run(
         .await;
     }
 
-    let history_sync_in_progress = match is_processing_gateway_history_events(local_db, goat_client)
-        .await
-    {
-        Ok(in_progress) => in_progress,
-        Err(error) => {
-            warn!(
+    let started = Instant::now();
+    let history = match AssertUnwindSafe(history_check).catch_unwind().await {
+        Ok(result) => result,
+        Err(payload) => Err(anyhow::anyhow!(
+            "history sync check panicked: {}",
+            crate::error::panic_message(payload.as_ref())
+        )),
+    };
+    let outcome = match history {
+        Ok(false) => {
+            metrics_state.record_task_run("gateway_history_sync", "success", started.elapsed());
+            MaintenanceRunOutcome::Completed
+        }
+        Ok(true) => {
+            metrics_state.record_task_run("gateway_history_sync", "deferred", started.elapsed());
+            info!(
                 event = "maintenance_subtask_result",
                 task = "gateway_history_sync",
-                outcome = "failed",
-                error_class = "maintenance",
-                error = %error,
-                "could not check the gateway history sync; protocol work deferred to the next tick"
+                outcome = "deferred",
+                "L2 maintenance deferred during history sync; Bitcoin scans already ran"
             );
-            return Ok(MaintenanceRunOutcome::DeferredHistorySyncUnknown);
+            MaintenanceRunOutcome::DeferredHistorySync
+        }
+        Err(error) => {
+            metrics_state.record_task_run("gateway_history_sync", "failed", started.elapsed());
+            warn!(event = "maintenance_subtask_result", task = "gateway_history_sync", outcome = "failed", error = %error,
+                "L2 maintenance deferred because history state is unavailable; Bitcoin scans already ran");
+            MaintenanceRunOutcome::DeferredHistorySyncUnknown
         }
     };
-    if history_sync_in_progress {
-        info!(
-            event = "maintenance_subtask_result",
-            task = "gateway_history_sync",
-            outcome = "deferred",
-            role = %actor,
-            reason = "history_sync_in_progress",
-            "maintenance protocol work deferred while gateway history sync is active"
-        );
-        return Ok(MaintenanceRunOutcome::DeferredHistorySync);
-    }
-
-    // New peg-in requests become instance rows and `pegin_request` events.
-    run_maintenance_subtask(
-        metrics_state,
-        "pegin_request_monitor",
-        pegin_request_monitor(local_db, btc_client, goat_client, engine),
-    )
-    .await;
-    // Chain facts for the Instance aggregate; the apply decides every status.
-    run_maintenance_subtask(
-        metrics_state,
-        "instance_answer_window_scan",
-        scan_answer_windows(local_db, goat_client, engine),
-    )
-    .await;
-    run_maintenance_subtask(
-        metrics_state,
-        "instance_btc_scan",
-        scan_instances_on_bitcoin(local_db, btc_client, engine, &actor),
-    )
-    .await;
-    run_maintenance_subtask(
-        metrics_state,
-        "swap_escrow_timeout_monitor",
-        swap_escrow_timeout_monitor(local_db),
-    )
-    .await;
-    // Rejected and stale unregistered network events leave the inbox quota.
-    run_maintenance_subtask(
-        metrics_state,
-        "inbox_quota_purge",
-        crate::p2p_admission::purge_stale_network_events(local_db),
-    )
-    .await;
-    // Chain facts for the Graph aggregate's peg-out phases.
-    run_maintenance_subtask(
-        metrics_state,
-        "graph_chain_scan",
-        scan_graphs_on_chain(local_db, btc_client, goat_client, engine),
-    )
-    .await;
-    if actor == Actor::Operator {
+    if matches!(outcome, MaintenanceRunOutcome::Completed) {
+        // New peg-in requests become instance rows and `pegin_request` events.
         run_maintenance_subtask(
             metrics_state,
-            "graph_setup_abandon_scan",
-            abandon_unfinished_setups(local_db, btc_client, engine),
+            "pegin_request_monitor",
+            pegin_request_monitor(local_db, btc_client, goat_client, engine),
+        )
+        .await;
+        // Chain facts for the Instance aggregate; the apply decides every status.
+        run_maintenance_subtask(
+            metrics_state,
+            "instance_answer_window_scan",
+            scan_answer_windows(local_db, goat_client, engine),
         )
         .await;
     }
-    Ok(MaintenanceRunOutcome::Completed)
+    Ok(outcome)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -368,14 +392,14 @@ pub async fn run_maintenance_tasks(
                         );
                     }
                     Ok(Ok(MaintenanceRunOutcome::DeferredHistorySync)) => {
-                        metrics_state.record_task_run("maintenance", "success", tick_start.elapsed());
+                        metrics_state.record_task_run("maintenance", "deferred", tick_start.elapsed());
                         info!(
                             event = "maintenance_tick_result",
                             tick,
                             outcome = "deferred",
                             reason = "history_sync_in_progress",
                             elapsed_ms = tick_start.elapsed().as_millis() as u64,
-                            "maintenance protocol work was deferred"
+                            "L2 maintenance was deferred; Bitcoin safety scans completed"
                         );
                     }
                     Ok(Ok(MaintenanceRunOutcome::DeferredHistorySyncUnknown)) => {
@@ -386,7 +410,7 @@ pub async fn run_maintenance_tasks(
                             outcome = "deferred",
                             reason = "history_sync_check_failed",
                             elapsed_ms = tick_start.elapsed().as_millis() as u64,
-                            "maintenance protocol work was deferred"
+                            "L2 maintenance was deferred; Bitcoin safety scans completed"
                         );
                     }
                     Ok(Err(error)) => {
@@ -458,6 +482,85 @@ fn get_timestamp_from_contract_data(input: &[u8; 32]) -> i64 {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    #[tokio::test]
+    async fn bitcoin_scans_run_before_pending_or_failed_history_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = LocalDB::new_with_busy_timeout(
+            &format!("sqlite:{}", dir.path().join("maintenance.db").display()),
+            false,
+            store::DEFAULT_BUSY_TIMEOUT,
+        )
+        .await;
+        db.migrate().await;
+        let (btc, _) = BTCClient::new_mock_client();
+        let (goat, _) = GOATClient::new_mock_client();
+        let (engine, _acks) =
+            engine::EngineBuilder::new(db.clone(), engine::EngineConfig::default()).build();
+        let engine = engine.handle();
+        let btc = Arc::new(btc);
+        let goat = Arc::new(goat);
+        for failed in [false, true] {
+            let registry = Arc::new(Mutex::new(libp2p_metrics::Registry::default()));
+            let metrics = MetricsState::new(registry.clone());
+            let outcome = run_with_history_check(
+                Actor::Verifier,
+                &db,
+                btc.clone(),
+                goat.clone(),
+                &metrics,
+                &engine,
+                async {
+                    assert_bitcoin_scans_completed(&registry);
+                    if failed {
+                        anyhow::bail!("indexer unavailable")
+                    }
+                    Ok(true)
+                },
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                (failed, outcome),
+                (false, MaintenanceRunOutcome::DeferredHistorySync)
+                    | (true, MaintenanceRunOutcome::DeferredHistorySyncUnknown)
+            ));
+            let mut output = String::new();
+            prometheus_client::encoding::text::encode(&mut output, &registry.lock().unwrap())
+                .unwrap();
+            let expected = if failed { "failed" } else { "deferred" };
+            assert!(
+                output.contains(&format!("task=\"gateway_history_sync\",outcome=\"{expected}\""))
+            );
+            assert!(!output.contains("task=\"pegin_request_monitor\""));
+            assert!(!output.contains("task=\"instance_answer_window_scan\""));
+        }
+        let registry = Arc::new(Mutex::new(libp2p_metrics::Registry::default()));
+        let metrics = MetricsState::new(registry.clone());
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            run_with_history_check(Actor::Verifier, &db, btc, goat, &metrics, &engine, async {
+                assert_bitcoin_scans_completed(&registry);
+                std::future::pending::<anyhow::Result<bool>>().await
+            }),
+        )
+        .await;
+        assert!(result.is_err());
+        assert_bitcoin_scans_completed(&registry);
+    }
+
+    fn assert_bitcoin_scans_completed(registry: &Arc<Mutex<libp2p_metrics::Registry>>) {
+        let mut output = String::new();
+        prometheus_client::encoding::text::encode(&mut output, &registry.lock().unwrap()).unwrap();
+        for task in ["graph_chain_scan", "instance_btc_scan"] {
+            assert!(
+                output.contains(&format!(
+                    "bitvm_node_task_runs_total{{task=\"{task}\",outcome=\"success\"}} 1"
+                )),
+                "{output}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn panicking_subtasks_are_failed_and_later_subtasks_still_run() {

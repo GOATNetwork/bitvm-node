@@ -219,6 +219,26 @@ async fn detect_watchtower_flow_disprove(
     Ok(None)
 }
 
+async fn initial_graph_stage(
+    goat_client: &GOATClient,
+    graph_id: Uuid,
+    prekickoff_confirmed: bool,
+    committee_presigned: bool,
+) -> Result<GraphStatus> {
+    if prekickoff_confirmed {
+        return Ok(GraphStatus::PreKickoff);
+    }
+    // Before Bitcoin progress, GraphData is still needed to recognize an L2-posted graph.
+    let graph_data = goat_client.gateway_get_graph_data(&graph_id).await?;
+    Ok(if graph_data.operator_pubkey != [0; 32] {
+        GraphStatus::OperatorDataPushed
+    } else if committee_presigned {
+        GraphStatus::CommitteePresigned
+    } else {
+        GraphStatus::OperatorPresigned
+    })
+}
+
 pub(crate) async fn scan_graph_chain_state(
     btc_client: &BTCClient,
     goat_client: &GOATClient,
@@ -231,27 +251,19 @@ pub(crate) async fn scan_graph_chain_state(
     // Derive the candidate from the graph and both chains, rather than using
     // the locally persisted status as the scan start. The stored status is a
     // projection and can be stale after a restart or missed listener event.
-    let mut current_status = if graph.committee_pre_signed() {
-        GraphStatus::CommitteePresigned
-    } else {
-        GraphStatus::OperatorPresigned
-    };
-
     let prekickoff_txid = graph.cur_prekickoff.tx().compute_txid();
     let kickoff_txid = graph.kickoff.tx().compute_txid();
     let take1_txid = graph.take1.tx().compute_txid();
     let take2_txid = graph.take2.tx().compute_txid();
-
-    // GraphData is a Goat-chain fact and must be checked regardless of the
-    // current local projection. A fully synced node may otherwise remain at
-    // OperatorPresigned forever after a prior status regression.
-    let graph_data_on_goat = goat_client.gateway_get_graph_data(&graph_id).await?;
-    if graph_data_on_goat.operator_pubkey != [0u8; 32] {
-        current_status = GraphStatus::OperatorDataPushed;
-    }
-    // Derive stages from confirmed chain progress, not local Obsoleted state.
-    // Mempool transactions can be replaced and must not decide a terminal stage.
-    if !tx_confirmed(btc_client, &prekickoff_txid).await? {
+    let prekickoff_confirmed = tx_confirmed(btc_client, &prekickoff_txid).await?;
+    let mut current_status = initial_graph_stage(
+        goat_client,
+        graph_id,
+        prekickoff_confirmed,
+        graph.committee_pre_signed(),
+    )
+    .await?;
+    if !prekickoff_confirmed {
         return Ok(GraphChainScan {
             status: current_status,
             sub_status,
@@ -452,4 +464,21 @@ pub(crate) async fn scan_graph_chain_state(
     }
 
     Ok(GraphChainScan { status: current_status, sub_status, challenge_txid, disprove: None })
+}
+
+#[cfg(test)]
+mod liveness_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn confirmed_prekickoff_does_not_require_goat_graph_data() {
+        let (goat, _) = GOATClient::new_mock_client();
+        let graph_id = Uuid::new_v4();
+        assert!(goat.gateway_get_graph_data(&graph_id).await.is_err());
+        assert_eq!(
+            initial_graph_stage(&goat, graph_id, true, false).await.unwrap(),
+            GraphStatus::PreKickoff
+        );
+        assert!(initial_graph_stage(&goat, graph_id, false, false).await.is_err());
+    }
 }
