@@ -13,7 +13,6 @@ use client::Utxo as ClientUtxo;
 use client::btc_chain::BTCClient;
 use client::goat_chain::GOATClient;
 use client::graphs::graph_query::BridgeInRequestEvent;
-use goat::contexts::base::generate_n_of_n_public_key;
 use goat::transactions::base::Input;
 use indexmap::IndexMap;
 use std::str::FromStr;
@@ -202,7 +201,10 @@ pub fn gen_instance_parameters_local(
         );
     }
 
-    let committee_agg_pubkey = generate_n_of_n_public_key(&committee_pubkeys).0;
+    let committee_agg_pubkey = bitvm_lib::types::checked_committee_key(&committee_pubkeys)
+        .map_err(|error| {
+            crate::error::SpecialError::InvalidPeginData(format!("invalid committee: {error}"))
+        })?;
     let utxos: Vec<client::Utxo> = serde_json::from_str(&instance.input_utxos)?;
     Ok(BitvmGcInstanceParameters {
         network,
