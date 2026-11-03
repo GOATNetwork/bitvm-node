@@ -27,7 +27,7 @@ use std::panic::AssertUnwindSafe;
 use std::str::FromStr;
 use std::sync::{LazyLock, Mutex};
 use store::localdb::{InstanceQuery, LocalDB};
-use store::{GoatTxProcessingStatus, GoatTxRecord, GoatTxType, Instance, InstanceBridgeInStatus};
+use store::{GoatTxProcessingStatus, GoatTxRecord, Instance, InstanceBridgeInStatus};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -368,22 +368,48 @@ pub async fn gather_snapshot(
     Ok(Some(snapshot))
 }
 
-/// Store pending Goat bridge-in requests. Submit pegin_request events only while
-/// the response window is open; late requests are handled by the answer-window scan.
+type RequestCursor = (i64, Uuid, Uuid);
+static PEGIN_REQUEST_CURSORS: LazyLock<Mutex<HashMap<String, RequestCursor>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Submit pending requests in bounded, rotating pages; late requests are handled
+/// by the answer-window scan. The cursor advances before each cancellable item.
 pub async fn pegin_request_monitor(
     local_db: &LocalDB,
     btc_client: &BTCClient,
     goat_client: &GOATClient,
     engine: &EngineHandle,
 ) -> anyhow::Result<()> {
+    pegin_request_monitor_page(
+        local_db,
+        btc_client,
+        goat_client,
+        engine,
+        crate::env::get_instance_maintenance_batch_size(),
+    )
+    .await
+}
+
+async fn pegin_request_monitor_page(
+    local_db: &LocalDB,
+    btc_client: &BTCClient,
+    goat_client: &GOATClient,
+    engine: &EngineHandle,
+    batch_size: u32,
+) -> anyhow::Result<()> {
+    let cursor = PEGIN_REQUEST_CURSORS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&local_db.path)
+        .copied();
     let tx_records = {
-        let mut storage_processor = local_db.acquire().await?;
-        storage_processor
-            .get_goat_tx_record_by_processing_status(
-                &GoatTxType::BridgeInRequest.to_string(),
-                &GoatTxProcessingStatus::Pending.to_string(),
-            )
-            .await?
+        let mut storage = local_db.acquire().await?;
+        let page = storage.pending_bridge_in_page(cursor, batch_size).await?;
+        if page.is_empty() && cursor.is_some() {
+            storage.pending_bridge_in_page(None, batch_size).await?
+        } else {
+            page
+        }
     };
     if tx_records.is_empty() {
         return Ok(());
@@ -392,6 +418,10 @@ pub async fn pegin_request_monitor(
     let response_window_blocks = goat_client.gateway_get_response_window_blocks().await? as i64;
     let mut failures = 0;
     for tx_record in tx_records {
+        PEGIN_REQUEST_CURSORS.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            local_db.path.clone(),
+            (tx_record.height, tx_record.instance_id, tx_record.graph_id),
+        );
         let operation = process_pegin_request_record(
             local_db,
             btc_client,
@@ -401,7 +431,13 @@ pub async fn pegin_request_monitor(
             current_height,
             response_window_blocks,
         );
-        if let Err(error) = isolate_pegin_request(local_db, &tx_record, operation).await {
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            isolate_pegin_request(local_db, &tx_record, operation),
+        )
+        .await
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("peg-in request processing timed out")));
+        if let Err(error) = result {
             failures += 1;
             warn!(event = "pegin_request", instance_id = %tx_record.instance_id,
                 error = %error, "BridgeInRequest processing failed; continuing with the next record");
@@ -547,6 +583,7 @@ mod tests {
     use super::*;
     use bitcoin::{Address, hashes::Hash, key::Keypair, secp256k1::SECP256K1};
     use client::goat_chain::{PeginData, PeginStatus};
+    use store::GoatTxType;
 
     async fn database() -> (LocalDB, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
@@ -558,6 +595,25 @@ mod tests {
         .await;
         db.migrate().await;
         (db, dir)
+    }
+
+    #[tokio::test]
+    async fn request_monitor_processes_only_one_bounded_page_each_pass() {
+        let (db, _dir) = database().await;
+        let (btc, _) = BTCClient::new_mock_client();
+        let (goat, _) = GOATClient::new_mock_client();
+        let (engine, _acks) =
+            engine::EngineBuilder::new(db.clone(), engine::EngineConfig::default()).build();
+        for id in 1..=5 {
+            db.acquire().await.unwrap().upsert_goat_tx_record(&pending_record(id)).await.unwrap();
+        }
+        for remaining in [3, 1, 0] {
+            pegin_request_monitor_page(&db, &btc, &goat, &engine.handle(), 2).await.unwrap();
+            assert_eq!(
+                db.acquire().await.unwrap().pending_bridge_in_page(None, 10).await.unwrap().len(),
+                remaining
+            );
+        }
     }
 
     fn pending_record(id: u128) -> GoatTxRecord {
