@@ -634,3 +634,6 @@ mod tests {
         drop(other);
     }
 }
+
+#[cfg(test)]
+mod pagination_tests;
