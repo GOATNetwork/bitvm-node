@@ -127,8 +127,8 @@ pub const REGULAR_TASK_INTERVAL_SECOND: u64 = 20;
 pub const SEQUENCER_SET_MONITOR_INTERVAL_SECS: u64 = 5;
 pub const ENV_INSTANCE_MAINTENANCE_BATCH_SIZE: &str = "INSTANCE_MAINTENANCE_BATCH_SIZE";
 pub const DEFAULT_INSTANCE_MAINTENANCE_BATCH_SIZE: u32 = 50;
-pub const ENV_MAINTENANCE_RUN_TIMEOUT_SECS: &str = "MAINTENANCE_RUN_TIMEOUT_SECS";
-pub const DEFAULT_MAINTENANCE_RUN_TIMEOUT_SECS: u64 = 60;
+pub const ENV_MAINTENANCE_SUBTASK_TIMEOUT_SECS: &str = "MAINTENANCE_SUBTASK_TIMEOUT_SECS";
+pub const DEFAULT_MAINTENANCE_SUBTASK_TIMEOUT_SECS: u64 = 60;
 /// Maximum decoded JSON gossip size.
 pub const ENV_P2P_MAX_JSON_MESSAGE_BYTES: &str = "P2P_MAX_JSON_MESSAGE_BYTES";
 pub const DEFAULT_P2P_MAX_JSON_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
@@ -780,12 +780,12 @@ pub fn get_instance_maintenance_batch_size() -> u32 {
         .unwrap_or(DEFAULT_INSTANCE_MAINTENANCE_BATCH_SIZE)
 }
 
-pub fn get_maintenance_run_timeout_secs() -> u64 {
-    std::env::var(ENV_MAINTENANCE_RUN_TIMEOUT_SECS)
+pub fn get_maintenance_subtask_timeout_secs() -> u64 {
+    std::env::var(ENV_MAINTENANCE_SUBTASK_TIMEOUT_SECS)
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .map(|timeout| timeout.clamp(1, 300))
-        .unwrap_or(DEFAULT_MAINTENANCE_RUN_TIMEOUT_SECS)
+        .unwrap_or(DEFAULT_MAINTENANCE_SUBTASK_TIMEOUT_SECS)
 }
 
 pub fn get_p2p_max_json_message_bytes() -> usize {

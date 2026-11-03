@@ -186,6 +186,18 @@ impl StorageProcessor<'_> {
             .await?)
     }
 
+    pub async fn update_verified_operator_balance(
+        &mut self,
+        peer: &str,
+        pubkey: &str,
+        balance: &str,
+    ) -> anyhow::Result<()> {
+        sqlx::query("UPDATE node SET available_peg_btc = ? WHERE peer_id = ? AND (lower(btc_pub_key) = ? OR lower(btc_pub_key) = ?)")
+            .bind(balance).bind(peer).bind(pubkey).bind(format!("0x{pubkey}"))
+            .execute(self.conn()).await?;
+        Ok(())
+    }
+
     pub async fn find_nodes(&mut self, params: &NodeQuery) -> anyhow::Result<(Vec<Node>, i64)> {
         let data_query_builder = params.get_query_builder("SELECT *  FROM node");
         let mut count_params = params.clone();
