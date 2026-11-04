@@ -7,7 +7,7 @@
 set -euo pipefail
 source "$(cd "$(dirname "$0")/.." && pwd)/scripts/localnet.env"
 mkdir -p "$LOCALNET_DATA/forge/home"
-env_args=(); for v in PRIVATE_KEY BITCOINSPV_ADDR STAKE_TOKEN_ADDR COMMITTEE_0 COMMITTEE_1 COMMITTEE_2 COMMITTEE_3 WATCHTOWER_0 WATCHTOWER_1; do
+env_args=(); for v in ETH_GAS_PRICE ETH_PRIORITY_GAS_PRICE PRIVATE_KEY BITCOINSPV_ADDR STAKE_TOKEN_ADDR COMMITTEE_0 COMMITTEE_1 COMMITTEE_2 COMMITTEE_3 WATCHTOWER_0 WATCHTOWER_1; do
   [[ -n "${!v:-}" ]] && env_args+=(-e "$v=${!v}"); done
 exec docker run --rm --network host -u "$LOCALNET_UID:$LOCALNET_GID" \
   -v "$LOCALNET_ROOT:/work:ro" -v "$LOCALNET_DATA/forge:/forge" -w /work \

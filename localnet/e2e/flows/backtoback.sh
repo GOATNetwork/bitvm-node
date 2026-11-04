@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
-# Two peg-ins back to back with a slow verifier soldering (MOCK_GC_SOLDER_DELAY_SECS=120). B is prepared while A's
+# Two peg-ins back to back with a slow verifier soldering (MOCK_GC_SOLDER_DELAY_SECS=E2E_BACKTOBACK_SOLDER_SECS:
+# 120 s on anvil, 240 s on testnet3, whose committee answers take ~70 s longer). B is prepared while A's
 # ceremony still runs; the engine's cpu pool runs one GC job per node at a time (ENGINE_CPU_POOL_SLOTS, default 1),
 # so the verifier queues B's setup behind A's solder. Asserted: A is still in its ceremony on every node when B's
 # Prepare confirms, the verifier created B's setup job before A's solder finished, both end L2Minted / L2Recorded,
 # and their graphs take consecutive slots.
 source "$(cd "$(dirname "$0")/.." && pwd)/lib.sh"
 "$ROOT/scripts/miner.sh" stop >/dev/null 2>&1 || true
-SOLDER_BEFORE=$(tuning_get MOCK_GC_SOLDER_DELAY_SECS); set_tuning MOCK_GC_SOLDER_DELAY_SECS 120
-NODES_SH restart verifier_0 >/dev/null 2>&1; log "verifier_0 restarted with a 120 s solder delay"
+SLOW=${E2E_BACKTOBACK_SOLDER_SECS:-$([[ $GOAT_BACKEND == testnet3 ]] && echo 240 || echo 120)}
+SOLDER_BEFORE=$(tuning_get MOCK_GC_SOLDER_DELAY_SECS); set_tuning MOCK_GC_SOLDER_DELAY_SECS "$SLOW"
+NODES_SH restart verifier_0 >/dev/null 2>&1; log "verifier_0 restarted with a $SLOW s solder delay"
 sleep 8
 req() { local out id; out=$( set -a; source "$CLI_ENV/user.env"; set +a; "$BIN_DIR/pegin-request" --network regtest --esplora-url "$BTC_CHAIN_URL" request --pegin-amount-sats 1000000 --receiver-evm-address "$OP0_GOAT_ADDRESS" 2>&1 ) || { echo "$out" >&2; return 1; }
   grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' <<<"$out" | head -1; }
