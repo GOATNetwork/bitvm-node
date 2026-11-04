@@ -55,6 +55,24 @@ impl InputValidator {
         }
     }
 
+    /// Parses a Watchtower-Challenge-Init txid and requires the graph's registered one.
+    pub(crate) fn validate_challenge_init_txid(
+        txid: &str,
+        graph_data: &GraphData,
+    ) -> ValidationResult<Txid> {
+        let txid = Self::validate_btc_txid(txid, "challenge_init_txid")?;
+        if txid.to_byte_array() != graph_data.watchtower_challenge_init_txid {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "INVALID_WATCHTOWER_CHALLENGE_INIT_TXID".to_string(),
+                    message: "challenge_init_txid does not match the graph".to_string(),
+                }),
+            ));
+        }
+        Ok(txid)
+    }
+
     /// Checks the operator task inputs that the proof loop cannot repair later
     /// against the graph registered on GOAT.
     pub(crate) fn validate_operator_task(

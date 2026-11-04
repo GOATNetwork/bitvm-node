@@ -309,6 +309,18 @@ mod tests {
             operator.x_only_public_key().0,
         );
         authorization_chain.set_graph_watchtowers(Uuid::parse_str(&graph_id)?, [0x22; 32], 1);
+        // A second graph of the instance that has no Operator task yet.
+        let watchtower_graph_id = "22112233-4455-6677-8899-aabbccddeeff".to_string();
+        authorization_chain.set_graph(
+            Uuid::parse_str(&instance_id)?,
+            Uuid::parse_str(&watchtower_graph_id)?,
+            operator.x_only_public_key().0,
+        );
+        authorization_chain.set_graph_watchtowers(
+            Uuid::parse_str(&watchtower_graph_id)?,
+            [0x33; 32],
+            1,
+        );
         authorization_chain.add_watchtower(watchtower.x_only_public_key().0);
         let gateway_address = gateway(1);
         let addr = available_addr();
@@ -424,36 +436,49 @@ mod tests {
         assert!(operator_timeout_response.starts_with("HTTP/1.1 200"));
         assert!(operator_timeout_response.contains("1 rows affected"));
 
-        let watchtower_submit = WatchtowerProofRequest {
+        let watchtower_request = |graph_id: &str, init_txid: &str| WatchtowerProofRequest {
             instance_id: instance_id.clone(),
-            graph_id: graph_id.clone(),
+            graph_id: graph_id.to_string(),
             gateway_address: Some(gateway_address.to_string()),
             public_key: watchtower.public_key().to_string(),
-            challenge_init_txid: "33".repeat(32),
+            challenge_init_txid: init_txid.repeat(32),
             execution_layer_block_number: 1,
         };
-        let watchtower_submit_body = serde_json::to_string(&watchtower_submit)?;
-        let watchtower_submit_auth = sign_proof_builder_request(
-            &watchtower,
-            ProofBuilderAuthRole::Watchtower,
-            "POST",
-            routes::v1::PROOFS_WATCHTOWER_PROOF,
-            &watchtower_submit,
-        )?;
-        assert!(
-            post(
-                &addr,
-                routes::v1::PROOFS_WATCHTOWER_PROOF,
-                &watchtower_submit_body,
-                Some(&watchtower_submit_auth),
-            )
-            .await?
-            .starts_with("HTTP/1.1 200")
-        );
+        let submit_watchtower = |request: WatchtowerProofRequest| {
+            let addr = addr.clone();
+            async move {
+                let auth = sign_proof_builder_request(
+                    &watchtower,
+                    ProofBuilderAuthRole::Watchtower,
+                    "POST",
+                    routes::v1::PROOFS_WATCHTOWER_PROOF,
+                    &request,
+                )?;
+                post(
+                    &addr,
+                    routes::v1::PROOFS_WATCHTOWER_PROOF,
+                    &serde_json::to_string(&request)?,
+                    Some(&auth),
+                )
+                .await
+            }
+        };
+        // Wrong Watchtower-Challenge-Init txid, unregistered graph, and a graph
+        // whose Operator task already fixed a list without this Watchtower.
+        for (request, status) in [
+            (watchtower_request(&watchtower_graph_id, "44"), "HTTP/1.1 400"),
+            (watchtower_request("33112233-4455-6677-8899-aabbccddeeff", "33"), "HTTP/1.1 403"),
+            (watchtower_request(&graph_id, "22"), "HTTP/1.1 403"),
+        ] {
+            let response = submit_watchtower(request).await?;
+            assert!(response.starts_with(status), "{response}");
+        }
+        let response = submit_watchtower(watchtower_request(&watchtower_graph_id, "33")).await?;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
 
         let watchtower_timeout = WatchtowerProofTimeoutUpdateRequest {
             instance_id,
-            graph_id,
+            graph_id: watchtower_graph_id,
             gateway_address: Some(gateway_address.to_string()),
             public_key: watchtower.public_key().to_string(),
         };
