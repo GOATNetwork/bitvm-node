@@ -96,3 +96,42 @@ async fn kickoff_challenge_does_not_wait_for_spv_and_preserves_other_gates() {
     btc_mock.set_tx(take1, spender);
     assert!(matches!(preflight().await.unwrap(), Some(Step::Plan(_))));
 }
+
+#[test]
+fn challenge_connector_a_is_recognized_at_any_input_index() {
+    use bitcoin::{OutPoint, TxIn, TxOut};
+    let connector_a = OutPoint { txid: make_txid(1), vout: 2 };
+    let fee_input =
+        TxIn { previous_output: OutPoint { txid: make_txid(2), vout: 0 }, ..Default::default() };
+    let mut challenge = bitcoin::Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![
+            TxIn { previous_output: connector_a, ..Default::default() },
+            fee_input.clone(),
+            TxIn { previous_output: OutPoint { txid: make_txid(4), vout: 1 }, ..fee_input },
+        ],
+        output: vec![
+            TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: bitcoin::ScriptBuf::new()
+            };
+            3
+        ],
+    };
+    for index in 0..3 {
+        assert!(challenge_spends_connector_a(&challenge, connector_a), "input {index}");
+        // Move the SINGLE-signed input/output pair behind a fee input.
+        challenge.input.rotate_right(1);
+        challenge.output.rotate_right(1);
+    }
+    assert!(!challenge_spends_connector_a(
+        &challenge,
+        OutPoint { txid: make_txid(3), ..connector_a }
+    ));
+    assert!(!challenge_spends_connector_a(&challenge, OutPoint { vout: 3, ..connector_a }));
+    challenge.input.remove(0);
+    assert!(!challenge_spends_connector_a(&challenge, connector_a));
+    challenge.input.clear();
+    assert!(!challenge_spends_connector_a(&challenge, connector_a));
+}
