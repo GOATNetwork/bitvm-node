@@ -186,16 +186,29 @@ impl StorageProcessor<'_> {
             .await?)
     }
 
+    pub async fn get_node_btc_pub_key(&mut self, peer: &str) -> anyhow::Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, String>("SELECT btc_pub_key FROM node WHERE peer_id = ?")
+            .bind(peer)
+            .fetch_optional(self.conn())
+            .await?)
+    }
+
+    /// Update only while the row still carries the key spelling that was verified.
     pub async fn update_verified_operator_balance(
         &mut self,
         peer: &str,
-        pubkey: &str,
+        btc_pub_key: &str,
         balance: &str,
-    ) -> anyhow::Result<()> {
-        sqlx::query("UPDATE node SET available_peg_btc = ? WHERE peer_id = ? AND (lower(btc_pub_key) = ? OR lower(btc_pub_key) = ?)")
-            .bind(balance).bind(peer).bind(pubkey).bind(format!("0x{pubkey}"))
-            .execute(self.conn()).await?;
-        Ok(())
+    ) -> anyhow::Result<bool> {
+        let result = sqlx::query(
+            "UPDATE node SET available_peg_btc = ? WHERE peer_id = ? AND btc_pub_key = ?",
+        )
+        .bind(balance)
+        .bind(peer)
+        .bind(btc_pub_key)
+        .execute(self.conn())
+        .await?;
+        Ok(result.rows_affected() == 1)
     }
 
     pub async fn find_nodes(&mut self, params: &NodeQuery) -> anyhow::Result<(Vec<Node>, i64)> {
