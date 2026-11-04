@@ -1038,6 +1038,14 @@ async fn disprove(
 
 // ---------------------------------------------------------------- operator
 
+// SINGLE|ANYONECANPAY permits moving the connector input and its paired output.
+fn challenge_spends_connector_a(
+    transaction: &bitcoin::Transaction,
+    connector_a: bitcoin::OutPoint,
+) -> bool {
+    transaction.input.iter().any(|input| input.previous_output == connector_a)
+}
+
 /// Challenge on Connector-A: Watchtower-Challenge-Init.
 async fn watchtower_challenge_init(
     deps: &JobDeps,
@@ -1060,7 +1068,7 @@ async fn watchtower_challenge_init(
         .connector_a_input()
         .map_err(|e| anyhow!("failed to get connector-a input: {e}"))?
         .outpoint;
-    if challenge_tx.input.first().map(|input| input.previous_output) != Some(connector_a) {
+    if !challenge_spends_connector_a(&challenge_tx, connector_a) {
         return Step::ignore("challenge does not spend connector-A");
     }
     let (master, _) = local_operator()?;
