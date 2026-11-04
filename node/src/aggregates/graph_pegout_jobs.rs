@@ -596,55 +596,69 @@ async fn challenge_kickoff(deps: &JobDeps, graph: &BitvmGcGraph) -> Result<Step>
     let btc = &deps.btc_client;
     let graph_id = graph.parameters.graph_id;
     let kickoff_txid = graph.kickoff.tx().compute_txid();
-    let Some(kickoff_height) = btc.get_tx_status(&kickoff_txid).await?.block_height else {
-        return after_blocks(deps, "kickoff is not confirmed yet", 1);
-    };
     let take1_txid = graph.take1.tx().compute_txid();
     let (challenge_tx, _) = export_challenge_tx(graph)?;
     let outpoint = challenge_tx.input[0].previous_output;
+    if let Some(step) =
+        kickoff_challenge_preflight(deps, graph_id, kickoff_txid, take1_txid, outpoint).await?
+    {
+        return Ok(step);
+    }
+    // Challenge only needs the confirmed kickoff and L2 withdraw state.
+    // GOAT SPV coverage is required later for L2 settlement, not this broadcast.
+    // The connector is unspent, so no Challenge of ours is pending.
+    let txid = send_challenge_tx(btc, graph).await?;
+    info!(event = "graph_challenge", graph_id = %graph_id, txid = %txid, "Challenge broadcast");
+    broadcast_pending(deps, &format!("Challenge {txid}"))
+}
+
+/// `None` means the confirmed kickoff is eligible for immediate Challenge broadcast.
+async fn kickoff_challenge_preflight(
+    deps: &JobDeps,
+    graph_id: Uuid,
+    kickoff_txid: Txid,
+    take1_txid: Txid,
+    outpoint: bitcoin::OutPoint,
+) -> Result<Option<Step>> {
+    let btc = &deps.btc_client;
+    if !btc.get_tx_status(&kickoff_txid).await?.confirmed {
+        return Ok(Some(after_blocks(deps, "kickoff is not confirmed yet", 1)?));
+    }
     if let Some(spent_txid) =
         outpoint_spent_txid(btc, &outpoint.txid, u64::from(outpoint.vout)).await?
     {
         // Only a confirmed spend settles it: a Challenge in the mempool may be
         // ours (resent below if it is evicted) or a decoy an operator replaces.
         if !btc.get_tx_status(&spent_txid).await?.confirmed {
-            return after_blocks(
+            return Ok(Some(after_blocks(
                 deps,
                 format!("challenge connector spent by unconfirmed {spent_txid}"),
                 1,
-            );
+            )?));
         }
         let spender = if spent_txid == take1_txid { "Take-1" } else { "Challenge" };
-        return Step::ignore(format!(
+        return Ok(Some(Step::ignore(format!(
             "challenge connector already spent by {spender} {spent_txid}"
-        ));
+        ))?));
     }
     match deps.goat_client.gateway_get_withdraw_data(&graph_id).await?.status {
         WithdrawStatus::None | WithdrawStatus::Canceled => {}
         // Passing: the relayer's proceedWithdraw makes it Processing, a
         // cancel makes it Canceled. Decided on the next look, not dropped.
         WithdrawStatus::Initialized => {
-            return after_blocks(
+            return Ok(Some(after_blocks(
                 deps,
                 "withdraw is initialized; waiting for proceedWithdraw or a cancel",
                 1,
-            );
+            )?));
         }
-        other => return Step::ignore(format!("withdraw is {other:?}")),
+        other => return Ok(Some(Step::ignore(format!("withdraw is {other:?}"))?)),
     }
-    let spv_height = deps.goat_client.btc_spv_latest_height().await? as u32;
-    if kickoff_height >= spv_height {
-        return after_blocks(
-            deps,
-            "kickoff block is not available through GOAT SPV",
-            u64::from(kickoff_height - spv_height),
-        );
-    }
-    // The connector is unspent, so no Challenge of ours is pending.
-    let txid = send_challenge_tx(btc, graph).await?;
-    info!(event = "graph_challenge", graph_id = %graph_id, txid = %txid, "Challenge broadcast");
-    broadcast_pending(deps, &format!("Challenge {txid}"))
+    Ok(None)
 }
+
+#[cfg(test)]
+mod challenge_entry_tests;
 
 fn local_verifier_pubkey() -> Result<PublicKey> {
     Ok(VerifierMasterKey::new(get_bitvm_key()?).master_keypair().public_key().into())
