@@ -13,9 +13,10 @@ use crate::aggregates::graph_pegout::{
     EVENT_CHAIN_SCAN, EVENT_GOAT_STATUS, EVENT_WITHDRAW_CANCEL, EVENT_WITHDRAW_INIT, PEGOUT_JOBS,
     PHASE_KICKOFF, PHASE_SETTLEMENT, pegout_job_pool,
 };
-use crate::aggregates::instance::graph_endorsed_event;
+use crate::aggregates::instance::{graph_endorsed_event, instance_ref};
 use crate::aggregates::jobs::Plan;
 use crate::engine_bridge::record_event_in;
+use crate::messages::{GOATMessage, GOATMessageContent, verify_init_graph_signature};
 use crate::metrics_service::node_metrics_state;
 use crate::middleware::get_topic_name;
 use anyhow::anyhow;
@@ -26,11 +27,12 @@ use engine::{
     EngineOutboxCloseTarget, EventSource, JOB_RESULT_KIND, JobPool, JobResultEvent,
     JobResultOutcome, JobSpec, NewEvent, OutboxMessage, WaitingFor,
 };
+use libp2p::PeerId;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use std::sync::Arc;
 use store::localdb::GraphQuery;
-use store::{EngineJobState, GraphStatus, GraphStatusSource};
+use store::{EngineJobState, GraphStatus, GraphStatusSource, InstanceBridgeInStatus};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -247,6 +249,9 @@ pub struct GraphState {
     /// The operator gave up its unfinished setup at the abandon height.
     #[serde(default)]
     pub abandoned: bool,
+    /// Verifier: the authenticated operator whose InitGraph was admitted to setup.
+    #[serde(default)]
+    pub setup_operator: Option<String>,
 }
 
 impl GraphState {
@@ -523,6 +528,91 @@ impl GraphAggregate {
         Ok(ApplyOutcome::Waiting(waiting))
     }
 
+    /// Admits an InitGraph to the CPU-heavy verifier setup only for an
+    /// authenticated operator, on an instance that is ready for graphs, and
+    /// once per (instance, operator). Returns the outcome when not admitted.
+    async fn admit_verifier_setup(
+        &self,
+        ctx: &mut ApplyContext<'_>,
+        graph_id: Uuid,
+        state: &mut GraphState,
+        inbound: &InboundMessage,
+        created_at: i64,
+    ) -> anyhow::Result<Option<ApplyOutcome>> {
+        if state.setup_operator.is_some() {
+            return Ok(None);
+        }
+        let init = match GOATMessage::deserialize_message(&inbound.message).await {
+            Ok(GOATMessage { content: GOATMessageContent::InitGraph(init), .. }) => init,
+            Ok(_) => return Ok(Some(ApplyOutcome::Rejected("not an InitGraph message".into()))),
+            Err(error) => {
+                return Ok(Some(ApplyOutcome::Rejected(format!("malformed InitGraph: {error}"))));
+            }
+        };
+        if init.graph_id != graph_id || init.instance_id != inbound.instance_id {
+            return Ok(Some(ApplyOutcome::Rejected("InitGraph identity mismatch".into())));
+        }
+        if PeerId::from_str(&inbound.author).ok().map(|peer| peer.to_bytes())
+            != Some(init.operator_peer_id.clone())
+        {
+            debug!(event = "graph_apply", graph_id = %graph_id, "signed operator peer id differs from the P2P source; InitGraph ignored");
+            return Ok(Some(ApplyOutcome::Applied));
+        }
+        if !verify_init_graph_signature(&init) {
+            return Ok(Some(ApplyOutcome::Rejected(
+                "invalid operator signature on InitGraph".into(),
+            )));
+        }
+
+        use InstanceBridgeInStatus::*;
+        let instance_status = ctx
+            .storage
+            .find_instance(&init.instance_id)
+            .await?
+            .and_then(|instance| InstanceBridgeInStatus::from_str(&instance.status).ok());
+        match instance_status {
+            Some(UserBroadcastPeginPrepare | Presigned) => {}
+            Some(status)
+                if status.is_failed()
+                    || matches!(status, RelayerL1Broadcasted | RelayerL2Minted) =>
+            {
+                debug!(event = "graph_apply", graph_id = %graph_id, %status, "instance no longer takes graphs; InitGraph ignored");
+                return Ok(Some(ApplyOutcome::Applied));
+            }
+            // Unknown here yet, or before Peg-In-Prepare: wait for the instance.
+            _ => {
+                let waited = ctx.now - created_at;
+                if waited > PARKED_MESSAGE_TTL_SECS {
+                    return Ok(Some(ApplyOutcome::Rejected(format!(
+                        "waited {waited}s for instance {} to take graphs; giving up",
+                        init.instance_id
+                    ))));
+                }
+                return Ok(Some(ApplyOutcome::Waiting(WaitingFor::on_ref(
+                    instance_ref(init.instance_id).wake_ref(),
+                    "instance not ready for graphs",
+                ))));
+            }
+        }
+
+        // An operator builds one graph per instance; another graph id from the
+        // same operator would only spend this node's setup slot again.
+        let operator = init.operator_pubkey.to_string();
+        let admitted = ctx
+            .storage
+            .find_engine_aggregate_ids_by_state(
+                GRAPH_KIND,
+                &[("instance_id", &init.instance_id.to_string()), ("setup_operator", &operator)],
+            )
+            .await?;
+        if let Some(other) = admitted.iter().find(|id| **id != graph_id.to_string()) {
+            debug!(event = "graph_apply", graph_id = %graph_id, other = %other, "operator already has a graph in setup for this instance; InitGraph ignored");
+            return Ok(Some(ApplyOutcome::Applied));
+        }
+        state.setup_operator = Some(operator);
+        Ok(None)
+    }
+
     fn enqueue_setup_job(&self, ctx: &mut ApplyContext<'_>, action: &str, payload: &[u8]) {
         ctx.effects.enqueue_job(JobSpec::new(
             &ctx.aggregate,
@@ -582,6 +672,13 @@ impl GraphAggregate {
             "InitGraph" => {
                 if status.is_some() {
                     return Ok(ApplyOutcome::Applied);
+                }
+                if self.actor == Actor::Verifier
+                    && let Some(outcome) = self
+                        .admit_verifier_setup(ctx, graph_id, state, &inbound, created_at)
+                        .await?
+                {
+                    return Ok(outcome);
                 }
             }
             "GenCircuits" | "SolderingProofReady" => {

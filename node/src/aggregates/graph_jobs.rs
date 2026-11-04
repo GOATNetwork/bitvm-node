@@ -1265,11 +1265,11 @@ async fn verifier_setup(deps: &JobDeps, graph_id: Uuid, params: &[u8]) -> Result
     if !verify_init_graph_signature(&init) {
         return invalid("invalid operator signature on InitGraph");
     }
-    // The instance can fail while this message waits (or while a restart
-    // re-claims the job): the operator dropped its session, so the setup
-    // would only cost CPU and be ignored.
-    if instance_status(deps, instance_id).await?.is_some_and(|status| status.is_failed()) {
-        return Step::ignore("instance failed; verifier setup skipped");
+    // The instance can fail or reach T0 while this message waits (or while a
+    // restart re-claims the job): the operator can no longer finish the graph,
+    // so the setup would only cost CPU and be ignored.
+    if let Some(reason) = gate_closed(deps, instance_id).await? {
+        return Step::ignore(format!("verifier setup skipped: {reason}"));
     }
     if !matches!(
         operator_stake_status(&deps.goat_client, &init.operator_pubkey)
