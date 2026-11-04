@@ -221,7 +221,15 @@ fn classify_connector_spend(
             }));
         }
     }
-    bail!("unrecognized confirmed connector spender {txid}")
+    // The guardian key path and Connector-D's operator timelock leaf let the
+    // operator spend these connectors with arbitrary transactions. Such a spend
+    // is not a disprove, and it must not stop the rest of the graph scan.
+    warn!(
+        event = "graph_scan",
+        txid = %txid,
+        "connector spent by an unrecognized transaction; not treated as a disprove"
+    );
+    Ok(None)
 }
 
 async fn detect_guardian_disprove(
@@ -647,7 +655,8 @@ mod disprove_tests {
             tx.input[1].witness = Witness::default();
             assert!(
                 classify_connector_spend(&tx, &candidates, &[], Some((d, &pubin, &disprove)))
-                    .is_err()
+                    .unwrap()
+                    .is_none()
             );
         }
     }
@@ -677,7 +686,9 @@ mod disprove_tests {
         );
         tx.input[2].witness = leaf_witness(Script::from_bytes(&[0x53]));
         assert!(
-            classify_connector_spend(&tx, &candidates, &[], Some((d, &pubin, &disprove))).is_err()
+            classify_connector_spend(&tx, &candidates, &[], Some((d, &pubin, &disprove)))
+                .unwrap()
+                .is_none()
         );
     }
 
@@ -692,14 +703,15 @@ mod disprove_tests {
                     .unwrap()
                     .is_none()
             );
-            assert!(classify_connector_spend(&take, &candidates, &[], None).is_err());
+            // An operator key-path spend looks like this: ignored, never an error.
+            assert!(classify_connector_spend(&take, &candidates, &[], None).unwrap().is_none());
         }
         let mut changed = candidate.clone();
         changed.input[0].sequence = bitcoin::Sequence(10);
-        assert!(classify_connector_spend(&changed, &candidates, &[], None).is_err());
+        assert!(classify_connector_spend(&changed, &candidates, &[], None).unwrap().is_none());
         changed = candidate.clone();
         changed.input.swap(0, 1);
-        assert!(classify_connector_spend(&changed, &candidates, &[], None).is_err());
+        assert!(classify_connector_spend(&changed, &candidates, &[], None).unwrap().is_none());
     }
 
     #[tokio::test]
