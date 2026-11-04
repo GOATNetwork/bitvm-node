@@ -74,12 +74,10 @@ pub(crate) async fn find_one_instance_page(
     query = query
         .with_order("created_at ASC, instance_id ASC".to_string())
         .with_limit(batch_size)
-        .with_raw_condition(format!("created_at <= {}", page_state.watermark));
+        .with_created_at_max(page_state.watermark);
 
     if let Some((created_at, instance_id)) = page_state.cursor {
-        query = query.with_raw_condition(format!(
-            "(created_at > {created_at} OR (created_at = {created_at} AND instance_id > '{instance_id}'))"
-        ));
+        query = query.with_after_created_at_id(created_at, instance_id);
     }
 
     let instances = {
@@ -487,4 +485,51 @@ pub async fn pegin_request_monitor(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn instance_pages_walk_rows_created_in_the_same_second() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("instance.db");
+        let db = LocalDB::new_with_busy_timeout(
+            &format!("sqlite:{}", path.display()),
+            false,
+            store::DEFAULT_BUSY_TIMEOUT,
+        )
+        .await;
+        db.migrate().await;
+
+        let created_at = current_time_secs() - 10;
+        let mut expected = HashSet::new();
+        {
+            let mut storage = db.acquire().await.unwrap();
+            for _ in 0..120 {
+                let instance =
+                    Instance { instance_id: Uuid::new_v4(), created_at, ..Default::default() };
+                assert!(storage.insert_instance_if_absent(&instance).await.unwrap());
+                expected.insert(instance.instance_id);
+            }
+        }
+
+        const TASK_KEY: &str = "test_instance_same_second_paging";
+        let mut seen = HashSet::new();
+        let mut pages = Vec::new();
+        for _ in 0..5 {
+            let page =
+                find_one_instance_page(&db, TASK_KEY, InstanceQuery::default(), 50).await.unwrap();
+            pages.push(page.len());
+            for instance in &page {
+                assert!(seen.insert(instance.instance_id), "instance returned twice");
+            }
+            if page.len() < 50 {
+                break;
+            }
+        }
+        assert_eq!(pages, vec![50, 50, 20]);
+        assert_eq!(seen, expected);
+    }
 }
