@@ -788,6 +788,17 @@ pub fn get_maintenance_subtask_timeout_secs() -> u64 {
         .unwrap_or(DEFAULT_MAINTENANCE_SUBTASK_TIMEOUT_SECS)
 }
 
+/// Budget for one item of a maintenance batch: the client timeouts of the
+/// backend calls it makes, plus slack for local work. Each backend call is
+/// already bounded by its own client timeout.
+pub fn maintenance_item_timeout(btc_calls: u64, goat_calls: u64) -> std::time::Duration {
+    std::time::Duration::from_secs(
+        btc_calls * client::timeout_config::get_btc_request_timeout_secs()
+            + goat_calls * client::timeout_config::get_goat_rpc_timeout_secs()
+            + 5,
+    )
+}
+
 pub fn get_p2p_max_json_message_bytes() -> usize {
     std::env::var(ENV_P2P_MAX_JSON_MESSAGE_BYTES)
         .ok()

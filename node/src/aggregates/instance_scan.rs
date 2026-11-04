@@ -432,7 +432,7 @@ async fn pegin_request_monitor_page(
             response_window_blocks,
         );
         let result = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            crate::env::maintenance_item_timeout(1, 1),
             isolate_pegin_request(local_db, &tx_record, operation),
         )
         .await

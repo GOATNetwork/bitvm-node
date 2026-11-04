@@ -921,7 +921,7 @@ real graph raw data in the database.
 | `P2P_LISTEN_IP` | No | Interface the p2p listener binds to; `127.0.0.1` keeps a node on a shared host loopback-only | `0.0.0.0` |
 | `BTC_REQUEST_TIMEOUT_SECS` / `GOAT_RPC_TIMEOUT_SECS` | No | Per-request timeout of the Esplora and GOAT RPC clients, seconds (clamped to 1–120) | `15` / `20` |
 | `HTTP_REQUEST_TIMEOUT_SECS` | No | Whole-request timeout of the proof-builder HTTP client, seconds (clamped to 1–600); the connect timeout is 10 s | `60` |
-| `MAINTENANCE_SUBTASK_TIMEOUT_SECS` | No | Timeout for each maintenance subtask; timed-out subtasks record `timed_out` and later subtasks still run. BTC scans use a separate serial loop. Operator balances refresh 32 verified bindings per pass; pending peg-ins use `INSTANCE_MAINTENANCE_BATCH_SIZE`. Both advance their cursor before each item, with a 5-second item timeout | `60` |
+| `MAINTENANCE_SUBTASK_TIMEOUT_SECS` | No | Timeout for each maintenance subtask; timed-out subtasks record `timed_out` and later subtasks still run. BTC scans use a separate serial loop. Operator balances refresh 32 verified bindings per pass, plus the local operator; pending peg-ins use `INSTANCE_MAINTENANCE_BATCH_SIZE`. Both advance their cursor before each item, and give each item the BTC and GOAT client timeouts of its backend calls plus 5 s | `60` |
 
 ### Relayer Configuration
 
