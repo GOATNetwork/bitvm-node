@@ -298,6 +298,8 @@ mod tests {
         let operator = keypair(7);
         let watchtower = keypair(9);
         let other_watchtower = keypair(11);
+        // The graph's own Watchtower slot; its missing proof is closed with the operator task.
+        let graph_watchtower = keypair(13);
         let instance_id = "00112233-4455-6677-8899-aabbccddeeff".to_string();
         let graph_id = "11112233-4455-6677-8899-aabbccddeeff".to_string();
         let authorization_chain = Arc::new(TestAuthorizationChain::default());
@@ -306,6 +308,7 @@ mod tests {
             Uuid::parse_str(&graph_id)?,
             operator.x_only_public_key().0,
         );
+        authorization_chain.set_graph_watchtowers(Uuid::parse_str(&graph_id)?, [0x22; 32], 1);
         authorization_chain.add_watchtower(watchtower.x_only_public_key().0);
         let gateway_address = gateway(1);
         let addr = available_addr();
@@ -319,17 +322,44 @@ mod tests {
             tokio::spawn(serve_with_app_state(addr.clone(), api_state, cancellation_token.clone()));
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        let operator_submit = OperatorProofRequest {
-            instance_id: instance_id.clone(),
-            graph_id: graph_id.clone(),
-            gateway_address: Some(gateway_address.to_string()),
-            operator_committed_blockhash: "11".repeat(32),
-            execution_layer_block_number: 1,
-            watchtower_challenge_txids: vec![],
-            included_watchtowers: vec![],
-            watchtower_challenge_init_txid: "22".repeat(32),
-            watchtower_challenge_pubkeys: vec![],
-        };
+        let operator_request =
+            |blockhash: &str, init_txid: &str, watchtowers: usize| OperatorProofRequest {
+                instance_id: instance_id.clone(),
+                graph_id: graph_id.clone(),
+                gateway_address: Some(gateway_address.to_string()),
+                operator_committed_blockhash: blockhash.repeat(32),
+                execution_layer_block_number: 1,
+                watchtower_challenge_txids: vec![None; watchtowers],
+                included_watchtowers: vec![false; watchtowers],
+                watchtower_challenge_init_txid: init_txid.repeat(32),
+                watchtower_challenge_pubkeys: vec![
+                    graph_watchtower.public_key().to_string();
+                    watchtowers
+                ],
+            };
+        // Inputs the proof loop could never use are refused before a task exists.
+        for invalid in [
+            operator_request("zz", "22", 1),
+            operator_request("11", "33", 1),
+            operator_request("11", "22", 0),
+        ] {
+            let auth = sign_proof_builder_request(
+                &operator,
+                ProofBuilderAuthRole::Operator,
+                "POST",
+                routes::v1::PROOFS_OPERATOR_PROOF,
+                &invalid,
+            )?;
+            let response = post(
+                &addr,
+                routes::v1::PROOFS_OPERATOR_PROOF,
+                &serde_json::to_string(&invalid)?,
+                Some(&auth),
+            )
+            .await?;
+            assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+        }
+        let operator_submit = operator_request("11", "22", 1);
         let operator_submit_body = serde_json::to_string(&operator_submit)?;
         assert!(
             post(&addr, routes::v1::PROOFS_OPERATOR_PROOF, &operator_submit_body, None,)

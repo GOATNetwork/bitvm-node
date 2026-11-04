@@ -452,7 +452,7 @@ async fn new_operator_proof(s: &mut StorageProcessor<'_>) -> OperatorProof {
         ..Default::default()
     };
     assert_eq!(s.create_operator_proof(&proof).await.unwrap(), 1);
-    s.find_next_operator_proof().await.unwrap().unwrap()
+    s.find_next_operator_proof(0).await.unwrap().unwrap()
 }
 
 #[tokio::test]
@@ -513,7 +513,7 @@ async fn test_timed_out_on_demand_proof_is_not_completed() {
         ..Default::default()
     };
     s.create_watchtower_proof(&watchtower).await.unwrap();
-    let watchtower_task = s.find_next_watchtower_proof().await.unwrap().unwrap();
+    let watchtower_task = s.find_next_watchtower_proof(0).await.unwrap().unwrap();
     s.update_watchtower_proof_state_with_instance_graph_pubkey(
         &watchtower.instance_id,
         &watchtower.graph_id,
@@ -555,4 +555,21 @@ async fn test_count_pending_long_running_task_proofs() {
     assert_eq!(s.count_pending_long_running_task_proofs(&chain, 20).await.unwrap(), 2);
     assert_eq!(s.count_pending_long_running_task_proofs(&chain, 0).await.unwrap(), 3);
     assert_eq!(s.count_pending_long_running_task_proofs("header-chain", 0).await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn test_find_next_on_demand_proof_starts_after_cursor() {
+    let db = setup_db().await;
+    let mut s = db.acquire().await.unwrap();
+    let first = new_operator_proof(&mut s).await;
+    let second = OperatorProof {
+        instance_id: Uuid::new_v4(),
+        graph_id: Uuid::new_v4(),
+        proof_state: crate::ProofState::New.to_i64(),
+        ..Default::default()
+    };
+    s.create_operator_proof(&second).await.unwrap();
+    let second = s.find_next_operator_proof(first.id).await.unwrap().unwrap();
+    assert!(second.id > first.id);
+    assert!(s.find_next_operator_proof(second.id).await.unwrap().is_none());
 }

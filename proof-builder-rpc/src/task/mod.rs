@@ -351,6 +351,24 @@ where
     Ok(if affected > 0 { OnDemandOutcome::Failed } else { OnDemandOutcome::Cancelled })
 }
 
+/// Closes a task whose inputs can never be proven, so the queue moves past it.
+pub(crate) async fn fail_invalid_on_demand_task(
+    local_db: &LocalDB,
+    table: OnDemandProofTable,
+    task_index: i64,
+    reason: &str,
+) -> anyhow::Result<()> {
+    warn!(task_index, "{} task cannot be proven; marking it failed: {reason}", table.table_name());
+    let completion =
+        OnDemandProofCompletion { proof_state: ProofState::Failed.to_i64(), ..Default::default() };
+    local_db
+        .acquire()
+        .await?
+        .complete_on_demand_proof_if_new(table, task_index, &completion)
+        .await?;
+    Ok(())
+}
+
 /// The proof attempt metric outcome of a failure.
 pub(crate) fn failure_outcome(error: &ProveError) -> &'static str {
     match error {
@@ -416,9 +434,70 @@ pub(crate) async fn fetch_latest_long_running_task_by_state(
         .await
 }
 
+/// The outcome of preparing the next on-demand task.
+#[derive(Debug)]
+pub(crate) enum OnDemandFetch {
+    /// Inputs are ready; prove the task.
+    Ready(Box<OnDemandTask>),
+    /// Inputs are not available yet; move on and retry the task on a later pass.
+    NotReady(i64),
+    /// Inputs can never become valid; the task is closed as failed.
+    Invalid(i64, String),
+}
+
+/// A task whose stored inputs can never be proven.
+#[derive(Debug)]
+struct InvalidTask(String);
+
+impl std::fmt::Display for InvalidTask {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for InvalidTask {}
+
+fn invalid_task(reason: String) -> anyhow::Error {
+    InvalidTask(reason).into()
+}
+
+enum OnDemandRow {
+    Operator(OperatorProof),
+    Watchtower(WatchtowerProof),
+}
+
+impl OnDemandRow {
+    fn id(&self) -> i64 {
+        match self {
+            Self::Operator(task) => task.id,
+            Self::Watchtower(task) => task.id,
+        }
+    }
+}
+
+/// The first `New` task after `after_id`, wrapping to the start of the queue
+/// so one task that cannot be prepared does not block the others.
+async fn next_on_demand_row(
+    storage_processor: &mut store::localdb::StorageProcessor<'_>,
+    is_watchtower: bool,
+    after_id: i64,
+) -> anyhow::Result<Option<OnDemandRow>> {
+    for after in [after_id, 0] {
+        let row = if is_watchtower {
+            storage_processor.find_next_watchtower_proof(after).await?.map(OnDemandRow::Watchtower)
+        } else {
+            storage_processor.find_next_operator_proof(after).await?.map(OnDemandRow::Operator)
+        };
+        if row.is_some() || after == 0 {
+            return Ok(row);
+        }
+    }
+    Ok(None)
+}
+
 async fn read_watchtower_challenge_details<'a>(
     storage_processor: &mut store::localdb::StorageProcessor<'a>,
-    is_watchtower: bool,
+    row: OnDemandRow,
 ) -> anyhow::Result<(
     i64,
     i64,
@@ -438,80 +517,72 @@ async fn read_watchtower_challenge_details<'a>(
         watchtower_public_keys,
         graph_id,
         operator_committed_blockhash,
-    ) = if is_watchtower {
-        match storage_processor.find_next_watchtower_proof().await? {
-            Some(task) => {
-                tracing::info!("watchtower task: {task:?}");
-                // NOTE: we use watchtower challenge init txid to calculate the height
-                let watchtower_challenge_txids: Vec<Option<String>> =
-                    vec![Some(task.challenge_init_txid.0.to_string())];
-                let pubkeys: Vec<String> = vec![task.public_key.clone()];
-                (
-                    task.id,
-                    task.execution_layer_block_number,
-                    None,
-                    watchtower_challenge_txids,
-                    vec![true],
-                    pubkeys,
-                    Some(task.graph_id.as_simple().to_string()),
-                    None,
-                )
+    ) = match row {
+        OnDemandRow::Watchtower(task) => {
+            tracing::info!("watchtower task: {task:?}");
+            // NOTE: we use watchtower challenge init txid to calculate the height
+            let watchtower_challenge_txids: Vec<Option<String>> =
+                vec![Some(task.challenge_init_txid.0.to_string())];
+            let pubkeys: Vec<String> = vec![task.public_key.clone()];
+            (
+                task.id,
+                task.execution_layer_block_number,
+                None,
+                watchtower_challenge_txids,
+                vec![true],
+                pubkeys,
+                Some(task.graph_id.as_simple().to_string()),
+                None,
+            )
+        }
+        OnDemandRow::Operator(task) => {
+            //fetch watchtower info
+            tracing::info!("operator task: {task:?}");
+            let watchtower_info: Vec<WatchtowerProof> = storage_processor
+                .find_watchtower_proof_by_instance_and_graph(&task.instance_id, &task.graph_id)
+                .await?;
+            tracing::info!("watchtower info: {watchtower_info:?}");
+            let challenge_init_txids: Vec<String> = watchtower_info
+                .iter()
+                .map(|w| w.challenge_init_txid.0.to_string())
+                .collect::<Vec<_>>();
+            if challenge_init_txids.is_empty() {
+                return Err(invalid_task(format!(
+                    "No watchtower challenge info found for instance {} and graph_id {}",
+                    task.instance_id, task.graph_id
+                )));
             }
-            None => {
-                anyhow::bail!("no watchtower task found")
+            if let Some(first) = challenge_init_txids.first()
+                && !challenge_init_txids.iter().all(|x| first == x)
+            {
+                return Err(invalid_task(format!(
+                    "Inconsistent watchtower challenge info from instance {} and graph_id {}",
+                    task.instance_id, task.graph_id
+                )));
             }
+            let challenge_txids: Vec<Option<String>> = watchtower_info
+                .iter()
+                .map(|w| w.included.then(|| w.challenge_txid.0.to_string()))
+                .collect::<Vec<_>>();
+            let challenge_public_keys: Vec<String> =
+                watchtower_info.iter().map(|w| w.public_key.clone()).collect::<Vec<_>>();
+            let included_watchtowers: Vec<bool> =
+                watchtower_info.iter().map(|w| w.included).collect::<Vec<_>>();
+            (
+                task.id,
+                task.execution_layer_block_number,
+                challenge_init_txids.first().cloned(),
+                challenge_txids,
+                included_watchtowers,
+                challenge_public_keys,
+                Some(task.graph_id.as_simple().to_string()),
+                Some(task.operator_committed_blockhash),
+            )
         }
-    } else {
-        //fetch watchtower info
-        let task = match storage_processor.find_next_operator_proof().await? {
-            Some(task) => task,
-            None => anyhow::bail!("no operator task found"),
-        };
-        tracing::info!("operator task: {task:?}");
-        let watchtower_info: Vec<WatchtowerProof> = storage_processor
-            .find_watchtower_proof_by_instance_and_graph(&task.instance_id, &task.graph_id)
-            .await?;
-        tracing::info!("watchtower info: {watchtower_info:?}");
-        let challenge_init_txids: Vec<String> =
-            watchtower_info.iter().map(|w| w.challenge_init_txid.0.to_string()).collect::<Vec<_>>();
-        if challenge_init_txids.is_empty() {
-            anyhow::bail!(
-                "No watchtower challenge info found for instance {} and graph_id {}",
-                task.instance_id,
-                task.graph_id
-            );
-        }
-        if let Some(first) = challenge_init_txids.first()
-            && !challenge_init_txids.iter().all(|x| first == x)
-        {
-            anyhow::bail!(
-                "Inconsistent watchtower challenge info from instance {} and graph_id {}",
-                task.instance_id,
-                task.graph_id
-            );
-        }
-        let challenge_txids: Vec<Option<String>> = watchtower_info
-            .iter()
-            .map(|w| w.included.then(|| w.challenge_txid.0.to_string()))
-            .collect::<Vec<_>>();
-        let challenge_public_keys: Vec<String> =
-            watchtower_info.iter().map(|w| w.public_key.clone()).collect::<Vec<_>>();
-        let included_watchtowers: Vec<bool> =
-            watchtower_info.iter().map(|w| w.included).collect::<Vec<_>>();
-        (
-            task.id,
-            task.execution_layer_block_number,
-            challenge_init_txids.first().cloned(),
-            challenge_txids,
-            included_watchtowers,
-            challenge_public_keys,
-            Some(task.graph_id.as_simple().to_string()),
-            Some(task.operator_committed_blockhash),
-        )
     };
 
     tracing::info!(
-        "is_watchtower {is_watchtower}, operator_committed_blockhash {operator_committed_blockhash:?}, execution_layer_block_number {execution_layer_block_number}"
+        "operator_committed_blockhash {operator_committed_blockhash:?}, execution_layer_block_number {execution_layer_block_number}"
     );
     Ok((
         task_index,
@@ -525,16 +596,50 @@ async fn read_watchtower_challenge_details<'a>(
     ))
 }
 
-// fetch next task from watchtower or operator.
+/// Fetches and prepares the next watchtower or operator task after `after_id`.
+/// Returns `None` when no task is `New`.
 #[tracing::instrument(level = "info", skip(local_db))]
 pub(crate) async fn fetch_on_demand_task(
     local_db: &LocalDB,
     is_watchtower: bool,
+    after_id: i64,
+    bitcoin_network: Network,
+    esplora_url: &str,
+) -> anyhow::Result<Option<OnDemandFetch>> {
+    let mut storage_processor = local_db.acquire().await?;
+    let Some(row) = next_on_demand_row(&mut storage_processor, is_watchtower, after_id).await?
+    else {
+        return Ok(None);
+    };
+    let task_index = row.id();
+    let prepared = prepare_on_demand_task(
+        &mut storage_processor,
+        row,
+        is_watchtower,
+        bitcoin_network,
+        esplora_url,
+    )
+    .await;
+    Ok(Some(match prepared {
+        Ok(Some(task)) => OnDemandFetch::Ready(Box::new(task)),
+        Ok(None) => OnDemandFetch::NotReady(task_index),
+        Err(error) => match error.downcast::<InvalidTask>() {
+            Ok(InvalidTask(reason)) => OnDemandFetch::Invalid(task_index, reason),
+            Err(error) => {
+                warn!(task_index, "on-demand task inputs are unavailable: {error:#}");
+                OnDemandFetch::NotReady(task_index)
+            }
+        },
+    }))
+}
+
+async fn prepare_on_demand_task(
+    storage_processor: &mut store::localdb::StorageProcessor<'_>,
+    row: OnDemandRow,
+    is_watchtower: bool,
     bitcoin_network: Network,
     esplora_url: &str,
 ) -> anyhow::Result<Option<OnDemandTask>> {
-    // btc header chain: always fetch the latest.
-    let mut storage_processor = local_db.acquire().await?;
     let (
         task_index,
         execution_layer_block_number,
@@ -544,13 +649,7 @@ pub(crate) async fn fetch_on_demand_task(
         watchtower_public_keys,
         graph_id,
         operator_committed_blockhash,
-    ) = match read_watchtower_challenge_details(&mut storage_processor, is_watchtower).await {
-        Ok(d) => d,
-        Err(e) => {
-            tracing::warn!("Failed to read watchtower challenge details, error: {}", e);
-            return Ok(None);
-        }
-    };
+    ) = read_watchtower_challenge_details(storage_processor, row).await?;
 
     if !is_watchtower && operator_committed_blockhash.is_none() {
         tracing::warn!("Watchtower challenge tx is not confirmed yet.");
@@ -590,9 +689,13 @@ pub(crate) async fn fetch_on_demand_task(
         largest_btc_block_height
     } else {
         let hash = operator_committed_blockhash.as_ref().unwrap();
-        let committed_height = match btc_client.get_block_by_hash(&BlockHash::from_str(hash)?).await
-        {
-            Ok(Some(block)) => block.bip34_block_height()? as u32,
+        let hash = BlockHash::from_str(hash).map_err(|error| {
+            invalid_task(format!("invalid committed block hash {hash}: {error}"))
+        })?;
+        let committed_height = match btc_client.get_block_by_hash(&hash).await {
+            Ok(Some(block)) => block.bip34_block_height().map_err(|error| {
+                invalid_task(format!("committed block {hash} has no BIP34 height: {error}"))
+            })? as u32,
             Ok(None) => {
                 tracing::warn!(
                     "Operator committed block hash {hash} is not found in BTC, it might be mempool tx, wait for the next round"
@@ -607,9 +710,9 @@ pub(crate) async fn fetch_on_demand_task(
             }
         };
         if committed_height < largest_btc_block_height {
-            anyhow::bail!(
+            return Err(invalid_task(format!(
                 "operator committed block height {committed_height} is lower than challenge tx height {largest_btc_block_height}"
-            );
+            )));
         }
         committed_height
     };
@@ -1201,5 +1304,87 @@ mod tests {
         //let result = read_watchtower_challenge_details(&mut storage_processor, is_watchtower, bitcoin_network, esplora_url).await.unwrap();
         //println!("result: {:?}", result);
         //assert!(result.3.len() == 2);
+    }
+}
+
+#[cfg(test)]
+mod queue_tests {
+    use super::*;
+    use store::create_local_db;
+
+    // Nothing listens here, so every Bitcoin lookup fails as a transient error.
+    const UNREACHABLE_ESPLORA: &str = "http://127.0.0.1:9";
+
+    async fn operator_task(local_db: &LocalDB, with_watchtower: bool) -> i64 {
+        let (instance_id, graph_id) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut storage = local_db.acquire().await.unwrap();
+        if with_watchtower {
+            let txid = Txid::from_str(&"22".repeat(32)).unwrap();
+            let watchtower = WatchtowerProof {
+                instance_id,
+                graph_id,
+                public_key: "pk".to_string(),
+                challenge_init_txid: txid.into(),
+                challenge_txid: txid.into(),
+                proof_state: ProofState::Failed.to_i64(),
+                ..Default::default()
+            };
+            storage.create_watchtower_proof(&watchtower).await.unwrap();
+        }
+        let task = OperatorProof {
+            instance_id,
+            graph_id,
+            operator_committed_blockhash: "11".repeat(32),
+            proof_state: ProofState::New.to_i64(),
+            ..Default::default()
+        };
+        storage.create_operator_proof(&task).await.unwrap();
+        storage
+            .find_operator_proof_by_instance_and_graph(&instance_id, &graph_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .id
+    }
+
+    async fn fetch(local_db: &LocalDB, after_id: i64) -> OnDemandFetch {
+        fetch_on_demand_task(local_db, false, after_id, Network::Regtest, UNREACHABLE_ESPLORA)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_task_that_cannot_be_prepared_does_not_block_the_queue() {
+        let local_db = create_local_db("sqlite::memory:").await;
+        // No watchtower rows: this task can never be proven.
+        let invalid = operator_task(&local_db, false).await;
+        // Its Bitcoin data is not reachable yet: retried on a later pass.
+        let waiting = operator_task(&local_db, true).await;
+
+        let OnDemandFetch::Invalid(task_index, _) = fetch(&local_db, 0).await else {
+            panic!("the first task should be invalid");
+        };
+        assert_eq!(task_index, invalid);
+        fail_invalid_on_demand_task(&local_db, OnDemandProofTable::Operator, invalid, "test")
+            .await
+            .unwrap();
+        assert!(
+            matches!(fetch(&local_db, invalid).await, OnDemandFetch::NotReady(id) if id == waiting)
+        );
+        // Past the end the queue wraps around, and the failed task is gone.
+        assert!(
+            matches!(fetch(&local_db, waiting).await, OnDemandFetch::NotReady(id) if id == waiting)
+        );
+        assert_eq!(
+            local_db
+                .acquire()
+                .await
+                .unwrap()
+                .get_on_demand_proof_state(OnDemandProofTable::Operator, invalid)
+                .await
+                .unwrap(),
+            Some(ProofState::Failed.to_i64())
+        );
     }
 }

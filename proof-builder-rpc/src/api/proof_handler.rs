@@ -208,7 +208,7 @@ pub(super) async fn post_operator_proof_task(
         &mut api_result,
         InputValidator::validate_uuid(&payload.graph_id, "graph_id"),
     )?;
-    record_auth_result(
+    let graph_data = record_auth_result(
         &mut api_result,
         api_state
             .auth
@@ -253,6 +253,10 @@ pub(super) async fn post_operator_proof_task(
         }
 
         None => {
+            record_invalid(
+                &mut api_result,
+                InputValidator::validate_operator_task(&payload, &graph_data),
+            )?;
             add_operator_task(
                 &api_state.local_db,
                 instance_id,

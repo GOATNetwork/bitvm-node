@@ -1,7 +1,10 @@
 use crate::prover::ProverRuntime;
 use crate::{
     config::ProofBuilderConfig,
-    task::{OnDemandJob, OnDemandOutcome, fetch_on_demand_task, prove_on_demand},
+    task::{
+        OnDemandFetch, OnDemandJob, OnDemandOutcome, fail_invalid_on_demand_task,
+        fetch_on_demand_task, prove_on_demand,
+    },
 };
 use bitcoin_light_client_circuit::le_bits_to_u256;
 use operator_proof::{OperatorProofBuilder, fetch_target_block_and_watchtower_tx};
@@ -40,6 +43,8 @@ pub(crate) fn spawn_operator_proof_task(
         let builder = runtime.builder(OperatorProofBuilder::with_client).await?;
         // Consecutive failed attempts per task, reset when a task finishes.
         let mut attempts = HashMap::new();
+        // The last task handed out; the next fetch starts after it.
+        let mut after_id = 0;
         info!("operator vk hash {:?}", builder.vk().bytes32());
         loop {
             tokio::select! {
@@ -47,9 +52,10 @@ pub(crate) fn spawn_operator_proof_task(
                     // fetch args from the database.
                     let task_index;
                     match fetch_on_demand_task(
-                        &local_db, false, args.bitcoin_network, &args.esplora_url,
+                        &local_db, false, after_id, args.bitcoin_network, &args.esplora_url,
                     ).await {
-                        Ok(Some(next_task)) => {
+                        Ok(Some(OnDemandFetch::Ready(next_task))) => {
+                            after_id = next_task.task_index;
                             args.latest_sequencer_commit_txid = next_task.latest_sequencer_commit_txid;
                             args.header_chain_input_proof = next_task.header_chain_input_proof;
                             args.commit_chain_input_proof = next_task.commit_chain_input_proof;
@@ -72,7 +78,21 @@ pub(crate) fn spawn_operator_proof_task(
                             args.included_watchtowers = le_bits_to_u256(&next_task.included_watchtowers).to_string();
                             task_index = next_task.task_index;
                         }
+                        Ok(Some(OnDemandFetch::NotReady(task_index))) => {
+                            after_id = task_index;
+                            continue;
+                        }
+                        Ok(Some(OnDemandFetch::Invalid(task_index, reason))) => {
+                            after_id = task_index;
+                            if let Err(e) = fail_invalid_on_demand_task(
+                                &local_db, OnDemandProofTable::Operator, task_index, &reason,
+                            ).await {
+                                tracing::error!("Failed to close operator task {task_index}, error: {e}");
+                            }
+                            continue;
+                        }
                         Ok(None) => {
+                            after_id = 0;
                             tracing::warn!("No on demand task found for operator proof, wait for the next round");
                             tokio::time::sleep(Duration::from_secs(5)).await;
                             continue;

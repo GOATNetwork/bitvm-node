@@ -87,14 +87,15 @@ impl RequestAuthorizer {
         Ok(signer)
     }
 
-    /// Checks current graph ownership and instance membership for an Operator.
+    /// Checks current graph ownership and instance membership for an Operator
+    /// and returns the registered graph data.
     pub(crate) async fn authorize_operator(
         &self,
         signer: &XOnlyPublicKey,
         gateway_address: Option<&str>,
         instance_id: &Uuid,
         graph_id: &Uuid,
-    ) -> AuthResult<()> {
+    ) -> AuthResult<GraphData> {
         let chain = self.chain_for_gateway(gateway_address)?;
         let signer_bytes = signer.serialize();
         let graph_data = chain.graph_data(graph_id).await.map_err(contract_unavailable)?;
@@ -109,7 +110,7 @@ impl RequestAuthorizer {
         if !graph_ids.contains(graph_id) {
             return Err(forbidden("graph does not belong to instance"));
         }
-        Ok(())
+        Ok(graph_data)
     }
 
     /// Checks that the signer is in the current global Watchtower registry.
@@ -248,6 +249,19 @@ pub(crate) mod test_support {
             let mut state = self.state.lock().unwrap();
             state.graphs.insert(graph_id, graph_data(owner));
             state.instance_graphs.entry(instance_id).or_default().push(graph_id);
+        }
+
+        /// Sets the registered Watchtower-Challenge-Init txid and Watchtower count.
+        pub(crate) fn set_graph_watchtowers(
+            &self,
+            graph_id: Uuid,
+            challenge_init_txid: [u8; 32],
+            watchtowers: usize,
+        ) {
+            let mut state = self.state.lock().unwrap();
+            let graph = state.graphs.get_mut(&graph_id).expect("graph is set");
+            graph.watchtower_challenge_init_txid = challenge_init_txid;
+            graph.watchtower_challenge_timeout_txids = vec![[0; 32]; watchtowers];
         }
 
         pub(crate) fn set_graph_owner(&self, graph_id: Uuid, owner: XOnlyPublicKey) {
