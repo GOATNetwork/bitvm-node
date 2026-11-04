@@ -1,4 +1,6 @@
+use crate::p2p_admission::{OperatorKey, operator_key};
 use client::goat_chain::GOATClient;
+use std::str::FromStr;
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use store::localdb::LocalDB;
@@ -12,12 +14,23 @@ pub(crate) async fn node_available_pbtc_update_monitor(
     goat_client: &GOATClient,
 ) -> anyhow::Result<()> {
     let registry = crate::p2p_admission::peer_registry();
-    let operators = registry.registered_operators(Instant::now());
+    let mut operators = registry.registered_operators(Instant::now());
+    // The local node never receives its own NodeInfo, so it is not in the registry.
+    if crate::env::get_actor() == bitvm_lib::actors::Actor::Operator {
+        let peer = libp2p::PeerId::from_str(&crate::env::get_peer_id())?;
+        let key = crate::env::get_node_pubkey()?;
+        if !operators.iter().any(|(known, _)| *known == peer) {
+            operators.push((peer, operator_key(&key.inner.x_only_public_key().0)));
+        }
+    }
     refresh_operator_batch(
         operators,
         &BALANCE_CURSOR,
-        Duration::from_secs(5),
+        crate::env::maintenance_item_timeout(0, 2),
         |peer, pubkey| async move {
+            let Some(stored_key) = verified_row_key(local_db, &peer, &pubkey).await? else {
+                return Ok(());
+            };
             let address = goat_client.stake_mana_pubkey_to_address(&pubkey).await?;
             anyhow::ensure!(address != [0; 20], "operator registration no longer exists");
             let balance = goat_client.peg_btc_balance(&address).await?;
@@ -26,13 +39,35 @@ pub(crate) async fn node_available_pbtc_update_monitor(
                 .await?
                 .update_verified_operator_balance(
                     &peer.to_string(),
-                    &hex::encode(pubkey),
+                    &stored_key,
                     &balance.to_string(),
                 )
-                .await
+                .await?;
+            Ok(())
         },
     )
     .await
+}
+
+/// The node row keeps the key spelling its NodeInfo used. Return it only when it
+/// names the verified binding's x-only key; `None` means no row yet.
+async fn verified_row_key(
+    local_db: &LocalDB,
+    peer: &libp2p::PeerId,
+    pubkey: &OperatorKey,
+) -> anyhow::Result<Option<String>> {
+    let Some(stored) = local_db.acquire().await?.get_node_btc_pub_key(&peer.to_string()).await?
+    else {
+        return Ok(None);
+    };
+    let stored_operator = bitcoin::PublicKey::from_str(&stored)
+        .ok()
+        .map(|key| operator_key(&key.inner.x_only_public_key().0));
+    anyhow::ensure!(
+        stored_operator.as_ref() == Some(pubkey),
+        "node row key {stored} does not match the verified operator binding"
+    );
+    Ok(Some(stored))
 }
 
 async fn refresh_operator_batch<F, Fut>(
@@ -136,5 +171,53 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(first, Some(operators[1].0));
+    }
+
+    #[tokio::test]
+    async fn balance_rows_match_real_key_spellings_of_the_verified_binding() {
+        use bitcoin::secp256k1::{Keypair, SECP256K1, SecretKey};
+        let dir = tempfile::tempdir().unwrap();
+        let db = LocalDB::new_with_busy_timeout(
+            &format!("sqlite:{}", dir.path().join("balance.db").display()),
+            false,
+            store::DEFAULT_BUSY_TIMEOUT,
+        )
+        .await;
+        db.migrate().await;
+        let keypair =
+            Keypair::from_secret_key(SECP256K1, &SecretKey::from_slice(&[9; 32]).unwrap());
+        let compressed = bitcoin::PublicKey::new(keypair.public_key());
+        let binding = operator_key(&keypair.x_only_public_key().0);
+        let mut uncompressed = compressed;
+        uncompressed.compressed = false;
+        let peer = PeerId::random();
+        assert!(verified_row_key(&db, &peer, &binding).await.unwrap().is_none());
+        for spelling in [
+            compressed.to_string(),
+            compressed.to_string().to_uppercase(),
+            uncompressed.to_string(),
+        ] {
+            let row = store::Node {
+                peer_id: peer.to_string(),
+                btc_pub_key: spelling.clone(),
+                ..Default::default()
+            };
+            db.acquire().await.unwrap().upsert_node(&row).await.unwrap();
+            let stored = verified_row_key(&db, &peer, &binding).await.unwrap().unwrap();
+            assert_eq!(stored, spelling);
+            let mut storage = db.acquire().await.unwrap();
+            assert!(
+                storage
+                    .update_verified_operator_balance(&peer.to_string(), &stored, "777")
+                    .await
+                    .unwrap(),
+                "{spelling}"
+            );
+            assert_eq!(
+                storage.find_nodes(&Default::default()).await.unwrap().0[0].available_peg_btc,
+                "777"
+            );
+        }
+        assert!(verified_row_key(&db, &peer, &[7; 32]).await.is_err());
     }
 }

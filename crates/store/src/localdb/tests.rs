@@ -607,19 +607,24 @@ async fn pending_request_keyset_pages_do_not_starve_behind_retrying_rows() {
 async fn balance_update_does_not_overwrite_node_fields_or_a_rebound_key() {
     let db = setup_db().await;
     let mut storage = db.acquire().await.unwrap();
+    let key = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
     let row = Node {
         peer_id: "operator".into(),
-        btc_pub_key: "0XAA".into(),
+        btc_pub_key: key.into(),
         goat_addr: "untrusted".into(),
         reward: "42".into(),
         ..Default::default()
     };
     storage.upsert_node(&row).await.unwrap();
     storage.update_node_reward_by_peer_id("operator", "42").await.unwrap();
-    storage.update_verified_operator_balance("operator", "bb", "999").await.unwrap();
+    assert_eq!(storage.get_node_btc_pub_key("operator").await.unwrap().as_deref(), Some(key));
+    assert!(storage.get_node_btc_pub_key("missing").await.unwrap().is_none());
+    // A row rebound to another key spelling between read and write is left alone.
+    let rebound = format!("03{}", &key[2..]);
+    assert!(!storage.update_verified_operator_balance("operator", &rebound, "999").await.unwrap());
     let nodes = storage.find_nodes(&NodeQuery::default()).await.unwrap().0;
     assert_ne!(nodes[0].available_peg_btc, "999");
-    storage.update_verified_operator_balance("operator", "aa", "123").await.unwrap();
+    assert!(storage.update_verified_operator_balance("operator", key, "123").await.unwrap());
     let nodes = storage.find_nodes(&NodeQuery::default()).await.unwrap().0;
     assert_eq!(nodes[0].available_peg_btc, "123");
     assert_eq!(nodes[0].goat_addr, "untrusted");
