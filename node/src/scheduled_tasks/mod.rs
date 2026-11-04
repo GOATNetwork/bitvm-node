@@ -25,8 +25,10 @@ use client::btc_chain::BTCClient;
 use client::goat_chain::GOATClient;
 use engine::EngineHandle;
 pub use event_watch::{is_processing_gateway_history_events, run_watch_event_task};
+use futures::FutureExt;
 pub use sequencer_set_hash_monitor_task::run_sequencer_set_hash_monitor_task;
 use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use store::localdb::LocalDB;
@@ -152,8 +154,8 @@ async fn run_maintenance_subtask<T>(
     operation: impl Future<Output = anyhow::Result<T>>,
 ) {
     let started_at = Instant::now();
-    match operation.await {
-        Ok(_) => {
+    match AssertUnwindSafe(operation).catch_unwind().await {
+        Ok(Ok(_)) => {
             let elapsed = started_at.elapsed();
             metrics_state.record_task_run(task, "success", elapsed);
             debug!(
@@ -164,7 +166,7 @@ async fn run_maintenance_subtask<T>(
                 "maintenance subtask completed"
             )
         }
-        Err(error) => {
+        Ok(Err(error)) => {
             let elapsed = started_at.elapsed();
             metrics_state.record_task_run(task, "failed", elapsed);
             warn!(
@@ -176,6 +178,19 @@ async fn run_maintenance_subtask<T>(
                 error = %error,
                 "maintenance subtask failed after execution"
             )
+        }
+        Err(payload) => {
+            let elapsed = started_at.elapsed();
+            metrics_state.record_task_run(task, "failed", elapsed);
+            error!(
+                event = "maintenance_subtask_result",
+                task,
+                outcome = "failed",
+                elapsed_ms = elapsed.as_millis() as u64,
+                error_class = "panic",
+                error = crate::error::panic_message(payload.as_ref()),
+                "maintenance subtask panicked; continuing with later subtasks"
+            );
         }
     }
 }
@@ -437,4 +452,42 @@ fn get_timestamp_from_contract_data(input: &[u8; 32]) -> i64 {
     let mut timestamp_bytes = [0u8; 8];
     timestamp_bytes.copy_from_slice(&input[24..32]);
     i64::from_be_bytes(timestamp_bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    #[tokio::test]
+    async fn panicking_subtasks_are_failed_and_later_subtasks_still_run() {
+        let registry = Arc::new(Mutex::new(libp2p_metrics::Registry::default()));
+        let metrics = MetricsState::new(registry.clone());
+        run_maintenance_subtask::<()>(&metrics, "panicking", async {
+            tokio::task::yield_now().await;
+            std::panic::panic_any(17u8);
+        })
+        .await;
+        run_maintenance_subtask::<()>(&metrics, "backend_error", async {
+            anyhow::bail!("backend unavailable")
+        })
+        .await;
+        let mut completed = false;
+        run_maintenance_subtask(&metrics, "next", async {
+            completed = true;
+            Ok(())
+        })
+        .await;
+        assert!(completed);
+        let mut output = String::new();
+        prometheus_client::encoding::text::encode(&mut output, &registry.lock().unwrap()).unwrap();
+        for (task, outcome) in
+            [("panicking", "failed"), ("backend_error", "failed"), ("next", "success")]
+        {
+            assert!(output.contains(&format!(
+                "bitvm_node_task_runs_total{{task=\"{task}\",outcome=\"{outcome}\"}} 1"
+            )));
+        }
+        assert!(!output.contains("task=\"panicking\",outcome=\"success\""));
+    }
 }
