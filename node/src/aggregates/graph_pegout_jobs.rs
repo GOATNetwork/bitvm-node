@@ -1906,11 +1906,15 @@ mod tests {
 
     // ── collect_ack_txins ─────────────────────────────────────────────────────
 
-    fn make_txid(byte: u8) -> Txid {
+    pub(super) fn make_txid(byte: u8) -> Txid {
         Txid::from_byte_array([byte; 32])
     }
 
-    fn make_confirmed_ack_tx(ack_txid: Txid, wci_txid: Txid, ack_vout: u32) -> esplora_client::Tx {
+    pub(super) fn make_confirmed_ack_tx(
+        ack_txid: Txid,
+        wci_txid: Txid,
+        ack_vout: u32,
+    ) -> esplora_client::Tx {
         use esplora_client::{TxStatus, Vin};
         let preimage = b"test-ack-preimage".to_vec();
         esplora_client::Tx {
