@@ -127,8 +127,16 @@ async fn settlement_step(
             JOB_FINISH_DISPROVED,
             DisproveSent { disprove_type, index, challenge_finish_txid, .. },
         ) => {
-            finish_disproved(deps, &graph, disprove_type, index, challenge_finish_txid, attempts)
-                .await
+            finish_disproved(
+                deps,
+                graph.parameters.graph_id,
+                graph.kickoff.tx().compute_txid(),
+                graph.take1.tx().compute_txid(),
+                disprove_type,
+                index,
+                challenge_finish_txid,
+            )
+            .await
         }
         (JOB_TAKE1, _) => take1(deps, row, graph).await,
         (JOB_FINISH_HAPPY, _) => finish_happy(deps, &graph, attempts).await,
@@ -1622,9 +1630,9 @@ const WITHDRAW_LAG_RETRIES: i64 = 30;
 /// Runs (six blocks apart) a finish job waits for `proceedWithdraw` to land.
 const WITHDRAW_PROCEED_RETRIES: i64 = 60;
 
-/// Goat does not show the withdraw: a lagging node (the `InitWithdraw` came
-/// from a finalized block) is waited out; a kickoff without a withdraw is
-/// given up on with an alert. These jobs run once per graph, so an early
+/// For proceed/happy/unhappy jobs, wait for the withdraw to become visible.
+/// Disproved settlement must not use this gate: it also handles rogue kickoffs
+/// without initWithdraw. These jobs run once per graph, so an early
 /// `ignore` would leave the Goat side behind for good.
 fn withdraw_missing(deps: &JobDeps, graph_id: Uuid, call: &str, attempts: i64) -> Result<Step> {
     if attempts < WITHDRAW_LAG_RETRIES {
@@ -1796,30 +1804,29 @@ async fn finish_unhappy(deps: &JobDeps, graph: &BitvmGcGraph, attempts: i64) -> 
     Step::done(GraphPlan::noted("finishWithdrawUnhappyPath sent"))
 }
 
+#[cfg(test)]
+mod disprove_settlement_tests;
+
 /// A challenge succeeded on Bitcoin: `finishWithdrawDisproved`.
 async fn finish_disproved(
     deps: &JobDeps,
-    graph: &BitvmGcGraph,
+    graph_id: Uuid,
+    kickoff_txid: Txid,
+    take1_txid: Txid,
     disprove_type: DisproveTxType,
     index: usize,
     challenge_finish_txid: Txid,
-    attempts: i64,
 ) -> Result<Step> {
     if !deps.relayer {
         return Step::ignore("not a relayer");
     }
     let btc = &deps.btc_client;
-    let graph_id = graph.parameters.graph_id;
     let withdraw_status = deps.goat_client.gateway_get_withdraw_data(&graph_id).await?.status;
-    match withdraw_status {
-        WithdrawStatus::Disproved => return Step::ignore("already disproved on Goat"),
-        WithdrawStatus::None => {
-            return withdraw_missing(deps, graph_id, "finishWithdrawDisproved", attempts);
-        }
-        _ => {}
+    // A malicious operator can skip initWithdraw/proceedWithdraw. None is a
+    // valid settlement state; only an already applied disprove is a no-op.
+    if withdraw_status == WithdrawStatus::Disproved {
+        return Step::ignore("already disproved on Goat");
     }
-    let kickoff_txid = graph.kickoff.tx().compute_txid();
-    let take1_txid = graph.take1.tx().compute_txid();
     let connector_a = output_topology::kickoff::connector_a() as u64;
     let challenge_start_tx = match outpoint_spent_txid(btc, &kickoff_txid, connector_a).await? {
         Some(spent_txid) if spent_txid == take1_txid => {
