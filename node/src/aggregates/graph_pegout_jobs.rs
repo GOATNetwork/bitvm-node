@@ -795,26 +795,26 @@ async fn verifier_assert(deps: &JobDeps, graph: &BitvmGcGraph, assert_txid: Txid
         }
         return after_blocks(deps, "operator commit-timeout is not confirmed yet", 1);
     }
-    let Some(commit_pubin_tx) = btc.get_tx(&connector_e_spent).await? else {
+    // Commit-Pubin is not pre-signed: Connector-E may be any of its inputs.
+    // Its WOTS data counts once seen, confirmed or not.
+    let Some((_, _, commit_pubin_txin)) =
+        outpoint_spent_txin(btc, &connector_e.txid, u64::from(connector_e.vout)).await?
+    else {
         return after_blocks(deps, "operator commit-pubin is not available yet", 1);
     };
-    let commit_pubin_txin = commit_pubin_tx
-        .input
-        .first()
-        .ok_or_else(|| anyhow!("operator commit-pubin transaction has no input"))?;
     let wci_txid = graph.watchtower_challenge_init.tx().compute_txid();
     let timeout_txids = graph
         .watchtower_challenge_timeouts
         .iter()
         .map(|tx| tx.tx().compute_txid())
         .collect::<Vec<_>>();
-    let ack_txins = match collect_ack_txins(btc, &wci_txid, &timeout_txids).await {
-        Ok(txins) => txins,
+    let (ack_txins, acks_settled) = match collect_ack_txins(btc, &wci_txid, &timeout_txids).await {
+        Ok(acks) => acks,
         Err(error) => {
             return after_blocks(deps, format!("operator ACK inputs are not ready: {error}"), 1);
         }
     };
-    match validate_pubin_disprove(graph, commit_pubin_txin, assert_txin, &ack_txins) {
+    match validate_pubin_disprove(graph, &commit_pubin_txin, assert_txin, &ack_txins) {
         Ok(Some((witness_data, _))) => {
             // PubinDisprove is not pre-signed, so fund it directly rather
             // than relying on CPFP.
@@ -846,6 +846,10 @@ async fn verifier_assert(deps: &JobDeps, graph: &BitvmGcGraph, assert_txid: Txid
             .await?;
             info!(event = "graph_challenge", graph_id = %graph_id, txid = %txid, "Pubin-Disprove broadcast");
             broadcast_pending(deps, &format!("Pubin-Disprove {txid}"))
+        }
+        // An ACK published later may still disprove this pubin.
+        Ok(None) if !acks_settled => {
+            after_blocks(deps, "operator ACK connectors are not settled yet", 1)
         }
         Ok(None) => Step::ignore("operator assert proof and committed pubin are valid"),
         Err(error) => {
@@ -1873,20 +1877,25 @@ fn validate_expected_challenge_assert_txid(
     Ok(())
 }
 
-/// The on-chain ACK inputs of every watchtower that ACKed.
+/// The ACK inputs of every watchtower that ACKed, and whether every ACK
+/// connector is settled: ACKed (the preimage is public once in the mempool)
+/// or spent by a confirmed watchtower timeout.
 async fn collect_ack_txins(
     btc_client: &client::btc_chain::BTCClient,
     wci_txid: &Txid,
     watchtower_timeout_txids: &[Txid],
-) -> Result<Vec<bitcoin::TxIn>> {
+) -> Result<(Vec<bitcoin::TxIn>, bool)> {
     let mut ack_txins = Vec::new();
+    let mut settled = true;
     for (i, timeout_txid) in watchtower_timeout_txids.iter().enumerate() {
         let ack_vout = output_topology::watchtower_challenge_init::ack_connector(i) as u64;
         let Some(ack_spent_txid) = outpoint_spent_txid(btc_client, wci_txid, ack_vout).await?
         else {
+            settled = false;
             continue;
         };
         if &ack_spent_txid == timeout_txid {
+            settled &= btc_client.get_tx_status(timeout_txid).await?.confirmed;
             continue;
         }
         let Some((_, _, txin)) = outpoint_spent_txin(btc_client, wci_txid, ack_vout).await? else {
@@ -1894,7 +1903,7 @@ async fn collect_ack_txins(
         };
         ack_txins.push(txin);
     }
-    Ok(ack_txins)
+    Ok((ack_txins, settled))
 }
 
 #[cfg(test)]
@@ -1962,11 +1971,100 @@ mod tests {
         let vout_2 = output_topology::watchtower_challenge_init::ack_connector(2) as u32;
         mock.set_tx(ack_txid_2, make_confirmed_ack_tx(ack_txid_2, wci_txid, vout_2));
 
-        let txins = collect_ack_txins(&btc_client, &wci_txid, &timeout_txids).await.unwrap();
+        let (txins, settled) =
+            collect_ack_txins(&btc_client, &wci_txid, &timeout_txids).await.unwrap();
 
+        assert!(settled);
         assert_eq!(txins.len(), 2);
         assert_eq!(txins[0].previous_output.vout, vout_0);
         assert_eq!(txins[1].previous_output.vout, vout_2);
+    }
+
+    /// `tx` as unconfirmed, with the output statuses the mock only derives
+    /// for confirmed transactions.
+    fn mempool_spend(
+        txid: Txid,
+        mut tx: esplora_client::Tx,
+    ) -> (esplora_client::Tx, Vec<(Txid, u64, esplora_client::OutputStatus)>) {
+        tx.status.confirmed = false;
+        tx.status.block_height = None;
+        let statuses = tx
+            .vin
+            .iter()
+            .enumerate()
+            .map(|(index, vin)| {
+                let status = esplora_client::OutputStatus {
+                    spent: true,
+                    txid: Some(txid),
+                    vin: Some(index as u64),
+                    status: Some(tx.status.clone()),
+                };
+                (vin.txid, vin.vout as u64, status)
+            })
+            .collect();
+        (tx, statuses)
+    }
+
+    #[tokio::test]
+    async fn collect_ack_txins_waits_for_every_connector_to_settle() {
+        let (btc_client, mock) = client::btc_chain::BTCClient::new_mock_client();
+        let wci_txid = make_txid(0x00);
+        let ack_txid_0 = make_txid(0x01);
+        let timeout_txid_1 = make_txid(0x11);
+        let timeout_txids = vec![make_txid(0x10), timeout_txid_1];
+        let vout_0 = output_topology::watchtower_challenge_init::ack_connector(0) as u32;
+        let vout_1 = output_topology::watchtower_challenge_init::ack_connector(1) as u32;
+
+        // Watchtower 0 ACKed in the mempool, watchtower 1 is still open.
+        let set_mempool_spend = |txid, tx| {
+            let (tx, statuses) = mempool_spend(txid, tx);
+            for (prev_txid, prev_vout, status) in statuses {
+                mock.set_output_status(prev_txid, prev_vout, status);
+            }
+            mock.set_tx(txid, tx);
+        };
+        set_mempool_spend(ack_txid_0, make_confirmed_ack_tx(ack_txid_0, wci_txid, vout_0));
+        let (txins, settled) =
+            collect_ack_txins(&btc_client, &wci_txid, &timeout_txids).await.unwrap();
+        assert!(!settled);
+        assert_eq!(txins.len(), 1);
+
+        // A mempool timeout may still be replaced by an ACK.
+        let timeout_tx = make_confirmed_ack_tx(timeout_txid_1, wci_txid, vout_1);
+        set_mempool_spend(timeout_txid_1, timeout_tx.clone());
+        let (_, settled) = collect_ack_txins(&btc_client, &wci_txid, &timeout_txids).await.unwrap();
+        assert!(!settled);
+
+        mock.set_tx(timeout_txid_1, timeout_tx);
+        let (txins, settled) =
+            collect_ack_txins(&btc_client, &wci_txid, &timeout_txids).await.unwrap();
+        assert!(settled);
+        assert_eq!(txins.len(), 1);
+        assert_eq!(txins[0].previous_output.vout, vout_0);
+    }
+
+    #[tokio::test]
+    async fn commit_pubin_input_is_found_by_spent_outpoint() {
+        let (btc_client, mock) = client::btc_chain::BTCClient::new_mock_client();
+        let wci_txid = make_txid(0x00);
+        let connector_e_vout = 7;
+        let commit_pubin_txid = make_txid(0x20);
+        let mut commit_pubin = make_confirmed_ack_tx(commit_pubin_txid, wci_txid, connector_e_vout);
+        // The operator puts a fee input in front of Connector-E.
+        let mut fee_vin = commit_pubin.vin[0].clone();
+        fee_vin.txid = make_txid(0x30);
+        fee_vin.vout = 0;
+        commit_pubin.vin.insert(0, fee_vin);
+        mock.set_tx(commit_pubin_txid, commit_pubin);
+
+        let (txid, vin, txin) =
+            outpoint_spent_txin(&btc_client, &wci_txid, u64::from(connector_e_vout))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(txid, commit_pubin_txid);
+        assert_eq!(vin, 1);
+        assert_eq!(txin.previous_output, bitcoin::OutPoint::new(wci_txid, connector_e_vout));
     }
 
     // ── recover_challenge_assert_witness ──────────────────────────────────────
