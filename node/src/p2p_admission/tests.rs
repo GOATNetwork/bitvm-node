@@ -1480,3 +1480,31 @@ fn trusted_operator_bindings_are_parsed_strictly() {
     );
     assert!(parse_trusted_operator_bindings("").is_empty());
 }
+
+#[tokio::test]
+async fn committee_members_of_recent_instances_are_registered_outside_discovery() {
+    let local_db = store::create_local_db("sqlite::memory:").await;
+    let (goat_client, goat_mock) = client::goat_chain::GOATClient::new_mock_client();
+    let member = PeerId::random();
+    let (member_address, former_address) = ([0x11; 20], [0x22; 20]);
+    goat_mock.set_committee_peer_id(member_address, member.to_bytes());
+    let mut instance = store::Instance { instance_id: Uuid::new_v4(), ..Default::default() };
+    for address in [member_address, former_address] {
+        instance
+            .committees_answers
+            .insert(alloy::primitives::Address::from(address).to_string(), vec![2; 33]);
+    }
+    local_db.acquire().await.unwrap().insert_instance_if_absent(&instance).await.unwrap();
+
+    // The candidate discovery budget is spent on forged announcements.
+    let now = Instant::now();
+    while peer_registry().plan_candidate_lookup(&PeerId::random(), now) {}
+    assert!(!peer_registry().plan_candidate_lookup(&member, now));
+
+    refresh_known_committee_members(&local_db, &std::sync::Arc::new(goat_client)).await;
+    assert!(peer_registry().is_committee(&member, Instant::now()));
+    // The address that is no longer a member registers nothing.
+    let persisted = local_db.acquire().await.unwrap().load_p2p_registered_peers().await.unwrap();
+    assert_eq!(persisted.len(), 1);
+    assert_eq!(persisted[0].0, member.to_string());
+}

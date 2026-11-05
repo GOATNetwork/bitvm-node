@@ -44,9 +44,10 @@ pub use registry::{
     TrustedBindingConflict, operator_key, peer_registry,
 };
 pub use registry_refresh::{
-    refresh_due_registrations_in_background, refresh_neighbour_in_background,
-    refresh_operator_binding_in_background, refresh_registry_in_background,
-    revalidate_committee_candidates, revoke_persisted_operator, seed_registry_from_store,
+    refresh_due_registrations_in_background, refresh_known_committee_members,
+    refresh_neighbour_in_background, refresh_operator_binding_in_background,
+    refresh_registry_in_background, revalidate_committee_candidates, revoke_persisted_operator,
+    seed_registry_from_store,
 };
 pub use replay::{ReplayGuard, replay_guard, unix_nanos_now};
 pub use strikes::{DirectPeerStrikes, direct_peer_strikes, note_refused_peer};

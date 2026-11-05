@@ -279,6 +279,23 @@ impl InstanceUpdate {
 }
 
 impl StorageProcessor<'_> {
+    /// Committee addresses that answered the `instance_limit` most recent
+    /// instances, as copied from their Goat peg-in data.
+    pub async fn list_recent_committee_addresses(
+        &mut self,
+        instance_limit: i64,
+    ) -> anyhow::Result<Vec<String>> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT answer.key AS address
+             FROM (SELECT committees_answers FROM instance ORDER BY created_at DESC LIMIT ?) AS recent,
+                  json_each(recent.committees_answers) AS answer",
+        )
+        .bind(instance_limit)
+        .fetch_all(self.conn())
+        .await?;
+        Ok(rows.into_iter().map(|row| row.get("address")).collect())
+    }
+
     /// Insert an instance only when its ID is not already present.
     ///
     /// Parameters:
