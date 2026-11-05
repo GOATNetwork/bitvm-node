@@ -35,7 +35,6 @@ circuits/*/*/*.bin.in
 **/*.out
 **/*/output.data*
 proof-builder-rpc/*.ckpt
-audit/tla/states/
 
 local_docs/
 local_scripts/

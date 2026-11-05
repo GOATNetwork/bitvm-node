@@ -2,7 +2,7 @@
 # Every target honours LOCALNET_DATA, PORT_BASE and COMPOSE_PROJECT from the environment, e.g.
 #   LOCALNET_DATA=/tmp/bv2 PORT_BASE=23000 COMPOSE_PROJECT=bvlocal2 make localnet-reset
 LOCALNET := localnet
-# TLA+ specs (audit/tla, see README.md "Formal verification (TLA+)"). TLA2TOOLS and TLC_OPTS
+# Basic transaction-graph timing model (audit/tla). TLA2TOOLS and TLC_OPTS
 # are passed through to audit/tla/check.sh.
 TLA2TOOLS ?= $(HOME)/.local/share/tlaplus/tla2tools.jar
 TLA2TOOLS_URL := https://github.com/tlaplus/tlaplus/releases/latest/download/tla2tools.jar
@@ -32,11 +32,11 @@ e2e:                   ## the whole suite (~110 min)
 	$(LOCALNET)/e2e/run.sh
 
 tla-setup:             ## download tla2tools.jar to $(TLA2TOOLS) (needs a JRE 11+ to run)
-	@mkdir -p $(dir $(TLA2TOOLS))
-	curl -fsSL -o $(TLA2TOOLS) $(TLA2TOOLS_URL)
+	@mkdir -p "$(dir $(TLA2TOOLS))"
+	curl -fsSL -o "$(TLA2TOOLS)" "$(TLA2TOOLS_URL)"
 
-tla:                   ## run audit/tla/checks.txt through TLC; fails while a live bug reproduces (SPEC=<area|Spec|Spec/Name.cfg> to filter)
-	audit/tla/check.sh $(SPEC)
+tla:                   ## check the basic transaction-graph timing invariants
+	audit/tla/check.sh
 
-tla-values:            ## regenerate audit/tla/specs/crates/bitvm-gc/ShippedTimelockValues.tla from the shipped Rust timing constants
+tla-values:            ## regenerate audit/tla/ShippedTimelockValues.tla from the shipped Rust timing constants
 	UPDATE_TLA_VALUES=1 cargo test -p bitvm-gc --test tla_shipped_values

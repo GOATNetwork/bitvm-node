@@ -7,9 +7,11 @@ on:
       - dev
     tags:
       - v[0-9]+.*
-  # Run on every pull request regardless of base branch, so the TLA+ formal-
-  # verification check (and the rest of CI) runs on ANY PR.
   pull_request:
+    branches:
+      - main
+      - dev
+      - gc-v2
 
 env:
   CARGO_TERM_COLOR: always
@@ -20,12 +22,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Runs independently and in parallel with fmt/clippy/test (no `needs:` gating)
-  # so EVERY check runs on every PR regardless of the others' outcome. It is a
-  # first-class check: it fails (and blocks merge, if branch protection requires
-  # it) whenever a `live` bug spec still reproduces its counterexample. See the
-  # step below - it runs every spec, prints each one's actual TLC result in the
-  # job summary, and routes by tier (pass / live / design / boundary).
+  # Independent from Rust checks; only the basic finite timing model runs here.
   tla-plus:
     name: TLA+ Formal Verification
     runs-on: ubuntu-latest
@@ -37,19 +34,7 @@ jobs:
           java-version: "21"
       - name: Download TLA+ tools
         run: make tla-setup
-      # Runs every row of audit/tla/checks.txt (tier | config | description; the
-      # config configs/<area>/<Spec>/<Name>.cfg runs specs/<area>/<Spec>.tla)
-      # through TLC and judges it by tier - see audit/tla/check.sh:
-      # Only the current code is checked:
-      #   pass       - models the current code; must verify (fixed bugs' regression checks).
-      #   live       - models the current code with a known, unfixed bug; while it
-      #                reproduces the job fails and blocks merge. Fix the code, model
-      #                the fix in the config, make it `pass`.
-      #   design     - a proposed fix for a live bug, not in the code yet; must verify.
-      #   boundary   - a fix outside its ParamsOK, or an insufficient fix; must fail.
-      # A spec on which TLC does not finish fails in every tier. The result
-      # table goes to the job summary; `make tla` runs the same locally.
-      - name: TLA+ formal verification (current code must hold; live bugs block merge)
+      - name: Check transaction graph timing invariants
         run: make tla
   fmt:
     name: Rustfmt

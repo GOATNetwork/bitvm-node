@@ -3010,7 +3010,6 @@ dependencies = [
  "strum 0.26.3",
  "tokio",
  "tracing",
- "util",
  "uuid",
  "verifiable-circuit-babe",
  "zkm-sdk",
