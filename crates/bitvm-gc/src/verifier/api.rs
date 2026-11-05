@@ -7,7 +7,7 @@ use anyhow::{Result, bail};
 use ark_bn254::{G1Affine, G2Affine};
 use ark_serialize::CanonicalSerialize;
 use bitcoin::{
-    Address, Amount, Network, ScriptBuf, Transaction, TxIn, TxOut, script::read_scriptint,
+    Address, Amount, Network, ScriptBuf, Transaction, TxIn, TxOut, Witness, script::read_scriptint,
 };
 use bitvm::chunk::api::type_conversion_utils::RawWitness;
 use goat::{
@@ -202,15 +202,47 @@ fn validate_operator_assert_extra_data(pi2: &[u8], pi3: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// `txin` as a script-path spend of `leaf_script`, with any BIP341 annex
+/// dropped so the goat extractors see exactly `[data.., script, control block]`.
+fn script_path_txin(txin: &TxIn, leaf_script: &ScriptBuf) -> Result<TxIn> {
+    let mut witness = txin.witness.to_vec();
+    if txin.witness.taproot_annex().is_some() {
+        witness.pop();
+    }
+    if witness.len() < 2 || witness[witness.len() - 2] != leaf_script.as_bytes() {
+        bail!("input does not spend the expected leaf script");
+    }
+    Ok(TxIn { witness: Witness::from_slice(&witness), ..txin.clone() })
+}
+
+fn operator_assert_raw_witness(
+    graph: &BitvmGcGraph,
+    operator_assert_txin: &TxIn,
+) -> Result<RawWitness> {
+    let connector_c = graph.connector_c();
+    let txin =
+        script_path_txin(operator_assert_txin, &connector_c.generate_taproot_leaf_script(1))?;
+    connector_c
+        .extract_leaf_1_raw_witness(&txin)
+        .map_err(|e| anyhow::anyhow!("failed to extract operator assertion: {e}"))
+}
+
+fn operator_commit_pubin_raw_witness(
+    graph: &BitvmGcGraph,
+    commit_pubin_txin: &TxIn,
+) -> Result<RawWitness> {
+    let connector_e = graph.connector_e();
+    let txin = script_path_txin(commit_pubin_txin, &connector_e.generate_taproot_leaf_script(0))?;
+    connector_e
+        .extract_leaf_0_raw_witness(&txin)
+        .map_err(|e| anyhow::anyhow!("failed to extract operator commit pubin witness: {e}"))
+}
+
 pub fn extract_operator_assert_witness(
     graph: &BitvmGcGraph,
     operator_assert_txin: &TxIn,
 ) -> Result<TxAssertWitness> {
-    let operator_assertion =
-        graph
-            .connector_c()
-            .extract_leaf_1_raw_witness(operator_assert_txin)
-            .map_err(|e| anyhow::anyhow!("failed to extract operator assertion: {e}"))?;
+    let operator_assertion = operator_assert_raw_witness(graph, operator_assert_txin)?;
     let (operator_assertion, pi2, pi3) =
         split_operator_assert_wots_and_extra_data(operator_assertion)?;
 
@@ -227,11 +259,7 @@ pub fn extract_operator_assert_witness_for_challenge(
     graph: &BitvmGcGraph,
     operator_assert_txin: &TxIn,
 ) -> Result<TxAssertWitness> {
-    let operator_assertion =
-        graph
-            .connector_c()
-            .extract_leaf_1_raw_witness(operator_assert_txin)
-            .map_err(|e| anyhow::anyhow!("failed to extract operator assertion: {e}"))?;
+    let operator_assertion = operator_assert_raw_witness(graph, operator_assert_txin)?;
     let (operator_assertion, pi2, pi3) =
         split_operator_assert_wots_and_extra_data(operator_assertion)?;
     let wots_sig = operator_assert_wots_signature(&operator_assertion)?;
@@ -253,10 +281,7 @@ pub fn build_verifier_assert_tx(
         bail!("invalid verifier index {verifier_index}")
     };
 
-    let connector_c = graph.connector_c();
-    let operator_assertion = connector_c
-        .extract_leaf_1_raw_witness(&operator_assert_txin)
-        .map_err(|e| anyhow::anyhow!("failed to extract operator assertion: {e}"))?;
+    let operator_assertion = operator_assert_raw_witness(graph, &operator_assert_txin)?;
     let (operator_assertion, _pi2, _pi3) =
         split_operator_assert_wots_and_extra_data(operator_assertion)?;
 
@@ -316,14 +341,9 @@ pub fn validate_pubin_disprove(
         ack_preimages[watchtower_index] = preimage;
     }
 
-    let connector_e = graph.connector_e();
-    let connector_c = graph.connector_c();
-    let operator_commit_pubin_witness = connector_e
-        .extract_leaf_0_raw_witness(operator_commit_pubin_txin)
-        .map_err(|e| anyhow::anyhow!("failed to extract operator commit pubin witness: {e}"))?;
-    let operator_assert_witness = connector_c
-        .extract_leaf_1_raw_witness(operator_assert_txin)
-        .map_err(|e| anyhow::anyhow!("failed to extract operator assert witness: {e}"))?;
+    let operator_commit_pubin_witness =
+        operator_commit_pubin_raw_witness(graph, operator_commit_pubin_txin)?;
+    let operator_assert_witness = operator_assert_raw_witness(graph, operator_assert_txin)?;
     let (operator_assert_witness, _pi2, _pi3) =
         split_operator_assert_wots_and_extra_data(operator_assert_witness)?;
     let connector_d = graph.connector_d();
@@ -374,6 +394,60 @@ mod tests {
         scripts::{generate_opreturn_script, p2a_output},
         transactions::base::{Input, pubin_disprove_input_amount},
     };
+
+    #[test]
+    fn script_path_txin_drops_annex_and_checks_leaf_script() {
+        let leaf_script = ScriptBuf::from_bytes(vec![0x51]);
+        let data = vec![vec![1u8; 20], vec![2u8]];
+        let txin_with = |extra: &[Vec<u8>]| {
+            let mut items = data.clone();
+            items.extend_from_slice(extra);
+            TxIn { witness: Witness::from_slice(&items), ..Default::default() }
+        };
+        let expected = txin_with(&[leaf_script.to_bytes(), vec![0xc0; 33]]);
+
+        assert_eq!(script_path_txin(&expected, &leaf_script).unwrap(), expected);
+        let annexed = txin_with(&[leaf_script.to_bytes(), vec![0xc0; 33], vec![0x50, 0xaa]]);
+        assert_eq!(script_path_txin(&annexed, &leaf_script).unwrap(), expected);
+
+        let other_leaf = txin_with(&[vec![0x52], vec![0xc0; 33]]);
+        assert!(script_path_txin(&other_leaf, &leaf_script).is_err());
+        let too_short =
+            TxIn { witness: Witness::from_slice(&[vec![0xc0; 33]]), ..Default::default() };
+        assert!(script_path_txin(&too_short, &leaf_script).is_err());
+    }
+
+    #[test]
+    fn honest_commit_pubin_witness_extracts_with_or_without_annex() {
+        use goat::{
+            connectors::connector_e::ConnectorE,
+            transactions::watchtower_challenge::operator_commit_pubin,
+        };
+
+        let committee_secret = SecretKey::from_slice(&[2; 32]).expect("valid committee secret");
+        let committee_keypair = Keypair::from_secret_key(SECP256K1, &committee_secret);
+        let committee_key =
+            XOnlyPublicKey::from(bitcoin::PublicKey::from(committee_keypair.public_key()));
+        let wots_secret = Wots96::generate_secret_key();
+        let wots_public_key = Wots96::generate_public_key(&wots_secret);
+        let connector_e = ConnectorE::new(
+            Network::Testnet4,
+            &committee_key,
+            &wots_public_key,
+            &default_timelock_config(Network::Testnet4),
+        );
+        let input = Input { outpoint: OutPoint::null(), amount: Amount::from_sat(1_000) };
+        let mut txin = operator_commit_pubin(&connector_e, &[0x11; 96], &wots_secret, input)
+            .expect("honest commit-pubin");
+        let leaf_script = connector_e.generate_taproot_leaf_script(0);
+
+        let plain = script_path_txin(&txin, &leaf_script).expect("honest witness");
+        assert_eq!(connector_e.extract_leaf_0_raw_witness(&plain).unwrap().len(), PROVER_SIG_LEN);
+
+        txin.witness.push([0x50]);
+        assert!(connector_e.extract_leaf_0_raw_witness(&txin).is_err());
+        assert_eq!(script_path_txin(&txin, &leaf_script).unwrap(), plain);
+    }
 
     #[test]
     fn pubin_disprove_with_witness_is_standard_sized() {
