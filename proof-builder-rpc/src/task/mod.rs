@@ -21,7 +21,7 @@ use client::btc_chain::BTCClient;
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::{Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 use uuid::Uuid;
 
 use futures::future::Either;
@@ -472,6 +472,51 @@ impl OnDemandRow {
             Self::Operator(task) => task.id,
             Self::Watchtower(task) => task.id,
         }
+    }
+}
+
+/// How long the on-demand cursor may stay off the oldest task. Newer tasks keep
+/// the cursor from wrapping under steady load; without this a task that was not
+/// ready, or failed, on its turn would wait until the load drops.
+const ON_DEMAND_RESCAN_INTERVAL: Duration = Duration::from_secs(600);
+
+/// Where the next on-demand fetch starts: after the last task handed out, and
+/// back at the oldest task at least every `rescan_interval`.
+pub(crate) struct OnDemandCursor {
+    after_id: i64,
+    rescan_interval: Duration,
+    last_rescan: Instant,
+}
+
+impl OnDemandCursor {
+    pub(crate) fn new() -> Self {
+        Self::with_rescan_interval(ON_DEMAND_RESCAN_INTERVAL)
+    }
+
+    fn with_rescan_interval(rescan_interval: Duration) -> Self {
+        Self { after_id: 0, rescan_interval, last_rescan: Instant::now() }
+    }
+
+    /// The id the next fetch starts after.
+    pub(crate) fn after_id(&mut self) -> i64 {
+        if self.last_rescan.elapsed() >= self.rescan_interval {
+            self.rescan();
+        }
+        self.after_id
+    }
+
+    /// Records the task just handed out; a lower id means the queue wrapped.
+    pub(crate) fn advance(&mut self, task_index: i64) {
+        if task_index <= self.after_id {
+            self.last_rescan = Instant::now();
+        }
+        self.after_id = task_index;
+    }
+
+    /// Starts the next fetch from the oldest task.
+    pub(crate) fn rescan(&mut self) {
+        self.after_id = 0;
+        self.last_rescan = Instant::now();
     }
 }
 
@@ -1233,6 +1278,21 @@ mod tests {
     use std::str::FromStr;
     use store::create_local_db;
     use uuid::Uuid;
+
+    #[test]
+    fn on_demand_cursor_returns_to_the_oldest_task() {
+        let mut cursor = OnDemandCursor::new();
+        cursor.advance(3);
+        cursor.advance(7);
+        assert_eq!(cursor.after_id(), 7);
+        cursor.rescan();
+        assert_eq!(cursor.after_id(), 0);
+
+        // Newer tasks keep coming, so the queue never wraps on its own.
+        let mut cursor = OnDemandCursor::with_rescan_interval(Duration::ZERO);
+        cursor.advance(7);
+        assert_eq!(cursor.after_id(), 0);
+    }
 
     #[tokio::test]
     async fn test_add_watchtower_task() {

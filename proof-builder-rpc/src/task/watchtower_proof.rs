@@ -1,8 +1,8 @@
 use crate::ProofBuilderConfig;
 use crate::prover::ProverRuntime;
 use crate::task::{
-    OnDemandFetch, OnDemandJob, OnDemandOutcome, fail_invalid_on_demand_task, fetch_on_demand_task,
-    prove_on_demand,
+    OnDemandCursor, OnDemandFetch, OnDemandJob, OnDemandOutcome, fail_invalid_on_demand_task,
+    fetch_on_demand_task, prove_on_demand,
 };
 use proof_builder::{ProofBuilder, ProofRequest};
 use std::collections::HashMap;
@@ -39,7 +39,7 @@ pub(crate) fn spawn_watchtower_proof_task(
         // Consecutive failed attempts per task, reset when a task finishes.
         let mut attempts = HashMap::new();
         // The last task handed out; the next fetch starts after it.
-        let mut after_id = 0;
+        let mut cursor = OnDemandCursor::new();
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(interval)) => {
@@ -48,12 +48,12 @@ pub(crate) fn spawn_watchtower_proof_task(
                     match fetch_on_demand_task(
                         &local_db,
                         true,
-                        after_id,
+                        cursor.after_id(),
                         args.bitcoin_network,
                         &args.esplora_url,
                     ).await {
                         Ok(Some(OnDemandFetch::Ready(next_task))) => {
-                            after_id = next_task.task_index;
+                            cursor.advance(next_task.task_index);
                             args.latest_sequencer_commit_txid = next_task.latest_sequencer_commit_txid;
                             args.header_chain_input_proof = next_task.header_chain_input_proof;
                             args.commit_chain_input_proof = next_task.commit_chain_input_proof;
@@ -65,11 +65,11 @@ pub(crate) fn spawn_watchtower_proof_task(
                             task_index = next_task.task_index;
                         },
                         Ok(Some(OnDemandFetch::NotReady(task_index))) => {
-                            after_id = task_index;
+                            cursor.advance(task_index);
                             continue;
                         }
                         Ok(Some(OnDemandFetch::Invalid(task_index, reason))) => {
-                            after_id = task_index;
+                            cursor.advance(task_index);
                             if let Err(e) = fail_invalid_on_demand_task(
                                 &local_db, OnDemandProofTable::Watchtower, task_index, &reason,
                             ).await {
@@ -78,7 +78,7 @@ pub(crate) fn spawn_watchtower_proof_task(
                             continue;
                         }
                         Ok(None) => {
-                            after_id = 0;
+                            cursor.rescan();
                             tracing::warn!("No on demand task found for watchtower proof, wait for the next round");
                             tokio::time::sleep(Duration::from_secs(5)).await;
                             continue;
