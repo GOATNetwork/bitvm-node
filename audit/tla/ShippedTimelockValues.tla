@@ -10,7 +10,8 @@ ConnectorD == [Bitcoin |-> 432, Testnet4 |-> 32, Signet |-> 18, Regtest |-> 3]
 WatchtowerChallenge == [Bitcoin |-> 144, Testnet4 |-> 20, Signet |-> 6, Regtest |-> 1]
 OperatorAck == [Bitcoin |-> 288, Testnet4 |-> 28, Signet |-> 12, Regtest |-> 2]
 OperatorCommit == [Bitcoin |-> 432, Testnet4 |-> 42, Signet |-> 18, Regtest |-> 3]
-ConnectorF == [Bitcoin |-> 576, Testnet4 |-> 56, Signet |-> 24, Regtest |-> 4]
+ConnectorF == [Bitcoin |-> 600, Testnet4 |-> 66, Signet |-> 28, Regtest |-> 6]
 ActionWindow == [Bitcoin |-> 18, Testnet4 |-> 6, Signet |-> 3, Regtest |-> 1]
+DisproveWindow == [Bitcoin |-> 24, Testnet4 |-> 8, Signet |-> 4, Regtest |-> 1]
 
 ====

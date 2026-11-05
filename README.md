@@ -57,10 +57,9 @@ make tla
 Every TLC failure fails CI. There are no expected-failure configurations or
 stored traces. Temporary TLC files are removed on exit. `TLA2TOOLS` overrides
 the tool jar path; `TLC_OPTS` supplies optional whitespace-separated TLC flags.
-The current implementation violates dispute safety: an unresolved watchtower
-blocks Commit-Timeout while an invalid Assert waits for Connector E, allowing
-Take-2. Consequently `make tla` fails until the implementation and its model
-are corrected; the safety requirements must not be weakened to make CI green.
+Commit-Timeout no longer waits for unresolved watchtower branches, and an
+invalid Assert is challenged without waiting for Connector E, so both safety
+requirements hold. They must not be weakened to make CI green.
 
 ## Contributing
 

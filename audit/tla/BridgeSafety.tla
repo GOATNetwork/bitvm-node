@@ -9,9 +9,9 @@
 EXTENDS Integers, ShippedTimelockValues
 
 VARIABLES net, h, proofValid, watchtower, ack, branchAt,
-          e, eAt, f, d, verifierAssertAt
+          e, f, d, verifierAssertAt
 vars == <<net, h, proofValid, watchtower, ack, branchAt,
-          e, eAt, f, d, verifierAssertAt>>
+          e, f, d, verifierAssertAt>>
 
 Max(a, b) == IF a >= b THEN a ELSE b
 Horizon == Max(ConnectorD[net], ConnectorF[net])
@@ -22,7 +22,7 @@ Init ==
     /\ h = 1
     /\ proofValid \in BOOLEAN
     /\ watchtower = "open" /\ ack = "open" /\ branchAt = 0
-    /\ e = "open" /\ eAt = 0 /\ f = "open" /\ d = "open"
+    /\ e = "open" /\ f = "open" /\ d = "open"
     /\ verifierAssertAt = -1
 
 TypeOk ==
@@ -32,23 +32,20 @@ TypeOk ==
     /\ e \in {"open", "committed", "timeout"}
     /\ f \in {"open", "timeout", "nacked", "take2"}
     /\ d \in {"open", "disproved", "take2"}
-    /\ branchAt \in 0..h /\ eAt \in 0..h /\ verifierAssertAt \in -1..h
+    /\ branchAt \in 0..h /\ verifierAssertAt \in -1..h
 
-AllResolved == watchtower = "timeout"
-                \/ (watchtower = "challenged" /\ ack # "open")
-
-(* Source: graph_scan.rs watchtower_flow, Commit-Timeout signal at :679.  *)
+(* Source: graph_scan.rs watchtower_flow, Commit-Timeout signal at :697.  *)
+(* T6 alone gates it; unresolved watchtower branches do not.              *)
 CommitTimeoutEnabled ==
-    /\ AllResolved /\ h > branchAt
     /\ e = "open" /\ f = "open" /\ h >= OperatorCommit[net] + 1
-(* Source: graph_scan.rs watchtower_flow, NackReady at :642-657.           *)
+(* Source: graph_scan.rs watchtower_flow, NackReady at :648-659.           *)
 NackEnabled ==
     /\ watchtower = "challenged" /\ h > branchAt
     /\ ack = "open" /\ f = "open" /\ h >= OperatorAck[net] + 1
-(* Source: graph_pegout_jobs.rs verifier_assert, E gate at :775-790.       *)
+(* Source: graph_pegout_jobs.rs verifier_assert, proof check at :775. An   *)
+(* invalid proof is challenged without waiting for Connector E.          *)
 ChallengeEnabled ==
     /\ ~proofValid /\ d = "open" /\ verifierAssertAt = -1
-    /\ e # "open" /\ h > eAt
 (* Source: graph_scan.rs wrongly_challenge_timeout and is_timelock_ready. *)
 DisproveEnabled ==
     /\ d = "open" /\ verifierAssertAt >= 1
@@ -58,41 +55,41 @@ DisproveEnabled ==
 (* Source: goat transactions/watchtower_challenge.rs operator_challenge_ack. *)
 PublishAck ==
     /\ ack = "open" /\ ack' = "acked" /\ branchAt' = h
-    /\ UNCHANGED <<net, h, proofValid, watchtower, e, eAt, f, d, verifierAssertAt>>
+    /\ UNCHANGED <<net, h, proofValid, watchtower, e, f, d, verifierAssertAt>>
 
 (* Action: an optional watchtower challenge confirms. No honest WT is    *)
 (* assumed: one honest verifier must still protect against invalid proof. *)
 PublishWatchtowerChallenge ==
     /\ watchtower = "open" /\ watchtower' = "challenged" /\ branchAt' = h
-    /\ UNCHANGED <<net, h, proofValid, ack, e, eAt, f, d, verifierAssertAt>>
+    /\ UNCHANGED <<net, h, proofValid, ack, e, f, d, verifierAssertAt>>
 
 (* Action: the operator may spend the WT timeout, but may withhold it.     *)
 (* Source: goat WatchtowerChallengeTimeoutTransaction, WCI-rooted CSV.    *)
 WatchtowerTimeout ==
     /\ watchtower = "open" /\ ack = "open" /\ h >= WatchtowerChallenge[net]
     /\ watchtower' = "timeout" /\ ack' = "timeout" /\ branchAt' = h
-    /\ UNCHANGED <<net, h, proofValid, e, eAt, f, d, verifierAssertAt>>
+    /\ UNCHANGED <<net, h, proofValid, e, f, d, verifierAssertAt>>
 
 (* Action: the operator publishes its WOTS pubin evidence. The E leaf     *)
 (* does not require watchtower resolution, unlike the honest node's job. *)
 PublishPubin ==
-    /\ e = "open" /\ e' = "committed" /\ eAt' = h
+    /\ e = "open" /\ e' = "committed"
     /\ UNCHANGED <<net, h, proofValid, watchtower, ack, branchAt, f, d, verifierAssertAt>>
 
 (* Actions: honest verifier defences, confirmed at h.                     *)
 CommitTimeout ==
     /\ CommitTimeoutEnabled
-    /\ e' = "timeout" /\ eAt' = h /\ f' = "timeout"
+    /\ e' = "timeout" /\ f' = "timeout"
     /\ UNCHANGED <<net, h, proofValid, watchtower, ack, branchAt, d, verifierAssertAt>>
 Nack ==
     /\ NackEnabled /\ ack' = "nacked" /\ f' = "nacked"
-    /\ UNCHANGED <<net, h, proofValid, watchtower, branchAt, e, eAt, d, verifierAssertAt>>
+    /\ UNCHANGED <<net, h, proofValid, watchtower, branchAt, e, d, verifierAssertAt>>
 ChallengeAssert ==
     /\ ChallengeEnabled /\ verifierAssertAt' = h
-    /\ UNCHANGED <<net, h, proofValid, watchtower, ack, branchAt, e, eAt, f, d>>
+    /\ UNCHANGED <<net, h, proofValid, watchtower, ack, branchAt, e, f, d>>
 Disprove ==
     /\ DisproveEnabled /\ d' = "disproved"
-    /\ UNCHANGED <<net, h, proofValid, watchtower, ack, branchAt, e, eAt, f, verifierAssertAt>>
+    /\ UNCHANGED <<net, h, proofValid, watchtower, ack, branchAt, e, f, verifierAssertAt>>
 
 (* Action: Take-2 spends D and F at their actual CSV maturity.             *)
 (* Source: goat transactions/take2.rs, ConnectorD and ConnectorF inputs.  *)
@@ -100,20 +97,23 @@ Take2 ==
     /\ d = "open" /\ f = "open"
     /\ h >= ConnectorD[net] /\ h >= ConnectorF[net]
     /\ d' = "take2" /\ f' = "take2"
-    /\ UNCHANGED <<net, h, proofValid, watchtower, ack, branchAt, e, eAt, verifierAssertAt>>
+    /\ UNCHANGED <<net, h, proofValid, watchtower, ack, branchAt, e, verifierAssertAt>>
 
 (* Do not let time starve an enabled honest defence beyond its budget.    *)
 Tick ==
     /\ h < Horizon
-    /\ ~(CommitTimeoutEnabled /\ h >= Max(OperatorCommit[net] + 1, branchAt + 1) + ActionWindow[net])
+    /\ ~(CommitTimeoutEnabled /\ h >= OperatorCommit[net] + 1 + ActionWindow[net])
     /\ ~(NackEnabled /\ h >= Max(OperatorAck[net] + 1, branchAt + 1) + ActionWindow[net])
-    /\ ~(ChallengeEnabled /\ h >= eAt + 1 + ActionWindow[net])
+    /\ ~(ChallengeEnabled /\ h >= 1 + ActionWindow[net])
     /\ ~(DisproveEnabled /\ h >= verifierAssertAt + ProverConnector[net] + 1 + ActionWindow[net])
     /\ h' = h + 1
-    /\ UNCHANGED <<net, proofValid, watchtower, ack, branchAt, e, eAt, f, d, verifierAssertAt>>
+    /\ UNCHANGED <<net, proofValid, watchtower, ack, branchAt, e, f, d, verifierAssertAt>>
 
-Next == PublishAck \/ PublishWatchtowerChallenge \/ WatchtowerTimeout \/ PublishPubin
-        \/ CommitTimeout \/ Nack \/ ChallengeAssert \/ Disprove \/ Take2 \/ Tick
+(* Once D or F is spent, Take-2 can no longer happen and D never reopens,  *)
+(* so no later step can violate a requirement; the model stops there.     *)
+Next == /\ d = "open" /\ f = "open"
+        /\ \/ PublishAck \/ PublishWatchtowerChallenge \/ WatchtowerTimeout \/ PublishPubin
+           \/ CommitTimeout \/ Nack \/ ChallengeAssert \/ Disprove \/ Take2 \/ Tick
 Spec == Init /\ [][Next]_vars
 
 (* Protocol requirements, not expected failures or recorded attack traces. *)

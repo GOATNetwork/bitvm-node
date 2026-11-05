@@ -33,12 +33,16 @@ fn render() -> String {
     out += &record("OperatorAck", |n| tl(n).operator_ack);
     out += &record("OperatorCommit", |n| tl(n).operator_commit);
     out += &record("ConnectorF", |n| tl(n).connector_f);
-    out += &record("ActionWindow", |n| {
+    let action_window = |n| {
         let budget = protocol_timing_budget(n);
         budget
             .reaction_blocks
             .saturating_add(budget.inclusion_blocks)
             .saturating_add(budget.safety_blocks)
+    };
+    out += &record("ActionWindow", action_window);
+    out += &record("DisproveWindow", |n| {
+        action_window(n).saturating_add(protocol_timing_budget(n).inclusion_blocks)
     });
     out += "\n====\n";
     out
