@@ -265,6 +265,13 @@ async fn validate_prekickoff_continuity(
     }
 }
 
+pub fn validate_graph_preflight(parameters: &BitvmGcGraphParameters) -> Result<()> {
+    parameters.validate_basic().map_err(|error| {
+        SpecialError::InvalidGraph(format!("invalid graph parameters: {error}"))
+    })?;
+    validate_graph_policy(parameters)
+}
+
 pub async fn validate_init_graph_base(
     local_db: &LocalDB,
     btc_client: &BTCClient,
@@ -275,16 +282,8 @@ pub async fn validate_init_graph_base(
         bail!(SpecialError::InvalidGraph("graph is missing operator pre-signatures".to_string()));
     }
     // Basic structural and on-chain consistency checks for an incoming graph proposal.
-    // Return SpecialError::InvalidGraph on any validation failure.
-    // 1) Rebuild full graph (ensures signatures present if flags are set and tx graph is coherent)
-    let full_graph = BitvmGcGraph::from_simplified(graph)
-        .map_err(|e| SpecialError::InvalidGraph(format!("invalid graph structure: {e}")))?;
-    validate_graph_policy(&graph.parameters)?;
-    validate_prekickoff_continuity(local_db, &full_graph).await?;
-    verify_graph_operator_pre_signatures(&full_graph)
-        .map_err(|e| SpecialError::InvalidGraph(format!("invalid operator pre-signatures: {e}")))?;
-
-    // 2) Bind all instance and peg-in parameters to GoatChain and Bitcoin.
+    // Reject malformed input permanently; keep backend failures retryable.
+    validate_graph_preflight(&graph.parameters)?;
     validate_graph_instance_parameters(
         btc_client,
         goat_client,
@@ -292,12 +291,19 @@ pub async fn validate_init_graph_base(
     )
     .await?;
 
-    // 3) Challenge amount and assert-commit count must match local constants
+    // Rebuild only after basic checks and chain binding have passed.
+    let full_graph = BitvmGcGraph::from_simplified(graph)
+        .map_err(|e| SpecialError::InvalidGraph(format!("invalid graph structure: {e}")))?;
+    validate_prekickoff_continuity(local_db, &full_graph).await?;
+    verify_graph_operator_pre_signatures(&full_graph)
+        .map_err(|e| SpecialError::InvalidGraph(format!("invalid operator pre-signatures: {e}")))?;
+
+    // Challenge amount must match local constants.
     if graph.parameters.challenge_amount != challenge_amount() {
         bail!(SpecialError::InvalidGraph("unexpected challenge amount".to_string()));
     }
 
-    // 4) Watchtower config sanity: number of watchtowers should match number of hashlocks and registry size
+    // Check the selected watchtowers against the chain registry.
     let watchtowers_on_chain = goat_client
         .committee_mana_get_watchtowers()
         .await
@@ -312,7 +318,7 @@ pub async fn validate_init_graph_base(
         graph.parameters.pubin_disprove_constant,
     )?;
 
-    // 5) Operator stake sanity: verify operator is registered and has enough locked stake.
+    // Verify the operator is registered and has enough locked stake.
     // The query may fail transiently; only the verdict is a rejection.
     match operator_stake_status(goat_client, &graph.parameters.operator_pubkey)
         .await
@@ -458,23 +464,22 @@ pub async fn validate_finalized_graph(
             "finalized graph is missing operator or committee pre-signatures".to_string()
         ));
     }
-    // 1) Rebuild full graph to ensure structure is coherent and txns derivable
-    let full_graph = BitvmGcGraph::from_simplified(graph)
-        .map_err(|e| SpecialError::InvalidGraph(format!("invalid graph structure: {e}")))?;
-    validate_graph_policy(&graph.parameters)?;
-    verify_graph_operator_pre_signatures(&full_graph)
-        .map_err(|e| SpecialError::InvalidGraph(format!("invalid operator pre-signatures: {e}")))?;
-    verify_graph_committee_pre_signatures(&full_graph).map_err(|e| {
-        SpecialError::InvalidGraph(format!("invalid committee pre-signatures: {e}"))
-    })?;
-
-    // 2) Repeat the full instance and peg-in binding for nodes that did not see CreateGraph.
+    validate_graph_preflight(&graph.parameters)?;
     validate_graph_instance_parameters(
         btc_client,
         goat_client,
         &graph.parameters.instance_parameters,
     )
     .await?;
+
+    // Rebuild and verify signatures only after binding to both chains.
+    let full_graph = BitvmGcGraph::from_simplified(graph)
+        .map_err(|e| SpecialError::InvalidGraph(format!("invalid graph structure: {e}")))?;
+    verify_graph_operator_pre_signatures(&full_graph)
+        .map_err(|e| SpecialError::InvalidGraph(format!("invalid operator pre-signatures: {e}")))?;
+    verify_graph_committee_pre_signatures(&full_graph).map_err(|e| {
+        SpecialError::InvalidGraph(format!("invalid committee pre-signatures: {e}"))
+    })?;
 
     let instance_id = graph.parameters.instance_parameters.instance_id;
     if graph.parameters.challenge_amount != challenge_amount() {
@@ -629,4 +634,67 @@ pub fn prekickoff_fee_amount(replenish_fee_inputs_num: usize) -> Amount {
     let tx_vbytes = PRE_KICKOFF_BASE_VBYTES
         + (replenish_fee_inputs_num as u64 * CHECKSIG_P2WSH_INPUT_VBYTES_ESTIMATE);
     Amount::from_sat(tx_vbytes)
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    use crate::error::{FailureClass, classify_failure};
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../crates/bitvm-gc/tests/fixtures/admission.rs"
+    ));
+
+    fn definition(parameters: BitvmGcGraphParameters) -> SimplifiedBitvmGcGraph {
+        serde_json::from_value(serde_json::json!({"parameters":parameters,"operator_pre_signed":true,"committee_pre_signed":true,"operator_pre_sigs":null,"committee_pre_sigs":null})).unwrap()
+    }
+
+    #[tokio::test]
+    async fn malformed_proposals_are_permanent_rejections_and_next_candidate_reaches_chain_binding()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let db = LocalDB::new_with_busy_timeout(
+            &format!("sqlite:{}", dir.path().join("admission.db").display()),
+            false,
+            store::DEFAULT_BUSY_TIMEOUT,
+        )
+        .await;
+        db.migrate().await;
+        let (btc, _) = BTCClient::new_mock_client();
+        let (goat, _) = GOATClient::new_mock_client();
+        let parameters = admission_parameters(get_network(), min_required_verifier());
+        for case in 0..4 {
+            let mut bad = parameters.clone();
+            match case {
+                0 => bad.instance_parameters.committee_pubkeys.clear(),
+                1 => bad.instance_parameters.pegin_amount = Amount::from_sat(u64::MAX),
+                2 => bad.instance_parameters.user_info.txn_fees[1] = u64::MAX,
+                _ => bad.watchtower_ack_hashlocks.clear(),
+            }
+            let bad = definition(bad);
+            for error in [
+                validate_init_graph_base(&db, &btc, &goat, &bad).await.err().unwrap(),
+                validate_finalized_graph(&btc, &goat, &bad, &[], &[]).await.err().unwrap(),
+            ] {
+                assert!(
+                    matches!(classify_failure(&error), FailureClass::Permanent(_)),
+                    "{error:#}"
+                );
+                assert!(error.downcast_ref::<SpecialError>().is_some());
+            }
+        }
+        // Same graph ID, valid basic parameters. Missing pre-signatures would fail
+        // reconstruction, so reaching the RPC error proves binding runs first.
+        let next = definition(parameters);
+        for error in [
+            validate_init_graph_base(&db, &btc, &goat, &next).await.err().unwrap(),
+            validate_finalized_graph(&btc, &goat, &next, &[], &[]).await.err().unwrap(),
+        ] {
+            assert!(
+                format!("{error:#}").contains("failed to load instance parameters from GoatChain"),
+                "{error:#}"
+            );
+            assert!(!matches!(classify_failure(&error), FailureClass::Permanent(_)));
+        }
+    }
 }

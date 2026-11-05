@@ -117,7 +117,54 @@ pub struct BitvmGcCircuitData {
     pub wire_hashes: [WireHash; INPUT_WIRE_NUM],
 }
 
+/// Fallible aggregation for untrusted committee lists. musig2 panics on an empty list.
+pub fn checked_committee_key(pubkeys: &[PublicKey]) -> Result<PublicKey> {
+    anyhow::ensure!(!pubkeys.is_empty(), "committee public keys are empty");
+    let keys: Vec<musig2::secp::Point> = pubkeys.iter().map(|key| key.inner.into()).collect();
+    let context = musig2::KeyAggContext::new(keys)
+        .map_err(|error| anyhow::anyhow!("invalid committee keys: {error}"))?;
+    let key: bitcoin::secp256k1::PublicKey = context.aggregated_pubkey();
+    Ok(PublicKey::from(key))
+}
+
+fn checked_money_sum(amounts: impl IntoIterator<Item = Amount>) -> Result<Amount> {
+    let mut total = Amount::ZERO;
+    for amount in amounts {
+        total = total
+            .checked_add(amount)
+            .ok_or_else(|| anyhow::anyhow!("Bitcoin amount sum overflows"))?;
+        anyhow::ensure!(total <= Amount::MAX_MONEY, "Bitcoin amount exceeds MAX_MONEY");
+    }
+    Ok(total)
+}
+
 impl BitvmGcInstanceParameters {
+    /// Cheap safety checks before constructing scripts or adding transaction amounts.
+    pub fn validate_basic(&self) -> Result<()> {
+        anyhow::ensure!(
+            checked_committee_key(&self.committee_pubkeys)? == self.committee_agg_pubkey,
+            "committee aggregate key mismatch"
+        );
+        let unique: std::collections::HashSet<_> =
+            self.committee_pubkeys.iter().map(|key| key.inner).collect();
+        anyhow::ensure!(
+            unique.len() == self.committee_pubkeys.len(),
+            "duplicate committee public key"
+        );
+        anyhow::ensure!(!self.user_info.inputs.is_empty(), "peg-in inputs are empty");
+        checked_money_sum(self.user_info.inputs.iter().map(|input| input.amount))?;
+        checked_money_sum([
+            self.pegin_amount,
+            Amount::from_sat(self.user_info.txn_fees[1]),
+            Amount::from_sat(self.user_info.txn_fees[0]),
+        ])?;
+        anyhow::ensure!(
+            self.user_info.txn_fees[2] <= Amount::MAX_MONEY.to_sat(),
+            "refund fee exceeds MAX_MONEY"
+        );
+        Ok(())
+    }
+
     pub fn n_of_n_taproot_public_key(&self) -> XOnlyPublicKey {
         XOnlyPublicKey::from(self.committee_agg_pubkey)
     }
@@ -142,6 +189,7 @@ impl BitvmGcInstanceParameters {
     pub fn build_pegin_tx(
         &self,
     ) -> Result<(PegInDepositTransaction, PegInConfirmTransaction, PegInRefundTransaction)> {
+        self.validate_basic()?;
         let network = self.network;
         let connector_0 = self.connector_0();
         let connector_z = self.connector_z();
@@ -155,7 +203,9 @@ impl BitvmGcInstanceParameters {
         let pegin_deposit = PegInDepositTransaction::new_unsigned(
             &connector_z,
             self.user_info.inputs.clone(),
-            self.pegin_amount + Amount::from_sat(self.user_info.txn_fees[1]),
+            self.pegin_amount
+                .checked_add(Amount::from_sat(self.user_info.txn_fees[1]))
+                .ok_or_else(|| anyhow::anyhow!("peg-in amount plus confirm fee overflows"))?,
             Amount::from_sat(self.user_info.txn_fees[0]),
             self.user_info.user_change_address.clone(),
         )
@@ -183,13 +233,16 @@ impl BitvmGcInstanceParameters {
     }
 
     pub fn build_pegin_cancel_psbt(&self) -> Result<bitcoin::psbt::Psbt> {
+        self.validate_basic()?;
         let connector_z = self.connector_z();
         let n_of_n_taproot_public_key = self.n_of_n_taproot_public_key();
 
         let pegin_deposit = PegInDepositTransaction::new_unsigned(
             &connector_z,
             self.user_info.inputs.clone(),
-            self.pegin_amount + Amount::from_sat(self.user_info.txn_fees[1]),
+            self.pegin_amount
+                .checked_add(Amount::from_sat(self.user_info.txn_fees[1]))
+                .ok_or_else(|| anyhow::anyhow!("peg-in amount plus confirm fee overflows"))?,
             Amount::from_sat(self.user_info.txn_fees[0]),
             self.user_info.user_change_address.clone(),
         )
@@ -269,6 +322,47 @@ impl BitvmGcInstanceParameters {
 }
 
 impl BitvmGcGraphParameters {
+    pub fn validate_basic(&self) -> Result<()> {
+        self.instance_parameters.validate_basic()?;
+        anyhow::ensure!(
+            !self.watchtower_pubkeys.is_empty() && self.watchtower_pubkeys.len() <= 256,
+            "invalid watchtower count"
+        );
+        anyhow::ensure!(
+            self.watchtower_pubkeys.len() == self.watchtower_ack_hashlocks.len(),
+            "watchtower hashlock count mismatch"
+        );
+        anyhow::ensure!(!self.gc_data.is_empty(), "verifier slots are empty");
+        for data in &self.gc_data {
+            anyhow::ensure!(
+                data.final_msg_hashlocks.len() == crate::babe_adapter::BABE_M_CC,
+                "verifier final message hashlock count mismatch"
+            );
+        }
+        let prep = &self.prekickoff_parameters;
+        anyhow::ensure!(
+            prep.replenish_fee_inputs.len() == prep.replenish_fee_prev_outs.len(),
+            "replenish input/output count mismatch"
+        );
+        let current = prep
+            .cur_prekickoff_txn
+            .prekickoff_connector_input()
+            .map_err(|error| anyhow::anyhow!("invalid current prekickoff: {error}"))?;
+        checked_money_sum(
+            std::iter::once(current.amount)
+                .chain(prep.replenish_fee_inputs.iter().map(|input| input.amount)),
+        )?;
+        anyhow::ensure!(
+            prep.fee_amount <= Amount::MAX_MONEY.to_sat(),
+            "prekickoff fee exceeds MAX_MONEY"
+        );
+        anyhow::ensure!(
+            self.challenge_amount <= Amount::MAX_MONEY,
+            "challenge amount exceeds MAX_MONEY"
+        );
+        Ok(())
+    }
+
     pub fn network(&self) -> Network {
         self.instance_parameters.network
     }
@@ -790,5 +884,78 @@ pub mod node_serializer {
                 .map(|addr| addr.assume_checked())
                 .map_err(serde::de::Error::custom)
         }
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    use crate as bitvm_lib;
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/admission.rs"));
+
+    #[test]
+    fn malformed_instances_return_errors_instead_of_panicking_in_both_builders() {
+        let valid = admission_parameters(Network::Regtest, 1).instance_parameters;
+        valid.validate_basic().unwrap();
+        for case in 0..5 {
+            let mut bad = valid.clone();
+            match case {
+                0 => bad.committee_pubkeys.clear(),
+                1 => bad.pegin_amount = Amount::from_sat(u64::MAX),
+                2 => bad.user_info.txn_fees[0] = u64::MAX,
+                3 => bad.user_info.txn_fees[1] = u64::MAX,
+                _ => bad.user_info.inputs[0].amount = Amount::from_sat(u64::MAX),
+            }
+            assert!(
+                std::panic::catch_unwind(|| bad.build_pegin_tx()).expect("must not panic").is_err()
+            );
+            assert!(
+                std::panic::catch_unwind(|| bad.build_pegin_cancel_psbt())
+                    .expect("must not panic")
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn reconstruction_rejects_malformed_parameters_before_signatures() {
+        let valid = admission_parameters(Network::Regtest, 1);
+        for case in 0..4 {
+            let mut bad = valid.clone();
+            match case {
+                0 => bad.instance_parameters.committee_pubkeys.clear(),
+                1 => bad.instance_parameters.pegin_amount = Amount::from_sat(u64::MAX),
+                2 => bad.watchtower_ack_hashlocks.clear(),
+                _ => bad.gc_data.clear(),
+            }
+            let simplified = SimplifiedBitvmGcGraph {
+                parameters: bad,
+                operator_pre_signed: true,
+                committee_pre_signed: true,
+                operator_pre_sigs: None,
+                committee_pre_sigs: None,
+            };
+            assert!(
+                std::panic::catch_unwind(|| BitvmGcGraph::from_simplified(&simplified))
+                    .expect("must not panic")
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn direct_committee_verification_rejects_empty_keys_without_panic() {
+        let mut graph =
+            crate::operator::generate_bitvm_graph(admission_parameters(Network::Regtest, 1))
+                .unwrap();
+        graph.committee_pre_signed = true;
+        graph.parameters.instance_parameters.committee_pubkeys.clear();
+        assert!(
+            std::panic::catch_unwind(|| crate::committee::verify_graph_committee_pre_signatures(
+                &graph
+            ))
+            .expect("must not panic")
+            .is_err()
+        );
     }
 }
