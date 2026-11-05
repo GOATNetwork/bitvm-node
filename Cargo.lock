@@ -11578,6 +11578,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "state-chain",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber 0.3.23",

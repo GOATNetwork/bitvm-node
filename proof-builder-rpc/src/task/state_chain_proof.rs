@@ -81,7 +81,6 @@ async fn spawn_state_chain_ctx_builder(
 
                 let blocks = match fetch_state_chain(
                     &args.l2_contract_addresses,
-                    &args.proceed_withdraw_method_ids,
                     args.start,
                     args.batch_size,
                     &args.execution_layer_rpc,
