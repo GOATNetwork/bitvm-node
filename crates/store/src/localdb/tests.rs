@@ -573,3 +573,67 @@ async fn test_find_next_on_demand_proof_starts_after_cursor() {
     assert!(second.id > first.id);
     assert!(s.find_next_operator_proof(second.id).await.unwrap().is_none());
 }
+
+#[tokio::test]
+async fn watchtower_key_migration_keeps_one_task_per_key() {
+    use sqlx::migrate::Migrate;
+    use sqlx::{Connection, SqliteConnection};
+
+    const KEY_MIGRATION: i64 = 20261104000000;
+    let mut conn = SqliteConnection::connect("sqlite::memory:").await.unwrap();
+    conn.ensure_migrations_table().await.unwrap();
+    for migration in MIGRATOR.iter().filter(|m| m.version < KEY_MIGRATION) {
+        conn.apply(migration).await.unwrap();
+    }
+
+    let x = "ab".repeat(32);
+    let y_odd = format!("{}01", "cd".repeat(31));
+    // (id, public_key, proof_state): one signer in four spellings, and a
+    // finished proof on a newer row than a failed one.
+    let rows = [
+        (1, format!("03{x}"), 3),
+        (2, x.to_uppercase(), 0),
+        (3, format!("04{x}{y_odd}"), 2),
+        (4, format!("02{x}"), 1),
+        (5, "11".repeat(32), 0),
+    ];
+    for (id, public_key, proof_state) in rows {
+        sqlx::query(
+            "INSERT INTO watchtower_proof (id, instance_id, graph_id, public_key, challenge_txid,
+                                           challenge_init_txid, proof_state)
+             VALUES (?, 'instance', 'graph', ?, '', '', ?)",
+        )
+        .bind(id)
+        .bind(public_key)
+        .bind(proof_state)
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    }
+
+    for migration in MIGRATOR.iter().filter(|m| m.version >= KEY_MIGRATION) {
+        conn.apply(migration).await.unwrap();
+    }
+    let rows: Vec<(i64, String, i64)> =
+        sqlx::query_as("SELECT id, public_key, proof_state FROM watchtower_proof ORDER BY id")
+            .fetch_all(&mut conn)
+            .await
+            .unwrap();
+    assert_eq!(rows, vec![(3, format!("02{x}"), 2), (5, format!("02{}", "11".repeat(32)), 0)]);
+
+    // Ids are never reused, so a deleted task's id cannot name a newer task.
+    sqlx::query("DELETE FROM watchtower_proof WHERE id = 5").execute(&mut conn).await.unwrap();
+    sqlx::query(
+        "INSERT INTO watchtower_proof (instance_id, graph_id, public_key, challenge_txid,
+                                       challenge_init_txid)
+         VALUES ('instance', 'other', 'key', '', '')",
+    )
+    .execute(&mut conn)
+    .await
+    .unwrap();
+    let id: i64 = sqlx::query_scalar("SELECT id FROM watchtower_proof WHERE graph_id = 'other'")
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(id, 6);
+}
