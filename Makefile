@@ -2,7 +2,7 @@
 # Every target honours LOCALNET_DATA, PORT_BASE and COMPOSE_PROJECT from the environment, e.g.
 #   LOCALNET_DATA=/tmp/bv2 PORT_BASE=23000 COMPOSE_PROJECT=bvlocal2 make localnet-reset
 LOCALNET := localnet
-# Basic transaction-graph timing model (audit/tla). TLA2TOOLS and TLC_OPTS
+# Transaction-graph timing and safety models (audit/tla). TLA2TOOLS and TLC_OPTS
 # are passed through to audit/tla/check.sh.
 TLA2TOOLS ?= $(HOME)/.local/share/tlaplus/tla2tools.jar
 TLA2TOOLS_URL := https://github.com/tlaplus/tlaplus/releases/latest/download/tla2tools.jar
@@ -35,7 +35,7 @@ tla-setup:             ## download tla2tools.jar to $(TLA2TOOLS) (needs a JRE 11
 	@mkdir -p "$(dir $(TLA2TOOLS))"
 	curl -fsSL -o "$(TLA2TOOLS)" "$(TLA2TOOLS_URL)"
 
-tla:                   ## check the basic transaction-graph timing invariants
+tla:                   ## check transaction-graph timing and dispute safety
 	audit/tla/check.sh
 
 tla-values:            ## regenerate audit/tla/ShippedTimelockValues.tla from the shipped Rust timing constants

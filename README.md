@@ -15,22 +15,30 @@ GOAT Network's BitVM bridge implementation. See [GOAT BitVM Whitepaper](https://
 
 ## Transaction graph checks
 
-The checks cover critical connector relationships in constructed transactions and
-basic maturity relations for the default Bitcoin, Testnet4, Signet and Regtest
-parameters:
+The checks cover critical connector relationships, default network timing, and
+core dispute safety for Bitcoin, Testnet4, Signet and Regtest:
 
 - Rust tests construct the real transaction graph and check parent outpoints,
   competing spends, and the CSV values in transaction inputs and scripts.
 - `audit/tla/TransactionGraph.tla` checks the Take-1 budget, ACK budget,
   timeout order, conditional Disprove maturity, and Take-2's two CSV clocks.
+- `audit/tla/BridgeSafety.tla` checks actual dispute transitions against two
+  requirements: an invalid proof must never reach Take-2, and Take-2 must have
+  committed pubin. It models the current Commit-Timeout and verifier gates,
+  including an operator withholding evidence and a possibly offline watchtower.
+  An honest verifier's enabled defences have an explicit bounded response time.
 - `tests/tla_shipped_values.rs` checks that the TLA values match Rust. A timing
   change requires regenerating the values and rerunning the checks.
 
-The TLA model is finite, init-only arithmetic. It assumes VerifierAssert confirms
-within `action_window` of OperatorAssert for the Disprove comparison. Earlier
-maturity does not guarantee earlier confirmation. These checks do not establish
-end-to-end bridge safety or liveness, and do not model signatures, proof
-validity, fees, relay policy, reorgs, job scheduling, or contract settlement.
+The timing model is finite, init-only arithmetic. Its Disprove comparison assumes
+VerifierAssert confirms within `action_window` of OperatorAssert; earlier maturity
+does not guarantee earlier confirmation. The safety model explores transitions
+after WCI and OperatorAssert confirm in the same block, abstracts proof validity
+as a boolean, and assumes published pubin is consistent with the Assert. It does
+not assume pubin will be published or a watchtower branch will resolve.
+These checks do not establish end-to-end bridge safety or liveness and omit
+cryptographic verification, fees, relay policy, reorgs, executor capacity and
+contract settlement.
 Implementation changes outside the tested structure and generated values require
 manual review of the model's assumptions.
 
@@ -47,6 +55,10 @@ make tla
 Every TLC failure fails CI. There are no expected-failure configurations or
 stored traces. Temporary TLC files are removed on exit. `TLA2TOOLS` overrides
 the tool jar path; `TLC_OPTS` supplies optional whitespace-separated TLC flags.
+The current implementation violates dispute safety: an unresolved watchtower
+blocks Commit-Timeout while an invalid Assert waits for Connector E, allowing
+Take-2. Consequently `make tla` fails until the implementation and its model
+are corrected; the safety requirements must not be weakened to make CI green.
 
 ## Contributing
 

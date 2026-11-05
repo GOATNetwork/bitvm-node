@@ -498,8 +498,8 @@ the conditional SQL update, so concurrent writers do not use a separate
 read-then-write guard.
 
 The [transaction graph checks](../README.md#transaction-graph-checks) cover
-connector wiring and basic CSV maturity relations. They do not model these
-database transitions or establish state-machine safety or liveness.
+connector wiring, CSV maturity relations and core dispute safety. They do not
+model these database transitions or establish database safety or liveness.
 
 ---
 

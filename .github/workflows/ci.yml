@@ -22,7 +22,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Independent from Rust checks; only the basic finite timing model runs here.
+  # Timing and protocol safety must both hold; every TLC violation fails CI.
   tla-plus:
     name: TLA+ Formal Verification
     runs-on: ubuntu-latest
@@ -34,7 +34,7 @@ jobs:
           java-version: "21"
       - name: Download TLA+ tools
         run: make tla-setup
-      - name: Check transaction graph timing invariants
+      - name: Check transaction graph timing and safety invariants
         run: make tla
   fmt:
     name: Rustfmt
