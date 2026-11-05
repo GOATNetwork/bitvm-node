@@ -19,6 +19,19 @@ impl Harness {
         graph_id: Uuid,
         tamper: bool,
     ) -> NewEvent {
+        self.init_graph_from(operator, peer, peer, instance_id, graph_id, tamper).await
+    }
+
+    /// An InitGraph signed for `peer` but relayed by `source`.
+    async fn init_graph_from(
+        &self,
+        operator: &Keypair,
+        peer: PeerId,
+        source: PeerId,
+        instance_id: Uuid,
+        graph_id: Uuid,
+        tamper: bool,
+    ) -> NewEvent {
         let mut init = sign_init_graph(instance_id, graph_id, operator, peer.to_bytes());
         if tamper {
             // Claim another operator's key under this signature.
@@ -30,7 +43,7 @@ impl Harness {
                 .serialize_message()
                 .await
                 .unwrap();
-        let author = peer.to_string();
+        let author = source.to_string();
         let inbound = InboundMessage {
             author: author.clone(),
             instance_id,
@@ -106,5 +119,39 @@ async fn verifier_ignores_init_graph_for_a_failed_instance() {
         .await;
     t.wait_inbox(&event, EngineInboxState::Applied).await;
     assert!(t.jobs_of(graph_id).await.is_empty());
+    t.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn verifier_binds_the_admission_to_the_authenticated_init_graph() {
+    let t = start(Actor::Verifier, false).await;
+    let (operator, peer) = (operator_key(7), PeerId::random());
+    let instance_id = t.insert_instance(InstanceBridgeInStatus::UserBroadcastPeginPrepare).await;
+    let other_instance = t.insert_instance(InstanceBridgeInStatus::UserBroadcastPeginPrepare).await;
+
+    // A relayed copy under another instance is ignored and must not decide
+    // which instance the graph's admission counts against.
+    let first = Uuid::new_v4();
+    let event = t
+        .submit(
+            t.init_graph_from(&operator, peer, PeerId::random(), other_instance, first, false)
+                .await,
+        )
+        .await;
+    t.wait_inbox(&event, EngineInboxState::Applied).await;
+    let event = t.submit(t.init_graph(&operator, peer, instance_id, first, false).await).await;
+    t.wait_inbox(&event, EngineInboxState::Applied).await;
+    t.wait_job(first, JOB_VERIFIER_SETUP, EngineJobState::Done).await;
+
+    // The same graph under another instance does not reuse the admission.
+    let event = t.submit(t.init_graph(&operator, peer, other_instance, first, false).await).await;
+    t.wait_inbox(&event, EngineInboxState::Failed).await;
+
+    // The operator's second graph on the instance is still ignored.
+    let second = Uuid::new_v4();
+    let event = t.submit(t.init_graph(&operator, peer, instance_id, second, false).await).await;
+    t.wait_inbox(&event, EngineInboxState::Applied).await;
+    assert!(t.jobs_of(second).await.is_empty());
+    assert_eq!(t.called(JOB_VERIFIER_SETUP).len(), 1);
     t.stop().await;
 }

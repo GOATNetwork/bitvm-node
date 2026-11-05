@@ -249,9 +249,17 @@ pub struct GraphState {
     /// The operator gave up its unfinished setup at the abandon height.
     #[serde(default)]
     pub abandoned: bool,
-    /// Verifier: the authenticated operator whose InitGraph was admitted to setup.
+    /// Verifier: the authenticated InitGraph identity admitted to setup.
     #[serde(default)]
-    pub setup_operator: Option<String>,
+    pub setup_admission: Option<SetupAdmission>,
+}
+
+/// Set once, from an authenticated InitGraph; `state.instance_id` is not
+/// enough since any message may set it before authentication.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetupAdmission {
+    pub instance_id: Uuid,
+    pub operator: String,
 }
 
 impl GraphState {
@@ -539,9 +547,6 @@ impl GraphAggregate {
         inbound: &InboundMessage,
         created_at: i64,
     ) -> anyhow::Result<Option<ApplyOutcome>> {
-        if state.setup_operator.is_some() {
-            return Ok(None);
-        }
         let init = match GOATMessage::deserialize_message(&inbound.message).await {
             Ok(GOATMessage { content: GOATMessageContent::InitGraph(init), .. }) => init,
             Ok(_) => return Ok(Some(ApplyOutcome::Rejected("not an InitGraph message".into()))),
@@ -561,6 +566,18 @@ impl GraphAggregate {
         if !verify_init_graph_signature(&init) {
             return Ok(Some(ApplyOutcome::Rejected(
                 "invalid operator signature on InitGraph".into(),
+            )));
+        }
+        let admission = SetupAdmission {
+            instance_id: init.instance_id,
+            operator: init.operator_pubkey.to_string(),
+        };
+        if let Some(admitted) = &state.setup_admission {
+            if *admitted == admission {
+                return Ok(None);
+            }
+            return Ok(Some(ApplyOutcome::Rejected(
+                "InitGraph differs from the one admitted to setup".into(),
             )));
         }
 
@@ -597,19 +614,21 @@ impl GraphAggregate {
 
         // An operator builds one graph per instance; another graph id from the
         // same operator would only spend this node's setup slot again.
-        let operator = init.operator_pubkey.to_string();
         let admitted = ctx
             .storage
             .find_engine_aggregate_ids_by_state(
                 GRAPH_KIND,
-                &[("instance_id", &init.instance_id.to_string()), ("setup_operator", &operator)],
+                &[
+                    ("setup_admission.instance_id", &admission.instance_id.to_string()),
+                    ("setup_admission.operator", &admission.operator),
+                ],
             )
             .await?;
         if let Some(other) = admitted.iter().find(|id| **id != graph_id.to_string()) {
             debug!(event = "graph_apply", graph_id = %graph_id, other = %other, "operator already has a graph in setup for this instance; InitGraph ignored");
             return Ok(Some(ApplyOutcome::Applied));
         }
-        state.setup_operator = Some(operator);
+        state.setup_admission = Some(admission);
         Ok(None)
     }
 

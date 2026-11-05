@@ -809,8 +809,8 @@ impl<'a> StorageProcessor<'a> {
         Ok(row.map(|row| engine_aggregate_from_row(&row)).transpose()?)
     }
 
-    /// Ids of `aggregate_kind` aggregates whose JSON state has each top-level
-    /// `field` equal to the given text value.
+    /// Ids of `aggregate_kind` aggregates whose JSON state has each `field`
+    /// (a dotted path from the top level) equal to the given text value.
     pub async fn find_engine_aggregate_ids_by_state(
         &mut self,
         aggregate_kind: &str,
