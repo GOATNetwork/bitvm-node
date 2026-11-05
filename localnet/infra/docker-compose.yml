@@ -53,7 +53,10 @@ services:
     networks: [localnet]
     restart: "no"
 
+  # The GOAT chain: exactly one of anvil / goat-rpc runs, picked by COMPOSE_PROFILES (= GOAT_SERVICE,
+  # set by scripts/localnet.env from GOAT_BACKEND). Both answer on ANVIL_PORT and as goat-rpc:8545.
   anvil:
+    profiles: [anvil]
     image: ${FOUNDRY_IMAGE:-ghcr.io/foundry-rs/foundry:stable}
     container_name: ${COMPOSE_PROJECT:-bvlocal}-anvil
     user: *user
@@ -71,7 +74,26 @@ services:
       - "127.0.0.1:${ANVIL_PORT:-22545}:8545"
     volumes:
       - ${LOCALNET_DATA:?}/data/anvil:/anvil
-    networks: [localnet]
+    networks:
+      localnet:
+        aliases: [goat-rpc]
+    restart: "no"
+
+  goat-rpc:
+    # GOAT_BACKEND=testnet3: plain HTTP on ANVIL_PORT, forwarded to the public GOAT RPC over TLS.
+    profiles: [goat-rpc]
+    image: ${NGINX_IMAGE:-nginx:1.27-alpine}
+    container_name: ${COMPOSE_PROJECT:-bvlocal}-goat-rpc
+    environment:
+      GOAT_UPSTREAM_RPC: ${GOAT_UPSTREAM_RPC:-https://rpc.testnet3.goat.network}
+      GOAT_UPSTREAM_HOST: ${GOAT_UPSTREAM_HOST:-rpc.testnet3.goat.network}
+    volumes:
+      - ./goat-rpc.conf.template:/etc/nginx/templates/default.conf.template:ro
+    ports:
+      - "127.0.0.1:${ANVIL_PORT:-22545}:8545"
+    networks:
+      localnet:
+        aliases: [goat-rpc]
     restart: "no"
 
   postgres:
@@ -111,15 +133,17 @@ services:
       - "127.0.0.1:${GRAPH_ADMIN_PORT:-22820}:8020"
       - "127.0.0.1:${GRAPH_INDEX_PORT:-22830}:8030"
       - "127.0.0.1:${GRAPH_METRICS_PORT:-22840}:8040"
-    depends_on: [postgres, ipfs, anvil]
+    depends_on: [postgres, ipfs]
     environment:
       postgres_host: postgres
       postgres_user: graph-node
       postgres_pass: let-me-in
       postgres_db: graph-node
       ipfs: "ipfs:5001"
-      ethereum: "goat-local:http://anvil:8545"
+      ethereum: "goat-local:http://goat-rpc:8545"
       ETHEREUM_POLLING_INTERVAL: "1000"
+      # the public testnet3 RPC rejects eth_getLogs ranges above 2000 blocks
+      GRAPH_ETHEREUM_MAX_BLOCK_RANGE_SIZE: "1000"
       GRAPH_LOG: info
     networks: [localnet]
     restart: "no"

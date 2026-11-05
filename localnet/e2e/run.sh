@@ -12,7 +12,8 @@
 # is saved before every case and restored after it on every path (pass, fail, timeout, interrupt); a restore that
 # had to change something restarts the nodes and is noted in the report. Results in $LOCALNET_DATA/results/<run>/: <case>.log, report.md, report.json, logs.tar.gz
 # (every node/support log written during the run); results/latest -> newest run. Exit code 0 only when nothing failed
-# (a SKIP is not a failure).
+# (a SKIP is not a failure). E2E_STOP_AFTER=1 (default) stops the whole localnet, infra included, when the run
+# exits for any reason (scripts/down.sh infra; data kept, scripts/up.sh brings it back); 0 leaves it running.
 set -uo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 source "$ROOT/e2e/lib.sh" >/dev/null 2>&1
@@ -80,6 +81,9 @@ CASE_PID=""
 on_interrupt() { [[ -n $CASE_PID ]] && kill -TERM $(descendants "$CASE_PID") "$CASE_PID" 2>/dev/null
   [[ -f "$RUN/.tuning-before" ]] && tuning_restore >/dev/null 2>&1; "$CHAOS" reset >/dev/null 2>&1; echo "interrupted" >&2; exit 130; }
 trap on_interrupt INT TERM
+stop_after() { [[ "${E2E_STOP_AFTER:-1}" == 1 ]] || return 0
+  echo "stopping the localnet (E2E_STOP_AFTER=0 keeps it running)"; "$ROOT/scripts/down.sh" infra >/dev/null 2>&1 || echo "down.sh infra failed" >&2; }
+trap stop_after EXIT
 
 # ---- per-case timeout: the case runs in a subshell; on expiry its whole process tree is killed ----
 descendants() { local p; for p in $(ps -o pid= --ppid "$1" 2>/dev/null); do descendants "$p"; echo "$p"; done; }
