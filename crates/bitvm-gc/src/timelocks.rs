@@ -40,6 +40,9 @@ pub const NODE_SIGNET_TIMELOCK_CONFIG: TimelockConfig = TimelockConfig {
 /// Regtest keeps `connector_z` (T0) wide on purpose: the peg-in pre-signing
 /// ceremony and the abandon buffer are measured in blocks, and a one-block T0
 /// would expire every localnet peg-in before the committee finishes signing.
+/// Its budget has no inclusion or safety blocks, so `connector_f` keeps one
+/// block above the minimum: otherwise a Commit-Timeout sent one block after T6
+/// confirms in the block where Take-2 becomes valid.
 pub const NODE_REGTEST_TIMELOCK_CONFIG: TimelockConfig = TimelockConfig {
     connector_z: 60,
     connector_a: 2,
@@ -48,7 +51,7 @@ pub const NODE_REGTEST_TIMELOCK_CONFIG: TimelockConfig = TimelockConfig {
     watchtower_challenge: 1,
     operator_ack: 2,
     operator_commit: 3,
-    connector_f: 5,
+    connector_f: 6,
 };
 
 pub fn default_timelock_config(network: Network) -> TimelockConfig {
