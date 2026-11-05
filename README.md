@@ -29,6 +29,8 @@ core dispute safety for Bitcoin, Testnet4, Signet and Regtest:
   An honest verifier's enabled defences have an explicit bounded response time.
 - `tests/tla_shipped_values.rs` checks that the TLA values match Rust. A timing
   change requires regenerating the values and rerunning the checks.
+- Every other `audit/tla/<Model>.tla` with a `<Model>.cfg` is checked as well;
+  its header states what it models and which code it follows.
 
 The timing model is finite, init-only arithmetic. Its Disprove comparison assumes
 VerifierAssert confirms within `action_window` of OperatorAssert; earlier maturity
