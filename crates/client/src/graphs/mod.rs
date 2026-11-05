@@ -93,6 +93,9 @@ impl GraphQueryClient {
 
     pub async fn get_sync_block_height(&self, subgraph_url: &str) -> anyhow::Result<Option<i64>> {
         let query_res = self.execute_query(subgraph_url, &get_meta_data_query()).await?;
+        if query_res["_meta"]["hasIndexingErrors"].as_bool() == Some(true) {
+            anyhow::bail!("subgraph reports indexing errors");
+        }
         Ok(query_res["_meta"]["block"]["number"].clone().as_i64())
     }
 }
