@@ -54,7 +54,10 @@ jobs:
           args: --all -- --check
   clippy:
     name: Clippy
-    runs-on: ubuntu-latest
+    # Keep Ziren's generated FFI layouts on the tested LLVM 18 environment.
+    runs-on: ubuntu-24.04
+    env:
+      LIBCLANG_PATH: /usr/lib/llvm-18/lib
     steps:
       - uses: actions/checkout@v5
       - uses: actions-rs/toolchain@v1
@@ -77,13 +80,15 @@ jobs:
           rustc --version
           cargo --version
       - name: Install Dependencies
-        run: sudo apt update && sudo apt install protobuf-compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libclang-18-dev
       - run: |
           source ~/.zkm-toolchain/env
           cargo clippy --all-targets --features rpc-debug-endpoints -- -D warnings
   test:
     name: Cargo Test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    env:
+      LIBCLANG_PATH: /usr/lib/llvm-18/lib
     steps:
       - uses: actions/checkout@v5
       - name: Install Ziren toolchain
@@ -99,7 +104,7 @@ jobs:
           rustc --version
           cargo --version
       - name: Install Dependencies
-        run: sudo apt update && sudo apt install protobuf-compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libclang-18-dev
       - name: Launch the Regtest
         run: cd scripts && docker compose up -d
       - name: Run all unit tests
