@@ -414,6 +414,12 @@ pub async fn pegin_request_monitor(
 }
 
 /// Keep a poisoned request from unwinding the monitor or blocking later records.
+///
+/// Unwind-safe because a request shares no in-memory state with the monitor:
+/// all of its writes go through one database transaction committed last, so a
+/// panic drops the transaction and rolls them back, and the engine is only
+/// woken after the commit. A panicked request is marked `Failed` and is not
+/// picked up again; after the bug is fixed, set it back to `Pending` by hand.
 async fn isolate_pegin_request(
     local_db: &LocalDB,
     record: &GoatTxRecord,
@@ -482,9 +488,12 @@ async fn process_pegin_request_record(
         match generate_instance_from_bridge_in_request_event(btc_client, goat_client, &event).await
         {
             Ok(instance) => instance,
-            Err(error) if classify_failure(&error) == FailureClass::Transient => return Err(error),
+            // Only a proven-invalid request is skipped; an unknown failure says
+            // nothing about the request, so it stays pending and is retried.
+            Err(error) if !matches!(classify_failure(&error), FailureClass::Permanent(_)) => {
+                return Err(error);
+            }
             Err(error) => {
-                // Preserve the existing rejection of malformed data and contract refusals.
                 warn!(event = "pegin_request", instance_id = %instance_id, error = %error,
                 "could not build the instance of a BridgeInRequest; request skipped");
                 local_db
@@ -607,7 +616,8 @@ mod tests {
         );
         let mut records = Vec::new();
         let mut retry_data = None;
-        for id in 1..=4 {
+        let mut unknown_data = None;
+        for id in 1..=5 {
             let mut record = pending_record(id);
             let event = BridgeInRequestEvent {
                 id: id.to_string(),
@@ -650,10 +660,18 @@ mod tests {
                 assert!(error.to_string().contains("output count"));
             }
             if id == 3 {
-                retry_data = Some(data);
+                retry_data = Some(data.clone());
                 goat_mock.set_pegin_data(
                     *record.instance_id.as_bytes(),
                     Err("503 service unavailable".into()),
+                );
+            }
+            if id == 5 {
+                // Neither a backend outage nor a rejection: retried, not skipped.
+                unknown_data = Some(data.clone());
+                goat_mock.set_pegin_data(
+                    *record.instance_id.as_bytes(),
+                    Err("unexpected pegin data".into()),
                 );
             }
             record.extra =
@@ -662,7 +680,8 @@ mod tests {
             records.push(record);
         }
         assert!(pegin_request_monitor(&db, &btc, &goat, &engine.handle()).await.is_err());
-        for (record, expected) in records.iter().zip(["Skipped", "Skipped", "Pending", "Processed"])
+        for (record, expected) in
+            records.iter().zip(["Skipped", "Skipped", "Pending", "Processed", "Pending"])
         {
             assert_eq!(status(&db, record).await, expected);
         }
@@ -685,8 +704,10 @@ mod tests {
                 .is_some()
         );
         goat_mock.set_pegin_data(*records[2].instance_id.as_bytes(), Ok(retry_data.unwrap()));
+        goat_mock.set_pegin_data(*records[4].instance_id.as_bytes(), Ok(unknown_data.unwrap()));
         pegin_request_monitor(&db, &btc, &goat, &engine.handle()).await.unwrap();
         assert_eq!(status(&db, &records[2]).await, "Processed");
+        assert_eq!(status(&db, &records[4]).await, "Processed");
     }
 
     #[tokio::test]
@@ -699,6 +720,19 @@ mod tests {
         }
         let operation = async {
             let mut tx = db.start_transaction().await?;
+            tx.upsert_pegin_request_instance(&Instance {
+                instance_id: poisoned.instance_id,
+                ..Default::default()
+            })
+            .await?;
+            record_event_in(
+                &mut tx,
+                pegin_request_event(
+                    poisoned.instance_id,
+                    &PeginRequested { tx_hash: "poisoned".into() },
+                )?,
+            )
+            .await?;
             tx.update_goat_tx_record_processing_status(
                 &poisoned.graph_id,
                 &poisoned.instance_id,
@@ -719,6 +753,20 @@ mod tests {
         assert!(isolate_pegin_request(&db, &poisoned, operation).await.is_err());
         assert_eq!(status(&db, &poisoned).await, "Failed");
         assert_eq!(status(&db, &next).await, "Pending");
+        let mut storage = db.acquire().await.unwrap();
+        assert!(storage.find_instance(&poisoned.instance_id).await.unwrap().is_none());
+        assert!(
+            storage
+                .list_engine_inbox_events_for_aggregate(
+                    crate::aggregates::instance::INSTANCE_KIND,
+                    &poisoned.instance_id.to_string(),
+                    10,
+                )
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        drop(storage);
         isolate_pegin_request(&db, &next, async {
             db.acquire()
                 .await?
