@@ -486,15 +486,20 @@ pub enum DisproveTxType { Disprove, QuickChallenge, ChallengeIncompleteKickoff, 
 
 `watchtower_challenge_status` and `verifier_challenge_status` are **observational bookkeeping only** — they are recorded for the frontend/API (`node/src/rpc_service/bitvm.rs:672-693`, collapsed there into a simpler `SimpleChallengeSubStatus{None, WatchtowerChallenge, Assert}` view) but are never read by anything that decides `GraphStatus`.  The real `Challenge --> OperatorTake2` gate is purely `tx_on_chain(take2_txid)` after none of the four disprove detectors fired (`node/src/utils.rs:1661-1670`); the operator's actual authorization to broadcast take2 is enforced by Bitcoin-script timelocks (the `take2` job re-checks them), not by any application-level quorum over watchtower or verifier counts.
 
-### Known gap: no ordering guarantee between chain-scan and L2-event writers
+### Concurrent graph status updates
 
-`GraphStatus` is written from two independently-scheduled places with no inherent coordination between them:
-- `scan_graph_chain_state` above (Bitcoin-poll derived), and
-- the GoatChain L2-event watcher, `node/src/scheduled_tasks/event_watch_task.rs:392-502`, which writes `OperatorDataPushed`/`OperatorTake1`/`OperatorTake2`/`Disprove` directly via `StorageProcessor::update_graph` with no precondition on the graph's current status.
+Bitcoin chain scans and GoatChain event handling can update `GraphStatus`
+independently. Their updates pass through the transition guard rather than
+depending on the order in which these tasks run.
 
-Both currently go through a raw `UPDATE graph SET status = ?` (`crates/store/src/localdb.rs`) with no guard preventing a closed/terminal status (`GraphStatus::is_closed()`: `OperatorTake1`, `OperatorTake2`, `Skipped`, `Disprove`) from being overwritten by a later, differently-ordered write from the other subsystem — e.g. a `Disprove` status can be silently reverted by a stale `PostGraphDataEvent` replay. **This is an open bug, not yet fixed in code.**
+Status transitions use `StorageProcessor::transition_graph_status`
+(`crates/store/src/localdb/graph.rs`). The allowed source statuses are part of
+the conditional SQL update, so concurrent writers do not use a separate
+read-then-write guard.
 
-`node/tla/GraphLifecycle.tla` / `GraphLifecycle.cfg` has the machine-checked counterexample (`OperatorTake1 -> OperatorTake2` in 2 steps). A verified fix design exists and is formally proven correct — `GraphLifecycleFixed.cfg` (atomic guard: fold the check into the `UPDATE`'s `WHERE status IN (...)` clause rather than a separate read-then-decide-then-write) passes all safety and liveness properties, and `GraphLifecycleFineGrainedFixed.tla` additionally proves that atomicity is necessary (a naive read-then-write version of the same guard, modeled in `GraphLifecycleFineGrained.tla`, still fails). Applying that design to `node/src/utils.rs`/`crates/store/src/localdb.rs` is tracked as follow-up work, not part of this audit pass.
+The [transaction graph checks](../README.md#transaction-graph-checks) cover
+connector wiring, CSV maturity relations and core dispute safety. They do not
+model these database transitions or establish database safety or liveness.
 
 ---
 

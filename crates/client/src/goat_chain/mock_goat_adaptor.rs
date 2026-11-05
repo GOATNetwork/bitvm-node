@@ -25,14 +25,16 @@ pub struct GatewayContractConfig {
     pub min_slash_amount: u64,
 }
 
+type MockResponses<T> = Arc<Mutex<HashMap<[u8; 16], Result<T, String>>>>;
+
 #[derive(Clone, Debug)]
 pub struct MockAdaptor {
     finalized_block_number: Arc<Mutex<i64>>,
     latest_block_number: Arc<Mutex<i64>>,
     tx_receipts: Arc<Mutex<HashMap<String, TransactionReceipt>>>,
     gateway_contract_config: Arc<Mutex<GatewayContractConfig>>,
-    withdraw_data: Arc<Mutex<HashMap<[u8; 16], Result<WithdrawData, String>>>>,
-    pegin_data: Arc<Mutex<HashMap<[u8; 16], Result<PeginData, String>>>>,
+    withdraw_data: MockResponses<WithdrawData>,
+    pegin_data: MockResponses<PeginData>,
     spv_height: Arc<Mutex<Result<u64, String>>>,
 }
 
