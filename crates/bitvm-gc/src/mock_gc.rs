@@ -385,6 +385,16 @@ pub fn verify_operator_assert_proof(
     }
 }
 
+/// Replaces the operator's own pre-sign pairing check: mocked proofs cannot pass it, and the
+/// verdict must keep driving the verifiers, so an operator asserts any well-formed witness.
+pub fn check_own_assert_proof(
+    assert_witness: &TxAssertWitness,
+    _vk: &Groth16VerifyingKey<Bn254>,
+    _static_input: StaticInputs,
+) -> bool {
+    assert_witness.try_recover_pi1_xd().is_some() && assert_witness.recover_pi2_pi3().is_some()
+}
+
 /// Whether `verify_real_setup` re-derives every opened commitment from its revealed seed.
 /// Default on; set `MOCK_GC_VERIFY_OPENINGS=false`/`0` to skip (~174 instances) for speed.
 fn verify_openings_enabled() -> bool {
@@ -436,6 +446,22 @@ mod tests {
             b: G2Affine::generator(),
             c: G1Affine::generator(),
         }
+    }
+
+    #[test]
+    fn own_assert_check_only_requires_a_well_formed_witness() {
+        let (secret, _) = crate::operator::generate_assert_wots_key("own-assert-check");
+        let static_input = [Fr::from(2024u64); crate::babe_adapter::STATIC_SLOTS.len()];
+        let witness = crate::babe_adapter::build_assert_witness(
+            &mock_operator_proof(),
+            &secret,
+            Fr::from(7u64),
+        )
+        .expect("assert witness");
+        assert!(check_own_assert_proof(&witness, &test_vk(), static_input));
+        let mut malformed = witness;
+        malformed.pi2.clear();
+        assert!(!check_own_assert_proof(&malformed, &test_vk(), static_input));
     }
 
     struct Fixture {

@@ -371,3 +371,27 @@ fn assert_wots_message_works_for_invalid_field_elements() {
     let msg = assert_wots_message(&witness).expect("raw message extraction must succeed");
     assert_eq!(msg, raw_msg);
 }
+
+#[cfg(not(feature = "mock-gc"))]
+#[test]
+fn own_assert_check_accepts_only_a_verifying_proof() {
+    use ark_crypto_primitives::snark::SNARK;
+    use bitvm_gc::babe_adapter::check_own_assert_proof;
+    use bitvm_gc::operator::generate_assert_wots_key;
+
+    let mut rng = ChaCha12Rng::seed_from_u64(7);
+    let (a, b) = (Fr::from(3_u64), Fr::from(7_u64));
+    let circuit = DummyMulCircuit::<Fr> { a: Some(a), b: Some(b) };
+    let (pk, vk) = Groth16::<ark_bn254::Bn254>::setup(circuit, &mut rng).expect("groth16 setup");
+    let proof = Groth16::<ark_bn254::Bn254>::prove(&pk, circuit, &mut rng).expect("prove");
+    let static_input = [a * b, b];
+    let (sk, _) = generate_assert_wots_key("own-assert-check");
+
+    let honest = build_assert_witness(&proof, &sk, a * a).expect("assert witness");
+    assert!(check_own_assert_proof(&honest, &vk, static_input));
+
+    // A proof for another dynamic input, or against another statement, is refused.
+    let wrong_input = build_assert_witness(&proof, &sk, a * b).expect("assert witness");
+    assert!(!check_own_assert_proof(&wrong_input, &vk, static_input));
+    assert!(!check_own_assert_proof(&honest, &vk, [a * b, a]));
+}

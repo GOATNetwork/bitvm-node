@@ -26,8 +26,9 @@ pub use soldering_host::BabeBundleBuilder;
 // `build_real_challenge_assert_witness`) stays real in both builds.
 #[cfg(feature = "mock-gc")]
 pub use crate::mock_gc::{
-    BabeBundleBuilder, build_real_setup_package, open_real_setup_and_solder,
-    recover_real_wrongly_challenged_witness, verify_operator_assert_proof, verify_real_setup,
+    BabeBundleBuilder, build_real_setup_package, check_own_assert_proof,
+    open_real_setup_and_solder, recover_real_wrongly_challenged_witness,
+    verify_operator_assert_proof, verify_real_setup,
 };
 use verifiable_circuit_babe::babe::{
     GC_INPUT_WIRES, WitnessEncSetupCt,
@@ -412,6 +413,19 @@ pub fn recover_operator_proof_from_assert_witness(
 /// this is replaced by a policy verdict (`crate::mock_gc::verify_operator_assert_proof`).
 #[cfg(not(feature = "mock-gc"))]
 pub fn verify_operator_assert_proof(
+    assert_witness: &TxAssertWitness,
+    vk: &Groth16VerifyingKey<Bn254>,
+    static_input: StaticInputs,
+) -> bool {
+    assert_witness.verify_groth16_proof(vk, &static_input)
+}
+
+/// The operator's own pairing check of the proof it is about to assert, so a
+/// bad proof never consumes the one-time WOTS key. Under `mock-gc` the
+/// localnet proofs are fake and only the witness shape is checked
+/// (`crate::mock_gc::check_own_assert_proof`).
+#[cfg(not(feature = "mock-gc"))]
+pub fn check_own_assert_proof(
     assert_witness: &TxAssertWitness,
     vk: &Groth16VerifyingKey<Bn254>,
     static_input: StaticInputs,
