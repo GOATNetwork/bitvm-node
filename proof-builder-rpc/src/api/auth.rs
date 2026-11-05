@@ -113,18 +113,32 @@ impl RequestAuthorizer {
         Ok(graph_data)
     }
 
-    /// Checks that the signer is in the current global Watchtower registry.
+    /// Checks that the signer is in the current global Watchtower registry and
+    /// that the graph is registered under the instance; returns the graph data.
+    ///
+    /// The graph's own Watchtower list is not on chain, so slot membership is
+    /// enforced when the Operator task fixes the list.
     pub(crate) async fn authorize_watchtower(
         &self,
         signer: &XOnlyPublicKey,
         gateway_address: Option<&str>,
-    ) -> AuthResult<()> {
+        instance_id: &Uuid,
+        graph_id: &Uuid,
+    ) -> AuthResult<GraphData> {
         let chain = self.chain_for_gateway(gateway_address)?;
         let watchtowers = chain.watchtowers().await.map_err(contract_unavailable)?;
         if !watchtowers.contains(signer) {
             return Err(forbidden("watchtower signer is not registered"));
         }
-        Ok(())
+        let graph_data = chain.graph_data(graph_id).await.map_err(contract_unavailable)?;
+        if graph_data.operator_pubkey == [0; 32] {
+            return Err(forbidden("graph is not registered"));
+        }
+        let graph_ids = chain.graph_ids(instance_id).await.map_err(contract_unavailable)?;
+        if !graph_ids.contains(graph_id) {
+            return Err(forbidden("graph does not belong to instance"));
+        }
+        Ok(graph_data)
     }
 
     /// Selects the configured contract set identified by the signed request body.
@@ -192,7 +206,7 @@ fn unauthorized(message: &str) -> (StatusCode, Json<ErrorResponse>) {
 }
 
 /// Builds a 403 response for an authenticated identity without the required role or ownership.
-fn forbidden(message: &str) -> (StatusCode, Json<ErrorResponse>) {
+pub(crate) fn forbidden(message: &str) -> (StatusCode, Json<ErrorResponse>) {
     auth_error(StatusCode::FORBIDDEN, message)
 }
 
@@ -466,14 +480,36 @@ mod tests {
         let watchtower_keypair = keypair(9);
         let watchtower = watchtower_keypair.x_only_public_key().0;
         let other_watchtower = keypair(11);
+        let (instance_id, graph_id) = (Uuid::new_v4(), Uuid::new_v4());
         let chain = Arc::new(TestAuthorizationChain::default());
         chain.add_watchtower(watchtower);
+        chain.set_graph(instance_id, graph_id, keypair(7).x_only_public_key().0);
         let authorizer = RequestAuthorizer::new(chains(gateway(1), chain.clone()));
 
-        assert!(authorizer.authorize_watchtower(&watchtower, None).await.is_ok());
+        assert!(
+            authorizer
+                .authorize_watchtower(&watchtower, None, &instance_id, &graph_id)
+                .await
+                .is_ok()
+        );
+        // A graph that is unregistered or belongs to another instance is refused.
+        for (instance, graph) in [(instance_id, Uuid::new_v4()), (Uuid::new_v4(), graph_id)] {
+            assert_eq!(
+                authorizer
+                    .authorize_watchtower(&watchtower, None, &instance, &graph)
+                    .await
+                    .unwrap_err()
+                    .0,
+                StatusCode::FORBIDDEN
+            );
+        }
         chain.remove_watchtower(&watchtower);
         assert_eq!(
-            authorizer.authorize_watchtower(&watchtower, None).await.unwrap_err().0,
+            authorizer
+                .authorize_watchtower(&watchtower, None, &instance_id, &graph_id)
+                .await
+                .unwrap_err()
+                .0,
             StatusCode::FORBIDDEN
         );
 

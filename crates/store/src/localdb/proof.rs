@@ -516,6 +516,14 @@ impl StorageProcessor<'_> {
         Ok(res.rows_affected())
     }
 
+    pub async fn delete_watchtower_proof(&mut self, id: i64) -> anyhow::Result<u64> {
+        let res = sqlx::query("DELETE FROM watchtower_proof WHERE id = ?")
+            .bind(id)
+            .execute(self.conn())
+            .await?;
+        Ok(res.rows_affected())
+    }
+
     pub async fn find_watchtower_proof_by_instance_and_graph(
         &mut self,
         instance_id: &Uuid,

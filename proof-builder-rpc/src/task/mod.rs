@@ -18,6 +18,7 @@ use ::header_chain_proof::HeaderChainProofBuilder;
 use ::state_chain_proof::StateChainProofBuilder;
 use bitcoin::{BlockHash, Network, PublicKey, Txid};
 use client::btc_chain::BTCClient;
+use secp256k1::XOnlyPublicKey;
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -1007,11 +1008,20 @@ pub(crate) async fn update_long_running_task(
         .await
 }
 
+/// The stored form of a Watchtower key: compressed with even parity, as in
+/// the Operator's graph list. Only the x-only key matters to the circuit.
+pub(crate) fn watchtower_task_key(public_key: &XOnlyPublicKey) -> String {
+    format!("02{public_key}")
+}
+
 /// table schema: (index, instance_id, graph_id, public_key, challenge_txid, challenge_init_txid, path_to_proof, cycles, state, update_time)
 /// * index: incremental id
 /// * state: 0-new, 1-doing, 2-done, 3-failed
 ///
 /// Invoked by API.
+///
+/// Adds a Watchtower task. Returns `false` when the graph's Operator task
+/// already fixed its Watchtower list and this key has no slot in it.
 pub(crate) async fn add_watchtower_task(
     local_db: &LocalDB,
     instance_id: Uuid,
@@ -1019,8 +1029,17 @@ pub(crate) async fn add_watchtower_task(
     public_key: String,
     challenge_init_txid: String,
     execution_layer_block_number: i64,
-) -> anyhow::Result<u64> {
-    let mut storage_processor = local_db.acquire().await?;
+) -> anyhow::Result<bool> {
+    let mut storage_processor = local_db.start_transaction().await?;
+    // The Operator task creates a row for every slot of the graph, so once it
+    // exists any key without a row is not one of the graph's Watchtowers.
+    if storage_processor
+        .find_operator_proof_by_instance_and_graph(&instance_id, &graph_id)
+        .await?
+        .is_some()
+    {
+        return Ok(false);
+    }
     storage_processor
         .create_watchtower_proof(&WatchtowerProof {
             id: 1,
@@ -1035,7 +1054,9 @@ pub(crate) async fn add_watchtower_task(
             included: true,
             ..Default::default()
         })
-        .await
+        .await?;
+    storage_processor.commit().await?;
+    Ok(true)
 }
 
 pub(crate) async fn find_watchtower_task(
@@ -1100,23 +1121,21 @@ pub(crate) async fn add_operator_task(
     tracing::info!("existing_watchtower_proof_task: {:?}", existing_watchtower_proof_task);
     let mut existing_watchtower_indices = HashSet::new();
     for task in &existing_watchtower_proof_task {
-        let xonly_key = parse_xonly_public_key(&task.public_key).map_err(|error| {
-            anyhow::anyhow!(
-                "invalid stored watchtower public key for task {} in graph {}: {error}",
+        let node_index = parse_xonly_public_key(&task.public_key).ok().and_then(|xonly_key| {
+            graph_watchtower_xonly_keys.iter().position(|graph_key| *graph_key == xonly_key)
+        });
+        // A registered Watchtower may submit for any graph; a key outside this
+        // graph's list has no slot and is dropped instead of failing the task.
+        let Some(node_index) = node_index else {
+            tracing::warn!(
+                "dropping watchtower task {} with key {} outside graph {}",
                 task.id,
+                task.public_key,
                 graph_id
-            )
-        })?;
-        let node_index = graph_watchtower_xonly_keys
-            .iter()
-            .position(|graph_key| *graph_key == xonly_key)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "stored watchtower public key for task {} does not belong to graph {}",
-                    task.id,
-                    graph_id
-                )
-            })?;
+            );
+            storage_processor.delete_watchtower_proof(task.id).await?;
+            continue;
+        };
         if !existing_watchtower_indices.insert(node_index) {
             anyhow::bail!(
                 "multiple watchtower proof tasks map to node index {node_index} in graph {graph_id}"
@@ -1147,7 +1166,9 @@ pub(crate) async fn add_operator_task(
             updated_at: current_time_secs(),
             execution_layer_block_number,
             // The Graph key identifies the missing Watchtower slot.
-            public_key: watchtower_challenge_pubkeys[node_index].clone(),
+            public_key: watchtower_task_key(&XOnlyPublicKey::from_slice(
+                &graph_watchtower_xonly_keys[node_index],
+            )?),
             node_index: node_index as i32,
             included: included_watchtowers[node_index],
             ..Default::default()
@@ -1446,5 +1467,68 @@ mod queue_tests {
                 .unwrap(),
             Some(ProofState::Failed.to_i64())
         );
+    }
+}
+
+#[cfg(test)]
+mod watchtower_slot_tests {
+    use super::*;
+    use secp256k1::{Keypair, SECP256K1};
+    use store::create_local_db;
+
+    fn key(seed: u8) -> XOnlyPublicKey {
+        Keypair::from_seckey_slice(SECP256K1, &[seed; 32]).unwrap().x_only_public_key().0
+    }
+
+    async fn add(local_db: &LocalDB, graph_id: Uuid, key: &XOnlyPublicKey) -> anyhow::Result<bool> {
+        add_watchtower_task(
+            local_db,
+            Uuid::nil(),
+            graph_id,
+            watchtower_task_key(key),
+            "22".repeat(32),
+            1,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn operator_task_keeps_only_the_graphs_watchtower_slots() {
+        let local_db = create_local_db("sqlite::memory:").await;
+        let graph_id = Uuid::new_v4();
+        let (member, outsider) = (key(1), key(2));
+        assert!(add(&local_db, graph_id, &outsider).await.unwrap());
+        assert!(add(&local_db, graph_id, &member).await.unwrap());
+        // One row per key, whatever spelling the Watchtower used.
+        assert!(add(&local_db, graph_id, &member).await.is_err());
+
+        // The Operator lists the member as compressed with odd parity.
+        let member_odd = format!("03{member}");
+        add_operator_task(
+            &local_db,
+            Uuid::nil(),
+            graph_id,
+            "11".repeat(32),
+            1,
+            vec![None],
+            vec![false],
+            "22".repeat(32),
+            vec![member_odd],
+        )
+        .await
+        .unwrap();
+
+        let rows = local_db
+            .acquire()
+            .await
+            .unwrap()
+            .find_watchtower_proof_by_instance_and_graph(&Uuid::nil(), &graph_id)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].public_key, watchtower_task_key(&member));
+        assert_eq!(rows[0].node_index, 0);
+        // The list is fixed now; a key outside it cannot add a task.
+        assert!(!add(&local_db, graph_id, &outsider).await.unwrap());
     }
 }
