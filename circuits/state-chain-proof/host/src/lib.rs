@@ -132,6 +132,7 @@ fn parse_gateway_addresses(value: &str) -> anyhow::Result<Vec<Address>> {
 }
 
 /// Decode ProceedWithdraw(bytes16 indexed instanceId, bytes16 indexed graphId, bytes32 kickoffTxid).
+/// <https://github.com/GOATNetwork/bitvm-L2-contracts/blob/ad14d956ac670414553f08548345627cc7a88e1b/src/interfaces/IGateway.sol#L154>
 fn decode_proceed_withdraw(topics: &[B256], data: &[u8]) -> anyhow::Result<[u8; 16]> {
     if topics.len() != 3
         || data.len() != 32
