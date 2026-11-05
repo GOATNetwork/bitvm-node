@@ -70,7 +70,7 @@ pub enum ProofRequest {
         graph_watchtower_xonly_public_keys: Vec<[u8; 32]>,
         watchtower_challenge_init_txid: Txid,
         watchtower_challenge_init_txn: Option<Transaction>,
-        watchtower_challenge_witnesses: Vec<(u16, u32, Block, Transaction)>,
+        watchtower_challenge_witnesses: Vec<(u16, u32, Block, Transaction, Vec<Transaction>)>,
     },
 }
 

@@ -1100,7 +1100,7 @@ async fn challenge_ack(
         output_topology::watchtower_challenge_init::watchtower_connector(watchtower_index) as u64;
     // The scan saw this watchtower's challenge confirmed; a read that disagrees
     // is looked at again rather than ending the only ACK job of the branch.
-    let Some((spent_txid, vin, _)) = outpoint_spent_txin(btc, &wci_txid, watchtower_vout).await?
+    let Some((spent_txid, _, _)) = outpoint_spent_txin(btc, &wci_txid, watchtower_vout).await?
     else {
         return after_blocks(
             deps,
@@ -1108,11 +1108,6 @@ async fn challenge_ack(
             1,
         );
     };
-    if vin != 0 {
-        return Step::ignore(format!(
-            "watchtower connector {watchtower_index} spent by {spent_txid} at input {vin}"
-        ));
-    }
     let timeout_txid = graph.watchtower_challenge_timeouts[watchtower_index].tx().compute_txid();
     if spent_txid == timeout_txid {
         return Step::ignore(format!("watchtower {watchtower_index} timed out"));
