@@ -36,8 +36,8 @@ use bitcoin::{Amount, PublicKey, Txid};
 use bitvm_lib::babe_adapter::{
     BabeChallengeAssertWitness, ChallengeAssertWitnessRaw, TxAssertWitness, WOTS_SIG_COUNT,
     assert_wots_message, build_assert_witness, build_real_challenge_assert_witness,
-    expand_compact_soldering_proof_payload, recover_operator_proof_from_assert_witness,
-    recover_real_wrongly_challenged_witness,
+    check_own_assert_proof, expand_compact_soldering_proof_payload,
+    recover_operator_proof_from_assert_witness, recover_real_wrongly_challenged_witness,
 };
 use bitvm_lib::keys::{VerifierMasterKey, WatchtowerMasterKey};
 use bitvm_lib::operator::*;
@@ -1266,7 +1266,18 @@ async fn prover_assert(deps: &JobDeps, mut graph: BitvmGcGraph) -> Result<Step> 
     let assert_secret = master.assert_wots_keypair_for_graph(graph_id).0;
     let dynamic_input = operator_assert_dynamic_input(&proof.public_inputs)?;
     let witness = build_assert_witness(&proof.proof, &assert_secret, dynamic_input)?;
+    // The WOTS key signs once: check the proof as the verifiers will before using it.
+    let vk = crate::vk::get_vk().await.context("load Groth16 verifying key for operator assert")?;
+    if !check_own_assert_proof(&witness, &vk, derive_operator_static_input()?) {
+        bail!("operator proof fails Groth16 verification; not signing the assert");
+    }
     let message = assert_wots_message(&witness)?;
+    // Signed in memory only: nothing is revealed until the broadcast below.
+    let assert_tx =
+        operator_sign_assert(&mut graph, &assert_secret, &message, &witness.pi2, &witness.pi3)?;
+    if let Some(step) = check_own_assert_pubin(deps, &graph, &assert_tx).await? {
+        return Ok(step);
+    }
     let mut asserted_proof = Vec::new();
     proof.proof.serialize_compressed(&mut asserted_proof)?;
     let mut setup_state = load_babe_setup_state(&deps.local_db, instance_id, graph_id)?
@@ -1282,13 +1293,47 @@ async fn prover_assert(deps: &JobDeps, mut graph: BitvmGcGraph) -> Result<Step> 
     }
     operator_state.asserted_operator_proof = Some(asserted_proof);
     save_babe_setup_state(&deps.local_db, instance_id, graph_id, &setup_state)?;
-    let assert_tx =
-        operator_sign_assert(&mut graph, &assert_secret, &message, &witness.pi2, &witness.pi3)?;
     let input_amount = graph.operator_assert.prev_outs().iter().map(|o| o.value).sum::<Amount>();
     let assert_txid = assert_tx.compute_txid();
     broadcast_tx_with_cpfp(btc, assert_tx, input_amount).await?;
     info!(event = "graph_challenge", graph_id = %graph_id, txid = %assert_txid, "Prover-Assert broadcast");
     broadcast_pending(deps, &format!("Prover-Assert {assert_txid}"))
+}
+
+/// Run the verifiers' Pubin-Disprove check against the operator's own signed
+/// assert and its on-chain Commit-Pubin; refuse to broadcast an assert that it
+/// would disprove.
+async fn check_own_assert_pubin(
+    deps: &JobDeps,
+    graph: &BitvmGcGraph,
+    assert_tx: &bitcoin::Transaction,
+) -> Result<Option<Step>> {
+    let btc = &deps.btc_client;
+    let connector_e = graph
+        .watchtower_challenge_init
+        .connector_e_input()
+        .map_err(|error| anyhow!("failed to resolve connector-E input: {error}"))?
+        .outpoint;
+    let Some((_, _, commit_pubin_txin)) =
+        outpoint_spent_txin(btc, &connector_e.txid, u64::from(connector_e.vout)).await?
+    else {
+        return after_blocks(deps, "own commit-pubin is not available yet", 1).map(Some);
+    };
+    let assert_txin = assert_tx
+        .input
+        .first()
+        .ok_or_else(|| anyhow!("operator assert transaction has no input"))?;
+    let wci_txid = graph.watchtower_challenge_init.tx().compute_txid();
+    let timeout_txids = graph
+        .watchtower_challenge_timeouts
+        .iter()
+        .map(|tx| tx.tx().compute_txid())
+        .collect::<Vec<_>>();
+    let (ack_txins, _) = collect_ack_txins(btc, &wci_txid, &timeout_txids).await?;
+    if validate_pubin_disprove(graph, &commit_pubin_txin, assert_txin, &ack_txins)?.is_some() {
+        bail!("operator proof does not match the committed pubin; not signing the assert");
+    }
+    Ok(None)
 }
 
 /// Recovers a `BabeChallengeAssertWitness` from the on-chain challenge assert tx.
