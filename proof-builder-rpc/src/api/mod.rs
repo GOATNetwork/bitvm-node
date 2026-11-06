@@ -13,21 +13,30 @@ use crate::api::proof_handler::{
     update_watchtower_proof_task_timeout,
 };
 use anyhow::Context;
+use axum::extract::{Request, State};
 use axum::http::{Method, StatusCode};
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Router, middleware};
 use std::sync::Arc;
 use store::localdb::LocalDB;
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::{Any, CorsLayer};
 
 pub(crate) use auth::{AuthorizationChain, AuthorizationChains};
 
+/// Requests the business routes serve at once; further requests get 503
+/// instead of queueing signature checks, GOAT queries and database work.
+const MAX_CONCURRENT_REQUESTS: usize = 64;
+
 pub(crate) struct ApiState {
     pub local_db: LocalDB,
     pub metrics_state: ApiMetricsState,
     auth: RequestAuthorizer,
+    request_slots: Semaphore,
 }
 
 impl ApiState {
@@ -41,7 +50,20 @@ impl ApiState {
             local_db,
             metrics_state,
             auth: RequestAuthorizer::new(authorization_chains),
+            request_slots: Semaphore::new(MAX_CONCURRENT_REQUESTS),
         })
+    }
+}
+
+/// Refuses a request with 503 while `MAX_CONCURRENT_REQUESTS` are in flight.
+async fn limit_concurrency(
+    State(state): State<Arc<ApiState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    match state.request_slots.try_acquire() {
+        Ok(_slot) => next.run(request).await,
+        Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "too many concurrent requests").into_response(),
     }
 }
 
@@ -63,6 +85,7 @@ pub(crate) async fn serve_with_app_state(
         .route(routes::v1::PROOFS_OPERATOR_PROOF_TIMEOUT, post(update_operator_proof_task_timeout))
         .route(routes::v1::PROOFS_OPERATOR_PROOF_DESC, get(get_operator_proof_task_desc))
         .fallback(|| async { StatusCode::NOT_FOUND })
+        .layer(middleware::from_fn_with_state(api_state.clone(), limit_concurrency))
         .layer(middleware::from_fn_with_state(api_state.clone(), metrics_middleware));
     let server = instrumented_routes
         .layer(CorsLayer::new().allow_headers(Any).allow_origin(Any).allow_methods(vec![
@@ -644,6 +667,32 @@ mod tests {
         cancellation_token.cancel();
         server.await??;
         metrics_server.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn requests_beyond_the_concurrency_limit_get_503() -> anyhow::Result<()> {
+        let addr = available_addr();
+        let cancellation_token = CancellationToken::new();
+        let api_state = ApiState::new(
+            store::create_local_db("sqlite::memory:").await,
+            ApiMetricsState::new(),
+            authorization_chains(gateway(1), Arc::new(TestAuthorizationChain::default())),
+        );
+        let server = tokio::spawn(serve_with_app_state(
+            addr.clone(),
+            api_state.clone(),
+            cancellation_token.clone(),
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let busy = api_state.request_slots.try_acquire_many(MAX_CONCURRENT_REQUESTS as u32)?;
+        assert!(get(&addr, routes::ROOT).await?.starts_with("HTTP/1.1 503"));
+        drop(busy);
+        assert!(get(&addr, routes::ROOT).await?.starts_with("HTTP/1.1 200"));
+
+        cancellation_token.cancel();
+        server.await??;
         Ok(())
     }
 }

@@ -11,8 +11,9 @@ use proof_builder::api_auth::{
 };
 use secp256k1::XOnlyPublicKey;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 pub(crate) type AuthResult<T> = Result<T, (StatusCode, Json<ErrorResponse>)>;
@@ -43,18 +44,76 @@ impl AuthorizationChain for GOATClient {
     }
 }
 
+/// Upper bound on remembered nonces. Only authorized requests are remembered,
+/// so reaching it needs registered keys sending this many requests within
+/// `2 * AUTH_WINDOW_SECS`; past it new requests are refused, never earlier
+/// nonces forgotten.
+const MAX_ACCEPTED_NONCES: usize = 100_000;
+
+/// How long a fetched Watchtower registry answers authorization checks.
+const WATCHTOWER_REGISTRY_TTL: Duration = Duration::from_secs(5);
+
+/// A request whose signature verified and whose nonce is not yet used.
+/// The nonce is recorded only once authorization succeeds.
+#[derive(Debug)]
+pub(crate) struct AuthenticatedRequest {
+    pub(crate) signer: XOnlyPublicKey,
+    nonce: String,
+}
+
+type NonceKey = ([u8; 32], String);
+
+/// Nonces of authorized requests in acceptance order, kept until their
+/// request timestamps can no longer pass the auth window.
+struct ReplayCache {
+    capacity: usize,
+    expiry_order: VecDeque<(i64, NonceKey)>,
+    accepted: HashSet<NonceKey>,
+}
+
+impl ReplayCache {
+    fn new(capacity: usize) -> Self {
+        Self { capacity, expiry_order: VecDeque::new(), accepted: HashSet::new() }
+    }
+
+    /// Forgets nonces whose request timestamp has left the auth window.
+    fn evict_expired(&mut self, now: i64) {
+        while self.expiry_order.front().is_some_and(|(expires_at, _)| *expires_at < now) {
+            let (_, key) = self.expiry_order.pop_front().expect("front entry exists");
+            self.accepted.remove(&key);
+        }
+    }
+}
+
+/// One configured contract set plus its short-lived Watchtower registry copy.
+struct ChainEntry {
+    chain: Arc<dyn AuthorizationChain>,
+    watchtowers: tokio::sync::Mutex<Option<(Instant, Arc<Vec<XOnlyPublicKey>>)>>,
+}
+
 pub(crate) struct RequestAuthorizer {
-    chains: AuthorizationChains,
-    accepted_nonces: Mutex<HashMap<(String, String), i64>>,
+    chains: HashMap<Address, ChainEntry>,
+    replay_cache: Mutex<ReplayCache>,
 }
 
 impl RequestAuthorizer {
     /// Creates an authorizer backed by live GOAT contract queries.
     pub(crate) fn new(chains: AuthorizationChains) -> Self {
-        Self { chains, accepted_nonces: Mutex::new(HashMap::new()) }
+        Self::with_nonce_capacity(chains, MAX_ACCEPTED_NONCES)
     }
 
-    /// Verifies request credentials locally and returns the authenticated signer.
+    fn with_nonce_capacity(chains: AuthorizationChains, capacity: usize) -> Self {
+        let chains = chains
+            .into_iter()
+            .map(|(address, chain)| {
+                (address, ChainEntry { chain, watchtowers: tokio::sync::Mutex::new(None) })
+            })
+            .collect();
+        Self { chains, replay_cache: Mutex::new(ReplayCache::new(capacity)) }
+    }
+
+    /// Verifies request credentials locally and rejects a nonce already used
+    /// by the same signer. The nonce is recorded by `authorize_*`.
     pub(crate) fn authenticate<B: Serialize>(
         &self,
         headers: &HeaderMap,
@@ -63,7 +122,7 @@ impl RequestAuthorizer {
         path: &str,
         body: &B,
         claimed_watchtower_public_key: Option<&str>,
-    ) -> AuthResult<XOnlyPublicKey> {
+    ) -> AuthResult<AuthenticatedRequest> {
         let timestamp = required_header(headers, AUTH_TIMESTAMP_HEADER)?;
         let nonce = required_header(headers, AUTH_NONCE_HEADER)?;
         let signer_value = required_header(headers, AUTH_PUBLIC_KEY_HEADER)?;
@@ -83,20 +142,26 @@ impl RequestAuthorizer {
             role, method, path, timestamp, nonce, &signer, signature, body,
         )
         .map_err(|_| unauthorized("invalid request signature"))?;
-        self.record_nonce(&signer.to_string(), nonce)?;
-        Ok(signer)
+        let key = (signer.serialize(), nonce.to_string());
+        let mut cache = self.lock_replay_cache()?;
+        cache.evict_expired(current_time_secs());
+        if cache.accepted.contains(&key) {
+            return Err(unauthorized("request nonce has already been used"));
+        }
+        Ok(AuthenticatedRequest { signer, nonce: key.1 })
     }
 
     /// Checks current graph ownership and instance membership for an Operator
     /// and returns the registered graph data.
     pub(crate) async fn authorize_operator(
         &self,
-        signer: &XOnlyPublicKey,
+        request: &AuthenticatedRequest,
         gateway_address: Option<&str>,
         instance_id: &Uuid,
         graph_id: &Uuid,
     ) -> AuthResult<GraphData> {
-        let chain = self.chain_for_gateway(gateway_address)?;
+        let chain = &self.chain_for_gateway(gateway_address)?.chain;
+        let signer = &request.signer;
         let signer_bytes = signer.serialize();
         let graph_data = chain.graph_data(graph_id).await.map_err(contract_unavailable)?;
         if graph_data.operator_pubkey == [0; 32] {
@@ -110,6 +175,7 @@ impl RequestAuthorizer {
         if !graph_ids.contains(graph_id) {
             return Err(forbidden("graph does not belong to instance"));
         }
+        self.record_nonce(request)?;
         Ok(graph_data)
     }
 
@@ -120,14 +186,14 @@ impl RequestAuthorizer {
     /// enforced when the Operator task fixes the list.
     pub(crate) async fn authorize_watchtower(
         &self,
-        signer: &XOnlyPublicKey,
+        request: &AuthenticatedRequest,
         gateway_address: Option<&str>,
         instance_id: &Uuid,
         graph_id: &Uuid,
     ) -> AuthResult<GraphData> {
-        let chain = self.chain_for_gateway(gateway_address)?;
-        let watchtowers = chain.watchtowers().await.map_err(contract_unavailable)?;
-        if !watchtowers.contains(signer) {
+        let entry = self.chain_for_gateway(gateway_address)?;
+        let chain = &entry.chain;
+        if !watchtower_registry(entry).await?.contains(&request.signer) {
             return Err(forbidden("watchtower signer is not registered"));
         }
         let graph_data = chain.graph_data(graph_id).await.map_err(contract_unavailable)?;
@@ -138,14 +204,12 @@ impl RequestAuthorizer {
         if !graph_ids.contains(graph_id) {
             return Err(forbidden("graph does not belong to instance"));
         }
+        self.record_nonce(request)?;
         Ok(graph_data)
     }
 
     /// Selects the configured contract set identified by the signed request body.
-    fn chain_for_gateway(
-        &self,
-        gateway_address: Option<&str>,
-    ) -> AuthResult<Arc<dyn AuthorizationChain>> {
+    fn chain_for_gateway(&self, gateway_address: Option<&str>) -> AuthResult<&ChainEntry> {
         let gateway_address = match gateway_address {
             Some(value) => {
                 let address = value
@@ -157,7 +221,7 @@ impl RequestAuthorizer {
                 address
             }
             None if self.chains.len() == 1 => {
-                return Ok(self.chains.values().next().expect("one chain is configured").clone());
+                return Ok(self.chains.values().next().expect("one chain is configured"));
             }
             None => {
                 return Err(bad_request(
@@ -168,23 +232,52 @@ impl RequestAuthorizer {
 
         self.chains
             .get(&gateway_address)
-            .cloned()
             .ok_or_else(|| forbidden("gateway_address is not configured"))
     }
 
-    /// Atomically rejects a nonce already accepted from the same signer.
-    fn record_nonce(&self, signer: &str, nonce: &str) -> AuthResult<()> {
+    /// Atomically records an authorized request's nonce, rejecting a
+    /// concurrent replay that passed `authenticate` at the same time.
+    fn record_nonce(&self, request: &AuthenticatedRequest) -> AuthResult<()> {
         let now = current_time_secs();
-        let mut accepted_nonces = self
-            .accepted_nonces
-            .lock()
-            .map_err(|_| internal_error("authentication replay cache is unavailable"))?;
-        accepted_nonces.retain(|_, accepted_at| now - *accepted_at <= AUTH_WINDOW_SECS);
-        if accepted_nonces.insert((signer.to_string(), nonce.to_string()), now).is_some() {
+        let mut cache = self.lock_replay_cache()?;
+        cache.evict_expired(now);
+        let key = (request.signer.serialize(), request.nonce.clone());
+        if cache.accepted.contains(&key) {
             return Err(unauthorized("request nonce has already been used"));
         }
+        if cache.accepted.len() >= cache.capacity {
+            tracing::warn!(capacity = cache.capacity, "authentication replay cache is full");
+            return Err(auth_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "authentication replay cache is full",
+            ));
+        }
+        // A timestamp up to AUTH_WINDOW_SECS ahead of now stays valid for
+        // another AUTH_WINDOW_SECS, so keep the nonce for both windows.
+        cache.accepted.insert(key.clone());
+        cache.expiry_order.push_back((now + 2 * AUTH_WINDOW_SECS, key));
         Ok(())
     }
+
+    fn lock_replay_cache(&self) -> AuthResult<std::sync::MutexGuard<'_, ReplayCache>> {
+        self.replay_cache
+            .lock()
+            .map_err(|_| internal_error("authentication replay cache is unavailable"))
+    }
+}
+
+/// Returns the Watchtower registry, refetching it once the cached copy is
+/// older than `WATCHTOWER_REGISTRY_TTL`. Concurrent misses share one query.
+async fn watchtower_registry(entry: &ChainEntry) -> AuthResult<Arc<Vec<XOnlyPublicKey>>> {
+    let mut cached = entry.watchtowers.lock().await;
+    if let Some((fetched_at, watchtowers)) = cached.as_ref()
+        && fetched_at.elapsed() < WATCHTOWER_REGISTRY_TTL
+    {
+        return Ok(watchtowers.clone());
+    }
+    let watchtowers = Arc::new(entry.chain.watchtowers().await.map_err(contract_unavailable)?);
+    *cached = Some((Instant::now(), watchtowers.clone()));
+    Ok(watchtowers)
 }
 
 /// Builds a 400 response for an invalid or ambiguous Gateway selection.
@@ -369,6 +462,11 @@ mod tests {
         HashMap::from([(gateway, chain)])
     }
 
+    /// An authenticated request for `signer` with a fresh nonce.
+    fn request(signer: XOnlyPublicKey) -> AuthenticatedRequest {
+        AuthenticatedRequest { signer, nonce: Uuid::new_v4().to_string() }
+    }
+
     fn headers(values: &ProofBuilderAuthHeaders) -> HeaderMap {
         let mut headers = HeaderMap::new();
         for (name, value) in values.to_header_pairs() {
@@ -377,48 +475,162 @@ mod tests {
         headers
     }
 
-    #[test]
-    fn authenticates_valid_signer_once_and_rejects_replay() {
-        let operator = keypair(7);
-        let authorizer =
-            RequestAuthorizer::new(chains(gateway(1), Arc::new(TestAuthorizationChain::default())));
+    fn authenticate_operator(
+        authorizer: &RequestAuthorizer,
+        headers: &HeaderMap,
+        body: &TestBody,
+    ) -> AuthResult<AuthenticatedRequest> {
+        authorizer.authenticate(
+            headers,
+            ProofBuilderAuthRole::Operator,
+            "POST",
+            "/v1/proofs/operator_proofs",
+            body,
+            None,
+        )
+    }
+
+    fn signed_operator_request(operator: &Keypair) -> (HeaderMap, TestBody) {
         let body = TestBody { public_key: operator.public_key().to_string(), value: 1 };
         let signed = sign_proof_builder_request(
-            &operator,
+            operator,
             ProofBuilderAuthRole::Operator,
             "POST",
             "/v1/proofs/operator_proofs",
             &body,
         )
         .unwrap();
-        let headers = headers(&signed);
+        (headers(&signed), body)
+    }
 
-        assert!(
-            authorizer
-                .authenticate(
-                    &headers,
-                    ProofBuilderAuthRole::Operator,
-                    "POST",
-                    "/v1/proofs/operator_proofs",
-                    &body,
-                    None,
-                )
-                .is_ok()
-        );
+    fn accepted_nonces(authorizer: &RequestAuthorizer) -> usize {
+        authorizer.replay_cache.lock().unwrap().accepted.len()
+    }
+
+    #[tokio::test]
+    async fn authorized_nonce_is_rejected_on_replay() {
+        let operator = keypair(7);
+        let (instance_id, graph_id) = (Uuid::new_v4(), Uuid::new_v4());
+        let chain = Arc::new(TestAuthorizationChain::default());
+        chain.set_graph(instance_id, graph_id, operator.x_only_public_key().0);
+        let authorizer = RequestAuthorizer::new(chains(gateway(1), chain));
+        let (headers, body) = signed_operator_request(&operator);
+
+        let first = authenticate_operator(&authorizer, &headers, &body).unwrap();
+        // A copy racing the first one passes authentication, but only one of
+        // them can record the nonce.
+        let racing = authenticate_operator(&authorizer, &headers, &body).unwrap();
+        assert!(authorizer.authorize_operator(&first, None, &instance_id, &graph_id).await.is_ok());
         assert_eq!(
             authorizer
-                .authenticate(
-                    &headers,
-                    ProofBuilderAuthRole::Operator,
-                    "POST",
-                    "/v1/proofs/operator_proofs",
-                    &body,
-                    None,
-                )
+                .authorize_operator(&racing, None, &instance_id, &graph_id)
+                .await
                 .unwrap_err()
                 .0,
             StatusCode::UNAUTHORIZED
         );
+        assert_eq!(
+            authenticate_operator(&authorizer, &headers, &body).unwrap_err().0,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn unauthorized_signer_leaves_no_nonce_behind() {
+        // Any fresh key passes the signature check; without a registered
+        // graph it must not grow the replay cache.
+        let stranger = keypair(42);
+        let authorizer =
+            RequestAuthorizer::new(chains(gateway(1), Arc::new(TestAuthorizationChain::default())));
+        let (headers, body) = signed_operator_request(&stranger);
+
+        let request = authenticate_operator(&authorizer, &headers, &body).unwrap();
+        assert_eq!(
+            authorizer
+                .authorize_operator(&request, None, &Uuid::new_v4(), &Uuid::new_v4())
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(accepted_nonces(&authorizer), 0);
+    }
+
+    #[tokio::test]
+    async fn full_replay_cache_refuses_new_requests_until_entries_expire() {
+        let operator = keypair(7).x_only_public_key().0;
+        let (instance_id, graph_id) = (Uuid::new_v4(), Uuid::new_v4());
+        let chain = Arc::new(TestAuthorizationChain::default());
+        chain.set_graph(instance_id, graph_id, operator);
+        let authorizer = RequestAuthorizer::with_nonce_capacity(chains(gateway(1), chain), 2);
+
+        for _ in 0..2 {
+            let request = request(operator);
+            assert!(
+                authorizer
+                    .authorize_operator(&request, None, &instance_id, &graph_id)
+                    .await
+                    .is_ok()
+            );
+        }
+        assert_eq!(
+            authorizer
+                .authorize_operator(&request(operator), None, &instance_id, &graph_id)
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        // Once the oldest nonce's window has passed it is evicted and frees a slot.
+        authorizer.replay_cache.lock().unwrap().expiry_order[0].0 = current_time_secs() - 1;
+        assert!(
+            authorizer
+                .authorize_operator(&request(operator), None, &instance_id, &graph_id)
+                .await
+                .is_ok()
+        );
+        assert_eq!(accepted_nonces(&authorizer), 2);
+    }
+
+    #[tokio::test]
+    async fn watchtower_registry_is_reused_until_it_expires() {
+        let watchtower = keypair(9).x_only_public_key().0;
+        let (instance_id, graph_id) = (Uuid::new_v4(), Uuid::new_v4());
+        let chain = Arc::new(TestAuthorizationChain::default());
+        chain.add_watchtower(watchtower);
+        chain.set_graph(instance_id, graph_id, keypair(7).x_only_public_key().0);
+        let authorizer = RequestAuthorizer::new(chains(gateway(1), chain.clone()));
+
+        assert!(
+            authorizer
+                .authorize_watchtower(&request(watchtower), None, &instance_id, &graph_id)
+                .await
+                .is_ok()
+        );
+        // A deregistration shows up only once the cached registry expires.
+        chain.remove_watchtower(&watchtower);
+        assert!(
+            authorizer
+                .authorize_watchtower(&request(watchtower), None, &instance_id, &graph_id)
+                .await
+                .is_ok()
+        );
+        expire_watchtower_registry(&authorizer).await;
+        assert_eq!(
+            authorizer
+                .authorize_watchtower(&request(watchtower), None, &instance_id, &graph_id)
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    async fn expire_watchtower_registry(authorizer: &RequestAuthorizer) {
+        for entry in authorizer.chains.values() {
+            *entry.watchtowers.lock().await = None;
+        }
     }
 
     #[tokio::test]
@@ -432,7 +644,7 @@ mod tests {
 
         assert_eq!(
             authorizer
-                .authorize_operator(&operator, None, &instance_id, &graph_id)
+                .authorize_operator(&request(operator), None, &instance_id, &graph_id)
                 .await
                 .unwrap_err()
                 .0,
@@ -442,7 +654,7 @@ mod tests {
         chain.set_graph_owner(graph_id, other_operator);
         assert_eq!(
             authorizer
-                .authorize_operator(&operator, None, &instance_id, &graph_id)
+                .authorize_operator(&request(operator), None, &instance_id, &graph_id)
                 .await
                 .unwrap_err()
                 .0,
@@ -451,7 +663,10 @@ mod tests {
 
         chain.set_graph(instance_id, graph_id, operator);
         assert!(
-            authorizer.authorize_operator(&operator, None, &instance_id, &graph_id).await.is_ok()
+            authorizer
+                .authorize_operator(&request(operator), None, &instance_id, &graph_id)
+                .await
+                .is_ok()
         );
     }
 
@@ -467,7 +682,7 @@ mod tests {
 
         assert_eq!(
             authorizer
-                .authorize_operator(&operator, None, &instance_id, &graph_id)
+                .authorize_operator(&request(operator), None, &instance_id, &graph_id)
                 .await
                 .unwrap_err()
                 .0,
@@ -488,7 +703,7 @@ mod tests {
 
         assert!(
             authorizer
-                .authorize_watchtower(&watchtower, None, &instance_id, &graph_id)
+                .authorize_watchtower(&request(watchtower), None, &instance_id, &graph_id)
                 .await
                 .is_ok()
         );
@@ -496,7 +711,7 @@ mod tests {
         for (instance, graph) in [(instance_id, Uuid::new_v4()), (Uuid::new_v4(), graph_id)] {
             assert_eq!(
                 authorizer
-                    .authorize_watchtower(&watchtower, None, &instance, &graph)
+                    .authorize_watchtower(&request(watchtower), None, &instance, &graph)
                     .await
                     .unwrap_err()
                     .0,
@@ -504,9 +719,10 @@ mod tests {
             );
         }
         chain.remove_watchtower(&watchtower);
+        expire_watchtower_registry(&authorizer).await;
         assert_eq!(
             authorizer
-                .authorize_watchtower(&watchtower, None, &instance_id, &graph_id)
+                .authorize_watchtower(&request(watchtower), None, &instance_id, &graph_id)
                 .await
                 .unwrap_err()
                 .0,
