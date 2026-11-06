@@ -244,8 +244,7 @@ async fn validate_and_store(
     if !graph.operator_pre_signed() {
         bail!("definition lacks operator pre-signatures");
     }
-    let full_graph = BitvmGcGraph::from_simplified(&graph).context("rebuild pulled graph")?;
-    verify_graph_operator_pre_signatures(&full_graph).context("operator pre-signatures")?;
+    crate::utils::validate_graph_preflight(&graph.parameters)?;
     // Bind the instance parameters to both chains before trusting anything else.
     validate_graph_instance_parameters(
         btc_client,
@@ -254,10 +253,21 @@ async fn validate_and_store(
     )
     .await
     .context("instance parameters")?;
+    let full_graph = BitvmGcGraph::from_simplified(&graph).map_err(|error| {
+        crate::error::SpecialError::InvalidGraph(format!("rebuild pulled graph: {error}"))
+    })?;
+    verify_graph_operator_pre_signatures(&full_graph).map_err(|error| {
+        crate::error::SpecialError::InvalidGraph(format!("operator pre-signatures: {error}"))
+    })?;
     let posted = goat_client.gateway_get_graph_data(&graph_id).await?.operator_pubkey != [0u8; 32];
     let finalized = if graph.committee_pre_signed() {
-        bitvm_lib::committee::verify_graph_committee_pre_signatures(&full_graph)
-            .context("committee pre-signatures")?;
+        bitvm_lib::committee::verify_graph_committee_pre_signatures(&full_graph).map_err(
+            |error| {
+                crate::error::SpecialError::InvalidGraph(format!(
+                    "committee pre-signatures: {error}"
+                ))
+            },
+        )?;
         true
     } else {
         if posted {
@@ -279,4 +289,60 @@ async fn validate_and_store(
         graph_nonce: graph.parameters.graph_nonce,
         finalized,
     })
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    use crate::error::{FailureClass, classify_failure};
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../crates/bitvm-gc/tests/fixtures/admission.rs"
+    ));
+
+    #[tokio::test]
+    async fn pulled_malformed_graphs_reject_before_rebuild_and_same_id_can_be_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = LocalDB::new_with_busy_timeout(
+            &format!("sqlite:{}", dir.path().join("pull.db").display()),
+            false,
+            store::DEFAULT_BUSY_TIMEOUT,
+        )
+        .await;
+        db.migrate().await;
+        let (btc, _) = BTCClient::new_mock_client();
+        let (goat, _) = GOATClient::new_mock_client();
+        let parameters =
+            admission_parameters(crate::env::get_network(), crate::utils::min_required_verifier());
+        let graph_id = parameters.graph_id;
+        let instance_id = parameters.instance_parameters.instance_id;
+        let lookup = GraphLookup::Id { instance_id, graph_id, finalized: true };
+        for case in 0..3 {
+            let mut candidate = parameters.clone();
+            if case == 0 {
+                candidate.instance_parameters.committee_pubkeys.clear();
+            }
+            if case == 1 {
+                candidate.instance_parameters.pegin_amount = bitcoin::Amount::from_sat(u64::MAX);
+            }
+            let raw=serde_json::json!({"parameters":candidate,"operator_pre_signed":true,"committee_pre_signed":true,"operator_pre_sigs":null,"committee_pre_sigs":null}).to_string();
+            let error = validate_and_store(&db, &btc, &goat, &lookup, instance_id, graph_id, raw)
+                .await
+                .err()
+                .unwrap();
+            if case < 2 {
+                assert!(
+                    matches!(classify_failure(&error), FailureClass::Permanent(_)),
+                    "{error:#}"
+                );
+            } else {
+                assert!(
+                    format!("{error:#}")
+                        .contains("failed to load instance parameters from GoatChain"),
+                    "{error:#}"
+                );
+            }
+        }
+        assert!(db.acquire().await.unwrap().find_graph(&graph_id).await.unwrap().is_none());
+    }
 }

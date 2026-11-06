@@ -9,7 +9,6 @@ use bitcoin::hashes::Hash;
 use bitcoin::{Address, Amount, OutPoint, PublicKey, Txid, XOnlyPublicKey};
 use bitvm_lib::types::{BitvmGcGraph, BitvmGcInstanceParameters, UserInfo};
 use client::{btc_chain::BTCClient, goat_chain::GOATClient};
-use goat::contexts::base::generate_n_of_n_public_key;
 use goat::transactions::base::Input;
 use libp2p::PeerId;
 use std::str::FromStr;
@@ -240,7 +239,10 @@ pub async fn read_instance_info_from_goat(
         }
         Err(e) => bail!(e),
     };
-    let committee_agg_pubkey = generate_n_of_n_public_key(&committee_pubkeys).0;
+    let committee_agg_pubkey = bitvm_lib::types::checked_committee_key(&committee_pubkeys)
+        .map_err(|error| {
+            crate::error::SpecialError::InvalidPeginData(format!("invalid committee: {error}"))
+        })?;
     Ok(BitvmGcInstanceParameters {
         network,
         instance_id,

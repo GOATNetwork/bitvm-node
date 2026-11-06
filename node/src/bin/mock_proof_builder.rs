@@ -69,7 +69,7 @@ const DEFAULT_OPERATOR_VK: &str =
 const DEFAULT_WATCHTOWER_VK: &str =
     "0x0074ea3cc3dc181f156a1808459846d54700a7c4b2f6fd58a18499f2d7910e58";
 const WATCHTOWER_PROOF_SIZE: usize = 260;
-const WATCHTOWER_PUBLIC_INPUTS_SIZE: usize = 36;
+const WATCHTOWER_PUBLIC_INPUTS_SIZE: usize = bitcoin_light_client_circuit::PUBLIC_INPUTS_SIZE;
 
 #[derive(Parser, Debug)]
 #[command(name = "mock-proof-builder", about = "Localnet mock proof builder for bitvm-noded")]
@@ -213,8 +213,11 @@ fn operator_proof_data(state: &AppState, req: &OperatorProofRequest) -> Result<P
     })
 }
 
-fn watchtower_proof_data(state: &AppState, key: &str) -> ProofData {
-    // Deterministic dummy bytes of exactly the lengths the node validates; content is not checked.
+fn watchtower_proof_data(state: &AppState, key: &str) -> Result<ProofData, String> {
+    let genesis = state.genesis_txid_internal.ok_or_else(|| {
+        "GENESIS_SEQUENCER_COMMIT_TXID must be configured for mock watchtower proofs".to_string()
+    })?;
+    // Dummy work/height and proof bytes, with the configured genesis binding.
     let seed = {
         use sha2::{Digest, Sha256};
         let d: [u8; 32] = Sha256::digest(key.as_bytes()).into();
@@ -230,12 +233,15 @@ fn watchtower_proof_data(state: &AppState, key: &str) -> ProofData {
         public_inputs.extend_from_slice(&seed);
     }
     public_inputs.truncate(WATCHTOWER_PUBLIC_INPUTS_SIZE);
-    ProofData {
+    let genesis_offset = bitcoin_light_client_circuit::TOTAL_WORK_SIZE
+        + bitcoin_light_client_circuit::CONSENSUS_BLOCK_HEIGHT_SIZE;
+    public_inputs[genesis_offset..].copy_from_slice(&genesis);
+    Ok(ProofData {
         proof,
         vk: state.watchtower_vk.clone(),
         public_inputs,
         zkm_version: state.watchtower_zkm_version.clone(),
-    }
+    })
 }
 
 async fn handle_operator_proof(
@@ -285,10 +291,10 @@ async fn handle_watchtower_proof(
         });
     }
     tracing::info!(graph_id = %req.graph_id, "serving mock watchtower proof");
-    Json(WatchtowerProofResponse {
-        proof_data: Some(watchtower_proof_data(&state, &key)),
-        error: None,
-    })
+    match watchtower_proof_data(&state, &key) {
+        Ok(data) => Json(WatchtowerProofResponse { proof_data: Some(data), error: None }),
+        Err(error) => Json(WatchtowerProofResponse { proof_data: None, error: Some(error) }),
+    }
 }
 
 async fn handle_watchtower_timeout(
@@ -332,14 +338,14 @@ fn build_state() -> AppState {
             Some(bytes) => Some(bytes),
             None => {
                 tracing::warn!(
-                    "GENESIS_SEQUENCER_COMMIT_TXID is set but not a 32-byte hex txid; operator proofs will fail"
+                    "GENESIS_SEQUENCER_COMMIT_TXID is set but not a 32-byte hex txid; operator and watchtower proofs will fail"
                 );
                 None
             }
         },
         Err(_) => {
             tracing::warn!(
-                "GENESIS_SEQUENCER_COMMIT_TXID is not set; operator proofs cannot be served until it is"
+                "GENESIS_SEQUENCER_COMMIT_TXID is not set; operator and watchtower proofs cannot be served until it is"
             );
             None
         }
@@ -464,10 +470,25 @@ mod tests {
     #[test]
     fn watchtower_proof_has_expected_lengths() {
         let state = test_state();
-        let data = watchtower_proof_data(&state, "watchtower:i:g:pk");
+        let data = watchtower_proof_data(&state, "watchtower:i:g:pk").unwrap();
         assert_eq!(data.proof.len(), WATCHTOWER_PROOF_SIZE);
         assert_eq!(data.public_inputs.len(), WATCHTOWER_PUBLIC_INPUTS_SIZE);
         assert_eq!(data.vk.len(), 66);
         assert!(!data.zkm_version.is_empty());
+        let outputs =
+            bitcoin_light_client_circuit::decode_watchtower_public_outputs(&data.public_inputs)
+                .unwrap();
+        assert_eq!(outputs.genesis_sequencer_commit_txid, state.genesis_txid_internal.unwrap());
+    }
+
+    #[test]
+    fn watchtower_proof_requires_genesis_txid() {
+        let mut state = test_state();
+        state.genesis_txid_internal = None;
+        assert!(
+            watchtower_proof_data(&state, "watchtower:i:g:pk")
+                .unwrap_err()
+                .contains("GENESIS_SEQUENCER_COMMIT_TXID")
+        );
     }
 }

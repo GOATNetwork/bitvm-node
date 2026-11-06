@@ -809,6 +809,25 @@ impl<'a> StorageProcessor<'a> {
         Ok(row.map(|row| engine_aggregate_from_row(&row)).transpose()?)
     }
 
+    /// Ids of `aggregate_kind` aggregates whose JSON state has each `field`
+    /// (a dotted path from the top level) equal to the given text value.
+    pub async fn find_engine_aggregate_ids_by_state(
+        &mut self,
+        aggregate_kind: &str,
+        fields: &[(&str, &str)],
+    ) -> anyhow::Result<Vec<String>> {
+        let mut sql =
+            "SELECT aggregate_id FROM engine_aggregate WHERE aggregate_kind = ?".to_string();
+        for _ in fields {
+            sql.push_str(" AND json_extract(state, '$.' || ?) = ?");
+        }
+        let mut query = sqlx::query_scalar::<_, String>(&sql).bind(aggregate_kind);
+        for (field, value) in fields {
+            query = query.bind(*field).bind(*value);
+        }
+        Ok(query.fetch_all(self.conn()).await?)
+    }
+
     /// Create the row if needed and apply `update`; bumps `version`.
     pub async fn upsert_engine_aggregate(
         &mut self,

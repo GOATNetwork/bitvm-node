@@ -8,7 +8,7 @@ use crate::clock::current_time_secs;
 use crate::rpc_service::AppState;
 use alloy::primitives::U256;
 use axum::extract::{MatchedPath, Request, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use libp2p_metrics::Registry;
@@ -762,6 +762,21 @@ impl MetricsState {
         }
     }
 
+    /// Records one HTTP request; the method label is bounded to the standard methods.
+    fn record_http_request(&self, method: &Method, route: String, status: u16, duration: Duration) {
+        let method = http_method_label(method).to_owned();
+        self.http_requests_total
+            .get_or_create(&HttpRequestLabels {
+                method: method.clone(),
+                route: route.clone(),
+                status,
+            })
+            .inc();
+        self.http_request_duration_seconds
+            .get_or_create(&HttpRouteLabels { method, route })
+            .observe(duration.as_secs_f64());
+    }
+
     /// Records the outcome of dispatching a decoded protocol message.
     pub fn record_message_dispatch(&self, message_type: &str, outcome: &str) {
         self.message_dispatch_total
@@ -997,6 +1012,20 @@ fn u256_to_gauge(value: U256) -> i64 {
     if value > max { i64::MAX } else { value.to::<u64>() as i64 }
 }
 
+/// Returns a bounded method label; clients can send arbitrary extension methods.
+fn http_method_label(method: &Method) -> &'static str {
+    match *method {
+        Method::GET => "GET",
+        Method::POST => "POST",
+        Method::PUT => "PUT",
+        Method::DELETE => "DELETE",
+        Method::PATCH => "PATCH",
+        Method::HEAD => "HEAD",
+        Method::OPTIONS => "OPTIONS",
+        _ => "other",
+    }
+}
+
 /// Returns a bounded status label, mapping unexpected database values to `unknown`.
 fn known_status<T: FromStr>(state: &str) -> String {
     if state.parse::<T>().is_ok() { state.to_owned() } else { "unknown".to_string() }
@@ -1012,24 +1041,19 @@ pub async fn metrics_middleware(
         .extensions()
         .get::<MatchedPath>()
         .map_or_else(|| "unmatched".to_string(), |route| route.as_str().to_owned());
-    let method = request.method().to_string();
+    let method = request.method().clone();
 
     state.metrics_state.http_requests_in_flight.inc();
     let in_flight = InFlightGuard(state.metrics_state.http_requests_in_flight.clone());
     let response = next.run(request).await;
     drop(in_flight);
 
-    let status = response.status().as_u16();
-    state
-        .metrics_state
-        .http_requests_total
-        .get_or_create(&HttpRequestLabels { method: method.clone(), route: route.clone(), status })
-        .inc();
-    state
-        .metrics_state
-        .http_request_duration_seconds
-        .get_or_create(&HttpRouteLabels { method, route })
-        .observe(start.elapsed().as_secs_f64());
+    state.metrics_state.record_http_request(
+        &method,
+        route,
+        response.status().as_u16(),
+        start.elapsed(),
+    );
     response
 }
 
@@ -1124,6 +1148,24 @@ mod tests {
         assert!(!output.contains("unexpected-id-like-value"));
         assert!(!output.contains("another-unexpected-value"));
         assert!(output.contains("bitvm_node_instances{flow=\"bridge_in\",status=\"Presigned\"} 4"));
+    }
+
+    #[test]
+    fn http_method_label_is_bounded() {
+        let state = MetricsState::new(Arc::new(Mutex::new(Registry::default())));
+        for i in 0..100 {
+            let method = Method::from_bytes(format!("RANDOM{i}").as_bytes()).unwrap();
+            state.record_http_request(&method, "/v1/nodes".to_string(), 405, Duration::ZERO);
+        }
+        state.record_http_request(&Method::GET, "/v1/nodes".to_string(), 200, Duration::ZERO);
+
+        let output = encoded(&state);
+        assert!(!output.contains("RANDOM"));
+        assert!(output.contains(
+            "http_requests_total{method=\"other\",route=\"/v1/nodes\",status=\"405\"} 100"
+        ));
+        assert!(output.contains("method=\"GET\""));
+        assert_eq!(output.matches("http_request_duration_seconds_count{").count(), 2);
     }
 
     #[test]

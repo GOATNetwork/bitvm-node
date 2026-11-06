@@ -26,7 +26,7 @@ use verifier::verify_groth16_proof;
 
 pub const GRAPH_ID_SIZE: usize = 16;
 pub const PROOF_SIZE: usize = 260;
-pub const PUBLIC_INPUTS_SIZE: usize = 36;
+pub const PUBLIC_INPUTS_SIZE: usize = TOTAL_WORK_SIZE + CONSENSUS_BLOCK_HEIGHT_SIZE + 32;
 pub const ZKM_VERSION_LEN_SIZE: usize = 4;
 pub const VK_HASH_SIZE: usize = 66;
 
@@ -43,6 +43,43 @@ pub const ROOT_COMMIT_PROGRAM_ID: verifier::ProgramId = [
 pub struct WatchtowerPublicOutputs {
     pub total_work: [u8; TOTAL_WORK_SIZE],
     pub consensus_block_height: [u8; CONSENSUS_BLOCK_HEIGHT_SIZE],
+    pub genesis_sequencer_commit_txid: [u8; 32],
+}
+
+/// Decode the exact guest layout: work (BE), height (LE), genesis (internal txid bytes).
+pub fn decode_watchtower_public_outputs(bytes: &[u8]) -> Result<WatchtowerPublicOutputs, String> {
+    if bytes.len() != PUBLIC_INPUTS_SIZE {
+        return Err(format!(
+            "invalid watchtower public output length: expected {PUBLIC_INPUTS_SIZE}, got {}",
+            bytes.len()
+        ));
+    }
+    let height_end = TOTAL_WORK_SIZE + CONSENSUS_BLOCK_HEIGHT_SIZE;
+    Ok(WatchtowerPublicOutputs {
+        total_work: bytes[..TOTAL_WORK_SIZE].try_into().unwrap(),
+        consensus_block_height: bytes[TOTAL_WORK_SIZE..height_end].try_into().unwrap(),
+        genesis_sequencer_commit_txid: bytes[height_end..].try_into().unwrap(),
+    })
+}
+
+/// A claim from another genesis cannot invalidate this operator's proof.
+/// The caller must authenticate the watchtower proof and its graph/program identity first.
+fn check_watchtower_claim_against_operator(
+    claim: &WatchtowerPublicOutputs,
+    operator_genesis: [u8; 32],
+    operator_total_work: [u8; 32],
+    operator_height: u32,
+) -> Result<(), &'static str> {
+    if claim.genesis_sequencer_commit_txid != operator_genesis {
+        return Ok(());
+    }
+    if U256::from_be_bytes(claim.total_work) > U256::from_be_bytes(operator_total_work) {
+        return Err("valid watchtower challenge has more work than operator");
+    }
+    if u32::from_le_bytes(claim.consensus_block_height) > operator_height {
+        return Err("valid watchtower challenge has a later commitment than operator");
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,6 +93,33 @@ pub struct OperatorPublicOutputs {
 pub struct IndexedWatchtowerChallenge {
     pub node_index: u16,
     pub spv: SPV,
+    /// One full previous transaction per challenge input, in input order.
+    pub previous_transactions: Vec<Transaction>,
+}
+
+/// Bind every sighash prevout to the txid/vout committed by the spending transaction.
+pub fn checked_transaction_prevouts(
+    transaction: &Transaction,
+    previous_transactions: &[Transaction],
+) -> Result<Vec<bitcoin::TxOut>, &'static str> {
+    if previous_transactions.len() != transaction.input.len() {
+        return Err("previous transaction count does not match input count");
+    }
+    transaction
+        .input
+        .iter()
+        .zip(previous_transactions)
+        .map(|(input, previous)| {
+            if previous.compute_txid() != input.previous_output.txid {
+                return Err("previous transaction txid mismatch");
+            }
+            previous
+                .output
+                .get(input.previous_output.vout as usize)
+                .cloned()
+                .ok_or("previous transaction output is missing")
+        })
+        .collect()
 }
 
 /// Verifies that a proof identity matches both its output and Publisher authorization.
@@ -434,10 +498,18 @@ pub fn propose_longest_chain(
         );
 
         let tx = &challenge.spv.transaction.0;
-        let input = tx.input.first().expect("watchtower challenge must have input 0");
         let expected_vout = u32::from(challenge.node_index) * 2;
-        assert_eq!(input.previous_output.txid.to_byte_array(), watchtower_challenge_init_txid);
-        assert_eq!(input.previous_output.vout, expected_vout);
+        let expected_outpoint = bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_byte_array(watchtower_challenge_init_txid),
+            vout: expected_vout,
+        };
+        let input_index = tx
+            .input
+            .iter()
+            .position(|input| input.previous_output == expected_outpoint)
+            .expect("watchtower challenge must spend its connector");
+        let prev_outs = checked_transaction_prevouts(tx, &challenge.previous_transactions)
+            .expect("invalid watchtower challenge previous transactions");
 
         let prev_out = watchtower_challenge_init_txn
             .expect("watchtower challenge init transaction is required")
@@ -450,7 +522,8 @@ pub fn propose_longest_chain(
             .push_x_only_key(&xonly)
             .push_opcode(bitcoin::opcodes::all::OP_CHECKSIG)
             .into_script();
-        verify_taproot_leaf_schnorr_signature(&script, tx, 0, prev_out, &xonly)
+        assert_eq!(&prev_outs[input_index], prev_out, "watchtower challenge prevout mismatch");
+        verify_taproot_leaf_schnorr_signature(&script, tx, input_index, &prev_outs, &xonly)
             .expect("watchtower challenge signature verification failed");
 
         let Ok(commitment) = extract_data_from_commitment_outputs(&tx.output) else {
@@ -463,6 +536,7 @@ pub fn propose_longest_chain(
             vk,
             watchtower_total_work,
             watchtower_consensus_block_height,
+            watchtower_genesis,
             zkm_version,
         )) = parse_watchtower_commitment(&commitment)
         else {
@@ -474,15 +548,17 @@ pub fn propose_longest_chain(
         if program_id != authorized.watchtower || parsed_graph_id != graph_id {
             continue;
         }
-        assert!(
-            U256::from_be_bytes(watchtower_total_work) <= U256::from_be_bytes(operator_total_work),
-            "valid watchtower challenge has more work than operator"
-        );
-        assert!(
-            u32::from_le_bytes(watchtower_consensus_block_height)
-                <= operator_consensus_block_height,
-            "valid watchtower challenge has a later commitment than operator"
-        );
+        check_watchtower_claim_against_operator(
+            &WatchtowerPublicOutputs {
+                total_work: watchtower_total_work,
+                consensus_block_height: watchtower_consensus_block_height,
+                genesis_sequencer_commit_txid: watchtower_genesis,
+            },
+            operator_genesis_sequencer_commit_txid,
+            operator_total_work,
+            operator_consensus_block_height,
+        )
+        .expect("watchtower challenge defeats operator chain");
     }
 
     let mut is_found = false;
@@ -644,6 +720,7 @@ pub type WatchtowerCommitmentResult = (
     [u8; VK_HASH_SIZE],
     [u8; TOTAL_WORK_SIZE],
     [u8; CONSENSUS_BLOCK_HEIGHT_SIZE],
+    [u8; 32],
     String,
 );
 
@@ -683,7 +760,9 @@ pub fn parse_watchtower_commitment(
     }
     end += ZKM_VERSION_LEN_SIZE;
 
-    let expected_size = min_commitment_size + zkm_version_len;
+    let expected_size = min_commitment_size
+        .checked_add(zkm_version_len)
+        .ok_or_else(|| "commitment size overflow".to_string())?;
     if commitment.len() != expected_size {
         return Err(format!(
             "invalid commitment size: {}, expected {}",
@@ -694,13 +773,9 @@ pub fn parse_watchtower_commitment(
     let zkm_version = String::from_utf8(commitment[end..end + zkm_version_len].to_vec())
         .map_err(|err| format!("invalid zkm_version UTF-8: {err}"))?;
 
-    // extract ChainState
-    let mut watchtower_total_work = [0u8; TOTAL_WORK_SIZE];
-    watchtower_total_work.copy_from_slice(&zkm_public_values[0..TOTAL_WORK_SIZE]);
-    let mut watchtower_consensus_block_height = [0u8; CONSENSUS_BLOCK_HEIGHT_SIZE];
-    watchtower_consensus_block_height.copy_from_slice(
-        &zkm_public_values[TOTAL_WORK_SIZE..TOTAL_WORK_SIZE + CONSENSUS_BLOCK_HEIGHT_SIZE],
-    );
+    let outputs = decode_watchtower_public_outputs(&zkm_public_values)?;
+    let watchtower_total_work = outputs.total_work;
+    let watchtower_consensus_block_height = outputs.consensus_block_height;
 
     println!("watchtower total work: {watchtower_total_work:?}");
     println!("watchtower total work: {:?}", U256::from_be_bytes(watchtower_total_work));
@@ -717,6 +792,7 @@ pub fn parse_watchtower_commitment(
         zkm_vk_hash_bytes,
         watchtower_total_work,
         watchtower_consensus_block_height,
+        outputs.genesis_sequencer_commit_txid,
         zkm_version,
     ))
 }
@@ -725,10 +801,49 @@ pub fn parse_watchtower_commitment(
 mod tests {
     use super::*;
 
+    #[test]
+    fn challenge_prevouts_are_bound_to_each_input_txid_and_vout() {
+        use bitcoin::{Amount, OutPoint, ScriptBuf, TxIn, TxOut};
+        let previous = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let mut spending = Transaction {
+            input: vec![TxIn {
+                previous_output: OutPoint { txid: previous.compute_txid(), vout: 0 },
+                ..Default::default()
+            }],
+            ..previous.clone()
+        };
+        assert_eq!(
+            checked_transaction_prevouts(&spending, std::slice::from_ref(&previous)).unwrap(),
+            previous.output
+        );
+        assert!(checked_transaction_prevouts(&spending, &[]).is_err());
+        let mut forged = previous.clone();
+        forged.output[0].value += Amount::from_sat(1);
+        assert!(checked_transaction_prevouts(&spending, &[forged]).is_err());
+        spending.input[0].previous_output.vout = 1;
+        assert!(checked_transaction_prevouts(&spending, &[previous]).is_err());
+    }
+
     use bitcoin::Transaction;
     const PROOF: &[u8] = include_bytes!("../../../data/watchtower/output3.bin.proof.bin");
-    const PUBLIC_INPUTS: &[u8] =
+    const LEGACY_PUBLIC_INPUTS: &[u8] =
         include_bytes!("../../../data/watchtower/output3.bin.public_inputs.bin");
+    const TEST_GENESIS: [u8; 32] = [0x37; 32];
+    fn public_inputs() -> [u8; PUBLIC_INPUTS_SIZE] {
+        // Encoding fixture only: the legacy proof is not valid for these extended public values.
+        let mut bytes = [0; PUBLIC_INPUTS_SIZE];
+        bytes[..LEGACY_PUBLIC_INPUTS.len()].copy_from_slice(LEGACY_PUBLIC_INPUTS);
+        bytes[LEGACY_PUBLIC_INPUTS.len()..].copy_from_slice(&TEST_GENESIS);
+        bytes
+    }
     const VK_HASH: &str = include_str!("../../../data/watchtower/output3.bin.vk_hash.bin");
     const ZKM_VERSION: &str = "v1.2.4";
 
@@ -786,17 +901,84 @@ mod tests {
     }
 
     #[test]
+    fn watchtower_output_layout_binds_genesis_and_rejects_legacy_lengths() {
+        let genesis: [u8; 32] = std::array::from_fn(|index| index as u8);
+        let claim = WatchtowerPublicOutputs {
+            total_work: U256::from(1234).to_be_bytes(),
+            consensus_block_height: 5678u32.to_le_bytes(),
+            genesis_sequencer_commit_txid: genesis,
+        };
+        let bytes = bincode::serialize(&claim).unwrap();
+        assert_eq!(bytes.len(), 68);
+        assert_eq!(&bytes[..32], &claim.total_work);
+        assert_eq!(&bytes[32..36], &5678u32.to_le_bytes());
+        assert_eq!(&bytes[36..], &genesis);
+        assert_eq!(decode_watchtower_public_outputs(&bytes).unwrap(), claim);
+        for length in [0, 36, 67, 69] {
+            assert!(decode_watchtower_public_outputs(&vec![0; length]).is_err());
+        }
+        let mut legacy_commitment = vec![0; GRAPH_ID_SIZE];
+        legacy_commitment.extend_from_slice(PROOF);
+        legacy_commitment.extend_from_slice(LEGACY_PUBLIC_INPUTS);
+        legacy_commitment.extend_from_slice(VK_HASH.as_bytes());
+        legacy_commitment.extend_from_slice(&(ZKM_VERSION.len() as u32).to_le_bytes());
+        legacy_commitment.extend_from_slice(ZKM_VERSION.as_bytes());
+        assert!(parse_watchtower_commitment(&legacy_commitment).is_err());
+    }
+
+    #[test]
+    fn foreign_genesis_cannot_block_operator_even_with_maximal_claims() {
+        let claim = WatchtowerPublicOutputs {
+            total_work: U256::MAX.to_be_bytes(),
+            consensus_block_height: u32::MAX.to_le_bytes(),
+            genesis_sequencer_commit_txid: [2; 32],
+        };
+        assert!(
+            check_watchtower_claim_against_operator(&claim, [1; 32], U256::ZERO.to_be_bytes(), 0)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn same_genesis_still_enforces_work_and_height() {
+        let mut claim = WatchtowerPublicOutputs {
+            total_work: U256::from(100).to_be_bytes(),
+            consensus_block_height: 10u32.to_le_bytes(),
+            genesis_sequencer_commit_txid: TEST_GENESIS,
+        };
+        let check = |claim: &WatchtowerPublicOutputs| {
+            check_watchtower_claim_against_operator(
+                claim,
+                TEST_GENESIS,
+                U256::from(100).to_be_bytes(),
+                10,
+            )
+        };
+        assert!(check(&claim).is_ok());
+        claim.total_work = U256::from(101).to_be_bytes();
+        assert_eq!(check(&claim), Err("valid watchtower challenge has more work than operator"));
+        claim.total_work = U256::from(99).to_be_bytes();
+        claim.consensus_block_height = 11u32.to_le_bytes();
+        assert_eq!(
+            check(&claim),
+            Err("valid watchtower challenge has a later commitment than operator")
+        );
+        claim.consensus_block_height = 9u32.to_le_bytes();
+        assert!(check(&claim).is_ok());
+    }
+
+    #[test]
     fn test_build_watchtower_commitment() {
         let graph_id = hex::decode("00112233445566778899aabbccddeeff").unwrap().try_into().unwrap();
 
         let total_work = 1006120;
         let block_height = 503043;
-        println!("public inputs: {:?}", PUBLIC_INPUTS.len());
+        println!("public inputs: {:?}", public_inputs().len());
         println!("vk hash: {:?}", VK_HASH.len());
         let comm = build_watchtower_commitment(
             &graph_id,
             &PROOF.try_into().unwrap(),
-            &PUBLIC_INPUTS.try_into().unwrap(),
+            &public_inputs(),
             VK_HASH,
             ZKM_VERSION,
         );
@@ -808,11 +990,12 @@ mod tests {
 
         assert_eq!(expected.0, graph_id);
         assert_eq!(expected.1, PROOF);
-        assert_eq!(expected.2, PUBLIC_INPUTS);
+        assert_eq!(expected.2, public_inputs());
         assert_eq!(expected.3, VK_HASH.as_bytes());
         assert_eq!(expected.4, U256::from(total_work).to_be_bytes());
         assert_eq!(expected.5, U32::from(block_height).to_le_bytes());
-        assert_eq!(expected.6, ZKM_VERSION.to_string());
+        assert_eq!(expected.6, TEST_GENESIS);
+        assert_eq!(expected.7, ZKM_VERSION.to_string());
     }
 
     #[test]
@@ -952,8 +1135,18 @@ mod tests {
             hex::decode("00112233445566778899aabbccddeeff").unwrap().try_into().unwrap();
         let mut commitment = graph_id.to_vec();
         commitment.extend_from_slice(PROOF);
-        commitment.extend_from_slice(PUBLIC_INPUTS);
+        commitment.extend_from_slice(&public_inputs());
         commitment.extend_from_slice(VK_HASH.as_bytes());
+        assert!(parse_watchtower_commitment(&commitment).is_err());
+    }
+
+    #[test]
+    fn oversized_version_length_is_rejected_without_panicking() {
+        let mut commitment = vec![0; GRAPH_ID_SIZE];
+        commitment.extend_from_slice(PROOF);
+        commitment.extend_from_slice(&public_inputs());
+        commitment.extend_from_slice(VK_HASH.as_bytes());
+        commitment.extend_from_slice(&u32::MAX.to_le_bytes());
         assert!(parse_watchtower_commitment(&commitment).is_err());
     }
 
@@ -963,7 +1156,7 @@ mod tests {
             hex::decode("00112233445566778899aabbccddeeff").unwrap().try_into().unwrap();
         let mut commitment = graph_id.to_vec();
         commitment.extend_from_slice(PROOF);
-        commitment.extend_from_slice(PUBLIC_INPUTS);
+        commitment.extend_from_slice(&public_inputs());
         commitment.extend_from_slice(VK_HASH.as_bytes());
         commitment.extend_from_slice(&0u32.to_le_bytes());
 
@@ -976,7 +1169,7 @@ mod tests {
             hex::decode("00112233445566778899aabbccddeeff").unwrap().try_into().unwrap();
         let mut commitment = graph_id.to_vec();
         commitment.extend_from_slice(PROOF);
-        commitment.extend_from_slice(PUBLIC_INPUTS);
+        commitment.extend_from_slice(&public_inputs());
         commitment.extend_from_slice(VK_HASH.as_bytes());
         commitment.extend_from_slice(&2u32.to_le_bytes());
         commitment.extend_from_slice(&[0xff, 0xff]);

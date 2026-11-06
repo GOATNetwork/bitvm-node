@@ -127,8 +127,16 @@ async fn settlement_step(
             JOB_FINISH_DISPROVED,
             DisproveSent { disprove_type, index, challenge_finish_txid, .. },
         ) => {
-            finish_disproved(deps, &graph, disprove_type, index, challenge_finish_txid, attempts)
-                .await
+            finish_disproved(
+                deps,
+                graph.parameters.graph_id,
+                graph.kickoff.tx().compute_txid(),
+                graph.take1.tx().compute_txid(),
+                disprove_type,
+                index,
+                challenge_finish_txid,
+            )
+            .await
         }
         (JOB_TAKE1, _) => take1(deps, row, graph).await,
         (JOB_FINISH_HAPPY, _) => finish_happy(deps, &graph, attempts).await,
@@ -596,55 +604,69 @@ async fn challenge_kickoff(deps: &JobDeps, graph: &BitvmGcGraph) -> Result<Step>
     let btc = &deps.btc_client;
     let graph_id = graph.parameters.graph_id;
     let kickoff_txid = graph.kickoff.tx().compute_txid();
-    let Some(kickoff_height) = btc.get_tx_status(&kickoff_txid).await?.block_height else {
-        return after_blocks(deps, "kickoff is not confirmed yet", 1);
-    };
     let take1_txid = graph.take1.tx().compute_txid();
     let (challenge_tx, _) = export_challenge_tx(graph)?;
     let outpoint = challenge_tx.input[0].previous_output;
+    if let Some(step) =
+        kickoff_challenge_preflight(deps, graph_id, kickoff_txid, take1_txid, outpoint).await?
+    {
+        return Ok(step);
+    }
+    // Challenge only needs the confirmed kickoff and L2 withdraw state.
+    // GOAT SPV coverage is required later for L2 settlement, not this broadcast.
+    // The connector is unspent, so no Challenge of ours is pending.
+    let txid = send_challenge_tx(btc, graph).await?;
+    info!(event = "graph_challenge", graph_id = %graph_id, txid = %txid, "Challenge broadcast");
+    broadcast_pending(deps, &format!("Challenge {txid}"))
+}
+
+/// `None` means the confirmed kickoff is eligible for immediate Challenge broadcast.
+async fn kickoff_challenge_preflight(
+    deps: &JobDeps,
+    graph_id: Uuid,
+    kickoff_txid: Txid,
+    take1_txid: Txid,
+    outpoint: bitcoin::OutPoint,
+) -> Result<Option<Step>> {
+    let btc = &deps.btc_client;
+    if !btc.get_tx_status(&kickoff_txid).await?.confirmed {
+        return Ok(Some(after_blocks(deps, "kickoff is not confirmed yet", 1)?));
+    }
     if let Some(spent_txid) =
         outpoint_spent_txid(btc, &outpoint.txid, u64::from(outpoint.vout)).await?
     {
         // Only a confirmed spend settles it: a Challenge in the mempool may be
         // ours (resent below if it is evicted) or a decoy an operator replaces.
         if !btc.get_tx_status(&spent_txid).await?.confirmed {
-            return after_blocks(
+            return Ok(Some(after_blocks(
                 deps,
                 format!("challenge connector spent by unconfirmed {spent_txid}"),
                 1,
-            );
+            )?));
         }
         let spender = if spent_txid == take1_txid { "Take-1" } else { "Challenge" };
-        return Step::ignore(format!(
+        return Ok(Some(Step::ignore(format!(
             "challenge connector already spent by {spender} {spent_txid}"
-        ));
+        ))?));
     }
     match deps.goat_client.gateway_get_withdraw_data(&graph_id).await?.status {
         WithdrawStatus::None | WithdrawStatus::Canceled => {}
         // Passing: the relayer's proceedWithdraw makes it Processing, a
         // cancel makes it Canceled. Decided on the next look, not dropped.
         WithdrawStatus::Initialized => {
-            return after_blocks(
+            return Ok(Some(after_blocks(
                 deps,
                 "withdraw is initialized; waiting for proceedWithdraw or a cancel",
                 1,
-            );
+            )?));
         }
-        other => return Step::ignore(format!("withdraw is {other:?}")),
+        other => return Ok(Some(Step::ignore(format!("withdraw is {other:?}"))?)),
     }
-    let spv_height = deps.goat_client.btc_spv_latest_height().await? as u32;
-    if kickoff_height >= spv_height {
-        return after_blocks(
-            deps,
-            "kickoff block is not available through GOAT SPV",
-            u64::from(kickoff_height - spv_height),
-        );
-    }
-    // The connector is unspent, so no Challenge of ours is pending.
-    let txid = send_challenge_tx(btc, graph).await?;
-    info!(event = "graph_challenge", graph_id = %graph_id, txid = %txid, "Challenge broadcast");
-    broadcast_pending(deps, &format!("Challenge {txid}"))
+    Ok(None)
 }
+
+#[cfg(test)]
+mod challenge_entry_tests;
 
 fn local_verifier_pubkey() -> Result<PublicKey> {
     Ok(VerifierMasterKey::new(get_bitvm_key()?).master_keypair().public_key().into())
@@ -1024,6 +1046,14 @@ async fn disprove(
 
 // ---------------------------------------------------------------- operator
 
+// SINGLE|ANYONECANPAY permits moving the connector input and its paired output.
+fn challenge_spends_connector_a(
+    transaction: &bitcoin::Transaction,
+    connector_a: bitcoin::OutPoint,
+) -> bool {
+    transaction.input.iter().any(|input| input.previous_output == connector_a)
+}
+
 /// Challenge on Connector-A: Watchtower-Challenge-Init.
 async fn watchtower_challenge_init(
     deps: &JobDeps,
@@ -1046,7 +1076,7 @@ async fn watchtower_challenge_init(
         .connector_a_input()
         .map_err(|e| anyhow!("failed to get connector-a input: {e}"))?
         .outpoint;
-    if challenge_tx.input.first().map(|input| input.previous_output) != Some(connector_a) {
+    if !challenge_spends_connector_a(&challenge_tx, connector_a) {
         return Step::ignore("challenge does not spend connector-A");
     }
     let (master, _) = local_operator()?;
@@ -1078,7 +1108,7 @@ async fn challenge_ack(
         output_topology::watchtower_challenge_init::watchtower_connector(watchtower_index) as u64;
     // The scan saw this watchtower's challenge confirmed; a read that disagrees
     // is looked at again rather than ending the only ACK job of the branch.
-    let Some((spent_txid, vin, _)) = outpoint_spent_txin(btc, &wci_txid, watchtower_vout).await?
+    let Some((spent_txid, _, _)) = outpoint_spent_txin(btc, &wci_txid, watchtower_vout).await?
     else {
         return after_blocks(
             deps,
@@ -1086,11 +1116,6 @@ async fn challenge_ack(
             1,
         );
     };
-    if vin != 0 {
-        return Step::ignore(format!(
-            "watchtower connector {watchtower_index} spent by {spent_txid} at input {vin}"
-        ));
-    }
     let timeout_txid = graph.watchtower_challenge_timeouts[watchtower_index].tx().compute_txid();
     if spent_txid == timeout_txid {
         return Step::ignore(format!("watchtower {watchtower_index} timed out"));
@@ -1605,9 +1630,9 @@ const WITHDRAW_LAG_RETRIES: i64 = 30;
 /// Runs (six blocks apart) a finish job waits for `proceedWithdraw` to land.
 const WITHDRAW_PROCEED_RETRIES: i64 = 60;
 
-/// Goat does not show the withdraw: a lagging node (the `InitWithdraw` came
-/// from a finalized block) is waited out; a kickoff without a withdraw is
-/// given up on with an alert. These jobs run once per graph, so an early
+/// For proceed/happy/unhappy jobs, wait for the withdraw to become visible.
+/// Disproved settlement must not use this gate: it also handles rogue kickoffs
+/// without initWithdraw. These jobs run once per graph, so an early
 /// `ignore` would leave the Goat side behind for good.
 fn withdraw_missing(deps: &JobDeps, graph_id: Uuid, call: &str, attempts: i64) -> Result<Step> {
     if attempts < WITHDRAW_LAG_RETRIES {
@@ -1779,30 +1804,29 @@ async fn finish_unhappy(deps: &JobDeps, graph: &BitvmGcGraph, attempts: i64) -> 
     Step::done(GraphPlan::noted("finishWithdrawUnhappyPath sent"))
 }
 
+#[cfg(test)]
+mod disprove_settlement_tests;
+
 /// A challenge succeeded on Bitcoin: `finishWithdrawDisproved`.
 async fn finish_disproved(
     deps: &JobDeps,
-    graph: &BitvmGcGraph,
+    graph_id: Uuid,
+    kickoff_txid: Txid,
+    take1_txid: Txid,
     disprove_type: DisproveTxType,
     index: usize,
     challenge_finish_txid: Txid,
-    attempts: i64,
 ) -> Result<Step> {
     if !deps.relayer {
         return Step::ignore("not a relayer");
     }
     let btc = &deps.btc_client;
-    let graph_id = graph.parameters.graph_id;
     let withdraw_status = deps.goat_client.gateway_get_withdraw_data(&graph_id).await?.status;
-    match withdraw_status {
-        WithdrawStatus::Disproved => return Step::ignore("already disproved on Goat"),
-        WithdrawStatus::None => {
-            return withdraw_missing(deps, graph_id, "finishWithdrawDisproved", attempts);
-        }
-        _ => {}
+    // A malicious operator can skip initWithdraw/proceedWithdraw. None is a
+    // valid settlement state; only an already applied disprove is a no-op.
+    if withdraw_status == WithdrawStatus::Disproved {
+        return Step::ignore("already disproved on Goat");
     }
-    let kickoff_txid = graph.kickoff.tx().compute_txid();
-    let take1_txid = graph.take1.tx().compute_txid();
     let connector_a = output_topology::kickoff::connector_a() as u64;
     let challenge_start_tx = match outpoint_spent_txid(btc, &kickoff_txid, connector_a).await? {
         Some(spent_txid) if spent_txid == take1_txid => {

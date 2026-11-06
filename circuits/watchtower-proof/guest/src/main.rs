@@ -22,4 +22,5 @@ pub fn main() {
     );
     zkm_zkvm::io::commit(&total_work);
     zkm_zkvm::io::commit(&btc_best_block_height);
+    zkm_zkvm::io::commit(&genesis_sequencer_commit_txid);
 }
