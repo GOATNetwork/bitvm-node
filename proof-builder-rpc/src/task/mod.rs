@@ -478,18 +478,22 @@ impl OnDemandRow {
 
 /// Where the next on-demand fetch starts. Fetches alternate between a forward
 /// cursor, which only moves ahead (wrapping at the end of the queue), and a
-/// retry cursor, which walks the tasks behind it from the oldest one. A long
-/// run of tasks that are not ready cannot keep a later task from its turn,
-/// and a task skipped earlier is revisited even while new tasks keep coming.
+/// retry cursor, which walks from the oldest task up to where the forward
+/// cursor stood when that pass began. A long run of tasks that are not ready
+/// cannot keep a later task from its turn, and every task skipped earlier is
+/// revisited on each retry pass, even while new tasks keep coming.
 pub(crate) struct OnDemandCursor {
     forward: i64,
     retry: i64,
+    /// The forward position when the current retry pass began; the pass
+    /// starts over once it reaches it.
+    retry_end: i64,
     retry_turn: bool,
 }
 
 impl OnDemandCursor {
     pub(crate) fn new() -> Self {
-        Self { forward: 0, retry: 0, retry_turn: false }
+        Self { forward: 0, retry: 0, retry_end: 0, retry_turn: false }
     }
 
     /// The id the next fetch starts after.
@@ -500,8 +504,15 @@ impl OnDemandCursor {
     /// Records the task just handed out and passes the turn to the other cursor.
     pub(crate) fn advance(&mut self, task_index: i64) {
         if self.retry_turn {
-            // Once it reaches the forward cursor, the retry pass starts over.
-            self.retry = if task_index >= self.forward { 0 } else { task_index };
+            // The forward cursor moves as fast as this one, so a pass ends at
+            // a fixed point, not at the moving forward cursor. A fetch that
+            // wrapped also ends the pass.
+            if task_index >= self.retry_end || task_index <= self.retry {
+                self.retry = 0;
+                self.retry_end = self.forward;
+            } else {
+                self.retry = task_index;
+            }
         } else {
             self.forward = task_index;
         }
