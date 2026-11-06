@@ -151,6 +151,16 @@ impl StorageProcessor<'_> {
         .await?)
     }
 
+    pub async fn pending_bridge_in_page(
+        &mut self,
+        after: Option<(i64, Uuid, Uuid)>,
+        limit: u32,
+    ) -> anyhow::Result<Vec<GoatTxRecord>> {
+        let (height, instance, graph) = after.unwrap_or((-1, Uuid::nil(), Uuid::nil()));
+        Ok(sqlx::query_as::<_, GoatTxRecord>("SELECT * FROM goat_tx_record WHERE tx_type = 'BridgeInRequest' AND processing_status = 'Pending' AND (height, instance_id, graph_id) > (?, ?, ?) ORDER BY height, instance_id, graph_id LIMIT ?")
+            .bind(height).bind(instance).bind(graph).bind(limit).fetch_all(self.conn()).await?)
+    }
+
     pub async fn get_goat_tx_record_by_processing_status(
         &mut self,
         tx_type: &str,

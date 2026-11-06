@@ -361,6 +361,16 @@ impl PeerRegistry {
             .collect()
     }
 
+    /// Snapshot only currently verified, sufficiently staked operator bindings.
+    pub fn registered_operators(&self, now: Instant) -> Vec<(PeerId, OperatorKey)> {
+        self.lock()
+            .operators
+            .iter()
+            .filter(|(_, binding)| binding.is_registered(now))
+            .map(|(peer, binding)| (*peer, binding.pubkey))
+            .collect()
+    }
+
     /// The peer currently bound to an operator master key, if known.
     pub fn operator_peer_for(&self, pubkey: &OperatorKey) -> Option<PeerId> {
         self.lock().operator_owner.get(pubkey).copied()
