@@ -45,8 +45,18 @@ pub async fn generate_instance(
     let from_addr = if !params.user_info.inputs.is_empty()
         && let Some(tx) = btc_client.get_tx(&params.user_info.inputs[0].outpoint.txid).await?
     {
-        let tx_scripts =
-            tx.output[params.user_info.inputs[0].outpoint.vout as usize].script_pubkey.clone();
+        let outpoint = params.user_info.inputs[0].outpoint;
+        let tx_scripts = tx
+            .output
+            .get(outpoint.vout as usize)
+            .ok_or_else(|| {
+                SpecialError::InvalidPeginRequest(format!(
+                    "input {outpoint} references an output beyond transaction output count {}",
+                    tx.output.len()
+                ))
+            })?
+            .script_pubkey
+            .clone();
         Address::from_script(&tx_scripts, env::get_network())
             .map(|addr| addr.to_string())
             .unwrap_or_default()
@@ -165,17 +175,19 @@ pub async fn upsert_pegin_instance_process_data(
     Ok(())
 }
 
+/// The instance's stored round data, or an empty map when it has none yet.
+///
+/// Read and decode failures are errors: callers write the map back whole, so
+/// an empty stand-in would erase the other members' nonces and signatures.
 pub async fn find_pegin_instance_process_data(
     storage_processor: &mut StorageProcessor<'_>,
     instance_id: Uuid,
 ) -> Result<InstanceProcessDataMap> {
-    if let Ok(Some(data)) = storage_processor.find_pegin_instance_process_data(&instance_id).await
-        && let Ok(process_data) = serde_json::from_str(data.process_data.as_str())
-    {
-        Ok(process_data)
-    } else {
-        Ok(IndexMap::new())
-    }
+    let Some(data) = storage_processor.find_pegin_instance_process_data(&instance_id).await? else {
+        return Ok(IndexMap::new());
+    };
+    serde_json::from_str(&data.process_data)
+        .with_context(|| format!("decode the round data of instance {instance_id}"))
 }
 
 pub fn gen_instance_parameters_local(
@@ -297,4 +309,31 @@ pub(crate) async fn generate_instance_from_bridge_in_request_event(
         },
     )
     .await
+}
+
+#[cfg(test)]
+mod process_data_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn unreadable_round_data_is_an_error_not_an_empty_map() {
+        let local_db = store::create_local_db("sqlite::memory:").await;
+        let mut storage = local_db.acquire().await.unwrap();
+        let instance_id = Uuid::new_v4();
+        assert!(
+            find_pegin_instance_process_data(&mut storage, instance_id).await.unwrap().is_empty()
+        );
+
+        let stored = PeginInstanceProcessData {
+            instance_id,
+            process_data: "{not json".to_string(),
+            updated_at: 1,
+            created_at: 1,
+        };
+        storage.upsert_pegin_instance_process_data(&stored).await.unwrap();
+        assert!(find_pegin_instance_process_data(&mut storage, instance_id).await.is_err());
+        // The stored row is left for inspection, not replaced.
+        let row = storage.find_pegin_instance_process_data(&instance_id).await.unwrap().unwrap();
+        assert_eq!(row.process_data, stored.process_data);
+    }
 }

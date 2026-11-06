@@ -55,7 +55,6 @@ mock-gc = ["bitvm-lib/mock-gc"]
 [dependencies]
 libp2p = { workspace = true, features = [
     "autonat",
-    "dns",
     "tokio",
     "noise",
     "tcp",
@@ -68,8 +67,6 @@ libp2p = { workspace = true, features = [
     "rsa",
     "macros",
     "gossipsub",
-    "quic",
-    "websocket",
     "request-response",
 ] }
 libp2p-swarm-derive = { workspace = true }

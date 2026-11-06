@@ -9,7 +9,7 @@ use super::instance::{AnswerWindow, BtcSnapshot, PeginRequested, TxFact, pegin_r
 use crate::clock::current_time_secs;
 use crate::engine_bridge::record_event_in;
 use crate::env::{get_instance_maintenance_batch_size, is_enable_committee_instance_key_delete};
-use crate::error::{FailureClass, classify_failure};
+use crate::error::{FailureClass, SpecialError, classify_failure, panic_message};
 use crate::utils::{
     check_bridge_in_uxto_available_or_self_spent, generate_instance_from_bridge_in_request_event,
 };
@@ -20,13 +20,15 @@ use client::btc_chain::BTCClient;
 use client::goat_chain::GOATClient;
 use client::graphs::graph_query::BridgeInRequestEvent;
 use engine::EngineHandle;
+use futures::FutureExt;
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
+use std::panic::AssertUnwindSafe;
 use std::str::FromStr;
 use std::sync::{LazyLock, Mutex};
 use store::localdb::{InstanceQuery, LocalDB};
-use store::{GoatTxProcessingStatus, GoatTxType, Instance, InstanceBridgeInStatus};
-use tracing::{debug, info, warn};
+use store::{GoatTxProcessingStatus, GoatTxRecord, Instance, InstanceBridgeInStatus};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 const TASK_KEY_ANSWER_WINDOW: &str = "instance_answer_window_scan";
@@ -364,125 +366,212 @@ pub async fn gather_snapshot(
     Ok(Some(snapshot))
 }
 
-/// Store pending Goat bridge-in requests. Submit pegin_request events only while
-/// the response window is open; late requests are handled by the answer-window scan.
+type RequestCursor = (i64, Uuid, Uuid);
+static PEGIN_REQUEST_CURSORS: LazyLock<Mutex<HashMap<String, RequestCursor>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Submit pending requests in bounded, rotating pages; late requests are handled
+/// by the answer-window scan. The cursor advances before each cancellable item.
 pub async fn pegin_request_monitor(
     local_db: &LocalDB,
     btc_client: &BTCClient,
     goat_client: &GOATClient,
     engine: &EngineHandle,
 ) -> anyhow::Result<()> {
+    pegin_request_monitor_page(
+        local_db,
+        btc_client,
+        goat_client,
+        engine,
+        crate::env::get_instance_maintenance_batch_size(),
+    )
+    .await
+}
+
+async fn pegin_request_monitor_page(
+    local_db: &LocalDB,
+    btc_client: &BTCClient,
+    goat_client: &GOATClient,
+    engine: &EngineHandle,
+    batch_size: u32,
+) -> anyhow::Result<()> {
+    let cursor = PEGIN_REQUEST_CURSORS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&local_db.path)
+        .copied();
     let tx_records = {
-        let mut storage_processor = local_db.acquire().await?;
-        storage_processor
-            .get_goat_tx_record_by_processing_status(
-                &GoatTxType::BridgeInRequest.to_string(),
-                &GoatTxProcessingStatus::Pending.to_string(),
-            )
-            .await?
+        let mut storage = local_db.acquire().await?;
+        let page = storage.pending_bridge_in_page(cursor, batch_size).await?;
+        if page.is_empty() && cursor.is_some() {
+            storage.pending_bridge_in_page(None, batch_size).await?
+        } else {
+            page
+        }
     };
     if tx_records.is_empty() {
         return Ok(());
     }
     let current_height = goat_client.get_finalized_block_number().await?;
     let response_window_blocks = goat_client.gateway_get_response_window_blocks().await? as i64;
+    let mut failures = 0;
     for tx_record in tx_records {
-        let instance_id = tx_record.instance_id;
-        let event = tx_record
-            .extra
-            .as_deref()
-            .map(serde_json::from_str::<BridgeInRequestEvent>)
-            .transpose()?;
-        let is_outside_response_window = tx_record.height + response_window_blocks < current_height;
-        // The row is built from the indexed event and Goat's pegin data; the
-        // request's inputs are checked by the committee's answer job.
-        let instance = match event.as_ref() {
-            Some(event) => {
-                match generate_instance_from_bridge_in_request_event(btc_client, goat_client, event)
-                    .await
-                {
-                    Ok(instance) => Some(instance),
-                    Err(error)
-                        if classify_failure(&error) == FailureClass::Transient
-                            && !is_outside_response_window =>
-                    {
-                        warn!(
-                            event = "pegin_request",
-                            instance_id = %instance_id,
-                            error = %error,
-                            "could not build the instance of a BridgeInRequest; retried next tick"
-                        );
-                        continue;
-                    }
-                    Err(error) => {
-                        // A malformed request, a Goat refusal or a request past its
-                        // window: nothing a retry can change.
-                        warn!(
-                            event = "pegin_request",
-                            instance_id = %instance_id,
-                            outside_window = is_outside_response_window,
-                            error = %error,
-                            "could not build the instance of a BridgeInRequest; request skipped"
-                        );
-                        local_db
-                            .acquire()
-                            .await?
-                            .update_goat_tx_record_processing_status(
-                                &tx_record.graph_id,
-                                &instance_id,
-                                &tx_record.tx_type,
-                                &GoatTxProcessingStatus::Skipped.to_string(),
-                            )
-                            .await?;
-                        continue;
-                    }
-                }
-            }
-            None => None,
-        };
+        PEGIN_REQUEST_CURSORS.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            local_db.path.clone(),
+            (tx_record.height, tx_record.instance_id, tx_record.graph_id),
+        );
+        let operation = process_pegin_request_record(
+            local_db,
+            btc_client,
+            goat_client,
+            engine,
+            &tx_record,
+            current_height,
+            response_window_blocks,
+        );
+        let result = tokio::time::timeout(
+            crate::env::maintenance_item_timeout(1, 1),
+            isolate_pegin_request(local_db, &tx_record, operation),
+        )
+        .await
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("peg-in request processing timed out")));
+        if let Err(error) = result {
+            failures += 1;
+            warn!(event = "pegin_request", instance_id = %tx_record.instance_id,
+                error = %error, "BridgeInRequest processing failed; continuing with the next record");
+        }
+    }
+    if failures > 0 {
+        anyhow::bail!("{failures} BridgeInRequest records failed during this tick");
+    }
+    Ok(())
+}
 
-        let mut tx = local_db.start_transaction().await?;
-        if let Some(instance) = instance {
-            if is_outside_response_window {
-                if tx.insert_instance_if_absent(&instance).await? {
-                    info!(
-                        event = "pegin_request",
-                        instance_id = %instance_id,
-                        outcome = "late",
-                        "BridgeInRequest seen after its response window; the answer-window scan decides"
-                    );
-                }
-            } else {
-                // A re-indexed request refreshes its row; a row that moved on is
-                // left alone.
-                tx.upsert_pegin_request_instance(&instance).await?;
-                record_event_in(
-                    &mut tx,
-                    pegin_request_event(
-                        instance_id,
-                        &PeginRequested { tx_hash: tx_record.tx_hash.clone() },
-                    )?,
+/// Keep a poisoned request from unwinding the monitor or blocking later records.
+///
+/// Unwind-safe because a request shares no in-memory state with the monitor:
+/// all of its writes go through one database transaction committed last, so a
+/// panic drops the transaction and rolls them back, and the engine is only
+/// woken after the commit. A panicked request is marked `Failed` and is not
+/// picked up again; after the bug is fixed, set it back to `Pending` by hand.
+async fn isolate_pegin_request(
+    local_db: &LocalDB,
+    record: &GoatTxRecord,
+    operation: impl std::future::Future<Output = anyhow::Result<()>>,
+) -> anyhow::Result<()> {
+    let status = match AssertUnwindSafe(operation).catch_unwind().await {
+        Ok(Ok(())) => return Ok(()),
+        Ok(Err(error)) => {
+            if !matches!(classify_failure(&error), FailureClass::Permanent(_)) {
+                return Err(error);
+            }
+            warn!(event = "pegin_request", instance_id = %record.instance_id, error = %error,
+                "invalid BridgeInRequest skipped");
+            GoatTxProcessingStatus::Skipped
+        }
+        Err(payload) => {
+            let message = panic_message(payload.as_ref());
+            error!(event = "pegin_request_panic", instance_id = %record.instance_id,
+                error = message, "BridgeInRequest panicked; marking failed");
+            local_db
+                .acquire()
+                .await?
+                .update_goat_tx_record_processing_status(
+                    &record.graph_id,
+                    &record.instance_id,
+                    &record.tx_type,
+                    &GoatTxProcessingStatus::Failed.to_string(),
                 )
                 .await?;
-            }
-        } else {
-            warn!(
-                event = "pegin_request",
-                instance_id = %instance_id,
-                "BridgeInRequest record carries no event; skipped"
-            );
+            anyhow::bail!("BridgeInRequest panicked: {message}");
         }
-        tx.update_goat_tx_record_processing_status(
-            &tx_record.graph_id,
-            &instance_id,
-            &tx_record.tx_type,
-            &GoatTxProcessingStatus::Processed.to_string(),
+    };
+    local_db
+        .acquire()
+        .await?
+        .update_goat_tx_record_processing_status(
+            &record.graph_id,
+            &record.instance_id,
+            &record.tx_type,
+            &status.to_string(),
         )
         .await?;
-        tx.commit().await?;
-        if !is_outside_response_window {
-            engine.wake_for(&crate::aggregates::instance::instance_ref(instance_id));
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_pegin_request_record(
+    local_db: &LocalDB,
+    btc_client: &BTCClient,
+    goat_client: &GOATClient,
+    engine: &EngineHandle,
+    tx_record: &GoatTxRecord,
+    current_height: i64,
+    response_window_blocks: i64,
+) -> anyhow::Result<()> {
+    let instance_id = tx_record.instance_id;
+    let event_json = tx_record.extra.as_deref().ok_or_else(|| {
+        SpecialError::InvalidPeginRequest("BridgeInRequest record carries no event".into())
+    })?;
+    let event = serde_json::from_str::<BridgeInRequestEvent>(event_json).map_err(|error| {
+        SpecialError::InvalidPeginRequest(format!("malformed BridgeInRequest event: {error}"))
+    })?;
+    let is_outside_response_window = tx_record.height + response_window_blocks < current_height;
+    // Build before starting a transaction so backend errors cannot leave partial rows.
+    let instance =
+        match generate_instance_from_bridge_in_request_event(btc_client, goat_client, &event).await
+        {
+            Ok(instance) => instance,
+            // Only a proven-invalid request is skipped; an unknown failure says
+            // nothing about the request, so it stays pending and is retried.
+            Err(error) if !matches!(classify_failure(&error), FailureClass::Permanent(_)) => {
+                return Err(error);
+            }
+            Err(error) => {
+                warn!(event = "pegin_request", instance_id = %instance_id, error = %error,
+                "could not build the instance of a BridgeInRequest; request skipped");
+                local_db
+                    .acquire()
+                    .await?
+                    .update_goat_tx_record_processing_status(
+                        &tx_record.graph_id,
+                        &instance_id,
+                        &tx_record.tx_type,
+                        &GoatTxProcessingStatus::Skipped.to_string(),
+                    )
+                    .await?;
+                return Ok(());
+            }
+        };
+    let mut tx = local_db.start_transaction().await?;
+    if is_outside_response_window {
+        if tx.insert_instance_if_absent(&instance).await? {
+            info!(event = "pegin_request", instance_id = %instance_id, outcome = "late",
+                "BridgeInRequest seen after its response window; the answer-window scan decides");
         }
+    } else {
+        // A re-indexed request refreshes its row; a row that moved on is left alone.
+        tx.upsert_pegin_request_instance(&instance).await?;
+        record_event_in(
+            &mut tx,
+            pegin_request_event(
+                instance_id,
+                &PeginRequested { tx_hash: tx_record.tx_hash.clone() },
+            )?,
+        )
+        .await?;
+    }
+
+    tx.update_goat_tx_record_processing_status(
+        &tx_record.graph_id,
+        &instance_id,
+        &tx_record.tx_type,
+        &GoatTxProcessingStatus::Processed.to_string(),
+    )
+    .await?;
+    tx.commit().await?;
+    if !is_outside_response_window {
+        engine.wake_for(&crate::aggregates::instance::instance_ref(instance_id));
     }
     Ok(())
 }
@@ -490,6 +579,263 @@ pub async fn pegin_request_monitor(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bitcoin::{Address, hashes::Hash, key::Keypair, secp256k1::SECP256K1};
+    use client::goat_chain::{PeginData, PeginStatus};
+    use store::GoatTxType;
+
+    async fn database() -> (LocalDB, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = LocalDB::new_with_busy_timeout(
+            &format!("sqlite:{}", dir.path().join("requests.db").display()),
+            false,
+            store::DEFAULT_BUSY_TIMEOUT,
+        )
+        .await;
+        db.migrate().await;
+        (db, dir)
+    }
+
+    #[tokio::test]
+    async fn request_monitor_processes_only_one_bounded_page_each_pass() {
+        let (db, _dir) = database().await;
+        let (btc, _) = BTCClient::new_mock_client();
+        let (goat, _) = GOATClient::new_mock_client();
+        let (engine, _acks) =
+            engine::EngineBuilder::new(db.clone(), engine::EngineConfig::default()).build();
+        for id in 1..=5 {
+            db.acquire().await.unwrap().upsert_goat_tx_record(&pending_record(id)).await.unwrap();
+        }
+        for remaining in [3, 1, 0] {
+            pegin_request_monitor_page(&db, &btc, &goat, &engine.handle(), 2).await.unwrap();
+            assert_eq!(
+                db.acquire().await.unwrap().pending_bridge_in_page(None, 10).await.unwrap().len(),
+                remaining
+            );
+        }
+    }
+
+    fn pending_record(id: u128) -> GoatTxRecord {
+        GoatTxRecord {
+            instance_id: Uuid::from_u128(id),
+            graph_id: Uuid::nil(),
+            tx_type: GoatTxType::BridgeInRequest.to_string(),
+            processing_status: GoatTxProcessingStatus::Pending.to_string(),
+            height: id as i64,
+            ..Default::default()
+        }
+    }
+
+    async fn status(db: &LocalDB, record: &GoatTxRecord) -> String {
+        db.acquire()
+            .await
+            .unwrap()
+            .find_graph_goat_tx_record(&record.instance_id, &record.graph_id, &record.tx_type)
+            .await
+            .unwrap()
+            .unwrap()
+            .processing_status
+    }
+
+    #[tokio::test]
+    async fn malformed_requests_do_not_block_valid_requests_and_backend_errors_retry() {
+        let (db, _dir) = database().await;
+        let (btc, btc_mock) = BTCClient::new_mock_client();
+        let (goat, goat_mock) = GOATClient::new_mock_client();
+        let (engine, _acks) =
+            engine::EngineBuilder::new(db.clone(), engine::EngineConfig::default()).build();
+        let key = Keypair::from_seckey_slice(SECP256K1, &[7; 32]).unwrap().x_only_public_key().0;
+        let address = Address::p2tr(SECP256K1, key, None, crate::env::get_network());
+        let txid = Txid::from_byte_array([3; 32]);
+        btc_mock.set_tx(
+            txid,
+            esplora_client::Tx {
+                txid,
+                version: 2,
+                locktime: 0,
+                vin: vec![],
+                vout: vec![esplora_client::Vout {
+                    value: 50_000,
+                    scriptpubkey: address.script_pubkey(),
+                }],
+                size: 1,
+                weight: 1,
+                fee: 0,
+                status: esplora_client::TxStatus {
+                    confirmed: true,
+                    block_height: Some(1),
+                    block_hash: None,
+                    block_time: None,
+                },
+            },
+        );
+        let mut records = Vec::new();
+        let mut retry_data = None;
+        let mut unknown_data = None;
+        for id in 1..=5 {
+            let mut record = pending_record(id);
+            let event = BridgeInRequestEvent {
+                id: id.to_string(),
+                transaction_hash: format!("request-{id}"),
+                block_number: id.to_string(),
+                block_timestamp: "1".into(),
+                instance_id: record.instance_id.to_string(),
+                depositor_address: format!("0x{}", "11".repeat(20)),
+                pegin_amount_sats: "10000".into(),
+                txn_fees: ["100".into(), "100".into(), "100".into()],
+                user_xonly_pubkey: key.to_string(),
+                user_change_address: address.to_string(),
+                user_refund_address: address.to_string(),
+            };
+            let data = PeginData {
+                status: PeginStatus::Pending,
+                instance_id: *record.instance_id.as_bytes(),
+                depositor_address: [0x11; 20],
+                pegin_amount_sats: 10_000,
+                txn_fees: [100; 3],
+                user_inputs: vec![client::goat_chain::Utxo {
+                    txid: txid.to_byte_array(),
+                    vout: if id == 1 { u32::MAX } else { 0 },
+                    amount_sats: 50_000,
+                }],
+                user_xonly_pubkey: key.serialize(),
+                user_change_addr: address.to_string(),
+                user_refund_addr: address.to_string(),
+                pegin_txid: [0; 32],
+                created_at: 1,
+                committee_addresses: vec![],
+                committee_pubkeys: vec![],
+            };
+            goat_mock.set_pegin_data(*record.instance_id.as_bytes(), Ok(data.clone()));
+            if id == 1 {
+                let error = generate_instance_from_bridge_in_request_event(&btc, &goat, &event)
+                    .await
+                    .unwrap_err();
+                assert!(matches!(classify_failure(&error), FailureClass::Permanent(_)));
+                assert!(error.to_string().contains("output count"));
+            }
+            if id == 3 {
+                retry_data = Some(data.clone());
+                goat_mock.set_pegin_data(
+                    *record.instance_id.as_bytes(),
+                    Err("503 service unavailable".into()),
+                );
+            }
+            if id == 5 {
+                // Neither a backend outage nor a rejection: retried, not skipped.
+                unknown_data = Some(data.clone());
+                goat_mock.set_pegin_data(
+                    *record.instance_id.as_bytes(),
+                    Err("unexpected pegin data".into()),
+                );
+            }
+            record.extra =
+                Some(if id == 2 { "{".into() } else { serde_json::to_string(&event).unwrap() });
+            db.acquire().await.unwrap().upsert_goat_tx_record(&record).await.unwrap();
+            records.push(record);
+        }
+        assert!(pegin_request_monitor(&db, &btc, &goat, &engine.handle()).await.is_err());
+        for (record, expected) in
+            records.iter().zip(["Skipped", "Skipped", "Pending", "Processed", "Pending"])
+        {
+            assert_eq!(status(&db, record).await, expected);
+        }
+        assert!(
+            db.acquire()
+                .await
+                .unwrap()
+                .find_instance(&records[0].instance_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.acquire()
+                .await
+                .unwrap()
+                .find_instance(&records[3].instance_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        goat_mock.set_pegin_data(*records[2].instance_id.as_bytes(), Ok(retry_data.unwrap()));
+        goat_mock.set_pegin_data(*records[4].instance_id.as_bytes(), Ok(unknown_data.unwrap()));
+        pegin_request_monitor(&db, &btc, &goat, &engine.handle()).await.unwrap();
+        assert_eq!(status(&db, &records[2]).await, "Processed");
+        assert_eq!(status(&db, &records[4]).await, "Processed");
+    }
+
+    #[tokio::test]
+    async fn request_panic_rolls_back_its_transaction_and_does_not_block_the_next_record() {
+        let (db, _dir) = database().await;
+        let poisoned = pending_record(1);
+        let next = pending_record(2);
+        for record in [&poisoned, &next] {
+            db.acquire().await.unwrap().upsert_goat_tx_record(record).await.unwrap();
+        }
+        let operation = async {
+            let mut tx = db.start_transaction().await?;
+            tx.upsert_pegin_request_instance(&Instance {
+                instance_id: poisoned.instance_id,
+                ..Default::default()
+            })
+            .await?;
+            record_event_in(
+                &mut tx,
+                pegin_request_event(
+                    poisoned.instance_id,
+                    &PeginRequested { tx_hash: "poisoned".into() },
+                )?,
+            )
+            .await?;
+            tx.update_goat_tx_record_processing_status(
+                &poisoned.graph_id,
+                &poisoned.instance_id,
+                &poisoned.tx_type,
+                "Processed",
+            )
+            .await?;
+            tx.update_goat_tx_record_processing_status(
+                &next.graph_id,
+                &next.instance_id,
+                &next.tx_type,
+                "Processed",
+            )
+            .await?;
+            tokio::task::yield_now().await;
+            panic!("unexpected request failure");
+        };
+        assert!(isolate_pegin_request(&db, &poisoned, operation).await.is_err());
+        assert_eq!(status(&db, &poisoned).await, "Failed");
+        assert_eq!(status(&db, &next).await, "Pending");
+        let mut storage = db.acquire().await.unwrap();
+        assert!(storage.find_instance(&poisoned.instance_id).await.unwrap().is_none());
+        assert!(
+            storage
+                .list_engine_inbox_events_for_aggregate(
+                    crate::aggregates::instance::INSTANCE_KIND,
+                    &poisoned.instance_id.to_string(),
+                    10,
+                )
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        drop(storage);
+        isolate_pegin_request(&db, &next, async {
+            db.acquire()
+                .await?
+                .update_goat_tx_record_processing_status(
+                    &next.graph_id,
+                    &next.instance_id,
+                    &next.tx_type,
+                    "Processed",
+                )
+                .await
+        })
+        .await
+        .unwrap();
+        assert_eq!(status(&db, &next).await, "Processed");
+    }
 
     #[tokio::test]
     async fn instance_pages_walk_rows_created_in_the_same_second() {
