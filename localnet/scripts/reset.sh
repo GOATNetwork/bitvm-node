@@ -15,7 +15,7 @@ T_START=$(date +%s)
 step() { echo "==== $* ($(( $(date +%s) - T_START ))s) ===="; }
 
 [[ "${1:-}" == "--yes" ]] || { echo "Refusing without --yes. This WIPES all localnet data under $LOCALNET_DATA." >&2; exit 2; }
-echo "code $LOCALNET_ROOT"; echo "data $LOCALNET_DATA (project $COMPOSE_PROJECT, ports $PORT_BASE+, anvil chain id $ANVIL_CHAIN_ID)"
+echo "code $LOCALNET_ROOT"; echo "data $LOCALNET_DATA (project $COMPOSE_PROJECT, ports $PORT_BASE+, GOAT $GOAT_BACKEND, chain id $ANVIL_CHAIN_ID)"
 mkdir -p "$LOCALNET_DATA" "$STATE_DIR" "$LOGS_DIR" "$RUN_DIR" "$TMP_DIR" "$BIN_DIR"
 
 step "0. binaries"
@@ -49,7 +49,7 @@ if [[ -f "$STATE_DIR/keys.json" ]]; then echo "  keeping $STATE_DIR/keys.json"; 
 
 step "4. recreate infra"
 $COMPOSE up -d
-echo "  waiting for anvil + bitcoind ..."
+echo "  waiting for the GOAT chain ($GOAT_BACKEND) + bitcoind ..."
 for i in $(seq 1 60); do
   a=$($CAST chain-id --rpc-url "$GOAT_CHAIN_URL" 2>/dev/null || true)
   b=$($BCLI getblockcount 2>/dev/null || true)
@@ -57,7 +57,7 @@ for i in $(seq 1 60); do
   sleep 2
 done
 cid=$($CAST chain-id --rpc-url "$GOAT_CHAIN_URL" 2>/dev/null || true)
-[[ "$cid" == "$ANVIL_CHAIN_ID" ]] || { echo "anvil not ready / wrong chain id ('$cid')" >&2; exit 1; }
+[[ "$cid" == "$ANVIL_CHAIN_ID" ]] || { echo "GOAT chain ($GOAT_BACKEND) not ready / wrong chain id ('$cid')" >&2; exit 1; }
 
 step "5. bitcoind wallet + 101 blocks"
 $BCLI createwallet "$BTC_RPC_WALLET" >/dev/null 2>&1 || $BCLI loadwallet "$BTC_RPC_WALLET" >/dev/null 2>&1 || true

@@ -22,20 +22,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Runs first and gates everything else (fmt/clippy/test all `needs: tla-plus`
-  # below) - it's the fastest job (seconds, no Rust toolchain to build) and a
-  # failure here means either a real regression the other, much slower jobs
-  # can't catch, or a stale/broken spec - either way not worth burning 30+
-  # minutes of Cargo Test/Clippy compute on before finding out.
-  #
-  # All 8 findings from audit/TLAPlus-20260630.md were fixed in commit
-  # 991faaa, so this job is expected to be GREEN. Its steps still run every
-  # bug config that reproduced the original counterexamples, but a bug
-  # config correctly still failing is no longer treated as a job failure -
-  # see the second step's own comment for why (its constants are frozen
-  # historical snapshots, not a live read of the Rust source, so they can't
-  # detect a regression by staying red; only an unexpected PASS is a real
-  # drift signal now).
+  # Timing and protocol safety must both hold; every TLC violation fails CI.
   tla-plus:
     name: TLA+ Formal Verification
     runs-on: ubuntu-latest
@@ -46,79 +33,11 @@ jobs:
           distribution: temurin
           java-version: "21"
       - name: Download TLA+ tools
-        run: |
-          mkdir -p ~/.local/share/tlaplus
-          curl -sL -o ~/.local/share/tlaplus/tla2tools.jar \
-            https://github.com/tlaplus/tlaplus/releases/latest/download/tla2tools.jar
-      # These configs model the implemented fixes (or a baseline that was
-      # never buggy) and must always pass. The separate configs below retain
-      # the pre-fix counterexamples as historical regression documentation.
-      - name: Run baseline + fixed specs (must pass)
-        working-directory: node/tla
-        run: |
-          set -e
-          JAR=~/.local/share/tlaplus/tla2tools.jar
-          java -jar "$JAR" -config GraphLifecycleCoreOnly.cfg GraphLifecycle.tla
-          java -jar "$JAR" -config GraphLifecycleFixed.cfg GraphLifecycle.tla
-          java -jar "$JAR" -config GraphLifecycleFineGrainedFixed.cfg GraphLifecycleFineGrainedFixed.tla
-          java -jar "$JAR" -config InstancePresignedFixed.cfg InstancePresigned.tla
-          java -jar "$JAR" -config InstanceLifecycle.cfg InstanceLifecycle.tla
-          java -jar "$JAR" -config Take2DisproveRace.cfg Take2DisproveRace.tla
-          java -jar "$JAR" -config MultiActorRace.cfg MultiActorRace.tla
-          java -jar "$JAR" -config InstanceBridgeOutRaceFixed.cfg InstanceBridgeOutRace.tla
-          java -jar "$JAR" -config MessageStateRaceFixed.cfg MessageStateRace.tla
-          java -jar "$JAR" -config Take1ChallengeRaceFixed.cfg Take1ChallengeRace.tla
-      # This job's earlier design (while all 8 findings from this round were
-      # still genuinely unfixed) made this step - and everything gated
-      # behind it - fail for as long as any bug config still reproduced its
-      # counterexample. As of commit 991faaa, every one of those findings
-      # has actually been fixed in the shipped Rust code (see
-      # audit/TLAPlus-20260630.md) - keeping the job permanently red past
-      # that point stopped being useful: these bug configs' constants are
-      # frozen historical snapshots (e.g. Take1ChallengeRace.tla's
-      # ConnectorA), not live readings of the current Rust source, so they
-      # can never detect a real code regression by themselves - they will
-      # keep reproducing the same counterexample forever regardless of
-      # what the Rust code does. Their only genuine ongoing signal is the
-      # OPPOSITE direction: if one of them ever unexpectedly STOPS
-      # reproducing its counterexample, that means the spec itself was
-      # edited into no longer demonstrating the bug it's supposed to -
-      # that's the one case this step still treats as a hard failure.
-      # Otherwise, a bug config correctly still failing is expected and
-      # does not fail the job - it's just printed as an informational
-      # reproduction pointer.
-      - name: Confirm known-bug specs still reproduce their counterexample
-        working-directory: node/tla
-        run: |
-          JAR=~/.local/share/tlaplus/tla2tools.jar
-          {
-            echo "## TLA+ audit: historical bug-reproduction specs"
-            echo
-            echo "These model the PRE-FIX code as a permanent historical record (all"
-            echo "findings below were fixed in commit 991faaa - see"
-            echo "\`audit/TLAPlus-20260630.md\`). Still correctly reproducing their"
-            echo "original counterexample below is expected and does not fail this job."
-            echo
-          } >> "$GITHUB_STEP_SUMMARY"
-          while IFS='|' read -r cfg tla finding; do
-            [ -z "$cfg" ] && continue
-            if java -jar "$JAR" -config "$cfg" "$tla" | grep -q "Model checking completed. No error has been found."; then
-              echo "::error::$tla / $cfg was expected to keep reproducing its historical counterexample but passed instead - the spec itself was likely edited into no longer demonstrating the bug it's supposed to. If the underlying Rust fix was somehow reverted, this is also how you'd find out - either way, investigate before trusting this spec again."
-              exit 1
-            fi
-            repro="cd node/tla && java -jar ~/.local/share/tlaplus/tla2tools.jar -config $cfg $tla"
-            echo "- **$finding** - reproduce: \`$repro\`" >> "$GITHUB_STEP_SUMMARY"
-          done <<'BUGS'
-          GraphLifecycle.cfg|GraphLifecycle.tla|Finding 1: Graph.status race
-          GraphLifecycleFineGrained.cfg|GraphLifecycleFineGrained.tla|Finding 1b: naive guard still unsafe
-          InstancePresignedBug.cfg|InstancePresigned.tla|Finding 2: Instance.status regression past Presigned
-          InstanceBridgeOutRace.cfg|InstanceBridgeOutRace.tla|Finding 6: InstanceBridgeOutStatus resurrection
-          MessageStateRace.cfg|MessageStateRace.tla|Finding 7: MessageState resurrection
-          Take1ChallengeRace.cfg|Take1ChallengeRace.tla|Finding 9: connector_a has no margin check
-          BUGS
+        run: make tla-setup
+      - name: Check transaction graph timing and safety invariants
+        run: make tla
   fmt:
     name: Rustfmt
-    needs: tla-plus
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -135,8 +54,10 @@ jobs:
           args: --all -- --check
   clippy:
     name: Clippy
-    needs: tla-plus
-    runs-on: ubuntu-latest
+    # Keep Ziren's generated FFI layouts on the tested LLVM 18 environment.
+    runs-on: ubuntu-24.04
+    env:
+      LIBCLANG_PATH: /usr/lib/llvm-18/lib
     steps:
       - uses: actions/checkout@v5
       - uses: actions-rs/toolchain@v1
@@ -159,14 +80,15 @@ jobs:
           rustc --version
           cargo --version
       - name: Install Dependencies
-        run: sudo apt update && sudo apt install protobuf-compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libclang-18-dev
       - run: |
           source ~/.zkm-toolchain/env
           cargo clippy --all-targets --features rpc-debug-endpoints -- -D warnings
   test:
     name: Cargo Test
-    needs: tla-plus
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    env:
+      LIBCLANG_PATH: /usr/lib/llvm-18/lib
     steps:
       - uses: actions/checkout@v5
       - name: Install Ziren toolchain
@@ -182,7 +104,7 @@ jobs:
           rustc --version
           cargo --version
       - name: Install Dependencies
-        run: sudo apt update && sudo apt install protobuf-compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libclang-18-dev
       - name: Launch the Regtest
         run: cd scripts && docker compose up -d
       - name: Run all unit tests

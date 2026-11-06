@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fund every role on BTC regtest (P2WSH funding address) and on GOAT (anvil).
+# Fund every role on BTC regtest (P2WSH funding address) and on GOAT (gas from GOAT_FUNDER_KEY).
 # Idempotent: skips a role already funded above its threshold. Mines 1 block to
 # confirm the BTC sends. GOAT registrations/stake are done by the contracts agent;
 # this only tops up gas + BTC spending funds.
@@ -14,13 +14,14 @@ btc_utxos() { curl -s --max-time 5 "$BTC_CHAIN_URL/address/$1/utxo"; }
 btc_count() { btc_utxos "$1" | jq 'length' 2>/dev/null || echo 0; }
 btc_sats()  { btc_utxos "$1" | jq '[.[].value] | add // 0' 2>/dev/null || echo 0; }
 
-echo "==== GOAT funding (faucet = anvil acct0) ===="
+need_goat_funder
+echo "==== GOAT funding (funder $($CAST wallet address --private-key "$GOAT_FUNDER_KEY"), GOAT_BACKEND=$GOAT_BACKEND) ===="
 for name in DEPLOYER C0 C1 OP0 VF0 WT0 USER0; do
   var="${name}_GOAT_ADDRESS"; addr="${!var}"
   wei=$($CAST balance "$addr" --rpc-url "$RPC" 2>/dev/null || echo 0)
   eth=$($CAST from-wei "${wei:-0}")
-  if awk "BEGIN{exit !(${eth%%.*}+0 < $GOAT_FUND_MIN_ETH)}"; then
-    $CAST send "$addr" --value "${GOAT_FUND_ETH}ether" --private-key "$ANVIL_FAUCET_KEY" --rpc-url "$RPC" >/dev/null
+  if awk "BEGIN{exit !(${eth}+0 < $GOAT_FUND_MIN_ETH)}"; then
+    $CAST send "$addr" --value "${GOAT_FUND_ETH}ether" --private-key "$GOAT_FUNDER_KEY" --rpc-url "$RPC" >/dev/null
     echo "  funded $name $addr  (+${GOAT_FUND_ETH} ETH)"
   else
     echo "  skip   $name $addr  (${eth} ETH)"

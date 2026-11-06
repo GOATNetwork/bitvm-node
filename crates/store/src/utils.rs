@@ -1,4 +1,5 @@
 use crate::SerializableTxid;
+use sqlx::types::Uuid;
 
 #[derive(Clone)]
 pub struct QueryBuilder {
@@ -12,6 +13,7 @@ pub enum QueryParam {
     Text(String),
     Int(i64),
     BTCTxid(SerializableTxid),
+    Uuid(Uuid),
 }
 
 impl QueryBuilder {
@@ -66,6 +68,12 @@ impl QueryBuilder {
         if let Some(p) = param {
             self.params.push(p);
         }
+    }
+
+    /// Add a WHERE condition whose placeholders take several parameters, in order.
+    pub fn and_where_params(&mut self, condition: &str, params: Vec<QueryParam>) {
+        self.and_where(condition, None);
+        self.params.extend(params);
     }
 
     /// Add WHERE condition with IN clause
@@ -147,6 +155,7 @@ impl QueryBuilder {
         for<'a> bool: sqlx::Encode<'a, DB> + sqlx::Type<DB>,
         for<'a> SerializableTxid: sqlx::Encode<'a, DB> + sqlx::Type<DB>,
         for<'a> u32: sqlx::Encode<'a, DB> + sqlx::Type<DB>,
+        for<'a> Uuid: sqlx::Encode<'a, DB> + sqlx::Type<DB>,
     {
         // Bind parameters for query
         for param in self.params {
@@ -155,6 +164,7 @@ impl QueryBuilder {
                 QueryParam::Text(s) => query.bind(s),
                 QueryParam::Int(i) => query.bind(i),
                 QueryParam::BTCTxid(btc_txid) => query.bind(btc_txid),
+                QueryParam::Uuid(uuid) => query.bind(uuid),
             };
         }
         query
@@ -173,6 +183,7 @@ impl QueryBuilder {
         for<'a> bool: sqlx::Encode<'a, DB> + sqlx::Type<DB>,
         for<'a> SerializableTxid: sqlx::Encode<'a, DB> + sqlx::Type<DB>,
         for<'a> u32: sqlx::Encode<'a, DB> + sqlx::Type<DB>,
+        for<'a> Uuid: sqlx::Encode<'a, DB> + sqlx::Type<DB>,
     {
         // Bind parameters for query
         for param in self.params {
@@ -181,6 +192,7 @@ impl QueryBuilder {
                 QueryParam::Text(s) => query.bind(s),
                 QueryParam::Int(i) => query.bind(i),
                 QueryParam::BTCTxid(btc_txid) => query.bind(btc_txid),
+                QueryParam::Uuid(uuid) => query.bind(uuid),
             };
         }
         query

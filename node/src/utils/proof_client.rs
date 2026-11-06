@@ -77,11 +77,13 @@ fn gen_watchtower_commitment(graph_id: Uuid, proof_data: ProofData) -> Result<Ve
     let graph_id = graph_id.as_bytes();
     let proof =
         proof_data.proof.as_slice().try_into().map_err(|_| anyhow!("invalid proof length"))?;
-    let public_inputs = proof_data
-        .public_inputs
-        .as_slice()
-        .try_into()
-        .map_err(|_| anyhow!("invalid public inputs length"))?;
+    let public_inputs = proof_data.public_inputs.as_slice().try_into().map_err(|_| {
+        anyhow!(
+            "invalid watchtower public inputs length: expected {}, got {}",
+            bitcoin_light_client_circuit::PUBLIC_INPUTS_SIZE,
+            proof_data.public_inputs.len()
+        )
+    })?;
     if proof_data.vk.len() != VK_HASH_SIZE {
         bail!("invalid vk_hash length");
     }
@@ -607,6 +609,32 @@ pub fn get_guest_constant_value(
 #[cfg(test)]
 mod commit_pubin_tests {
     use super::*;
+
+    #[test]
+    fn watchtower_commitment_uses_genesis_bound_public_outputs() {
+        let graph_id = Uuid::new_v4();
+        let data = |length| ProofData {
+            proof: vec![0; bitcoin_light_client_circuit::PROOF_SIZE],
+            public_inputs: vec![0; length],
+            vk: format!("0x{}", "00".repeat(32)),
+            zkm_version: "v2.0.0".into(),
+        };
+        assert!(
+            gen_watchtower_commitment(graph_id, data(36))
+                .unwrap_err()
+                .to_string()
+                .contains("expected 68")
+        );
+        let mut proof = data(68);
+        let genesis: [u8; 32] = std::array::from_fn(|index| index as u8);
+        proof.public_inputs[36..].copy_from_slice(&genesis);
+        let commitment = gen_watchtower_commitment(graph_id, proof).unwrap();
+        let parsed =
+            bitcoin_light_client_circuit::parse_watchtower_commitment(&commitment).unwrap();
+        assert_eq!(parsed.0, *graph_id.as_bytes());
+        assert_eq!(parsed.6, genesis);
+    }
+
     use ark_serialize::CanonicalSerialize;
     use bitcoin::BlockHash;
     use bitcoin::ScriptBuf;

@@ -637,3 +637,77 @@ async fn watchtower_key_migration_keeps_one_task_per_key() {
         .unwrap();
     assert_eq!(id, 6);
 }
+
+#[tokio::test]
+async fn pending_request_keyset_pages_do_not_starve_behind_retrying_rows() {
+    use crate::GoatTxRecord;
+    let db = setup_db().await;
+    let mut storage = db.acquire().await.unwrap();
+    for index in 1..=7u128 {
+        let record = GoatTxRecord {
+            instance_id: Uuid::from_u128(index / 3),
+            graph_id: Uuid::from_u128(index),
+            height: 100,
+            tx_type: "BridgeInRequest".into(),
+            processing_status: if index == 7 { "Processed".into() } else { "Pending".into() },
+            ..Default::default()
+        };
+        storage.upsert_goat_tx_record(&record).await.unwrap();
+    }
+    let first = storage.pending_bridge_in_page(None, 2).await.unwrap();
+    assert_eq!(first.iter().map(|r| r.graph_id.as_u128()).collect::<Vec<_>>(), [1, 2]);
+    let last = first.last().unwrap();
+    let second = storage
+        .pending_bridge_in_page(Some((last.height, last.instance_id, last.graph_id)), 2)
+        .await
+        .unwrap();
+    assert_eq!(second.iter().map(|r| r.graph_id.as_u128()).collect::<Vec<_>>(), [3, 4]);
+    // Delete earlier pending rows: an offset-based cursor would skip records now.
+    for row in first {
+        storage
+            .update_goat_tx_record_processing_status(
+                &row.graph_id,
+                &row.instance_id,
+                &row.tx_type,
+                "Processed",
+            )
+            .await
+            .unwrap();
+    }
+    let last = second.last().unwrap();
+    let third = storage
+        .pending_bridge_in_page(Some((last.height, last.instance_id, last.graph_id)), 2)
+        .await
+        .unwrap();
+    assert_eq!(third.iter().map(|r| r.graph_id.as_u128()).collect::<Vec<_>>(), [5, 6]);
+    // Earlier retrying rows remain available after wrapping.
+    assert_eq!(storage.pending_bridge_in_page(None, 2).await.unwrap()[0].graph_id.as_u128(), 3);
+}
+
+#[tokio::test]
+async fn balance_update_does_not_overwrite_node_fields_or_a_rebound_key() {
+    let db = setup_db().await;
+    let mut storage = db.acquire().await.unwrap();
+    let key = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+    let row = Node {
+        peer_id: "operator".into(),
+        btc_pub_key: key.into(),
+        goat_addr: "untrusted".into(),
+        reward: "42".into(),
+        ..Default::default()
+    };
+    storage.upsert_node(&row).await.unwrap();
+    storage.update_node_reward_by_peer_id("operator", "42").await.unwrap();
+    assert_eq!(storage.get_node_btc_pub_key("operator").await.unwrap().as_deref(), Some(key));
+    assert!(storage.get_node_btc_pub_key("missing").await.unwrap().is_none());
+    // A row rebound to another key spelling between read and write is left alone.
+    let rebound = format!("03{}", &key[2..]);
+    assert!(!storage.update_verified_operator_balance("operator", &rebound, "999").await.unwrap());
+    let nodes = storage.find_nodes(&NodeQuery::default()).await.unwrap().0;
+    assert_ne!(nodes[0].available_peg_btc, "999");
+    assert!(storage.update_verified_operator_balance("operator", key, "123").await.unwrap());
+    let nodes = storage.find_nodes(&NodeQuery::default()).await.unwrap().0;
+    assert_eq!(nodes[0].available_peg_btc, "123");
+    assert_eq!(nodes[0].goat_addr, "untrusted");
+    assert_eq!(nodes[0].reward, "42");
+}

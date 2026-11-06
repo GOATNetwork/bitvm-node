@@ -83,6 +83,23 @@ pub enum SwapEventEntity {
     Refunds,
 }
 
+/// Event fields and range filters shared by the paginated reader.
+pub trait EventEntity: ToString {
+    fn add_event_query(&self, builder: QueryBuilder, range: BlockRange) -> QueryBuilder;
+}
+
+impl EventEntity for GatewayEventEntity {
+    fn add_event_query(&self, builder: QueryBuilder, range: BlockRange) -> QueryBuilder {
+        self.add_single_query(builder, Some(range))
+    }
+}
+
+impl EventEntity for SwapEventEntity {
+    fn add_event_query(&self, builder: QueryBuilder, range: BlockRange) -> QueryBuilder {
+        self.add_single_query(builder, Some(range))
+    }
+}
+
 impl GatewayEventEntity {
     pub fn add_single_query(
         &self,
@@ -256,6 +273,7 @@ pub fn get_meta_data_query() -> String {
     let tag = "_meta".to_string();
     builder = builder.add_query(&tag);
     builder = builder.add_field(&tag, "block { number }");
+    builder = builder.add_field(&tag, "hasIndexingErrors");
     builder.build()
 }
 
@@ -668,7 +686,7 @@ impl QueryBuilder {
             if !q.filters.is_empty() {
                 query.push_str("where: {");
                 for (field, value) in q.filters {
-                    query.push_str(&format!("{field}: \"{value}\", "));
+                    query.push_str(&format!("{field}: {}, ", serde_json::Value::String(value)));
                 }
                 query.push_str("}, ");
             }

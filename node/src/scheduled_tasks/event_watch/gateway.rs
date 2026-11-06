@@ -18,10 +18,10 @@ use client::btc_chain::BTCClient;
 use client::goat_chain::GOATClient;
 use client::graphs::GraphQueryClient;
 use client::graphs::graph_query::{
-    BlockRange, BridgeInEvent, BridgeInRequestEvent, CancelWithdrawEvent, CommitteeResponseEvent,
+    BridgeInEvent, BridgeInRequestEvent, CancelWithdrawEvent, CommitteeResponseEvent,
     GatewayEventEntity, InitWithdrawEvent, PostGraphDataEvent, ProceedWithdrawEvent,
     UserGraphWithdrawEvent, WithdrawDisprovedEvent, WithdrawHappyEvent, WithdrawPathsEvent,
-    WithdrawUnhappyEvent, get_gateway_events_query,
+    WithdrawUnhappyEvent,
 };
 use std::ops::AddAssign;
 use std::str::FromStr;
@@ -46,15 +46,7 @@ pub async fn fetch_and_handle_gateway_events<'a>(
     from_height: i64,
     to_height: i64,
 ) -> anyhow::Result<()> {
-    let query_res = client
-        .execute_query(
-            graph_url,
-            &get_gateway_events_query(
-                event_entities,
-                Some(BlockRange::new(from_height, to_height)),
-            ),
-        )
-        .await?;
+    let query_res = client.get_events(graph_url, event_entities, from_height, to_height).await?;
 
     let mut init_withdraw_events: Vec<InitWithdrawEvent> = vec![];
     let mut cancel_withdraw_events = vec![];

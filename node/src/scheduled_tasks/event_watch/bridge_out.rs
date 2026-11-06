@@ -10,8 +10,7 @@ use bitcoin::Address;
 use client::goat_chain::GOATClient;
 use client::graphs::GraphQueryClient;
 use client::graphs::graph_query::{
-    BlockRange, SwapClaimEvent, SwapEventEntity, SwapInitializeEvent, SwapRefundEvent,
-    get_bridge_out_events_query,
+    SwapClaimEvent, SwapEventEntity, SwapInitializeEvent, SwapRefundEvent,
 };
 use std::ops::AddAssign;
 use std::str::FromStr;
@@ -32,15 +31,7 @@ pub async fn fetch_and_handle_bridge_out_events<'a>(
     to_height: i64,
     gateway_peg_btc_address: EvmAddress,
 ) -> anyhow::Result<()> {
-    let query_res = client
-        .execute_query(
-            graph_url,
-            &get_bridge_out_events_query(
-                event_entities,
-                Some(BlockRange::new(from_height, to_height)),
-            ),
-        )
-        .await?;
+    let query_res = client.get_events(graph_url, event_entities, from_height, to_height).await?;
     for event_entity in event_entities {
         let entity = event_entity.clone();
         if let Some(value_vec) = query_res[entity.to_string()].as_array() {
