@@ -422,7 +422,8 @@ pub struct Transition {
     pub prepare_height: Option<i64>,
     pub committees_answers: Option<IndexMap<String, Vec<u8>>>,
     pub post_pegin_txhash: Option<String>,
-    /// Success-side key deletion is due (Peg-In-Confirm confirmed + depth).
+    /// Success-side key deletion is due (Peg-In-Confirm confirmed + depth,
+    /// and `H_p + T0` reached).
     pub delete_key: bool,
     pub alerts: Vec<InstanceAlert>,
 }
@@ -506,12 +507,14 @@ pub fn decide_btc_snapshot(
         }
     }
 
-    // 3. Post / Done: success-side key deletion depth.
+    // 3. Post / Done: success-side key deletion depth. Operators may still
+    // start graphs, which need committee pre-signatures, until `H_p + T0`.
     if matches!(current, RelayerL1Broadcasted | RelayerL2Minted)
         && !key_deleted
         && let Some(confirm) = confirm.filter(|f| f.confirmed)
         && let Some(confirmed_at) = confirm.block_height
         && confirmed_at + deadlines.key_delete_blocks <= snapshot.height
+        && deadlines.cancel_from_height(prepare_height).is_some_and(|t0| t0 <= snapshot.height)
     {
         transition.delete_key = true;
     }
@@ -1492,6 +1495,18 @@ mod tests {
         assert!(decide(RelayerL2Minted, &snap).delete_key);
         assert!(!decide_btc_snapshot(RelayerL2Minted, PREPARE, true, &snap, &DEADLINES).delete_key);
         assert_eq!(decide(RelayerL2Minted, &snap).next, None);
+    }
+
+    #[test]
+    fn success_side_key_deletion_waits_for_t0() {
+        // Deep enough at 1_042, but graphs may still be started until H_p + T0.
+        let mut snap = snapshot(1_059);
+        snap.confirm = Some(TxFact::confirmed_at(1_010));
+        assert!(!decide(RelayerL2Minted, &snap).delete_key);
+        snap.height = PREPARE + DEADLINES.t0_blocks;
+        assert!(decide(RelayerL2Minted, &snap).delete_key);
+        // Without the Prepare height the key is kept.
+        assert!(!decide_btc_snapshot(RelayerL2Minted, 0, false, &snap, &DEADLINES).delete_key);
     }
 
     #[test]
