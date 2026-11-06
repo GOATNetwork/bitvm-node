@@ -2,7 +2,7 @@
 
 use crate::env::*;
 use crate::error::SpecialError;
-use alloy::primitives::Address as EvmAddress;
+use alloy::primitives::{Address as EvmAddress, U256};
 use anyhow::{Context, Result, anyhow, bail};
 use bitcoin::hashes::Hash;
 use bitcoin::{Amount, Network, PublicKey, XOnlyPublicKey};
@@ -343,7 +343,7 @@ pub async fn validate_init_graph_base(
 pub enum OperatorStakeStatus {
     Staked,
     NotRegistered,
-    Insufficient { locked: u64, min: u64 },
+    Insufficient { locked: U256, min: U256 },
 }
 
 pub async fn operator_stake_status(
@@ -696,5 +696,31 @@ mod admission_tests {
             );
             assert!(!matches!(classify_failure(&error), FailureClass::Permanent(_)));
         }
+    }
+}
+
+#[cfg(test)]
+mod stake_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn locked_stake_above_u64_counts_as_staked() {
+        let (goat_client, goat_mock) = GOATClient::new_mock_client();
+        let operator = PublicKey::from_str(
+            "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+        )
+        .unwrap();
+        let xonly = XOnlyPublicKey::from(operator).serialize();
+        assert_eq!(
+            operator_stake_status(&goat_client, &operator).await.unwrap(),
+            OperatorStakeStatus::NotRegistered
+        );
+        // 20 tokens with 18 decimals: more than u64::MAX smallest units.
+        let locked = U256::from(20u64) * U256::from(10u64).pow(U256::from(18u64));
+        goat_mock.set_operator_stake(xonly, [0x11; 20], locked);
+        assert_eq!(
+            operator_stake_status(&goat_client, &operator).await.unwrap(),
+            OperatorStakeStatus::Staked
+        );
     }
 }

@@ -26,6 +26,8 @@ pub struct GatewayContractConfig {
 }
 
 type MockResponses<T> = Arc<Mutex<HashMap<[u8; 16], Result<T, String>>>>;
+/// x-only operator key -> (stake address, locked stake).
+type OperatorStakes = Arc<Mutex<HashMap<[u8; 32], ([u8; 20], U256)>>>;
 
 #[derive(Clone, Debug)]
 pub struct MockAdaptor {
@@ -37,6 +39,7 @@ pub struct MockAdaptor {
     pegin_data: MockResponses<PeginData>,
     spv_height: Arc<Mutex<Result<u64, String>>>,
     committee_peer_ids: Arc<Mutex<HashMap<[u8; 20], Vec<u8>>>>,
+    operator_stakes: OperatorStakes,
 }
 
 impl MockAdaptor {
@@ -51,6 +54,11 @@ impl MockAdaptor {
     /// Make `member` a committee member that registered `peer_id`.
     pub fn set_committee_peer_id(&self, member: [u8; 20], peer_id: Vec<u8>) {
         self.committee_peer_ids.lock().unwrap().insert(member, peer_id);
+    }
+
+    /// Registers an operator's x-only key at `address` with `locked` stake.
+    pub fn set_operator_stake(&self, pubkey: [u8; 32], address: [u8; 20], locked: U256) {
+        self.operator_stakes.lock().unwrap().insert(pubkey, (address, locked));
     }
 
     pub fn set_spv_height(&self, height: Result<u64, String>) {
@@ -175,8 +183,12 @@ impl ChainAdaptor for MockAdaptor {
         Ok(if let Ok(h) = self.gateway_contract_config.lock() { h.operator_reward_rate } else { 0 })
     }
 
-    async fn gateway_get_min_stake_amount(&self) -> anyhow::Result<u64> {
-        Ok(if let Ok(h) = self.gateway_contract_config.lock() { h.min_stake_amount } else { 0 })
+    async fn gateway_get_min_stake_amount(&self) -> anyhow::Result<U256> {
+        Ok(U256::from(if let Ok(h) = self.gateway_contract_config.lock() {
+            h.min_stake_amount
+        } else {
+            0
+        }))
     }
 
     async fn gateway_get_min_challenger_reward(&self) -> anyhow::Result<u64> {
@@ -429,15 +441,16 @@ impl ChainAdaptor for MockAdaptor {
         Ok([0_u8; 20])
     }
 
-    async fn stake_mana_pubkey_to_address(&self, _pubkey: &[u8; 32]) -> anyhow::Result<[u8; 20]> {
-        Ok([0_u8; 20])
+    async fn stake_mana_pubkey_to_address(&self, pubkey: &[u8; 32]) -> anyhow::Result<[u8; 20]> {
+        Ok(self.operator_stakes.lock().unwrap().get(pubkey).map_or([0_u8; 20], |(a, _)| *a))
     }
-    async fn stake_mana_stake_of(&self, _operator: &[u8; 20]) -> anyhow::Result<u64> {
-        Ok(0)
+    async fn stake_mana_stake_of(&self, operator: &[u8; 20]) -> anyhow::Result<U256> {
+        self.stake_mana_lock_stake_of(operator).await
     }
 
-    async fn stake_mana_lock_stake_of(&self, _operator: &[u8; 20]) -> anyhow::Result<u64> {
-        Ok(0)
+    async fn stake_mana_lock_stake_of(&self, operator: &[u8; 20]) -> anyhow::Result<U256> {
+        let stakes = self.operator_stakes.lock().unwrap();
+        Ok(stakes.values().find(|(a, _)| a == operator).map_or(U256::ZERO, |(_, l)| *l))
     }
 
     async fn stake_mana_slash_stake(
@@ -563,6 +576,7 @@ impl MockAdaptor {
             pegin_data: Arc::new(Mutex::new(HashMap::new())),
             spv_height: Arc::new(Mutex::new(Ok(0))),
             committee_peer_ids: Arc::new(Mutex::new(HashMap::new())),
+            operator_stakes: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }

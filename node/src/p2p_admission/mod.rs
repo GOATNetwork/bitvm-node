@@ -64,6 +64,9 @@ pub enum DropReason {
     /// A graph parameter endorsement from a peer outside the loaded verifier
     /// set: verifying one costs chain reads, and only verifiers send them.
     EndorsementFromNonVerifier,
+    /// A GraphSetupAck from an unregistered sender: this node only waits for
+    /// ACKs from the registered peers it delivered to.
+    AckFromUnregistered,
     /// A registered author's message whose sequence number was already seen, or
     /// is older than the replay window: a verbatim re-publish by someone else.
     ReplayedSequence,
@@ -102,6 +105,7 @@ impl DropReason {
             Self::OversizedBinary => "oversized_binary",
             Self::BinaryFromNonVerifier => "binary_from_non_verifier",
             Self::EndorsementFromNonVerifier => "endorsement_from_non_verifier",
+            Self::AckFromUnregistered => "ack_from_unregistered",
             Self::ReplayedSequence => "replayed_sequence",
             Self::FutureSequence => "future_sequence",
             Self::ForwardRate => "forward_rate",
@@ -132,6 +136,7 @@ impl DropReason {
             self,
             Self::UnexpectedBinaryKind
                 | Self::EndorsementFromNonVerifier
+                | Self::AckFromUnregistered
                 | Self::ForwardRate
                 | Self::ImmediateRateLimited
                 | Self::ControlQueueFull
@@ -437,6 +442,12 @@ pub async fn evaluate_inbound_message(
         && !gates.registry.is_verifier(source)
     {
         return Ok(InboundVerdict::Drop(DropReason::EndorsementFromNonVerifier));
+    }
+
+    // ACKs reach the control queue that NodeInfo also needs, and each one is
+    // matched against the outbox.
+    if matches!(message.content, GOATMessageContent::GraphSetupAck(_)) && !class.is_registered() {
+        return Ok(InboundVerdict::Drop(DropReason::AckFromUnregistered));
     }
 
     if message.content.p2p_delivery() == P2PMessageDelivery::Immediate {
