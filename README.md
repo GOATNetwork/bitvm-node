@@ -35,7 +35,8 @@ core dispute safety for Bitcoin, Testnet4, Signet and Regtest:
 The timing model is finite, init-only arithmetic. Its Disprove comparison assumes
 VerifierAssert confirms within `action_window` of OperatorAssert; earlier maturity
 does not guarantee earlier confirmation. The safety model explores transitions
-after WCI and OperatorAssert confirm in the same block, abstracts proof validity
+after WCI confirms, with OperatorAssert confirming in the same or any later
+block (including after Connector-F has matured), abstracts proof validity
 as a boolean, and assumes published pubin is consistent with the Assert. It does
 not assume pubin will be published or a watchtower branch will resolve.
 These checks do not establish end-to-end bridge safety or liveness and omit
