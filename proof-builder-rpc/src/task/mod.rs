@@ -1341,6 +1341,30 @@ mod tests {
         assert_eq!(cursor.after_id(), 0);
     }
 
+    #[test]
+    fn an_old_task_becoming_ready_later_is_revisited_under_continuous_arrivals() {
+        let mut ids: Vec<i64> = (1..=10).collect();
+        let mut cursor = OnDemandCursor::new();
+        let mut visits = Vec::new();
+
+        // Every row stays New/NotReady, except task 1 whose external inputs
+        // become available at poll 10. New arrivals keep the forward scan from
+        // wrapping. Revisiting task 1 before poll 10 cannot service it.
+        for poll in 1..=10_000 {
+            let task = next_task(&ids, cursor.after_id()).unwrap();
+            if task == 1 {
+                visits.push(poll);
+                if poll >= 10 {
+                    return;
+                }
+            }
+            cursor.advance(task);
+            ids.push(ids.last().unwrap() + 1);
+        }
+
+        panic!("task 1 became ready at poll 10 but was never retried; visits: {visits:?}");
+    }
+
     #[tokio::test]
     async fn test_add_watchtower_task() {
         let db_path = std::env::var("TEST_DB")
