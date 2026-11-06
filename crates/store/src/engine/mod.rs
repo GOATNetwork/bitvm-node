@@ -1221,6 +1221,31 @@ impl<'a> StorageProcessor<'a> {
         Ok(result.rows_affected())
     }
 
+    /// Open rows whose outstanding set maps `peer` to `delivery_id`, with
+    /// that set. Served by `idx_engine_outbox_ack`, so the payloads are never
+    /// read; an ACK that matches nothing costs no write lock (see the engine).
+    pub async fn find_engine_outbox_acks(
+        &mut self,
+        peer: &str,
+        delivery_id: &str,
+    ) -> anyhow::Result<Vec<(String, BTreeMap<String, String>)>> {
+        let rows = sqlx::query(
+            "SELECT outbox_id, ack_set FROM engine_outbox \
+             WHERE state = 'Open' AND ack_set IS NOT NULL \
+               AND json_extract(ack_set, '$.' || json_quote(?)) = ?",
+        )
+        .bind(peer)
+        .bind(delivery_id)
+        .fetch_all(self.conn())
+        .await?;
+        rows.iter()
+            .map(|row| {
+                let ack_set: String = row.try_get("ack_set")?;
+                Ok((row.try_get("outbox_id")?, serde_json::from_str(&ack_set)?))
+            })
+            .collect()
+    }
+
     /// Apply an ACK from `peer` for `delivery_id`. Only a peer listed in the
     /// row's outstanding set with exactly that delivery id counts.
     ///
@@ -1234,19 +1259,7 @@ impl<'a> StorageProcessor<'a> {
         delivery_id: &str,
         now: i64,
     ) -> anyhow::Result<EngineOutboxAck> {
-        let candidates = sqlx::query(&format!(
-            "SELECT {ENGINE_OUTBOX_COLUMNS} FROM engine_outbox \
-             WHERE state = 'Open' AND ack_set IS NOT NULL AND instr(ack_set, ?) > 0"
-        ))
-        .bind(delivery_id)
-        .fetch_all(self.conn())
-        .await?;
-        for row in candidates {
-            let message = engine_outbox_message_from_row(&row)?;
-            let Some(mut ack_set) = message.ack_set else { continue };
-            if ack_set.get(peer).map(String::as_str) != Some(delivery_id) {
-                continue;
-            }
+        for (outbox_id, mut ack_set) in self.find_engine_outbox_acks(peer, delivery_id).await? {
             ack_set.remove(peer);
             let closed = ack_set.is_empty();
             let updated = if closed {
@@ -1257,7 +1270,7 @@ impl<'a> StorageProcessor<'a> {
                 )
                 .bind(now)
                 .bind(now)
-                .bind(&message.outbox_id)
+                .bind(&outbox_id)
                 .execute(self.conn())
                 .await?
             } else {
@@ -1267,12 +1280,12 @@ impl<'a> StorageProcessor<'a> {
                 )
                 .bind(ack_set_json(&ack_set)?)
                 .bind(now)
-                .bind(&message.outbox_id)
+                .bind(&outbox_id)
                 .execute(self.conn())
                 .await?
             };
             if updated.rows_affected() > 0 {
-                return Ok(EngineOutboxAck::Matched { outbox_id: message.outbox_id, closed });
+                return Ok(EngineOutboxAck::Matched { outbox_id, closed });
             }
         }
         Ok(EngineOutboxAck::NoMatch)

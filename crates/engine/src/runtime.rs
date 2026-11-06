@@ -210,6 +210,19 @@ impl EngineHandle {
         delivery_id: &str,
     ) -> anyhow::Result<EngineOutboxAck> {
         let now = self.inner.clock.now();
+        // Any peer can send an ACK; one that matches no open row must not
+        // take the write lock.
+        if self
+            .inner
+            .db
+            .acquire()
+            .await?
+            .find_engine_outbox_acks(peer, delivery_id)
+            .await?
+            .is_empty()
+        {
+            return Ok(EngineOutboxAck::NoMatch);
+        }
         // Read-modify-write of the row's outstanding set: the immediate
         // transaction serializes concurrent ACKs for the same row.
         let mut tx = self.inner.db.start_immediate_transaction().await?;

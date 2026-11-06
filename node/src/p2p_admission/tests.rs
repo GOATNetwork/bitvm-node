@@ -899,6 +899,29 @@ async fn immediate_messages_are_rate_limited_per_sender() {
     assert!(matches!(verdict, InboundVerdict::Immediate(_)), "limits are per sender");
 }
 
+#[tokio::test]
+async fn acks_from_unregistered_senders_never_reach_the_control_queue() {
+    let local_db = store::create_local_db("sqlite::memory:").await;
+    let gates = TestGates::new(PeerRateLimiter::new(1.0, 0.0, 16));
+    let now = Instant::now();
+    let ack = GOATMessage::new(
+        Actor::All,
+        GOATMessageContent::GraphSetupAck(crate::messages::GraphSetupAck {
+            delivery_id: "deliv".to_string(),
+        }),
+    )
+    .serialize_message()
+    .await
+    .unwrap();
+    let stranger = PeerId::random();
+    let verdict = gates.evaluate(&local_db, &SMALL, &stranger, 1, &ack, now).await;
+    assert!(matches!(verdict, InboundVerdict::Drop(DropReason::AckFromUnregistered)));
+    let member = PeerId::random();
+    gates.registry.record_committee_peer(&member, Some(true), now);
+    let verdict = gates.evaluate(&local_db, &SMALL, &member, 1, &ack, now).await;
+    assert!(matches!(verdict, InboundVerdict::Immediate(_)));
+}
+
 /// Verify equivalent key encodings share one operator identity.
 #[test]
 fn operator_identity_ignores_how_the_key_is_spelled() {

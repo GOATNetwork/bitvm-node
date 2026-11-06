@@ -580,3 +580,29 @@ async fn rejected_network_rows_are_purged_early() {
         assert_eq!(s.find_engine_inbox_event(id).await.unwrap().is_some(), kept, "{id}");
     }
 }
+
+#[tokio::test]
+async fn ack_lookup_matches_exactly_and_skips_payloads() {
+    let db = setup_db().await;
+    let mut s = db.acquire().await.unwrap();
+    let acks = BTreeMap::from([("peer-a".to_string(), "deliv-a".to_string())]);
+    assert!(s.insert_engine_outbox_message(&outbox("o1", Some(acks)), 10).await.unwrap());
+    // A substring of the delivery id or of the set is not a match.
+    for (peer, delivery_id) in [("peer-a", "deliv"), ("peer", "deliv-a"), ("peer-b", "deliv-a")] {
+        assert!(s.find_engine_outbox_acks(peer, delivery_id).await.unwrap().is_empty());
+    }
+    assert_eq!(s.find_engine_outbox_acks("peer-a", "deliv-a").await.unwrap().len(), 1);
+
+    let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(
+        "EXPLAIN QUERY PLAN SELECT outbox_id, ack_set FROM engine_outbox \
+         WHERE state = 'Open' AND ack_set IS NOT NULL \
+           AND json_extract(ack_set, '$.' || json_quote('p')) = 'd'",
+    )
+    .fetch_all(s.conn())
+    .await
+    .unwrap();
+    assert!(
+        plan.iter().any(|(.., detail)| detail.contains("COVERING INDEX idx_engine_outbox_ack")),
+        "{plan:?}"
+    );
+}
