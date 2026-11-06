@@ -69,6 +69,7 @@ pub fn operator_presig_num() -> usize {
 }
 
 pub fn generate_bitvm_graph(params: BitvmGcGraphParameters) -> Result<BitvmGcGraph> {
+    params.validate_basic()?;
     validate_timelock_config(params.network(), &params.timelock_config)?;
 
     let watchtower_num = params.watchtower_pubkeys.len();

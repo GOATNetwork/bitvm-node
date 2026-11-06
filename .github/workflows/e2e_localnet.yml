@@ -22,6 +22,11 @@ env:
   COMPOSE_PROJECT: bvci
   # Dedicated target dir, kept between runs; only this workflow builds into it.
   CARGO_TARGET_DIR: /data/actions-runner-bitvm2-node/cache/localnet-e2e/target
+  # GOAT side on the public GOAT testnet3 (our own contracts, redeployed by every reset) instead of a
+  # local anvil. Gas comes from a funded testnet3 key kept on the runner host, outside the repo and
+  # outside LOCALNET_DATA (chmod 600).
+  GOAT_BACKEND: testnet3
+  GOAT_FUNDER_KEY_FILE: /data/actions-runner-bitvm2-node/cache/localnet-e2e/goat-funder.key
 
 jobs:
   e2e:

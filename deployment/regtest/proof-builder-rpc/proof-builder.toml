@@ -31,7 +31,6 @@ init_input = true
 #l2_contract_address = "0x26Aa99d72f5f85D60A1B44773B3897793981B7F7"
 l2_contract_addresses = "0x294306b29b7A25EAe079fd874131B350bbA0b16c"
 #proceed_withdraw_method_id = "0xc3342df3"
-proceed_withdraw_method_ids = "0xd3d8a3f4"
 #start = 9511050
 start = 10579883
 batch_size = 40

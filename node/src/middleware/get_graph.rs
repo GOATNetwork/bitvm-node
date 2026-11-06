@@ -3,7 +3,6 @@
 //! Responses use the request's stream and authenticated peer connection.
 //! Definition validation is handled by the requester.
 
-use async_trait::async_trait;
 use futures::prelude::*;
 use libp2p::request_response::{self, ProtocolSupport};
 use libp2p::swarm::StreamProtocol;
@@ -18,7 +17,6 @@ pub type GetGraphBehaviour = request_response::Behaviour<GetGraphCodec>;
 #[derive(Clone, Debug, Default)]
 pub struct GetGraphCodec;
 
-#[async_trait]
 impl request_response::Codec for GetGraphCodec {
     type Protocol = StreamProtocol;
     type Request = GetGraphRequest;

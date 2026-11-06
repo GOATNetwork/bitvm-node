@@ -1383,3 +1383,5 @@ async fn a_copy_stored_after_its_instance_failed_is_obsoleted_by_its_scan() {
     t.wait_phase(graph_id, PHASE_OBSOLETED).await;
     t.stop().await;
 }
+
+mod setup_admission_tests;

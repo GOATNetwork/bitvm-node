@@ -634,6 +634,7 @@ fn taproot_script_spend_sighash(
 }
 
 fn key_agg_context(committee_pubkeys: &[PublicKey]) -> Result<KeyAggContext> {
+    ensure!(!committee_pubkeys.is_empty(), "committee public keys are empty");
     let pubkeys: Vec<Point> =
         committee_pubkeys.iter().map(|public_key| public_key.inner.into()).collect();
     KeyAggContext::new(pubkeys).map_err(|e| anyhow::anyhow!("invalid committee key set: {e}"))
@@ -909,8 +910,9 @@ pub fn verify_graph_committee_partial_sigs(
 
 pub fn verify_graph_committee_pre_signatures(graph: &BitvmGcGraph) -> Result<()> {
     ensure!(graph.committee_pre_signed(), "graph is not pre-signed by the committee");
-    let (_, committee_pubkey) =
-        generate_n_of_n_public_key(&graph.parameters.instance_parameters.committee_pubkeys);
+    let committee_pubkey = XOnlyPublicKey::from(crate::types::checked_committee_key(
+        &graph.parameters.instance_parameters.committee_pubkeys,
+    )?);
     ensure!(
         committee_pubkey == graph.parameters.instance_parameters.n_of_n_taproot_public_key(),
         "graph committee aggregate public key mismatch"

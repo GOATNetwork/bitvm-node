@@ -217,7 +217,7 @@ pub async fn fetch_target_block_and_watchtower_tx(
     Vec<[u8; 32]>,
     Txid,
     Option<Transaction>,
-    Vec<(u16, u32, Block, Transaction)>,
+    Vec<(u16, u32, Block, Transaction, Vec<Transaction>)>,
 )> {
     let (indexed_watchtower_inputs, graph_watchtower_xonly_public_keys) =
         parse_indexed_watchtower_inputs(watchtower_challenge_txids, watchtower_public_keys)?;
@@ -305,7 +305,29 @@ pub async fn fetch_target_block_and_watchtower_tx(
         if !block.txdata.iter().any(|candidate| candidate.compute_txid() == txid) {
             anyhow::bail!("watchtower challenge is missing from its reported block: {txid}");
         };
-        watchtower_challenge_witnesses.push((node_index, block_height, block, txn));
+        let mut previous_transactions = Vec::with_capacity(txn.input.len());
+        for input in &txn.input {
+            let previous = if input.previous_output.txid == watchtower_challenge_init_txid {
+                watchtower_challenge_init_txn
+                    .as_ref()
+                    .context("missing challenge init transaction")?
+                    .clone()
+            } else {
+                btc_client.get_tx(&input.previous_output.txid).await?.with_context(|| {
+                    format!("missing challenge previous transaction {}", input.previous_output.txid)
+                })?
+            };
+            previous_transactions.push(previous);
+        }
+        bitcoin_light_client_circuit::checked_transaction_prevouts(&txn, &previous_transactions)
+            .map_err(anyhow::Error::msg)?;
+        watchtower_challenge_witnesses.push((
+            node_index,
+            block_height,
+            block,
+            txn,
+            previous_transactions,
+        ));
     }
 
     Ok((
@@ -512,7 +534,7 @@ impl ProofBuilder for OperatorProofBuilder {
         );
         let watchtower_challenges = watchtower_challenge_witnesses
             .iter()
-            .map(|(node_index, block_height, block, transaction)| {
+            .map(|(node_index, block_height, block, transaction, previous_transactions)| {
                 anyhow::ensure!(
                     bitcoin_block_headers
                         .get(*block_height as usize)
@@ -522,6 +544,7 @@ impl ProofBuilder for OperatorProofBuilder {
                 );
                 Ok(IndexedWatchtowerChallenge {
                     node_index: *node_index,
+                    previous_transactions: previous_transactions.clone(),
                     spv: build_spv(
                         transaction,
                         *block_height,
