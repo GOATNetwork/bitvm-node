@@ -24,6 +24,7 @@ use alloy::{
     rpc::types::TransactionRequest,
     signers::{Signer, local::PrivateKeySigner},
     sol,
+    sol_types::SolValue,
     transports::http::reqwest::Url,
 };
 use anyhow::{bail, format_err};
@@ -182,8 +183,6 @@ sol!(
         function getCommitteePubkeys(bytes16 instanceId) public view returns (bytes[] memory committeePubkeys);
         function getCommitteeAddresses(bytes16 instanceId) public view returns (address[] memory committeeAddresses);
         function getCommitteePubkeysUnsafe(bytes16 instanceId) public view returns (bytes[] memory committeePubkeys);
-        function getPostGraphDigest(bytes16 instanceId, bytes16 graphId, GraphData calldata graphData) public view returns (bytes32);
-        function getPostPeginDigest(bytes16 instanceId, bytes32 peginTxid) public view returns (bytes32);
         function getGraphIdsByInstanceId(bytes16 instanceId) external view returns (bytes16[] memory);
         function getCancelWithdrawDigestNonced(bytes16 graphId, uint256 nonce) public view returns (bytes32);
         function getUnlockStakeDigestNonced(address operator, uint256 amount, uint256 nonce) public view returns (bytes32);
@@ -823,6 +822,47 @@ impl From<IGateway::PeginData> for PeginData {
         }
     }
 }
+// The committee signs these digests with its GOAT hot key, so they are
+// computed here as `Gateway.getPostPeginDigest` / `getPostGraphDigest` do,
+// never taken from the RPC.
+const POST_PEGIN_TYPE: &str =
+    "POST_PEGIN_DATA(address contract,bytes16 instanceId,bytes32 peginTxid)";
+const POST_GRAPH_TYPE: &str =
+    "POST_GRAPH_DATA(address contract,bytes16 instanceId,bytes16 graphId,bytes32 graphDataHash)";
+
+pub fn post_pegin_digest(
+    gateway: Address,
+    instance_id: &[u8; 16],
+    pegin_txid: &[u8; 32],
+) -> [u8; 32] {
+    let encoded = (
+        keccak256(POST_PEGIN_TYPE),
+        gateway,
+        FixedBytes::<16>::from(*instance_id),
+        FixedBytes::<32>::from(*pegin_txid),
+    )
+        .abi_encode();
+    keccak256(encoded).0
+}
+
+pub fn post_graph_digest(
+    gateway: Address,
+    instance_id: &[u8; 16],
+    graph_id: &[u8; 16],
+    graph_data: GraphData,
+) -> [u8; 32] {
+    let graph_data_hash = keccak256(IGateway::GraphData::from(graph_data).abi_encode());
+    let encoded = (
+        keccak256(POST_GRAPH_TYPE),
+        gateway,
+        FixedBytes::<16>::from(*instance_id),
+        FixedBytes::<16>::from(*graph_id),
+        graph_data_hash,
+    )
+        .abi_encode();
+    keccak256(encoded).0
+}
+
 impl From<GraphData> for IGateway::GraphData {
     fn from(value: GraphData) -> Self {
         Self {
@@ -1024,9 +1064,9 @@ impl ChainAdaptor for GoatAdaptor {
         Ok(gateway.operatorRewardRate().call().await?)
     }
 
-    async fn gateway_get_min_stake_amount(&self) -> anyhow::Result<u64> {
+    async fn gateway_get_min_stake_amount(&self) -> anyhow::Result<U256> {
         let gateway = self.get_gateway()?;
-        Ok(gateway.minStakeAmount().call().await?.try_into()?)
+        Ok(gateway.minStakeAmount().call().await?)
     }
 
     async fn gateway_get_min_challenger_reward(&self) -> anyhow::Result<u64> {
@@ -1332,16 +1372,7 @@ impl ChainAdaptor for GoatAdaptor {
         graph_id: &[u8; 16],
         graph_data: GraphData,
     ) -> anyhow::Result<[u8; 32]> {
-        let gateway = self.get_gateway()?;
-        Ok(gateway
-            .getPostGraphDigest(
-                FixedBytes::from_slice(instance_id),
-                FixedBytes::from_slice(graph_id),
-                graph_data.into(),
-            )
-            .call()
-            .await?
-            .0)
+        Ok(post_graph_digest(*self.get_gateway()?.address(), instance_id, graph_id, graph_data))
     }
 
     async fn gateway_get_post_pegin_digest(
@@ -1349,15 +1380,7 @@ impl ChainAdaptor for GoatAdaptor {
         instance_id: &[u8; 16],
         pegin_txid: &[u8; 32],
     ) -> anyhow::Result<[u8; 32]> {
-        let gateway = self.get_gateway()?;
-        Ok(gateway
-            .getPostPeginDigest(
-                FixedBytes::from_slice(instance_id),
-                FixedBytes::from_slice(pegin_txid),
-            )
-            .call()
-            .await?
-            .0)
+        Ok(post_pegin_digest(*self.get_gateway()?.address(), instance_id, pegin_txid))
     }
 
     async fn gateway_get_graph_ids_by_instance_id(
@@ -1435,24 +1458,15 @@ impl ChainAdaptor for GoatAdaptor {
             .into_array())
     }
 
-    async fn stake_mana_stake_of(&self, operator: &[u8; 20]) -> anyhow::Result<u64> {
+    // Stake amounts carry 18 decimals and exceed u64 above ~18.45 tokens.
+    async fn stake_mana_stake_of(&self, operator: &[u8; 20]) -> anyhow::Result<U256> {
         let stake_management = self.get_stake_management()?;
-        Ok(stake_management
-            .stakeOf(Address::from_slice(operator))
-            .call()
-            .await?
-            .try_into()
-            .map_err(|e| anyhow::anyhow!("StakeOf error :{e:?}"))?)
+        Ok(stake_management.stakeOf(Address::from_slice(operator)).call().await?)
     }
 
-    async fn stake_mana_lock_stake_of(&self, operator: &[u8; 20]) -> anyhow::Result<u64> {
+    async fn stake_mana_lock_stake_of(&self, operator: &[u8; 20]) -> anyhow::Result<U256> {
         let stake_management = self.get_stake_management()?;
-        Ok(stake_management
-            .lockedStakeOf(Address::from_slice(operator))
-            .call()
-            .await?
-            .try_into()
-            .map_err(|e| anyhow::anyhow!("StakeOf error :{e:?}"))?)
+        Ok(stake_management.lockedStakeOf(Address::from_slice(operator)).call().await?)
     }
 
     async fn stake_mana_slash_stake(
@@ -1709,5 +1723,52 @@ impl GoatAdaptor {
             btc_spv: config.btc_spv_address.map(|addr| IBitcoinSPV::new(addr, provider.clone())),
             peg_btc: config.peg_btc_address.map(|addr| IPegBtc::new(addr, provider.clone())),
         }
+    }
+}
+
+#[cfg(test)]
+mod digest_tests {
+    use super::*;
+
+    // Values from the Gateway contract (localnet/contracts) deployed by forge.
+    const GATEWAY: &str = "0x5615dEB798BB3E4dFa0139dFa1b3D433Cc23b72f";
+    const INSTANCE_ID: [u8; 16] = [
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
+        0xff,
+    ];
+
+    fn word(value: u8) -> [u8; 32] {
+        let mut word = [0; 32];
+        word[31] = value;
+        word
+    }
+
+    #[test]
+    fn digests_match_the_gateway_contract() {
+        let gateway = Address::from_str(GATEWAY).unwrap();
+        assert_eq!(
+            hex::encode(post_pegin_digest(gateway, &INSTANCE_ID, &word(0x11))),
+            "0e3c99f1aa81d655c37ed28331afa3ea8e8969151c975f7eb98a5776ce34a40f"
+        );
+        let mut graph_id = INSTANCE_ID;
+        graph_id.reverse();
+        let graph_data = GraphData {
+            operator_pubkey_prefix: 0x03,
+            operator_pubkey: word(1),
+            pegin_txid: word(2),
+            kickoff_txid: word(3),
+            take1_txid: word(4),
+            take2_txid: word(5),
+            watchtower_challenge_init_txid: word(6),
+            prover_assert_txid: word(7),
+            disprove_txids: vec![word(0xd1), word(0xd2)],
+            watchtower_challenge_timeout_txids: vec![word(0xe1)],
+            operator_challenge_nack_txids: vec![],
+            operator_commit_timeout_txid: word(9),
+        };
+        assert_eq!(
+            hex::encode(post_graph_digest(gateway, &INSTANCE_ID, &graph_id, graph_data)),
+            "e9115e8303ab1480367c771bff96b27cd8753f6e80bcbc515b750494d3aca0e0"
+        );
     }
 }

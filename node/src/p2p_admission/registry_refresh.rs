@@ -308,6 +308,101 @@ pub async fn revalidate_committee_candidates(local_db: &LocalDB, goat_client: &A
     }
 }
 
+/// Committee members are refreshed by address, from the committee lists of
+/// recent instances (copied from their Goat peg-in data), outside every
+/// discovery budget: forged NodeInfo announcements cannot keep a member that
+/// already answered a peg-in unclassified.
+const KNOWN_COMMITTEE_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const KNOWN_COMMITTEE_INSTANCE_LIMIT: i64 = 256;
+const KNOWN_COMMITTEE_MAX_ADDRESSES: usize = 64;
+static KNOWN_COMMITTEE_REFRESHED_AT: Mutex<Option<Instant>> = Mutex::new(None);
+/// The last address a refresh checked; the next one resumes after it.
+static KNOWN_COMMITTEE_CURSOR: Mutex<Option<String>> = Mutex::new(None);
+
+/// The next `KNOWN_COMMITTEE_MAX_ADDRESSES` addresses after `cursor`, wrapping,
+/// so repeated passes check every address however long the list grows.
+pub(crate) fn next_known_committee_batch(
+    mut addresses: Vec<String>,
+    cursor: &mut Option<String>,
+) -> Vec<String> {
+    addresses.sort();
+    let start = cursor.as_ref().map_or(0, |last| addresses.partition_point(|a| a <= last));
+    let batch: Vec<String> = addresses
+        .iter()
+        .cycle()
+        .skip(start)
+        .take(KNOWN_COMMITTEE_MAX_ADDRESSES.min(addresses.len()))
+        .cloned()
+        .collect();
+    *cursor = batch.last().cloned();
+    batch
+}
+
+fn known_committee_refresh_due(now: Instant) -> bool {
+    let mut refreshed_at =
+        KNOWN_COMMITTEE_REFRESHED_AT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if refreshed_at
+        .is_some_and(|at| now.saturating_duration_since(at) < KNOWN_COMMITTEE_REFRESH_INTERVAL)
+    {
+        return false;
+    }
+    *refreshed_at = Some(now);
+    true
+}
+
+/// Register the peer ids of committee members that answered recent instances.
+pub async fn refresh_known_committee_members(local_db: &LocalDB, goat_client: &Arc<GOATClient>) {
+    if !known_committee_refresh_due(Instant::now()) {
+        return;
+    }
+    let addresses = match local_db.acquire().await {
+        Ok(mut storage) => {
+            storage.list_recent_committee_addresses(KNOWN_COMMITTEE_INSTANCE_LIMIT).await
+        }
+        Err(error) => Err(error),
+    };
+    let addresses = match addresses {
+        Ok(addresses) => addresses,
+        Err(error) => {
+            tracing::debug!(event = "p2p_admission", outcome = "known_committee_scan_failed", error = %error, "could not read committee addresses");
+            return;
+        }
+    };
+    let batch = next_known_committee_batch(
+        addresses,
+        &mut KNOWN_COMMITTEE_CURSOR.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
+    let registry = peer_registry();
+    for address in batch {
+        let Ok(address) = alloy::primitives::Address::from_str(&address) else { continue };
+        let Some(peer) = committee_member_peer(goat_client, &address).await else { continue };
+        let change = registry.record_committee_peer(&peer, Some(true), Instant::now());
+        persist_registration_change(local_db, &peer, REGISTERED_KIND_COMMITTEE, None, change).await;
+    }
+}
+
+/// The peer id a current committee member registered, if any.
+async fn committee_member_peer(
+    goat_client: &GOATClient,
+    address: &alloy::primitives::Address,
+) -> Option<PeerId> {
+    let lookup = async {
+        if !goat_client.committee_mana_is_committee_member(address).await? {
+            return Ok(None);
+        }
+        let peer_id = goat_client.committee_mana_get_committee_peer_id(address).await?;
+        anyhow::Ok(PeerId::from_bytes(&peer_id).ok())
+    };
+    match tokio::time::timeout(REGISTRY_RPC_TIMEOUT, lookup).await {
+        Ok(Ok(peer)) => peer,
+        Ok(Err(error)) => {
+            tracing::debug!(event = "p2p_admission", outcome = "known_committee_lookup_failed", address = %address, error = %error, "failed to look up a committee member's peer id");
+            None
+        }
+        Err(_) => None,
+    }
+}
+
 /// Confirm, off the event loop, that a proven operator binding belongs to a
 /// sufficiently staked operator, and cache the verdict for classification.
 pub fn refresh_operator_binding_in_background(

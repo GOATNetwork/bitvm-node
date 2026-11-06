@@ -26,10 +26,7 @@ use store::localdb::LocalDB;
 pub use gates::{
     CooldownGate, ResponseGate, node_info_response_gate, node_table_purge_due, peer_timestamp_gate,
 };
-pub use get_graph_budget::{
-    GET_GRAPH_SERVE_SLOTS, get_graph_peer_budget, get_graph_response_budget,
-    get_graph_response_gate, get_graph_serve_slots,
-};
+pub use get_graph_budget::{GET_GRAPH_SERVE_SLOTS, get_graph_refusal, get_graph_serve_slots};
 pub use limits::{InboundLimits, Quota, inbound_limits};
 pub use maintenance::{
     NODE_TABLE_EVICTABLE_AFTER_SECS, NODE_TABLE_MAX_UNREGISTERED_ROWS,
@@ -44,9 +41,10 @@ pub use registry::{
     TrustedBindingConflict, operator_key, peer_registry,
 };
 pub use registry_refresh::{
-    refresh_due_registrations_in_background, refresh_neighbour_in_background,
-    refresh_operator_binding_in_background, refresh_registry_in_background,
-    revalidate_committee_candidates, revoke_persisted_operator, seed_registry_from_store,
+    refresh_due_registrations_in_background, refresh_known_committee_members,
+    refresh_neighbour_in_background, refresh_operator_binding_in_background,
+    refresh_registry_in_background, revalidate_committee_candidates, revoke_persisted_operator,
+    seed_registry_from_store,
 };
 pub use replay::{ReplayGuard, replay_guard, unix_nanos_now};
 pub use strikes::{DirectPeerStrikes, direct_peer_strikes, note_refused_peer};
@@ -63,6 +61,9 @@ pub enum DropReason {
     /// A graph parameter endorsement from a peer outside the loaded verifier
     /// set: verifying one costs chain reads, and only verifiers send them.
     EndorsementFromNonVerifier,
+    /// A GraphSetupAck from an unregistered sender: this node only waits for
+    /// ACKs from the registered peers it delivered to.
+    AckFromUnregistered,
     /// A registered author's message whose sequence number was already seen, or
     /// is older than the replay window: a verbatim re-publish by someone else.
     ReplayedSequence,
@@ -101,6 +102,7 @@ impl DropReason {
             Self::OversizedBinary => "oversized_binary",
             Self::BinaryFromNonVerifier => "binary_from_non_verifier",
             Self::EndorsementFromNonVerifier => "endorsement_from_non_verifier",
+            Self::AckFromUnregistered => "ack_from_unregistered",
             Self::ReplayedSequence => "replayed_sequence",
             Self::FutureSequence => "future_sequence",
             Self::ForwardRate => "forward_rate",
@@ -131,6 +133,7 @@ impl DropReason {
             self,
             Self::UnexpectedBinaryKind
                 | Self::EndorsementFromNonVerifier
+                | Self::AckFromUnregistered
                 | Self::ForwardRate
                 | Self::ImmediateRateLimited
                 | Self::ControlQueueFull
@@ -436,6 +439,12 @@ pub async fn evaluate_inbound_message(
         && !gates.registry.is_verifier(source)
     {
         return Ok(InboundVerdict::Drop(DropReason::EndorsementFromNonVerifier));
+    }
+
+    // ACKs reach the control queue that NodeInfo also needs, and each one is
+    // matched against the outbox.
+    if matches!(message.content, GOATMessageContent::GraphSetupAck(_)) && !class.is_registered() {
+        return Ok(InboundVerdict::Drop(DropReason::AckFromUnregistered));
     }
 
     if message.content.p2p_delivery() == P2PMessageDelivery::Immediate {

@@ -45,7 +45,7 @@ pub trait ChainAdaptor: Send + Sync {
     async fn gateway_get_pegin_fee_rate(&self) -> anyhow::Result<u64>;
     async fn gateway_get_min_operator_reward_sats(&self) -> anyhow::Result<u64>;
     async fn gateway_get_operator_reward_rate(&self) -> anyhow::Result<u64>;
-    async fn gateway_get_min_stake_amount(&self) -> anyhow::Result<u64>;
+    async fn gateway_get_min_stake_amount(&self) -> anyhow::Result<U256>;
     async fn gateway_get_min_challenger_reward(&self) -> anyhow::Result<u64>;
     async fn gateway_get_min_disprover_reward(&self) -> anyhow::Result<u64>;
     async fn gateway_get_min_slash_amount(&self) -> anyhow::Result<u64>;
@@ -190,8 +190,8 @@ pub trait ChainAdaptor: Send + Sync {
 
     async fn stake_mana_stake_token_address(&self) -> anyhow::Result<[u8; 20]>;
     async fn stake_mana_pubkey_to_address(&self, pubkey: &[u8; 32]) -> anyhow::Result<[u8; 20]>;
-    async fn stake_mana_stake_of(&self, operator: &[u8; 20]) -> anyhow::Result<u64>;
-    async fn stake_mana_lock_stake_of(&self, operator: &[u8; 20]) -> anyhow::Result<u64>;
+    async fn stake_mana_stake_of(&self, operator: &[u8; 20]) -> anyhow::Result<U256>;
+    async fn stake_mana_lock_stake_of(&self, operator: &[u8; 20]) -> anyhow::Result<U256>;
     async fn stake_mana_slash_stake(
         &self,
         operator: &[u8; 20],

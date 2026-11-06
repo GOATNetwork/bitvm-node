@@ -2,7 +2,12 @@
 //! and concurrent reads.
 
 use std::sync::LazyLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use bitcoin::hashes::{Hash, sha256};
+use libp2p::PeerId;
+
+use crate::middleware::get_graph::GetGraphRequest;
 
 use super::gates::CooldownGate;
 use super::rate::{GlobalRate, PeerRateLimiter};
@@ -53,4 +58,37 @@ static GET_GRAPH_SERVE_SLOTS_SEMAPHORE: LazyLock<std::sync::Arc<tokio::sync::Sem
 
 pub fn get_graph_serve_slots() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
     &GET_GRAPH_SERVE_SLOTS_SEMAPHORE
+}
+
+/// Why a `GetGraph` request is refused, or `None` to serve it. Concurrency is
+/// limited separately by [`get_graph_serve_slots`].
+///
+/// A registered requester spends its own bucket and meets the cooldown before
+/// the class budget, so one member cannot drain what the others need. An
+/// unregistered one meets its small class budget first, before it gets an
+/// entry in any per-peer table. The cooldown is keyed by a hash of the request,
+/// so the key size does not depend on what the requester sent.
+pub fn get_graph_refusal(
+    peer: &PeerId,
+    registered: bool,
+    request: &GetGraphRequest,
+    now: Instant,
+) -> Option<&'static str> {
+    let class_budget = || get_graph_response_budget(registered).allow(now);
+    if !registered && !class_budget() {
+        return Some("budget_spent");
+    }
+    if !get_graph_peer_budget().allow(peer, now) {
+        return Some("peer_budget_spent");
+    }
+    let request_hash = serde_json::to_vec(request)
+        .map(|bytes| sha256::Hash::hash(&bytes).to_string())
+        .unwrap_or_default();
+    if !get_graph_response_gate().allow(&format!("{peer}:{request_hash}"), now) {
+        return Some("cooldown");
+    }
+    if registered && !class_budget() {
+        return Some("budget_spent");
+    }
+    None
 }

@@ -124,6 +124,7 @@ pub async fn run_p2p_admission_maintenance(local_db: &LocalDB, goat_client: &Arc
     let now = Instant::now();
     crate::p2p_admission::refresh_due_registrations_in_background(local_db, goat_client);
     crate::p2p_admission::revalidate_committee_candidates(local_db, goat_client).await;
+    crate::p2p_admission::refresh_known_committee_members(local_db, goat_client).await;
     crate::p2p_admission::log_drop_summary();
     // Expired bans only need forgetting: the gate compares against the clock.
     crate::p2p_admission::direct_peer_strikes().take_expired_bans(now);

@@ -899,6 +899,29 @@ async fn immediate_messages_are_rate_limited_per_sender() {
     assert!(matches!(verdict, InboundVerdict::Immediate(_)), "limits are per sender");
 }
 
+#[tokio::test]
+async fn acks_from_unregistered_senders_never_reach_the_control_queue() {
+    let local_db = store::create_local_db("sqlite::memory:").await;
+    let gates = TestGates::new(PeerRateLimiter::new(1.0, 0.0, 16));
+    let now = Instant::now();
+    let ack = GOATMessage::new(
+        Actor::All,
+        GOATMessageContent::GraphSetupAck(crate::messages::GraphSetupAck {
+            delivery_id: "deliv".to_string(),
+        }),
+    )
+    .serialize_message()
+    .await
+    .unwrap();
+    let stranger = PeerId::random();
+    let verdict = gates.evaluate(&local_db, &SMALL, &stranger, 1, &ack, now).await;
+    assert!(matches!(verdict, InboundVerdict::Drop(DropReason::AckFromUnregistered)));
+    let member = PeerId::random();
+    gates.registry.record_committee_peer(&member, Some(true), now);
+    let verdict = gates.evaluate(&local_db, &SMALL, &member, 1, &ack, now).await;
+    assert!(matches!(verdict, InboundVerdict::Immediate(_)));
+}
+
 /// Verify equivalent key encodings share one operator identity.
 #[test]
 fn operator_identity_ignores_how_the_key_is_spelled() {
@@ -1479,6 +1502,77 @@ fn trusted_operator_bindings_are_parsed_strictly() {
         "malformed entries are skipped, and every spelling is the same key"
     );
     assert!(parse_trusted_operator_bindings("").is_empty());
+}
+
+#[tokio::test]
+async fn committee_members_of_recent_instances_are_registered_outside_discovery() {
+    let local_db = store::create_local_db("sqlite::memory:").await;
+    let (goat_client, goat_mock) = client::goat_chain::GOATClient::new_mock_client();
+    let member = PeerId::random();
+    let (member_address, former_address) = ([0x11; 20], [0x22; 20]);
+    goat_mock.set_committee_peer_id(member_address, member.to_bytes());
+    let mut instance = store::Instance { instance_id: Uuid::new_v4(), ..Default::default() };
+    for address in [member_address, former_address] {
+        instance
+            .committees_answers
+            .insert(alloy::primitives::Address::from(address).to_string(), vec![2; 33]);
+    }
+    local_db.acquire().await.unwrap().insert_instance_if_absent(&instance).await.unwrap();
+
+    // The candidate discovery budget is spent on forged announcements.
+    let now = Instant::now();
+    while peer_registry().plan_candidate_lookup(&PeerId::random(), now) {}
+    assert!(!peer_registry().plan_candidate_lookup(&member, now));
+
+    refresh_known_committee_members(&local_db, &std::sync::Arc::new(goat_client)).await;
+    assert!(peer_registry().is_committee(&member, Instant::now()));
+    // The address that is no longer a member registers nothing.
+    let persisted = local_db.acquire().await.unwrap().load_p2p_registered_peers().await.unwrap();
+    assert_eq!(persisted.len(), 1);
+    assert_eq!(persisted[0].0, member.to_string());
+}
+
+#[test]
+fn known_committee_batches_rotate_through_every_address() {
+    use super::registry_refresh::next_known_committee_batch;
+
+    let addresses: Vec<String> = (0..65).map(|i| format!("0x{i:040x}")).collect();
+    let mut cursor = None;
+    let first = next_known_committee_batch(addresses.clone(), &mut cursor);
+    assert_eq!(first, addresses[..64]);
+    // The 65th address comes next, then the list wraps.
+    let second = next_known_committee_batch(addresses.clone(), &mut cursor);
+    assert_eq!(second[..2], [addresses[64].clone(), addresses[0].clone()]);
+    assert_eq!(second.len(), 64);
+    // A removed cursor address resumes at the next one.
+    let without_cursor: Vec<String> =
+        addresses.iter().filter(|a| Some(*a) != cursor.as_ref()).cloned().collect();
+    let third = next_known_committee_batch(without_cursor, &mut cursor);
+    assert_eq!(third[0], addresses[63]);
+    assert!(next_known_committee_batch(Vec::new(), &mut cursor).is_empty());
+}
+
+#[test]
+fn one_registered_get_graph_requester_cannot_drain_the_class_budget() {
+    use crate::middleware::get_graph::GetGraphRequest;
+    let request = |nonce: u64| GetGraphRequest {
+        instance_id: None,
+        graph_id: None,
+        operator_pubkey: Some("02".repeat(33)),
+        graph_nonce: Some(nonce),
+        finalized: false,
+    };
+    let now = Instant::now();
+    let flooder = PeerId::random();
+    let served = (0..64)
+        .filter(|nonce| super::get_graph_refusal(&flooder, true, &request(*nonce), now).is_none())
+        .count();
+    assert!(served < 64, "the flooder's own bucket runs out");
+    assert_eq!(super::get_graph_refusal(&PeerId::random(), true, &request(0), now), None);
+    // The same request again is on cooldown.
+    let member = PeerId::random();
+    assert_eq!(super::get_graph_refusal(&member, true, &request(1), now), None);
+    assert_eq!(super::get_graph_refusal(&member, true, &request(1), now), Some("cooldown"));
 }
 
 #[test]

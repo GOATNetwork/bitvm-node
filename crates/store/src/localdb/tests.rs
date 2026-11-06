@@ -639,6 +639,26 @@ async fn watchtower_key_migration_keeps_one_task_per_key() {
 }
 
 #[tokio::test]
+async fn test_list_recent_committee_addresses_dedupes_recent_instances() {
+    let local_db = create_local_db("sqlite::memory:").await;
+    let mut storage = local_db.acquire().await.unwrap();
+    for (created_at, addresses) in [(1, ["0xold", "0xshared"]), (2, ["0xnew", "0xshared"])] {
+        let mut instance = pegin_instance(Uuid::new_v4(), "UserInited");
+        instance.created_at = created_at;
+        for address in addresses {
+            instance.committees_answers.insert(address.to_string(), vec![2; 33]);
+        }
+        storage.insert_instance_if_absent(&instance).await.unwrap();
+    }
+    let mut all = storage.list_recent_committee_addresses(10).await.unwrap();
+    all.sort();
+    assert_eq!(all, ["0xnew", "0xold", "0xshared"]);
+    let mut latest = storage.list_recent_committee_addresses(1).await.unwrap();
+    latest.sort();
+    assert_eq!(latest, ["0xnew", "0xshared"]);
+}
+
+#[tokio::test]
 async fn pending_request_keyset_pages_do_not_starve_behind_retrying_rows() {
     use crate::GoatTxRecord;
     let db = setup_db().await;
