@@ -68,7 +68,7 @@ impl EvmChain {
         self.adaptor.gateway_get_operator_reward_rate().await
     }
 
-    pub async fn gateway_get_min_stake_amount(&self) -> anyhow::Result<u64> {
+    pub async fn gateway_get_min_stake_amount(&self) -> anyhow::Result<U256> {
         self.adaptor.gateway_get_min_stake_amount().await
     }
 
@@ -369,10 +369,10 @@ impl EvmChain {
     ) -> anyhow::Result<[u8; 20]> {
         self.adaptor.stake_mana_pubkey_to_address(pubkey).await
     }
-    pub async fn stake_mana_stake_of(&self, operator: &[u8; 20]) -> anyhow::Result<u64> {
+    pub async fn stake_mana_stake_of(&self, operator: &[u8; 20]) -> anyhow::Result<U256> {
         self.adaptor.stake_mana_stake_of(operator).await
     }
-    pub async fn stake_mana_lock_stake_of(&self, operator: &[u8; 20]) -> anyhow::Result<u64> {
+    pub async fn stake_mana_lock_stake_of(&self, operator: &[u8; 20]) -> anyhow::Result<U256> {
         self.adaptor.stake_mana_lock_stake_of(operator).await
     }
     pub async fn stake_mana_slash_stake(

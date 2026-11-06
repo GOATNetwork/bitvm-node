@@ -1024,9 +1024,9 @@ impl ChainAdaptor for GoatAdaptor {
         Ok(gateway.operatorRewardRate().call().await?)
     }
 
-    async fn gateway_get_min_stake_amount(&self) -> anyhow::Result<u64> {
+    async fn gateway_get_min_stake_amount(&self) -> anyhow::Result<U256> {
         let gateway = self.get_gateway()?;
-        Ok(gateway.minStakeAmount().call().await?.try_into()?)
+        Ok(gateway.minStakeAmount().call().await?)
     }
 
     async fn gateway_get_min_challenger_reward(&self) -> anyhow::Result<u64> {
@@ -1435,24 +1435,15 @@ impl ChainAdaptor for GoatAdaptor {
             .into_array())
     }
 
-    async fn stake_mana_stake_of(&self, operator: &[u8; 20]) -> anyhow::Result<u64> {
+    // Stake amounts carry 18 decimals and exceed u64 above ~18.45 tokens.
+    async fn stake_mana_stake_of(&self, operator: &[u8; 20]) -> anyhow::Result<U256> {
         let stake_management = self.get_stake_management()?;
-        Ok(stake_management
-            .stakeOf(Address::from_slice(operator))
-            .call()
-            .await?
-            .try_into()
-            .map_err(|e| anyhow::anyhow!("StakeOf error :{e:?}"))?)
+        Ok(stake_management.stakeOf(Address::from_slice(operator)).call().await?)
     }
 
-    async fn stake_mana_lock_stake_of(&self, operator: &[u8; 20]) -> anyhow::Result<u64> {
+    async fn stake_mana_lock_stake_of(&self, operator: &[u8; 20]) -> anyhow::Result<U256> {
         let stake_management = self.get_stake_management()?;
-        Ok(stake_management
-            .lockedStakeOf(Address::from_slice(operator))
-            .call()
-            .await?
-            .try_into()
-            .map_err(|e| anyhow::anyhow!("StakeOf error :{e:?}"))?)
+        Ok(stake_management.lockedStakeOf(Address::from_slice(operator)).call().await?)
     }
 
     async fn stake_mana_slash_stake(
