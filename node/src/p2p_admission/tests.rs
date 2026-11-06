@@ -1504,6 +1504,54 @@ fn trusted_operator_bindings_are_parsed_strictly() {
     assert!(parse_trusted_operator_bindings("").is_empty());
 }
 
+#[tokio::test]
+async fn committee_members_of_recent_instances_are_registered_outside_discovery() {
+    let local_db = store::create_local_db("sqlite::memory:").await;
+    let (goat_client, goat_mock) = client::goat_chain::GOATClient::new_mock_client();
+    let member = PeerId::random();
+    let (member_address, former_address) = ([0x11; 20], [0x22; 20]);
+    goat_mock.set_committee_peer_id(member_address, member.to_bytes());
+    let mut instance = store::Instance { instance_id: Uuid::new_v4(), ..Default::default() };
+    for address in [member_address, former_address] {
+        instance
+            .committees_answers
+            .insert(alloy::primitives::Address::from(address).to_string(), vec![2; 33]);
+    }
+    local_db.acquire().await.unwrap().insert_instance_if_absent(&instance).await.unwrap();
+
+    // The candidate discovery budget is spent on forged announcements.
+    let now = Instant::now();
+    while peer_registry().plan_candidate_lookup(&PeerId::random(), now) {}
+    assert!(!peer_registry().plan_candidate_lookup(&member, now));
+
+    refresh_known_committee_members(&local_db, &std::sync::Arc::new(goat_client)).await;
+    assert!(peer_registry().is_committee(&member, Instant::now()));
+    // The address that is no longer a member registers nothing.
+    let persisted = local_db.acquire().await.unwrap().load_p2p_registered_peers().await.unwrap();
+    assert_eq!(persisted.len(), 1);
+    assert_eq!(persisted[0].0, member.to_string());
+}
+
+#[test]
+fn known_committee_batches_rotate_through_every_address() {
+    use super::registry_refresh::next_known_committee_batch;
+
+    let addresses: Vec<String> = (0..65).map(|i| format!("0x{i:040x}")).collect();
+    let mut cursor = None;
+    let first = next_known_committee_batch(addresses.clone(), &mut cursor);
+    assert_eq!(first, addresses[..64]);
+    // The 65th address comes next, then the list wraps.
+    let second = next_known_committee_batch(addresses.clone(), &mut cursor);
+    assert_eq!(second[..2], [addresses[64].clone(), addresses[0].clone()]);
+    assert_eq!(second.len(), 64);
+    // A removed cursor address resumes at the next one.
+    let without_cursor: Vec<String> =
+        addresses.iter().filter(|a| Some(*a) != cursor.as_ref()).cloned().collect();
+    let third = next_known_committee_batch(without_cursor, &mut cursor);
+    assert_eq!(third[0], addresses[63]);
+    assert!(next_known_committee_batch(Vec::new(), &mut cursor).is_empty());
+}
+
 #[test]
 fn operator_balance_snapshot_excludes_negative_and_expired_stake_verdicts() {
     let registry = PeerRegistry::default();
