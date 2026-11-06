@@ -32,11 +32,11 @@ default-members = ["node"]
 bitvm = { git = "https://github.com/GOATNetwork/BitVM.git", branch = "gc-v2" }
 goat = { git = "https://github.com/GOATNetwork/BitVM.git", branch = "gc-v2" }
 
-libp2p = { version = "0.56.0", features = ["tokio", "kad", "noise", "tcp", "yamux", "rsa", "ping"] }
-libp2p-swarm-derive = "0.35.1"
-libp2p-metrics = "0.17.0"
-libp2p-core = "0.43.1"
-prometheus-client = "0.23.1"
+libp2p = { version = "0.57.1", features = ["tokio", "kad", "noise", "tcp", "yamux", "rsa", "ping"] }
+libp2p-swarm-derive = "0.36.0"
+libp2p-metrics = "0.18.0"
+libp2p-core = "0.44.0"
+prometheus-client = "0.25.2"
 once_cell = "1.5"
 bitcoin-script = { git = "https://github.com/BitVM/rust-bitcoin-script" }
 
