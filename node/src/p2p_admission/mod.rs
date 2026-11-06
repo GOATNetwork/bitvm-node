@@ -26,10 +26,7 @@ use store::localdb::LocalDB;
 pub use gates::{
     CooldownGate, ResponseGate, node_info_response_gate, node_table_purge_due, peer_timestamp_gate,
 };
-pub use get_graph_budget::{
-    GET_GRAPH_SERVE_SLOTS, get_graph_peer_budget, get_graph_response_budget,
-    get_graph_response_gate, get_graph_serve_slots,
-};
+pub use get_graph_budget::{GET_GRAPH_SERVE_SLOTS, get_graph_refusal, get_graph_serve_slots};
 pub use limits::{InboundLimits, Quota, inbound_limits};
 pub use maintenance::{
     NODE_TABLE_EVICTABLE_AFTER_SECS, NODE_TABLE_MAX_UNREGISTERED_ROWS,

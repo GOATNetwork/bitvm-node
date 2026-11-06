@@ -254,10 +254,9 @@ impl P2pMessageHandler for BitvmNodeProcessor {
 
     /// Serve a stored graph definition to a direct `GetGraph` request. Any
     /// role answers from its own copy; the requester authenticates what it
-    /// gets. Admission is a global budget by requester class first (it has no
-    /// per-key table an unregistered flood could fill), then the per-peer
-    /// bucket, the per-request cooldown and a cap on definitions in flight;
-    /// the read and the serialization run off the network loop.
+    /// gets. Admission is [`crate::p2p_admission::get_graph_refusal`] and a cap
+    /// on definitions in flight; the read and the serialization run off the
+    /// network loop.
     fn serve_graph_request(
         &self,
         peer: PeerId,
@@ -268,19 +267,10 @@ impl P2pMessageHandler for BitvmNodeProcessor {
         let now = std::time::Instant::now();
         let registered =
             crate::p2p_admission::peer_registry().sender_class(&peer, now).is_registered();
-        if !crate::p2p_admission::get_graph_response_budget(registered).allow(now) {
-            tracing::debug!(event = "get_graph", outcome = "budget_spent", %peer, registered, "GetGraph refused");
-            return Some(channel);
-        }
-        if !crate::p2p_admission::get_graph_peer_budget().allow(&peer, now) {
-            tracing::debug!(event = "get_graph", outcome = "peer_budget_spent", %peer, "GetGraph refused");
-            return Some(channel);
-        }
-        let gate_key = format!(
-            "{peer}:{:?}:{:?}:{:?}",
-            request.graph_id, request.operator_pubkey, request.graph_nonce
-        );
-        if !crate::p2p_admission::get_graph_response_gate().allow(&gate_key, now) {
+        if let Some(outcome) =
+            crate::p2p_admission::get_graph_refusal(&peer, registered, &request, now)
+        {
+            tracing::debug!(event = "get_graph", outcome, %peer, registered, "GetGraph refused");
             return Some(channel);
         }
         let Ok(slot) = crate::p2p_admission::get_graph_serve_slots().clone().try_acquire_owned()
