@@ -6,7 +6,7 @@ Networks == {"Bitcoin", "Testnet4", "Signet", "Regtest"}
 
 ConnectorA == [Bitcoin |-> 144, Testnet4 |-> 6, Signet |-> 6, Regtest |-> 2]
 ProverConnector == [Bitcoin |-> 144, Testnet4 |-> 16, Signet |-> 6, Regtest |-> 1]
-ConnectorD == [Bitcoin |-> 432, Testnet4 |-> 32, Signet |-> 18, Regtest |-> 3]
+ConnectorD == [Bitcoin |-> 432, Testnet4 |-> 32, Signet |-> 18, Regtest |-> 5]
 WatchtowerChallenge == [Bitcoin |-> 144, Testnet4 |-> 20, Signet |-> 6, Regtest |-> 1]
 OperatorAck == [Bitcoin |-> 288, Testnet4 |-> 28, Signet |-> 12, Regtest |-> 2]
 OperatorCommit == [Bitcoin |-> 432, Testnet4 |-> 42, Signet |-> 18, Regtest |-> 3]

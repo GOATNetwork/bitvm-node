@@ -475,6 +475,17 @@ fn is_timelock_ready(confirmed_height: i64, lock_blocks: i64, current_height: i6
     confirmed_height > 0 && confirmed_height + lock_blocks <= current_height
 }
 
+/// Whether the next block satisfies the CSV, so the mempool accepts the spend
+/// now. Disprove races Take-2 through Connector-D and is due one block before
+/// `is_timelock_ready`.
+fn is_spendable_in_next_block(
+    confirmed_height: i64,
+    lock_blocks: i64,
+    current_height: i64,
+) -> bool {
+    confirmed_height > 0 && confirmed_height + lock_blocks <= current_height + 1
+}
+
 /// Confirmation height of a transaction, cached in the graph's monitor table.
 async fn confirmed_monitor(
     btc_client: &BTCClient,
@@ -787,7 +798,7 @@ async fn wrongly_challenge_timeout(
         else {
             continue;
         };
-        if monitor.height + disprove_blocks <= height {
+        if is_spendable_in_next_block(monitor.height, disprove_blocks, height) {
             signals.push(PegoutSignal::WronglyChallengeTimeout {
                 challenge_assert_txid,
                 verifier_index: index,
@@ -1000,6 +1011,11 @@ mod tests {
         )));
         assert!(is_timelock_ready(10, 5, 15) && !is_timelock_ready(10, 5, 14));
         assert!(!is_timelock_ready(0, 0, 15));
+        // A ChallengeAssert in block 101 with a one-block prover-connector CSV:
+        // Disprove goes out at tip 101 and can confirm in block 102.
+        assert!(
+            is_spendable_in_next_block(101, 1, 101) && !is_spendable_in_next_block(101, 1, 100)
+        );
     }
 
     #[test]

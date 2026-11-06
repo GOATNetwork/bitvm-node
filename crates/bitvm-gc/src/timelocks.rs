@@ -47,7 +47,7 @@ pub const NODE_REGTEST_TIMELOCK_CONFIG: TimelockConfig = TimelockConfig {
     connector_z: 60,
     connector_a: 2,
     prover_connector: 1,
-    connector_d: 3,
+    connector_d: 5,
     watchtower_challenge: 1,
     operator_ack: 2,
     operator_commit: 3,
@@ -102,6 +102,14 @@ impl ProtocolTimingBudget {
     /// CSV, and reorg safety. The CSV itself is added by the caller.
     const fn disprove_window(self) -> u32 {
         self.action_window().saturating_add(self.inclusion_blocks)
+    }
+
+    /// From an OperatorAssert until Take-2 through Connector-D, besides the
+    /// prover-connector CSV: the block the Assert is first seen in, the
+    /// Verifier-Assert's action window, Disprove-X's action window once the
+    /// CSV allows it, and one block so Disprove-X lands strictly first.
+    const fn assert_disprove_window(self) -> u32 {
+        self.action_window().saturating_mul(2).saturating_add(2)
     }
 
     const fn watchtower_proof_window(self) -> u32 {
@@ -230,12 +238,14 @@ pub fn validate_timelock_config(network: Network, config: &TimelockConfig) -> Re
         budget.confirmed_action_window(),
     )?;
     ensure_at_least("prover_connector", config.prover_connector, action_window)?;
+    // An Assert may arrive after Connector-F has matured, leaving
+    // Connector-D as Take-2's only clock.
     ensure_gap_at_least(
         "prover_connector",
         config.prover_connector,
         "connector_d",
         config.connector_d,
-        budget.disprove_window(),
+        budget.assert_disprove_window(),
     )?;
     ensure_gap_at_least(
         "operator_commit",
@@ -375,7 +385,7 @@ mod tests {
     }
 
     #[test]
-    fn take2_gap_after_prover_connector_covers_both_inclusions() {
+    fn take2_gap_after_prover_connector_covers_both_action_windows() {
         for network in [
             Network::Bitcoin,
             Network::Testnet,
@@ -385,9 +395,9 @@ mod tests {
         ] {
             let mut config = default_timelock_config(network);
             let budget = protocol_timing_budget(network);
-            // Reaction, Verifier-Assert inclusion, Disprove-X inclusion, safety.
-            let required_gap =
-                budget.reaction_blocks + 2 * budget.inclusion_blocks + budget.safety_blocks;
+            // The block the Assert is seen in, the Verifier-Assert and
+            // Disprove-X action windows, and the block Take-2 would use.
+            let required_gap = 2 * budget.action_window() + 2;
             config.connector_d = config.prover_connector + required_gap;
             config.connector_f = config.connector_f.max(config.connector_d);
             validate_timelock_config(network, &config).unwrap();

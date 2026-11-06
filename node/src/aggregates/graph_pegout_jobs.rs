@@ -1004,9 +1004,14 @@ async fn disprove(
             graph.parameters.instance_parameters.network,
             &graph.parameters.timelock_config,
         ) as u64;
-    let height = u64::from(btc.get_height().await?);
-    if height < disprove_height {
-        return after_blocks(deps, "disprove timelock has not expired", disprove_height - height);
+    // Broadcast as soon as the next block satisfies the CSV.
+    let next_height = u64::from(btc.get_height().await?) + 1;
+    if next_height < disprove_height {
+        return after_blocks(
+            deps,
+            "disprove timelock has not expired",
+            disprove_height - next_height,
+        );
     }
     if let Some(step) = settled_by(
         deps,
