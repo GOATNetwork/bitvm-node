@@ -32,6 +32,12 @@ pub(crate) use auth::{AuthorizationChain, AuthorizationChains};
 /// instead of queueing signature checks, GOAT queries and database work.
 const MAX_CONCURRENT_REQUESTS: usize = 64;
 
+/// Longest a request may hold a slot, body read included. Reading the body
+/// happens before authentication, so without it a client that withholds the
+/// body would keep its slot for as long as the connection stays open.
+const REQUEST_DEADLINE: std::time::Duration =
+    std::time::Duration::from_secs(if cfg!(test) { 2 } else { 30 });
+
 pub(crate) struct ApiState {
     pub local_db: LocalDB,
     pub metrics_state: ApiMetricsState,
@@ -55,15 +61,19 @@ impl ApiState {
     }
 }
 
-/// Refuses a request with 503 while `MAX_CONCURRENT_REQUESTS` are in flight.
+/// Refuses a request with 503 while `MAX_CONCURRENT_REQUESTS` are in flight,
+/// and cancels one that runs past `REQUEST_DEADLINE` with 408, freeing its slot.
 async fn limit_concurrency(
     State(state): State<Arc<ApiState>>,
     request: Request,
     next: Next,
 ) -> Response {
-    match state.request_slots.try_acquire() {
-        Ok(_slot) => next.run(request).await,
-        Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "too many concurrent requests").into_response(),
+    let Ok(_slot) = state.request_slots.try_acquire() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "too many concurrent requests").into_response();
+    };
+    match tokio::time::timeout(REQUEST_DEADLINE, next.run(request)).await {
+        Ok(response) => response,
+        Err(_) => (StatusCode::REQUEST_TIMEOUT, "request deadline exceeded").into_response(),
     }
 }
 
@@ -690,6 +700,26 @@ mod tests {
         assert!(get(&addr, routes::ROOT).await?.starts_with("HTTP/1.1 503"));
         drop(busy);
         assert!(get(&addr, routes::ROOT).await?.starts_with("HTTP/1.1 200"));
+
+        // A client that sends the headers but withholds the body takes the
+        // last slot only until the deadline.
+        let busy = api_state.request_slots.try_acquire_many(MAX_CONCURRENT_REQUESTS as u32 - 1)?;
+        let mut slow = tokio::net::TcpStream::connect(&addr).await?;
+        slow.write_all(
+            format!(
+                "POST {} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: 10\r\n\r\n",
+                routes::v1::PROOFS_OPERATOR_PROOF
+            )
+            .as_bytes(),
+        )
+        .await?;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(get(&addr, routes::ROOT).await?.starts_with("HTTP/1.1 503"));
+        let mut response = vec![0; 64];
+        let read = tokio::time::timeout(REQUEST_DEADLINE * 2, slow.read(&mut response)).await??;
+        assert!(String::from_utf8_lossy(&response[..read]).starts_with("HTTP/1.1 408"));
+        assert!(get(&addr, routes::ROOT).await?.starts_with("HTTP/1.1 200"));
+        drop(busy);
 
         cancellation_token.cancel();
         server.await??;

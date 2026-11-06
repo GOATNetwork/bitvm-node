@@ -69,7 +69,8 @@ HTTP method, route, timestamp, nonce, and canonical JSON body. Rust callers shou
 `proof_builder::api_auth::sign_proof_builder_request`; each retry must generate a new nonce.
 A nonce is remembered only after the signer is authorized for the graph, and the service
 serves at most 64 requests at a time; requests beyond that, or arriving while the replay cache
-is full, get `503` and should be retried. The Watchtower registry is cached for 5 seconds.
+is full, get `503` and should be retried. A request, body upload included, that takes longer
+than 30 seconds is cancelled with `408`. The Watchtower registry is cached for 5 seconds.
 
 To enable multiple Gateways without interrupting proof polling, first upgrade Proof Builder with a
 single Gateway, then upgrade all Nodes to send `gateway_address`, and finally configure the
