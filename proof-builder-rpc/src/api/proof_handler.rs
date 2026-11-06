@@ -189,7 +189,7 @@ pub(super) async fn post_operator_proof_task(
     Json(payload): Json<OperatorProofRequest>,
 ) -> ApiResult<OperatorProofResponse> {
     let mut api_result = api_state.metrics_state.api_result("operator_submit");
-    let signer = record_auth_result(
+    let request = record_auth_result(
         &mut api_result,
         api_state.auth.authenticate(
             &headers,
@@ -213,7 +213,7 @@ pub(super) async fn post_operator_proof_task(
         api_state
             .auth
             .authorize_operator(
-                &signer,
+                &request,
                 payload.gateway_address.as_deref(),
                 &instance_id,
                 &graph_id,
@@ -286,7 +286,7 @@ pub(super) async fn update_operator_proof_task_timeout(
     Json(payload): Json<OperatorProofTimeoutUpdateRequest>,
 ) -> ApiResult<OperatorProofTimeoutUpdateResponse> {
     let mut api_result = api_state.metrics_state.api_result("operator_timeout");
-    let signer = record_auth_result(
+    let request = record_auth_result(
         &mut api_result,
         api_state.auth.authenticate(
             &headers,
@@ -310,7 +310,7 @@ pub(super) async fn update_operator_proof_task_timeout(
         api_state
             .auth
             .authorize_operator(
-                &signer,
+                &request,
                 payload.gateway_address.as_deref(),
                 &instance_id,
                 &graph_id,
@@ -354,7 +354,7 @@ pub(super) async fn post_watchtower_proof_task(
     Json(payload): Json<WatchtowerProofRequest>,
 ) -> ApiResult<WatchtowerProofResponse> {
     let mut api_result = api_state.metrics_state.api_result("watchtower_submit");
-    let signer = record_auth_result(
+    let request = record_auth_result(
         &mut api_result,
         api_state.auth.authenticate(
             &headers,
@@ -378,7 +378,7 @@ pub(super) async fn post_watchtower_proof_task(
         api_state
             .auth
             .authorize_watchtower(
-                &signer,
+                &request,
                 payload.gateway_address.as_deref(),
                 &instance_id,
                 &graph_id,
@@ -390,7 +390,7 @@ pub(super) async fn post_watchtower_proof_task(
         InputValidator::validate_challenge_init_txid(&payload.challenge_init_txid, &graph_data),
     )?
     .to_string();
-    let public_key = watchtower_task_key(&signer);
+    let public_key = watchtower_task_key(&request.signer);
 
     let watchtower_proof =
         find_watchtower_task(&api_state.local_db, instance_id, graph_id, &public_key)
@@ -457,7 +457,7 @@ pub(super) async fn update_watchtower_proof_task_timeout(
     Json(payload): Json<WatchtowerProofTimeoutUpdateRequest>,
 ) -> ApiResult<WatchtowerProofTimeoutUpdateResponse> {
     let mut api_result = api_state.metrics_state.api_result("watchtower_timeout");
-    let signer = record_auth_result(
+    let request = record_auth_result(
         &mut api_result,
         api_state.auth.authenticate(
             &headers,
@@ -481,7 +481,7 @@ pub(super) async fn update_watchtower_proof_task_timeout(
         api_state
             .auth
             .authorize_watchtower(
-                &signer,
+                &request,
                 payload.gateway_address.as_deref(),
                 &instance_id,
                 &graph_id,
@@ -492,7 +492,7 @@ pub(super) async fn update_watchtower_proof_task_timeout(
         &api_state.local_db,
         instance_id,
         graph_id,
-        &watchtower_task_key(&signer),
+        &watchtower_task_key(&request.signer),
         ProofState::New,
         ProofState::Failed,
     )
