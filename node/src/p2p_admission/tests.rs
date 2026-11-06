@@ -1508,3 +1508,23 @@ async fn committee_members_of_recent_instances_are_registered_outside_discovery(
     assert_eq!(persisted.len(), 1);
     assert_eq!(persisted[0].0, member.to_string());
 }
+
+#[test]
+fn known_committee_batches_rotate_through_every_address() {
+    use super::registry_refresh::next_known_committee_batch;
+
+    let addresses: Vec<String> = (0..65).map(|i| format!("0x{i:040x}")).collect();
+    let mut cursor = None;
+    let first = next_known_committee_batch(addresses.clone(), &mut cursor);
+    assert_eq!(first, addresses[..64]);
+    // The 65th address comes next, then the list wraps.
+    let second = next_known_committee_batch(addresses.clone(), &mut cursor);
+    assert_eq!(second[..2], [addresses[64].clone(), addresses[0].clone()]);
+    assert_eq!(second.len(), 64);
+    // A removed cursor address resumes at the next one.
+    let without_cursor: Vec<String> =
+        addresses.iter().filter(|a| Some(*a) != cursor.as_ref()).cloned().collect();
+    let third = next_known_committee_batch(without_cursor, &mut cursor);
+    assert_eq!(third[0], addresses[63]);
+    assert!(next_known_committee_batch(Vec::new(), &mut cursor).is_empty());
+}

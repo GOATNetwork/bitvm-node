@@ -316,6 +316,27 @@ const KNOWN_COMMITTEE_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const KNOWN_COMMITTEE_INSTANCE_LIMIT: i64 = 256;
 const KNOWN_COMMITTEE_MAX_ADDRESSES: usize = 64;
 static KNOWN_COMMITTEE_REFRESHED_AT: Mutex<Option<Instant>> = Mutex::new(None);
+/// The last address a refresh checked; the next one resumes after it.
+static KNOWN_COMMITTEE_CURSOR: Mutex<Option<String>> = Mutex::new(None);
+
+/// The next `KNOWN_COMMITTEE_MAX_ADDRESSES` addresses after `cursor`, wrapping,
+/// so repeated passes check every address however long the list grows.
+pub(crate) fn next_known_committee_batch(
+    mut addresses: Vec<String>,
+    cursor: &mut Option<String>,
+) -> Vec<String> {
+    addresses.sort();
+    let start = cursor.as_ref().map_or(0, |last| addresses.partition_point(|a| a <= last));
+    let batch: Vec<String> = addresses
+        .iter()
+        .cycle()
+        .skip(start)
+        .take(KNOWN_COMMITTEE_MAX_ADDRESSES.min(addresses.len()))
+        .cloned()
+        .collect();
+    *cursor = batch.last().cloned();
+    batch
+}
 
 fn known_committee_refresh_due(now: Instant) -> bool {
     let mut refreshed_at =
@@ -347,8 +368,12 @@ pub async fn refresh_known_committee_members(local_db: &LocalDB, goat_client: &A
             return;
         }
     };
+    let batch = next_known_committee_batch(
+        addresses,
+        &mut KNOWN_COMMITTEE_CURSOR.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
     let registry = peer_registry();
-    for address in addresses.into_iter().take(KNOWN_COMMITTEE_MAX_ADDRESSES) {
+    for address in batch {
         let Ok(address) = alloy::primitives::Address::from_str(&address) else { continue };
         let Some(peer) = committee_member_peer(goat_client, &address).await else { continue };
         let change = registry.record_committee_peer(&peer, Some(true), Instant::now());
