@@ -67,7 +67,6 @@ impl AllBehaviours {
         let gossipsub = gossipsub::Behaviour::new_with_subscription_filter(
             gossipsub::MessageAuthenticity::Signed(key.clone()),
             gossipsub_config,
-            None,
             subscription_filter,
         )
         .expect("Valid configuration");
