@@ -1553,6 +1553,29 @@ fn known_committee_batches_rotate_through_every_address() {
 }
 
 #[test]
+fn one_registered_get_graph_requester_cannot_drain_the_class_budget() {
+    use crate::middleware::get_graph::GetGraphRequest;
+    let request = |nonce: u64| GetGraphRequest {
+        instance_id: None,
+        graph_id: None,
+        operator_pubkey: Some("02".repeat(33)),
+        graph_nonce: Some(nonce),
+        finalized: false,
+    };
+    let now = Instant::now();
+    let flooder = PeerId::random();
+    let served = (0..64)
+        .filter(|nonce| super::get_graph_refusal(&flooder, true, &request(*nonce), now).is_none())
+        .count();
+    assert!(served < 64, "the flooder's own bucket runs out");
+    assert_eq!(super::get_graph_refusal(&PeerId::random(), true, &request(0), now), None);
+    // The same request again is on cooldown.
+    let member = PeerId::random();
+    assert_eq!(super::get_graph_refusal(&member, true, &request(1), now), None);
+    assert_eq!(super::get_graph_refusal(&member, true, &request(1), now), Some("cooldown"));
+}
+
+#[test]
 fn operator_balance_snapshot_excludes_negative_and_expired_stake_verdicts() {
     let registry = PeerRegistry::default();
     let now = Instant::now();
