@@ -157,7 +157,7 @@ impl GOATClient {
         self.chain_service.gateway_get_operator_reward_rate().await
     }
 
-    pub async fn gateway_get_min_stake_amount(&self) -> anyhow::Result<u64> {
+    pub async fn gateway_get_min_stake_amount(&self) -> anyhow::Result<U256> {
         self.chain_service.gateway_get_min_stake_amount().await
     }
 
@@ -687,10 +687,10 @@ impl GOATClient {
     ) -> anyhow::Result<[u8; 20]> {
         self.chain_service.stake_mana_pubkey_to_address(pubkey).await
     }
-    pub async fn stake_mana_stake_of(&self, operator: &[u8; 20]) -> anyhow::Result<u64> {
+    pub async fn stake_mana_stake_of(&self, operator: &[u8; 20]) -> anyhow::Result<U256> {
         self.chain_service.stake_mana_stake_of(operator).await
     }
-    pub async fn stake_mana_lock_stake_of(&self, operator: &[u8; 20]) -> anyhow::Result<u64> {
+    pub async fn stake_mana_lock_stake_of(&self, operator: &[u8; 20]) -> anyhow::Result<U256> {
         self.chain_service.stake_mana_lock_stake_of(operator).await
     }
     pub async fn stake_mana_slash_stake(
