@@ -22,7 +22,7 @@ use secp256k1::XOnlyPublicKey;
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Instant, UNIX_EPOCH};
 use uuid::Uuid;
 
 use futures::future::Either;
@@ -476,48 +476,41 @@ impl OnDemandRow {
     }
 }
 
-/// How long the on-demand cursor may stay off the oldest task. Newer tasks keep
-/// the cursor from wrapping under steady load; without this a task that was not
-/// ready, or failed, on its turn would wait until the load drops.
-const ON_DEMAND_RESCAN_INTERVAL: Duration = Duration::from_secs(600);
-
-/// Where the next on-demand fetch starts: after the last task handed out, and
-/// back at the oldest task at least every `rescan_interval`.
+/// Where the next on-demand fetch starts. Fetches alternate between a forward
+/// cursor, which only moves ahead (wrapping at the end of the queue), and a
+/// retry cursor, which walks the tasks behind it from the oldest one. A long
+/// run of tasks that are not ready cannot keep a later task from its turn,
+/// and a task skipped earlier is revisited even while new tasks keep coming.
 pub(crate) struct OnDemandCursor {
-    after_id: i64,
-    rescan_interval: Duration,
-    last_rescan: Instant,
+    forward: i64,
+    retry: i64,
+    retry_turn: bool,
 }
 
 impl OnDemandCursor {
     pub(crate) fn new() -> Self {
-        Self::with_rescan_interval(ON_DEMAND_RESCAN_INTERVAL)
-    }
-
-    fn with_rescan_interval(rescan_interval: Duration) -> Self {
-        Self { after_id: 0, rescan_interval, last_rescan: Instant::now() }
+        Self { forward: 0, retry: 0, retry_turn: false }
     }
 
     /// The id the next fetch starts after.
-    pub(crate) fn after_id(&mut self) -> i64 {
-        if self.last_rescan.elapsed() >= self.rescan_interval {
-            self.rescan();
-        }
-        self.after_id
+    pub(crate) fn after_id(&self) -> i64 {
+        if self.retry_turn { self.retry } else { self.forward }
     }
 
-    /// Records the task just handed out; a lower id means the queue wrapped.
+    /// Records the task just handed out and passes the turn to the other cursor.
     pub(crate) fn advance(&mut self, task_index: i64) {
-        if task_index <= self.after_id {
-            self.last_rescan = Instant::now();
+        if self.retry_turn {
+            // Once it reaches the forward cursor, the retry pass starts over.
+            self.retry = if task_index >= self.forward { 0 } else { task_index };
+        } else {
+            self.forward = task_index;
         }
-        self.after_id = task_index;
+        self.retry_turn = !self.retry_turn;
     }
 
-    /// Starts the next fetch from the oldest task.
+    /// Starts both cursors from the oldest task; used when no task is `New`.
     pub(crate) fn rescan(&mut self) {
-        self.after_id = 0;
-        self.last_rescan = Instant::now();
+        *self = Self::new();
     }
 }
 
@@ -1300,18 +1293,51 @@ mod tests {
     use store::create_local_db;
     use uuid::Uuid;
 
-    #[test]
-    fn on_demand_cursor_returns_to_the_oldest_task() {
-        let mut cursor = OnDemandCursor::new();
-        cursor.advance(3);
-        cursor.advance(7);
-        assert_eq!(cursor.after_id(), 7);
-        cursor.rescan();
-        assert_eq!(cursor.after_id(), 0);
+    /// Mirrors `next_on_demand_row`: the first id after `after`, wrapping.
+    fn next_task(ids: &[i64], after: i64) -> Option<i64> {
+        ids.iter().copied().find(|id| *id > after).or_else(|| ids.first().copied())
+    }
 
-        // Newer tasks keep coming, so the queue never wraps on its own.
-        let mut cursor = OnDemandCursor::with_rescan_interval(Duration::ZERO);
-        cursor.advance(7);
+    /// Polls until `ready` is handed out; returns the number of polls taken.
+    fn polls_until(cursor: &mut OnDemandCursor, ids: &[i64], ready: i64, limit: usize) -> usize {
+        for poll in 1..=limit {
+            let task = next_task(ids, cursor.after_id()).unwrap();
+            if task == ready {
+                return poll;
+            }
+            cursor.advance(task);
+        }
+        panic!("task {ready} was not reached within {limit} polls");
+    }
+
+    #[test]
+    fn a_long_not_ready_prefix_does_not_starve_the_tail() {
+        // 600 tasks that never become ready, then a ready one. At one poll a
+        // second this prefix outlasts any fixed rescan interval.
+        let ids: Vec<i64> = (1..=601).collect();
+        // The forward cursor moves on every other poll.
+        let polls = polls_until(&mut OnDemandCursor::new(), &ids, 601, 2 * 601);
+        assert!(polls > 600, "the prefix is still visited first");
+    }
+
+    #[test]
+    fn a_skipped_task_is_revisited_while_new_tasks_keep_coming() {
+        // A new task arrives on every poll, so the forward cursor never wraps.
+        // Task 1 is handed out on the first poll; it must come round again.
+        let mut ids: Vec<i64> = (1..=10).collect();
+        let mut cursor = OnDemandCursor::new();
+        let mut revisited_at = None;
+        for poll in 1..=40 {
+            let task = next_task(&ids, cursor.after_id()).unwrap();
+            if task == 1 && poll > 1 {
+                revisited_at = Some(poll);
+                break;
+            }
+            cursor.advance(task);
+            ids.push(ids.last().unwrap() + 1);
+        }
+        assert!(revisited_at.is_some(), "task 1 was never revisited");
+        cursor.rescan();
         assert_eq!(cursor.after_id(), 0);
     }
 
