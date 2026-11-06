@@ -122,3 +122,14 @@ fn transient_message(message: &str) -> bool {
     .iter()
     .any(|needle| message.contains(needle))
 }
+
+/// Log an unwind payload without assuming it contains a string.
+pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        message
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message
+    } else {
+        "non-string panic payload"
+    }
+}

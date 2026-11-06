@@ -14,6 +14,8 @@ pub struct InstanceQuery {
     pub statuses: Vec<String>,
     pub earliest_updated: Option<i64>,
     pub pegin_request_height_threshold: Option<i64>,
+    pub created_at_max: Option<i64>,
+    pub after_created_at_id: Option<(i64, Uuid)>,
     pub order: Option<String>,
     pub raw_conditions: Vec<String>,
     pub offset: Option<u32>,
@@ -43,6 +45,19 @@ impl InstanceQuery {
 
     pub fn with_pegin_request_height_threshold(mut self, threshold: i64) -> Self {
         self.pegin_request_height_threshold = Some(threshold);
+        self
+    }
+
+    /// Keeps rows created at or before `created_at`.
+    pub fn with_created_at_max(mut self, created_at: i64) -> Self {
+        self.created_at_max = Some(created_at);
+        self
+    }
+
+    /// Keeps rows strictly after `(created_at, instance_id)` in keyset order.
+    /// The id is bound as a UUID so it compares like the stored BLOB.
+    pub fn with_after_created_at_id(mut self, created_at: i64, instance_id: Uuid) -> Self {
+        self.after_created_at_id = Some((created_at, instance_id));
         self
     }
 
@@ -78,6 +93,19 @@ impl InstanceQuery {
             query_builder.and_where(
                 "goat_tx_height < ?",
                 Some(QueryParam::Int(pegin_request_height_threshold)),
+            );
+        }
+        if let Some(created_at_max) = self.created_at_max {
+            query_builder.and_where("created_at <= ?", Some(QueryParam::Int(created_at_max)));
+        }
+        if let Some((created_at, instance_id)) = self.after_created_at_id {
+            query_builder.and_where_params(
+                "(created_at > ? OR (created_at = ? AND instance_id > ?))",
+                vec![
+                    QueryParam::Int(created_at),
+                    QueryParam::Int(created_at),
+                    QueryParam::Uuid(instance_id),
+                ],
             );
         }
         for raw_condition in &self.raw_conditions {

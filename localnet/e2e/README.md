@@ -1,7 +1,7 @@
 # e2e — on-demand end-to-end regression of the node
 
 Not CI: run it by hand after a change, on the localnet of [../README.md](../README.md) (five mocked nodes on
-regtest + anvil + local graph). Honours `LOCALNET_DATA` / `PORT_BASE` / `COMPOSE_PROJECT` like every other script.
+regtest + the GOAT chain + local graph). Honours `LOCALNET_DATA` / `PORT_BASE` / `COMPOSE_PROJECT` like every other script.
 
 ```
 localnet/scripts/status.sh                       # infra, chains, nodes all up
@@ -14,7 +14,9 @@ localnet/e2e/run.sh --stop-on-fail               # stop at the first failing cas
 Knobs: `E2E_CASE_TIMEOUT` (seconds per case, default 1200; an expired case is killed with its whole process tree,
 chaos is reset and every node restarted before the post-check), `E2E_DELAY_TIER=fast|default` (default `fast`: the run
 writes 2 s GC / 5 s proof delays to `$LOCALNET_DATA/run/tuning.env`, restarts nodes + proof builder, and restores the
-`localnet.env` values (15/30 s, the manual-debugging tier) at the end), `E2E_POLL_SECS` (default 2).
+`localnet.env` values (15/30 s, the manual-debugging tier) at the end), `E2E_POLL_SECS` (default 2),
+`E2E_STOP_AFTER` (default 1: when the run exits, for any reason, `scripts/down.sh infra` stops nodes, support
+processes and containers, data kept; `make localnet-up` brings it back. 0 leaves everything running for debugging).
 Per run `$LOCALNET_DATA/results/<run>/` holds `<case>.log`, `report.md`, `report.json` (same table as structured
 data: result, duration, rc, post-check rc, notes) and `logs.tar.gz` (every node / miner / proof-builder / fault-proxy
 log written during the run). Exit code 0 only when nothing failed; `p2p_isolate_operator` is reported as SKIP (not a

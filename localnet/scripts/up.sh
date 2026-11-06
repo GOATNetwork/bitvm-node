@@ -17,7 +17,7 @@ echo "  data  $LOCALNET_DATA  (project $COMPOSE_PROJECT, ports $PORT_BASE+)"
 mkdir -p "$LOGS_DIR" "$RUN_DIR" "$TMP_DIR" "$SOLDERING_PROOF_PAYLOAD_STORE_PATH"
 
 echo "==== 1. infra ===="
-need=(bitcoind electrs anvil postgres ipfs graph-node)
+need=(bitcoind electrs "$GOAT_SERVICE" postgres ipfs graph-node)
 missing=0
 for c in "${need[@]}"; do
   docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$COMPOSE_PROJECT-$c" || { echo "  $COMPOSE_PROJECT-$c is down"; missing=1; }
@@ -28,7 +28,7 @@ if (( missing )); then
 else
   echo "  all 6 $COMPOSE_PROJECT containers already running"
 fi
-# wait for anvil + bitcoind to answer
+# wait for the GOAT chain + bitcoind to answer
 for i in $(seq 1 30); do
   a=$($CAST chain-id --rpc-url "$GOAT_CHAIN_URL" 2>/dev/null || true)
   b=$($BCLI getblockcount 2>/dev/null || true)
@@ -36,13 +36,13 @@ for i in $(seq 1 30); do
   sleep 2
 done
 cid=$($CAST chain-id --rpc-url "$GOAT_CHAIN_URL" 2>/dev/null || true)
-echo "  anvil chain-id=$cid  btc height=$($BCLI getblockcount 2>/dev/null)"
+echo "  GOAT ($GOAT_BACKEND) chain-id=$cid  btc height=$($BCLI getblockcount 2>/dev/null)"
 # bitcoind does not reload the miner wallet after its container restarted (down.sh infra, host reboot)
 $BCLI loadwallet "$BTC_RPC_WALLET" >/dev/null 2>&1 || true
 $BCLI -rpcwallet="$BTC_RPC_WALLET" getwalletinfo >/dev/null 2>&1 || { echo "  bitcoind wallet $BTC_RPC_WALLET not available" >&2; exit 1; }
-[[ -n "$cid" ]] || { echo "  anvil not reachable at $GOAT_CHAIN_URL" >&2; exit 1; }
+[[ -n "$cid" ]] || { echo "  GOAT chain ($GOAT_BACKEND) not reachable at $GOAT_CHAIN_URL" >&2; exit 1; }
 if [[ "$cid" != "$ANVIL_CHAIN_ID" ]]; then
-  echo "  anvil runs chain id $cid but ANVIL_CHAIN_ID=$ANVIL_CHAIN_ID; set ANVIL_CHAIN_ID=$cid in $LOCALNET_DATA/localnet.override.env to adopt this chain" >&2
+  echo "  the GOAT chain runs chain id $cid but ANVIL_CHAIN_ID=$ANVIL_CHAIN_ID; set ANVIL_CHAIN_ID=$cid in $LOCALNET_DATA/localnet.override.env to adopt this chain" >&2
   exit 1
 fi
 

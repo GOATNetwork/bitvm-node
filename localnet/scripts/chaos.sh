@@ -9,7 +9,7 @@
 #   p2p cut <roleA> <roleB> | isolate <role> | heal | show
 #         iptables chain <COMPOSE_PROJECT>_CHAOS on INPUT -i lo, rules only on this localnet's p2p port pairs
 #   freeze <role> [secs] | thaw <role>      SIGSTOP / SIGCONT (secs: auto-thaw from a detached timer)
-#   infra pause|unpause <anvil|electrs|graph-node>
+#   infra pause|unpause <goat|electrs|graph-node>   (goat = the GOAT chain container: anvil or goat-rpc)
 #   status                                  everything currently injected (must be empty between scenarios)
 #   reset                                   clear + heal + thaw all + unpause all
 set -uo pipefail
@@ -108,7 +108,8 @@ cmd_freeze() { local r=${1:?role} secs=${2:-} pid; pid=$(node_pid "$r"); [[ -n $
   kill -STOP "$pid" && echo "$r (pid $pid) FROZEN${secs:+ for ${secs}s}"
   [[ -n $secs ]] && nohup bash -c "sleep $secs; kill -CONT $pid 2>/dev/null" >/dev/null 2>&1 & true; }
 cmd_thaw() { local pid; pid=$(node_pid "${1:?role}"); [[ -n $pid ]] && kill -CONT "$pid" 2>/dev/null && echo "$1 thawed"; }
-cmd_infra() { docker "${1:?pause|unpause}" "$COMPOSE_PROJECT-${2:?name}" >/dev/null && echo "$COMPOSE_PROJECT-$2 ${1}d"; }
+cmd_infra() { local n=${2:?name}; [[ $n == goat || $n == anvil ]] && n=$GOAT_SERVICE
+  docker "${1:?pause|unpause}" "$COMPOSE_PROJECT-$n" >/dev/null && echo "$COMPOSE_PROJECT-$n ${1}d"; }
 
 cmd_status() {
   echo "--- chaos status ---"

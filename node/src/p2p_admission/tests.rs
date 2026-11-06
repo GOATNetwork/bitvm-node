@@ -1528,3 +1528,17 @@ fn known_committee_batches_rotate_through_every_address() {
     assert_eq!(third[0], addresses[63]);
     assert!(next_known_committee_batch(Vec::new(), &mut cursor).is_empty());
 }
+
+#[test]
+fn operator_balance_snapshot_excludes_negative_and_expired_stake_verdicts() {
+    let registry = PeerRegistry::default();
+    let now = Instant::now();
+    let positive = PeerId::random();
+    let negative = PeerId::random();
+    registry.observe_operator_binding(&positive, &key(1), 1);
+    registry.observe_operator_binding(&negative, &key(2), 1);
+    registry.record_operator_stake(&positive, &key(1), Some(true), now);
+    registry.record_operator_stake(&negative, &key(2), Some(false), now);
+    assert_eq!(registry.registered_operators(now), vec![(positive, key(1))]);
+    assert!(registry.registered_operators(now + OPERATOR_STAKE_STALE_LIMIT).is_empty());
+}

@@ -1,7 +1,8 @@
 # localnet — a clone-and-run mock testnet for the node
 
 Five `mock-gc` nodes (committee_0, committee_1, operator_0, verifier_0, watchtower_0) on bitcoin
-regtest + a local anvil + a local graph-node, every endpoint on 127.0.0.1. The garbled circuits,
+regtest + a GOAT chain (a local anvil, or the public GOAT testnet3, see "GOAT backend") + a local
+graph-node, every endpoint on 127.0.0.1. The garbled circuits,
 soldering and proofs are deterministic mocks with configurable delays; everything on chain is
 real, so peg-in, peg-out, challenge/assert/take-2 and disprove run the genuine transaction graph
 (see `node/README.md`, "Mock build for local testnets"). The on-demand regression suite lives in
@@ -41,7 +42,7 @@ on one host derives from three variables, all taken from the environment:
 | variable | default | effect |
 |---|---|---|
 | `LOCALNET_DATA` | `localnet/.local` | state directory |
-| `PORT_BASE` | `22000` | every port is `PORT_BASE + offset`: esplora +2, bitcoind RPC +443, ipfs +501, anvil +545, graph query/admin/index/metrics +800/+820/+830/+840, node rpc/p2p/metrics +900/+910/+920 (+ role index), proof builder +950, fault proxies +960..+979, chaos control +989 |
+| `PORT_BASE` | `22000` | every port is `PORT_BASE + offset`: esplora +2, bitcoind RPC +443, ipfs +501, GOAT RPC (anvil or the testnet3 forwarder) +545, graph query/admin/index/metrics +800/+820/+830/+840, node rpc/p2p/metrics +900/+910/+920 (+ role index), proof builder +950, fault proxies +960..+979, chaos control +989 |
 | `COMPOSE_PROJECT` | `bvlocal` | docker project, container names `<project>-<service>`, network `<project>-net`, iptables chain `<PROJECT>_CHAOS` |
 
 So a second localnet next to the first one is
@@ -51,6 +52,21 @@ Per-data-dir overrides go in `$LOCALNET_DATA/localnet.override.env` (sourced las
 moved to 48816. Runtime knobs the e2e suite flips (proof verdict, solder delay) are written to
 `$LOCALNET_DATA/run/tuning.env` and picked up by `scripts/nodes.sh` at (re)start; the tracked
 `localnet.env` is never edited by a script.
+
+### GOAT backend
+
+`GOAT_BACKEND=anvil` (default) runs a private anvil. `GOAT_BACKEND=testnet3` runs no chain at all:
+the `goat-rpc` container (nginx, ~20 MiB) forwards plain HTTP on port +545 to
+`GOAT_UPSTREAM_RPC` (default `https://rpc.testnet3.goat.network`, chain id 48816 like the anvil), so
+nodes, the fault proxy and graph-node are unchanged. Every reset still deploys a fresh contract stack
+of our own there and the subgraph starts at its creation block. Gas comes from `GOAT_FUNDER_KEY`, or
+from the file `GOAT_FUNDER_KEY_FILE` (default `$LOCALNET_DATA/secrets/goat-funder.key`, chmod 600,
+never in the repo): a funded testnet3 account, one per data dir, since two localnets sharing a funder
+race on its nonce. The role top-ups default to 0.0005 below 0.0002 (anvil: 100 below 10); the reset
+keeps `state/keys.json`, so the roles keep their balances between runs. Set the backend per data dir
+in `localnet.override.env`, then reset; `chaos.sh infra pause goat` pauses whichever GOAT container
+runs. The public chain brings its limits: an RPC outage fails the run, and anyone can call the
+deployed contracts.
 
 ## Scripts
 
@@ -84,7 +100,7 @@ GOATNetwork/bitvm-L2-contracts ("fix GUARDIAN_CONNECTOR_VOUT & remove debug cont
 `.gitmodules` back at `GOATNetwork/bitvm-L2-contracts` and bump the pin. The PR sets
 `GUARDIAN_CONNECTOR_VOUT = 3`, which is what the node's kickoff topology uses (`goat`
 `output_topology::kickoff::guardian_connector()`); older contract revisions parse peg-outs wrong.
-No upstream source is patched. The localnet runs anvil at chain id 48816 (= the contracts'
+No upstream source is patched. The localnet GOAT chain runs at chain id 48816 (= the contracts'
 testnet id, so `Constants.magicBytes()` accepts the regtest OP_RETURN magic the node emits).
 
 `contracts-local/` is a second foundry project that imports the submodule (`bitvm-l2/` remapping):
@@ -93,7 +109,7 @@ testnet id, so `Constants.magicBytes()` accepts the regtest OP_RETURN magic the 
   (pegBTC faucet for the peg-out cases) and `debugSetResponseWindowBlocks` (the initializer fixes
   200 goat blocks; the deploy lowers it to `RESPONSE_WINDOW_BLOCKS`, default 50). Runtime size
   23,930 B, ~650 B under the EIP-170 limit: keep additions tiny.
-- `MockBitcoinSPV.sol`, `MockWGBTC.sol`: the SPV relay and the stake token that do not exist on anvil.
+- `MockBitcoinSPV.sol`, `MockWGBTC.sol`: the SPV relay and the stake token, our own instances on either backend.
 - `script/DeployLocal.sol`: one broadcast deploys mocks + GatewayLocal/CommitteeManagement/
   StakeManagement proxies (same order and console labels as upstream `DeployGateway.sol`).
 - `deploy-local.sh`: gas funding, the script, the committee/verifier/operator registrations and
@@ -135,19 +151,21 @@ Nodes report `ready=1` two to three minutes after a reset; the suite's pre-check
 ## CI
 
 `.github/workflows/e2e_localnet.yml` runs on the self-hosted `bitvm2-node` runner on every push to
-`main` / `dev` and on manual dispatch (Actions → "Localnet e2e" → Run workflow); the same triggers
+`main` / `dev` and on manual dispatch, with `GOAT_BACKEND=testnet3` (Actions → "Localnet e2e" → Run workflow); the same triggers
 as `ci_time_consuming.yml`. It is informational, not a required check. One run is build →
 `make localnet-reset` → `make e2e` → stop, about two hours; runs queue (`concurrency:
 localnet-e2e`) and a running one is never cancelled.
 
 The CI localnet is a third, private one: `LOCALNET_DATA=/data/actions-runner-bitvm2-node/cache/localnet-e2e/data`,
-`PORT_BASE=25000`, `COMPOSE_PROJECT=bvci`, `CARGO_TARGET_DIR=.../localnet-e2e/target`. The data dir
+`PORT_BASE=25000`, `COMPOSE_PROJECT=bvci`, `CARGO_TARGET_DIR=.../localnet-e2e/target`, and the
+funder key in `.../localnet-e2e/goat-funder.key` on the runner host (outside the data dir). The data dir
 is kept between runs (keys, solc and node_modules caches; the reset wipes chains and node DBs), and
 the last 10 result dirs stay in it. The job summary shows `report.md`; the run's result dir
 (`report.json`, per-case logs, `logs.tar.gz`) is uploaded as the `localnet-e2e-<run id>` artifact for
 14 days. The runner user needs docker, passwordless `sudo` for the p2p case (otherwise it is
 reported as SKIP), the zkm toolchain and a free 25000–25999 port range. To reproduce a CI failure
-locally, run the same three make targets with the same three variables (any free `PORT_BASE`).
+locally, run the same three make targets with the same variables (any free `PORT_BASE`, and a
+funder key of your own).
 
 ## Known limits
 

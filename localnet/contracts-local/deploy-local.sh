@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# deploy-local.sh -- deploy + configure the BitVM2 L2 contracts on the localnet anvil.
+# deploy-local.sh -- deploy + configure the BitVM2 L2 contracts on the localnet GOAT chain.
 #
 # Each run deploys a FRESH stack with one forge script (script/DeployLocal.sol, run inside the
 # foundry container by tools/forge.sh): MockWGBTC, MockBitcoinSPV, GatewayLocal impl+proxy, PegBTC,
@@ -8,8 +8,8 @@
 # node roles need, then writes $LOCALNET_DATA/state/contracts.json. Meant for a FRESH anvil, but a
 # re-run on a live one simply deploys a second, independent stack (nonces never clash).
 #
-# Reads identities from state/keys.env. Faucet = anvil dev account 0 (gas only).
-# Env overrides: RPC, OUT_FILE (dry-run target), STAKE_AMOUNT_WEI, LOCK_AMOUNT_WEI, GAS_TOPUP_ETHER,
+# Reads identities from state/keys.env. Gas comes from GOAT_FUNDER_KEY (scripts/localnet.env).
+# Env overrides: RPC, OUT_FILE (dry-run target), STAKE_AMOUNT_WEI, LOCK_AMOUNT_WEI, GAS_TOPUP_ETHER, GAS_MIN_ETHER,
 #                VERIFIER_NONCE, RESPONSE_WINDOW_BLOCKS
 # =============================================================================
 set -euo pipefail
@@ -19,7 +19,8 @@ source "$ROOT/scripts/localnet.env"
 RPC=${RPC:-$GOAT_CHAIN_URL}
 STAKE_AMOUNT_WEI=${STAKE_AMOUNT_WEI:-100000000000000000}   # 0.1 WGBTC (min on-chain stake is 0.06)
 LOCK_AMOUNT_WEI=${LOCK_AMOUNT_WEI:-100000000000000000}     # lock the whole stake
-GAS_TOPUP_ETHER=${GAS_TOPUP_ETHER:-100}
+GAS_TOPUP_ETHER=${GAS_TOPUP_ETHER:-$GOAT_FUND_ETH}
+GAS_MIN_ETHER=${GAS_MIN_ETHER:-$GOAT_FUND_MIN_ETH}
 VERIFIER_NONCE=${VERIFIER_NONCE:-1}
 FORGE_DIR="$LOCALNET_DATA/forge"
 
@@ -32,17 +33,20 @@ cast(){ "$CAST" "$@"; }
 [ -f "$STATE_DIR/keys.env" ] || die "missing $STATE_DIR/keys.env (run tools/gen-keys.sh first)"
 set -a; source "$STATE_DIR/keys.env"; set +a
 
-CID=$(cast chain-id --rpc-url "$RPC") || die "cannot reach anvil at $RPC"
-[ "$CID" = "$ANVIL_CHAIN_ID" ] || die "anvil chain id is $CID, expected ANVIL_CHAIN_ID=$ANVIL_CHAIN_ID"
-log "anvil chain id $CID, block $(cast block-number --rpc-url "$RPC")"
+need_goat_funder || die "no GOAT funder key"
+CID=$(cast chain-id --rpc-url "$RPC") || die "cannot reach the GOAT chain ($GOAT_BACKEND) at $RPC"
+[ "$CID" = "$ANVIL_CHAIN_ID" ] || die "GOAT chain id is $CID, expected ANVIL_CHAIN_ID=$ANVIL_CHAIN_ID"
+log "GOAT $GOAT_BACKEND chain id $CID, block $(cast block-number --rpc-url "$RPC")"
+FUNDER=$(cast wallet address --private-key "$GOAT_FUNDER_KEY")
+log "funder $FUNDER balance $(cast balance "$FUNDER" --ether --rpc-url "$RPC")"
 
 # -----------------------------------------------------------------------------
 # 1. Fund every GOAT (EVM) address with gas from the faucet (idempotent)
 # -----------------------------------------------------------------------------
 fund_gas(){ # $1 = address
   local addr=$1 bal; bal=$(cast balance "$addr" --rpc-url "$RPC")
-  if [ "$(python3 -c "print(1 if int('$bal') < 50000000000000000000 else 0)")" = "1" ]; then
-    cast send "$addr" --value "${GAS_TOPUP_ETHER}ether" --private-key "$ANVIL_FAUCET_KEY" --rpc-url "$RPC" >/dev/null
+  if [ "$(python3 -c "print(1 if int('$bal') < $(cast to-wei "$GAS_MIN_ETHER" ether) else 0)")" = "1" ]; then
+    cast send "$addr" --value "${GAS_TOPUP_ETHER}ether" --private-key "$GOAT_FUNDER_KEY" --rpc-url "$RPC" >/dev/null
     log "funded $addr with ${GAS_TOPUP_ETHER} ETH gas"
   else
     log "gas ok for $addr"

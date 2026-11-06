@@ -1265,11 +1265,11 @@ async fn verifier_setup(deps: &JobDeps, graph_id: Uuid, params: &[u8]) -> Result
     if !verify_init_graph_signature(&init) {
         return invalid("invalid operator signature on InitGraph");
     }
-    // The instance can fail while this message waits (or while a restart
-    // re-claims the job): the operator dropped its session, so the setup
-    // would only cost CPU and be ignored.
-    if instance_status(deps, instance_id).await?.is_some_and(|status| status.is_failed()) {
-        return Step::ignore("instance failed; verifier setup skipped");
+    // The instance can fail or reach T0 while this message waits (or while a
+    // restart re-claims the job): the operator can no longer finish the graph,
+    // so the setup would only cost CPU and be ignored.
+    if let Some(reason) = gate_closed(deps, instance_id).await? {
+        return Step::ignore(format!("verifier setup skipped: {reason}"));
     }
     if !matches!(
         operator_stake_status(&deps.goat_client, &init.operator_pubkey)
@@ -1483,6 +1483,7 @@ async fn verifier_validate_graph(deps: &JobDeps, graph_id: Uuid, params: &[u8]) 
     ) {
         return invalid("CreateGraph envelope and graph parameters name different graphs");
     }
+    crate::utils::validate_graph_preflight(&graph.parameters)?;
     let verifier_master_key = VerifierMasterKey::new(get_bitvm_key()?);
     let local_verifier_pubkey: PublicKey = verifier_master_key.master_keypair().public_key().into();
     let Some(verifier_index) =
@@ -1490,7 +1491,14 @@ async fn verifier_validate_graph(deps: &JobDeps, graph_id: Uuid, params: &[u8]) 
     else {
         return Step::ignore("local verifier is not in this graph");
     };
-    let full_graph = BitvmGcGraph::from_simplified(&graph)?;
+    crate::utils::validate_graph_instance_parameters(
+        &deps.btc_client,
+        &deps.goat_client,
+        &graph.parameters.instance_parameters,
+    )
+    .await?;
+    let full_graph = BitvmGcGraph::from_simplified(&graph)
+        .map_err(|error| SpecialError::InvalidGraph(format!("invalid graph structure: {error}")))?;
     validate_verifier_slot(&full_graph, verifier_index)?;
     verify_graph_operator_pre_signatures(&full_graph).map_err(|error| {
         SpecialError::InvalidGraph(format!("invalid operator pre-signatures: {error}"))

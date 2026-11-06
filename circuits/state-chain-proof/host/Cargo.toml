@@ -44,3 +44,6 @@ zkm-verifier.workspace = true
 
 [build-dependencies]
 zkm-build.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

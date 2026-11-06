@@ -85,9 +85,22 @@ async fn refresh_event_watch_metrics(
     })?;
 
     metrics_state.apply_event_watch_lag(snapshot.lag_blocks);
+    let watch = gateway_watch_contract(local_db).await?;
+    let indexed = indexed_height(&GraphQueryClient::new(), &watch).await.inspect_err(|error| {
+        metrics_state.backend_probe_failed("graph", "get_sync_block_height", error);
+    })?;
+    if let Err(error) = check_indexer_lag(indexed, finalized_height, watch.gap) {
+        metrics_state.backend_probe_failed("graph", "indexer_lag", &error);
+        metrics_state.set_event_watch_state(EventWatchState::Failed);
+        return Err(error);
+    }
+    metrics_state.record_backend_call("graph", true, None);
+    let gateway_pending = history_sync_pending(&watch, indexed, current_time_secs())?;
+    let other_syncing = snapshot.syncing_count
+        > i64::from(watch.status == WatchContractStatus::Syncing.to_string());
     let state = if snapshot.failed_count > 0 {
         EventWatchState::Failed
-    } else if snapshot.syncing_count > 0 {
+    } else if gateway_pending || other_syncing {
         EventWatchState::Syncing
     } else {
         EventWatchState::Healthy
@@ -288,29 +301,10 @@ pub async fn monitor_events_item(
 
     let query_client = GraphQueryClient::new();
     // let current_finalized = goat_client.get_finalized_block_number().await?;
-    let current_finalized = match query_client
-        .get_sync_block_height(&watch_contract.the_graph_url)
-        .await
-    {
-        Ok(Some(v)) => {
-            crate::metrics_service::record_backend_ok("graph");
-            v
-        }
-        Ok(None) => {
-            warn!(
-                "monitor_events_item:fail to get graph sync block height, will try later, empty value returned"
-            );
-            return Ok(());
-        }
-        Err(e) => {
-            crate::metrics_service::record_backend_failure(
-                "graph",
-                "get_sync_block_height",
-                &format!("{e:#}"),
-            );
-            return Ok(());
-        }
-    };
+    let current_finalized =
+        indexed_height(&query_client, &watch_contract).await.inspect_err(|error| {
+            crate::metrics_service::record_backend_failure("graph", "get_sync_block_height", error);
+        })?;
 
     if watch_contract.from_height == 0 || watch_contract.from_height >= current_finalized {
         // A misconfigured (zero) or not yet reachable start height: say it once at
@@ -519,7 +513,7 @@ pub async fn run_watch_event_task(
                             let goat_client = goat_client.clone();
                             let metrics_state = metrics_state.clone();
                             tokio::spawn(async move {
-                                if let Ok(Err(error)) = tokio::time::timeout(
+                                let refresh = tokio::time::timeout(
                                     Duration::from_secs(30),
                                     refresh_event_watch_metrics(
                                         &local_db,
@@ -527,8 +521,12 @@ pub async fn run_watch_event_task(
                                         &metrics_state,
                                     ),
                                 )
-                                .await
-                                {
+                                .await;
+                                let result = match refresh {
+                                    Ok(result) => result,
+                                    Err(error) => Err(anyhow::anyhow!("event watch health refresh timed out: {error}")),
+                                };
+                                if let Err(error) = result {
                                     metrics_state.set_event_watch_state(EventWatchState::Failed);
                                     if metrics_state.backend_unavailable("goat") {
                                         tracing::debug!(event = "metrics_event_watch", error = %error, "failed to refresh event watcher metrics (Goat unavailable)");
@@ -545,6 +543,7 @@ pub async fn run_watch_event_task(
                                 "failed",
                                 started_at.elapsed(),
                             );
+                            metrics_state.set_event_watch_state(EventWatchState::Failed);
                             warn!("fail to monitor events: {e}");
                         }
                     }
@@ -601,28 +600,116 @@ async fn get_watch_contract<'a>(
     }
 }
 
-pub async fn is_processing_gateway_history_events(
-    local_db: &LocalDB,
-    goat_client: &GOATClient,
-) -> anyhow::Result<bool> {
-    let gateway_contract: EvmAddress = get_goat_address_from_env(ENV_GOAT_GATEWAY_CONTRACT_ADDRESS)
-        .ok_or(anyhow::anyhow!("need to set gateway contract address"))?;
-    let mut storage_processor = local_db.acquire().await?;
-    // use finalized block height to judge is processing history events
-    let current_finalized = goat_client.get_finalized_block_number().await?;
-    let watch_contract = get_watch_contract(
-        &mut storage_processor,
-        &gateway_contract.to_string(),
-        WatchContractType::Gateway,
-    )
-    .await?;
-    Ok(watch_contract.from_height + watch_contract.gap < current_finalized
-        || watch_contract.status == WatchContractStatus::Syncing.to_string())
+async fn gateway_watch_contract(local_db: &LocalDB) -> anyhow::Result<WatchContract> {
+    let gateway = get_goat_address_from_env(ENV_GOAT_GATEWAY_CONTRACT_ADDRESS)
+        .ok_or_else(|| anyhow::anyhow!("need to set gateway contract address"))?;
+    let mut storage = local_db.acquire().await?;
+    get_watch_contract(&mut storage, &gateway.to_string(), WatchContractType::Gateway).await
+}
+
+async fn indexed_height(client: &GraphQueryClient, watch: &WatchContract) -> anyhow::Result<i64> {
+    let height = client
+        .get_sync_block_height(&watch.the_graph_url)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("subgraph metadata has no indexed block height"))?;
+    anyhow::ensure!(height >= 0, "subgraph indexed height is negative");
+    Ok(height)
+}
+
+fn history_sync_pending(watch: &WatchContract, indexed: i64, now: i64) -> anyhow::Result<bool> {
+    anyhow::ensure!(
+        watch.gap > 0 && watch.from_height >= 0 && indexed >= 0,
+        "invalid event watcher cursor, gap or indexed height"
+    );
+    let behind = watch.from_height < indexed;
+    let live_sync = watch.status == WatchContractStatus::Syncing.to_string()
+        && watch.updated_at.saturating_add(LOAD_HISTORY_EVENT_NO_WOKING_MAX_SECS) > now;
+    Ok(watch.from_height.saturating_add(watch.gap) < indexed || (behind && live_sync))
+}
+
+fn check_indexer_lag(indexed: i64, finalized: i64, allowed_lag: i64) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        indexed >= 0 && finalized >= 0 && allowed_lag > 0,
+        "invalid indexer height or lag budget"
+    );
+    let lag = finalized.saturating_sub(indexed);
+    anyhow::ensure!(
+        lag <= allowed_lag,
+        "subgraph indexing is behind GOAT finalized height: indexed={indexed}, finalized={finalized}, lag={lag}, allowed={allowed_lag}"
+    );
+    Ok(())
+}
+
+/// Compare the cursor with what the indexer can actually serve, independently of GOAT RPC.
+pub async fn is_processing_gateway_history_events(local_db: &LocalDB) -> anyhow::Result<bool> {
+    let watch = gateway_watch_contract(local_db).await?;
+    let indexed = indexed_height(&GraphQueryClient::new(), &watch).await?;
+    history_sync_pending(&watch, indexed, current_time_secs())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::HistorySyncGuard;
+    use super::*;
+
+    #[test]
+    fn history_sync_tracks_indexed_backlog_and_expires_stale_status() {
+        let mut watch = WatchContract {
+            from_height: 100,
+            gap: 10,
+            updated_at: 1000,
+            status: WatchContractStatus::Synced.to_string(),
+            ..Default::default()
+        };
+        assert!(!history_sync_pending(&watch, 100, 1001).unwrap());
+        assert!(!history_sync_pending(&watch, 110, 1001).unwrap());
+        assert!(history_sync_pending(&watch, 111, 1001).unwrap());
+        watch.status = WatchContractStatus::Syncing.to_string();
+        assert!(history_sync_pending(&watch, 105, 1001).unwrap());
+        assert!(!history_sync_pending(&watch, 100, 1001).unwrap());
+        let expired = 1000 + LOAD_HISTORY_EVENT_NO_WOKING_MAX_SECS;
+        assert!(!history_sync_pending(&watch, 105, expired).unwrap());
+        assert!(history_sync_pending(&watch, 111, expired).unwrap());
+        watch.gap = 0;
+        assert!(history_sync_pending(&watch, 105, expired).is_err());
+    }
+
+    #[test]
+    fn indexer_lag_is_a_backend_fault_separate_from_history_backlog() {
+        assert!(check_indexer_lag(100, 110, 10).is_ok());
+        assert!(check_indexer_lag(110, 100, 10).is_ok());
+        assert!(check_indexer_lag(100, 111, 10).is_err());
+        assert!(check_indexer_lag(-1, 100, 10).is_err());
+    }
+
+    #[tokio::test]
+    async fn unavailable_or_unhealthy_metadata_is_not_treated_as_history_sync() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (metadata, expected) in [
+            (serde_json::json!({"block":{"number":123},"hasIndexingErrors":false}), Some(123)),
+            (serde_json::Value::Null, None),
+            (serde_json::json!({"block":{"number":123},"hasIndexingErrors":true}), None),
+            (serde_json::json!({"block":{"number":-1}}), None),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 8192];
+                assert!(stream.read(&mut request).await.unwrap() > 0);
+                let body = serde_json::json!({"data":{"_meta":metadata}}).to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            });
+            let watch = WatchContract { the_graph_url: url, ..Default::default() };
+            let result = indexed_height(&GraphQueryClient::new(), &watch).await;
+            assert_eq!(result.ok(), expected);
+            server.await.unwrap();
+        }
+    }
 
     #[test]
     fn history_sync_guard_is_exclusive_per_contract() {
@@ -634,3 +721,6 @@ mod tests {
         drop(other);
     }
 }
+
+#[cfg(test)]
+mod pagination_tests;
