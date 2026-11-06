@@ -229,7 +229,8 @@ pub struct BtcSnapshot {
     pub prepare: Option<TxFact>,
     pub confirm: Option<TxFact>,
     pub cancel: Option<TxFact>,
-    /// Whether every input of Peg-In-Prepare is unspent or spent by Prepare itself.
+    /// False once an input of Peg-In-Prepare is spent by a confirmed transaction
+    /// other than Prepare; a mempool conflict does not count.
     pub inputs_available: Option<bool>,
 }
 

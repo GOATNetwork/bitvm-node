@@ -542,24 +542,70 @@ pub async fn wait_tx_confirmation(
     }
 }
 
+/// Returns false only when an input is spent by a confirmed transaction other
+/// than `target_txid`. A mempool spend can still be replaced or dropped, and
+/// one stale backend answer must not discard the instance and its keys.
 pub async fn check_bridge_in_uxto_available_or_self_spent(
     btc_client: &BTCClient,
     target_txid: Option<String>,
     utxos: &[client::Utxo],
 ) -> Result<bool> {
     for utxo in utxos {
-        if let Ok(txid) = Txid::from_slice(&utxo.txid)
-            && let Ok(Some(status)) = btc_client.get_output_status(&txid, utxo.vout as u64).await
-            && status.spent
-        {
-            if let Some(target_txid) = target_txid
-                && let Some(txid) = status.txid
-                && txid.to_string() == target_txid
-            {
-                return Ok(true);
-            }
+        let Ok(txid) = Txid::from_slice(&utxo.txid) else { continue };
+        let Ok(Some(status)) = btc_client.get_output_status(&txid, utxo.vout as u64).await else {
+            continue;
+        };
+        if !status.spent {
+            continue;
+        }
+        let self_spent = target_txid
+            .as_deref()
+            .is_some_and(|target| status.txid.is_some_and(|spender| spender.to_string() == target));
+        let confirmed = status.status.as_ref().is_some_and(|tx_status| tx_status.confirmed);
+        if !self_spent && confirmed {
             return Ok(false);
         }
     }
     Ok(true)
+}
+
+#[cfg(test)]
+mod input_availability_tests {
+    use super::*;
+    use bitcoin::hashes::Hash;
+    use esplora_client::{OutputStatus, TxStatus};
+
+    fn spend(spender: Txid, confirmed: bool) -> OutputStatus {
+        OutputStatus {
+            spent: true,
+            txid: Some(spender),
+            vin: Some(0),
+            status: Some(TxStatus {
+                confirmed,
+                block_height: confirmed.then_some(10),
+                block_hash: None,
+                block_time: None,
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn only_a_confirmed_conflicting_spend_makes_inputs_unavailable() {
+        let (btc, mock) = BTCClient::new_mock_client();
+        let funding = Txid::from_byte_array([1; 32]);
+        let prepare = Txid::from_byte_array([2; 32]);
+        let other = Txid::from_byte_array([3; 32]);
+        let utxos = [client::Utxo { txid: funding.to_byte_array(), vout: 0, amount_sats: 1 }];
+        let check = || {
+            check_bridge_in_uxto_available_or_self_spent(&btc, Some(prepare.to_string()), &utxos)
+        };
+
+        assert!(check().await.unwrap(), "unspent input");
+        mock.set_output_status(funding, 0, spend(prepare, false));
+        assert!(check().await.unwrap(), "spent by Prepare itself");
+        mock.set_output_status(funding, 0, spend(other, false));
+        assert!(check().await.unwrap(), "a mempool conflict can still be replaced");
+        mock.set_output_status(funding, 0, spend(other, true));
+        assert!(!check().await.unwrap(), "a confirmed conflict discards the request");
+    }
 }
