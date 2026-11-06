@@ -86,9 +86,8 @@ async fn refresh_event_watch_metrics(
 
     metrics_state.apply_event_watch_lag(snapshot.lag_blocks);
     let watch = gateway_watch_contract(local_db).await?;
-    let indexed = indexed_height(&GraphQueryClient::new(), &watch).await.map_err(|error| {
-        metrics_state.backend_probe_failed("graph", "get_sync_block_height", &error);
-        error
+    let indexed = indexed_height(&GraphQueryClient::new(), &watch).await.inspect_err(|error| {
+        metrics_state.backend_probe_failed("graph", "get_sync_block_height", error);
     })?;
     if let Err(error) = check_indexer_lag(indexed, finalized_height, watch.gap) {
         metrics_state.backend_probe_failed("graph", "indexer_lag", &error);
@@ -696,7 +695,7 @@ mod tests {
             let server = tokio::spawn(async move {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut request = [0u8; 8192];
-                stream.read(&mut request).await.unwrap();
+                assert!(stream.read(&mut request).await.unwrap() > 0);
                 let body = serde_json::json!({"data":{"_meta":metadata}}).to_string();
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
