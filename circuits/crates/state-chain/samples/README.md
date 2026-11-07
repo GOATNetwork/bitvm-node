@@ -1,13 +1,8 @@
-# Samples
+# State-chain samples
 
-* signed_header
+These samples contain signed headers and current and next validator sets for
+two adjacent GOAT consensus heights. They provide concrete inputs for checking
+consensus transitions in the state-chain proof.
 
-http://127.0.0.1:26657/commit?height=5756785
-
-* validator_set and next_validator_set
-
-"http://127.0.0.1:26657/validators?height=5756784"
-
-* [optional]blocks
-
-http://127.0.0.1:26657/block?height=5756785
+See the [circuits guide](../../../README.md) for how state-chain proofs fit into
+the bridge's proof composition.

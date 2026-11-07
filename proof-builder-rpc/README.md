@@ -1,190 +1,53 @@
-# Proof Builder RPC
+# Proof Builder
 
-## Build
+The Proof Builder coordinates header, commit and state-chain proofs, then
+produces Operator and Watchtower proofs on demand. See the
+[circuits guide](../circuits/README.md) for proof composition and the
+[transaction graph](../transaction-graph.svg) for their role in claims and disputes.
 
-From the repository root:
+## Build and inspect
 
-```
-BITCOIN_NETWORK=testnet4 cargo build -r -p proof-builder-rpc
-```
-
-## Deployment
-
-Run the service from `proof-builder-rpc/` so the example configuration's relative
-proof paths resolve correctly. Copy `proof-builder.toml.example` to
-`proof-builder.toml` and configure the chain endpoints and proof inputs before
-startup.
-
-Initial parameters are read from `proof-builder.toml` (see
-[proof-builder.toml.example](./proof-builder.toml.example)). After that, they will be loaded from
-the database.
-
-Proof inputs are described in the [circuits guide](../circuits/README.md). The
-[transaction graph](../transaction-graph.svg) shows where the on-demand proofs
-are used.
-
-To reuse local Bitcoin headers for the first batch built from Genesis, set
-`prefer_local_headers_on_init = true` in `[header_chain]`, together with `init_input = true`
-and `start = 0`. The option defaults to `false` for existing configurations. Headers are read
-from `block_headers`, which contains consecutive 80-byte headers starting at height 0.
-If that working cache is missing or incomplete, the builder also checks
-`0-<batch_size>.bin.blocks` in the same directory. A sidecar containing more complete headers
-is copied into the working cache, up to the requested batch size; the source sidecar is unchanged.
-For example, a Genesis batch of 157450 headers can reuse `0-157450.bin.blocks` without changing
-the configured `block_headers` path. Logs identify both the sidecar source and working cache.
-Choose a distinct Genesis `output_proof`, such as `genesis-157450.bin`; the following batch is
-written to `157450-1.bin` in the same output directory.
-For `batch_size = 10000`, the first batch uses heights 0 through 9999. A complete local batch
-requires no Bitcoin RPC calls and leaves any later cached headers intact. If local files are absent
-or incomplete, only missing headers are fetched through Esplora; an incomplete trailing header
-is fetched again. This preference overrides `force_fetch` for the Genesis batch only.
-After the first proof succeeds, subsequent batches contain one block and use the existing
-fetching behaviour. Restarting with database progress also resumes with one block per batch.
-When this option is enabled, surplus cached headers are replaced as later batches are fetched,
-including when `force_fetch = false`.
-
-The four Operator/Watchtower task endpoints require signed requests and live GOAT contract
-authorization. Configure the read-only GOAT connection before startup:
-
-```dotenv
-GOAT_NETWORK=test
-GOAT_CHAIN_URL=https://rpc.testnet3.goat.network
-GOAT_GATEWAY_CONTRACT_ADDRESS=<gateway-address-1>,<gateway-address-2>
-```
-
-Proof Builder accepts one or more comma-separated Gateway addresses. All configured Gateways use
-the same GOAT network and RPC. It discovers the CommitteeManagement contract through each Gateway
-and exits if any configured contract set cannot be initialized. Operator requests require graph
-ownership and a matching instance/graph relation. Operator registration and stake are enforced
-when graphs are admitted and are not rechecked for existing proof tasks.
-Watchtower requests require membership in the current global Watchtower registry and the request
-public key must match the authenticated signer. Operator graph authorization is queried for each request. Watchtower membership
-uses the short-lived registry cache described below. Failed authorization queries
-return HTTP 503.
-
-Each authenticated request selects a configured deployment with the signed `gateway_address`
-field. For staged upgrades, the field may be omitted while Proof Builder has exactly one Gateway;
-it is required when multiple Gateways are configured. Nodes continue to use one
-`GOAT_GATEWAY_CONTRACT_ADDRESS` value and add it to every Operator/Watchtower proof request.
-
-Nodes sign requests with their existing `BITVM_SECRET`; no GOAT or Bitcoin private key is
-configured on the Proof Builder. Deploy signing-capable nodes before enabling the authenticated
-Proof Builder so that in-flight proof polling is not rejected.
-
-Authenticated requests carry `x-proof-auth-timestamp`, `x-proof-auth-nonce`,
-`x-proof-auth-public-key`, and `x-proof-auth-signature`. The signature binds the caller role,
-HTTP method, route, timestamp, nonce, and canonical JSON body. Rust callers should use
-`proof_builder::api_auth::sign_proof_builder_request`; each retry must generate a new nonce.
-A nonce is remembered only after the signer is authorized for the graph, and the service
-serves at most 64 requests at a time; requests beyond that, or arriving while the replay cache
-is full, get `503` and should be retried. A request, body upload included, that takes longer
-than 30 seconds is cancelled with `408`. The Watchtower registry is cached for 5 seconds.
-
-To enable multiple Gateways without interrupting proof polling, first upgrade Proof Builder with a
-single Gateway, then upgrade all Nodes to send `gateway_address`, and finally configure the
-comma-separated Gateway list.
-
-## Fleet app worker mode
-
-Proof Builder can run as a zkm-fleet integrated app worker. Fleet starts a dedicated Ziren GPU
-server for the app and launches `proof-builder-rpc` beside it. The
-worker proves directly against that loopback server instead of submitting through the SDK
-network prover and the Fleet gateway. The HTTP API and node configuration are unchanged.
-
-Fleet mode starts when Fleet supplies its worker environment. Any partial Fleet environment is a
-startup error. Without these variables the SDK network prover (`ZKM_PROVER=network`) is used as
-before, which is how operators fall back explicitly.
-
-| Variable | Source | Meaning |
-|---|---|---|
-| `FLEET_GPU_ENDPOINT` | Fleet | Loopback URL of the replica's GPU server |
-| `FLEET_APP_STORAGE_ROOT` | Fleet | Durable app storage (`proof_storage_root`) |
-| `FLEET_APP_ELF_ID` | Fleet | App id: the SHA-256 of the program bundle manifest |
-| `FLEET_APP_NAMESPACE`, `FLEET_APP_TENANT` | Fleet | App identity |
-| `FLEET_EXIT_WITH_PARENT` | Fleet | Exit with the Fleet actor (Linux `PR_SET_PDEATHSIG`) |
-| `PROOF_BUILDER_PROGRAMS_FILE` | worker env file | `programs.json` from the package |
-
-The app id covers all five guests. Each line is `<name> <ELF SHA-256>`, sorted by name
-(commit-chain, header-chain, operator, state-chain, watchtower), and the id is the SHA-256 of
-those lines. `proof-builder-rpc --print-programs` sets every program up on the CPU prover and
-prints the ELF digests, program IDs, verifying-key hashes, wrap mode and app id as JSON; package
-that output as `programs.json`. At startup the worker checks that the embedded programs, the
-programs file and `ZKM_IMM_WRAP_VK` match the Fleet app id. After each GPU setup it also checks
-the verifying key.
-
-Startup also requires the following:
-
-- The working directory (`worker_workdir`) and the sqlite database must be inside the storage
-  root, and the worker takes an exclusive lock on `<root>/proof-builder.lock`.
-- Use `<root>/run` as the working directory so that relative `../circuits/data/...` paths
-  resolve to `<root>/circuits/data/...`.
-- Groth16 wrapping runs on the worker's CPU. Pre-install the Groth16 circuit artifacts for the
-  Fleet execution user before enabling the app.
-
-Proving behaviour in Fleet mode:
-
-- The GPU server runs one proof at a time. Builder setup and every proving unit (prove, publish
-  and database commit) pass through a FIFO gate.
-- An operator or watchtower task stays `New` while it queues and proves. Its result is written
-  only while it is still `New`, so a timeout request that arrives in the meantime wins.
-- If the GPU server stops reporting ready, or a proof cannot be published, the task stays
-  pending and the worker exits. Fleet then restarts the GPU server and the worker.
-- Otherwise a failed prover call is replayed by executing its guest on the CPU. GPU RPC
-  errors do not distinguish transport failures from rejected inputs. If the guest executes,
-  the prover or its transport failed; the proof is retried in place and the failure does not
-  count as an attempt.
-- A proof that fails because the guest rejects its input, or because the result does not
-  verify, marks the task `Failed` after `--max-proof-attempts` consecutive failures
-  (default 2).
-- On SIGTERM or a task failure the worker starts no new proof. It waits up to
-  `--drain-timeout-secs` for the proof in progress to be published and committed, then exits.
-  A proof still running at the timeout does not delay the exit; it is retried after restart.
-  Keep that value below the service's `worker_stop_timeout_s`. Exit codes: 0 after a clean stop,
-  1 after a task failure or an abandoned proof, 101 after a panic.
-- Proofs and their sidecars are published through synced temporary files and atomic renames.
-  Sidecars are published before the proof file, and the database is updated after all files
-  and the directory are synced. Sidecars include the header chain's `.blocks`, which operator
-  and watchtower proofs read for SPV. State-chain `.args`/`.ctx` snapshots are written atomically
-  as well.
-- The state-chain context builder prepares at most `--state-chain-max-pending-batches`
-  unproved batches (default 2; 0 means unlimited).
-
-## Metrics
-
-Prometheus metrics use a dedicated listener and are disabled unless `--metrics-addr` is set. The
-business RPC listener does not serve metrics, so `GET /metrics` on `--rpc-addr` returns `404`.
+Run from the repository root:
 
 ```bash
-proof-builder-rpc \
-  --rpc-addr 0.0.0.0:7777 \
-  --metrics-addr 10.42.0.8:9109 \
-  --config proof-builder.toml
+cargo build -r -p proof-builder-rpc
+cargo run -r -p proof-builder-rpc -- --help
 ```
 
-The dedicated listener serves only `/metrics`. Bind it to a private interface and allow only the
-Prometheus source network to reach it. The listener does not provide TLS or authentication and
-should not be exposed directly to the public internet. An unavailable metrics port causes startup
-to fail.
+## Authorization
 
-## Progress and recovery
+Nodes authenticate proof requests with their bridge signing identities. The
+service checks Operator ownership of a graph or current Watchtower membership
+before accepting work. It supports multiple Gateway deployments on the same
+GOAT network, with each request selecting its intended deployment.
 
-Long-running header, commit and state-chain tasks persist their progress in
-SQLite. Restarting the service resumes from that progress; retain the matching
-proof files and sidecars when restoring a database backup.
+The service does not need the nodes' private keys. Replay protection, bounded
+concurrency, and request deadlines limit repeated or stalled work.
 
-Operator and Watchtower tasks with unavailable inputs stay pending while later
-tasks are checked. Forward and bounded retry scans alternate, so older tasks are
-revisited even while new work arrives. Timeout requests prevent a subsequently
-completed proof from overwriting a task that is no longer pending.
+## Scheduling and recovery
 
-Sequencer-set publication is a separate operation. Inspect the publisher CLI
-before advancing or rotating the publisher set:
+Long-running chain proofs persist their progress. Operator and Watchtower tasks
+with unavailable inputs stay pending while later work is checked. Independent
+forward and bounded retry scans revisit older tasks under continuing load.
 
-```bash
-cargo run -r -p bitvm-noded --bin sequencer-set-publish -- --help
-```
+A timeout prevents a subsequently completed proof from overwriting a task that
+is no longer pending. Restarting resumes from saved progress; restore proof
+artifacts together with the matching service state.
 
-The [Regtest publication fixture](../node/ssp-ci.sh) demonstrates the sequence
-with test publishers. For state-chain initialization and proof inputs, see the
-[circuits guide](../circuits/README.md#state-chain) and the
-[configuration example](proof-builder.toml.example).
+## Fleet workers
+
+Fleet can run the service beside a dedicated GPU server. Proving is serialized
+through a shared gate, and completed artifacts are published before progress is
+committed. The worker checks program identities and verification keys at startup.
+
+Transient proving failures leave work pending. Invalid inputs have a bounded
+attempt count. On shutdown, the worker stops accepting new proving work and
+allows in-flight work a bounded time to finish; unfinished work can resume after
+restart.
+
+## Operations
+
+Monitor chain-proof progress and pending on-demand tasks alongside node health.
+Sequencer-set publication is a separate operation from proof generation. For
+bridge deployment and local regression scenarios, see the
+[deployment guide](../deployment/README.md) and [localnet](../localnet/README.md).
