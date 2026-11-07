@@ -41,7 +41,7 @@ core dispute safety for Bitcoin, Testnet4, Signet and Regtest:
   committed pubin. It models the current Commit-Timeout and verifier gates,
   including an operator withholding evidence and a possibly offline watchtower.
   An honest verifier's enabled defences have an explicit bounded response time.
-- `tests/tla_shipped_values.rs` checks that the TLA values match Rust. A timing
+- `crates/bitvm-gc/tests/tla_shipped_values.rs` checks that the TLA values match Rust. A timing
   change requires regenerating the values and rerunning the checks.
 - Every other `audit/tla/<Model>.tla` with a `<Model>.cfg` is checked as well;
   its header states what it models and which code it follows.

@@ -112,7 +112,7 @@ bitvm-noded \
   --metrics-addr 127.0.0.1:9108 \
   --db-path ./node.db \
   --p2p-port 4001 \
-  --bootnodes /ip4/x.x.x.x/tcp/4001/p2p/<peer_id>
+  --bootnodes '/ip4/x.x.x.x/tcp/4001/p2p/<peer_id>'
 ```
 
 ### Start Local Mock RPC

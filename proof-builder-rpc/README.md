@@ -2,19 +2,26 @@
 
 ## Build
 
-Use the following command to build the project:
+From the repository root:
 
 ```
-BITCOIN_NETWORK=testnet4 cargo build -r
+BITCOIN_NETWORK=testnet4 cargo build -r -p proof-builder-rpc
 ```
 
 ## Deployment
+
+Run the service from `proof-builder-rpc/` so the example configuration's relative
+proof paths resolve correctly. Copy `proof-builder.toml.example` to
+`proof-builder.toml` and configure the chain endpoints and proof inputs before
+startup.
 
 Initial parameters are read from `proof-builder.toml` (see
 [proof-builder.toml.example](./proof-builder.toml.example)). After that, they will be loaded from
 the database.
 
-Field descriptions for the configuration are available in the circuits documentation: [circuits README](../circuits/README.md).
+Proof inputs are described in the [circuits guide](../circuits/README.md). The
+[transaction graph](../transaction-graph.svg) shows where the on-demand proofs
+are used.
 
 To reuse local Bitcoin headers for the first batch built from Genesis, set
 `prefer_local_headers_on_init = true` in `[header_chain]`, together with `init_input = true`
@@ -51,8 +58,9 @@ and exits if any configured contract set cannot be initialized. Operator request
 ownership and a matching instance/graph relation. Operator registration and stake are enforced
 when graphs are admitted and are not rechecked for existing proof tasks.
 Watchtower requests require membership in the current global Watchtower registry and the request
-public key must match the authenticated signer. Contract authorization is queried for every
-request; failures return HTTP 503 rather than falling back to stale authorization data.
+public key must match the authenticated signer. Operator graph authorization is queried for each request. Watchtower membership
+uses the short-lived registry cache described below. Failed authorization queries
+return HTTP 503.
 
 Each authenticated request selects a configured deployment with the signed `gateway_address`
 field. For staged upgrades, the field may be omitted while Proof Builder has exactly one Gateway;
@@ -158,44 +166,25 @@ Prometheus source network to reach it. The listener does not provide TLS or auth
 should not be exposed directly to the public internet. An unavailable metrics port causes startup
 to fail.
 
-## Failure recovery
+## Progress and recovery
 
-Long-running proof tasks (stored in the `long_running_task_proof` table) — such as header-chain, commit-chain, and state-chain proofs — can be recovered from the database. Recovery notes:
+Long-running header, commit and state-chain tasks persist their progress in
+SQLite. Restarting the service resumes from that progress; retain the matching
+proof files and sidecars when restoring a database backup.
 
-- **Header Chain**: A newly confirmed block (>=1) must wait for the configured number of confirmations before being included in a proof. If the confirmation count is insufficient, delete the corresponding entries from the `long_running_task_proof` table; proof generation will resume from the database state.
+Operator and Watchtower tasks with unavailable inputs stay pending while later
+tasks are checked. Forward and bounded retry scans alternate, so older tasks are
+revisited even while new work arrives. Timeout requests prevent a subsequently
+completed proof from overwriting a task that is no longer pending.
 
-- **Commit Chain**: The `sequencer-set-publish` process is manual. When a new publish is required, run the publication script with the appropriate `GOAT_BLOCK_NUMBER` to create a sequencer-set commitment. Example invocation:
+Sequencer-set publication is a separate operation. Inspect the publisher CLI
+before advancing or rotating the publisher set:
 
 ```bash
-GOAT_BLOCK_NUMBER=${THE_GOAT_BLOCK_NUMBER} bash -x scp.sh
+cargo run -r -p bitvm-noded --bin sequencer-set-publish -- --help
 ```
 
-Example `scp.sh` used for Regtest integration tests, remember to set the `OPERATOR_VK_HASH` environment variable before running:
-
-```bash
-#!/bin/bash
-set -e
-source .env
-
-DIR="$( cd "$( dirname "$0" )" && pwd )"
-
-if [ -f $OUTPUT_FILE ]; then
-    cp $OUTPUT_FILE ${OUTPUT_FILE}.bk 
-fi 
-
-cargo build -r --bin sequencer-set-publish
-export RUST_LOG=info
-CMD="../target/release/sequencer-set-publish"
-
-echo "Recovering publisher set: next_publishers => publishers"
-$CMD payfee --total 3
-
-$CMD sign-seq --owner-btc-key-wif $PUBLISHER1 --goat-block-number $GOAT_BLOCK_NUMBER \ --next-publisher-btc-pubkeys=$PUBLISHER_BTC_PUBKEYS --publisher-btc-pubkeys=$NEXT_PUBLISHER_BTC_PUBKEYS 
-$CMD sign-seq --owner-btc-key-wif $PUBLISHER2 --goat-block-number $GOAT_BLOCK_NUMBER \ --next-publisher-btc-pubkeys=$PUBLISHER_BTC_PUBKEYS --publisher-btc-pubkeys=$NEXT_PUBLISHER_BTC_PUBKEYS 
-$CMD sign-seq --owner-btc-key-wif $PUBLISHER3 --goat-block-number $GOAT_BLOCK_NUMBER \ --next-publisher-btc-pubkeys=$PUBLISHER_BTC_PUBKEYS --publisher-btc-pubkeys=$NEXT_PUBLISHER_BTC_PUBKEYS 
-
-# broadcast publisher changes to Bitcoin
-$CMD push-seq --goat-block-number $GOAT_BLOCK_NUMBER --next-publisher-btc-pubkeys=$PUBLISHER_BTC_PUBKEYS --publisher-btc-pubkeys=$NEXT_PUBLISHER_BTC_PUBKEYS  --commit-info="${DIR}/../circuits/data/commit-chain/commit_info.json.latest"
-```
-
-- **State Chain**: For sequencer-set genesis commitments or when re-anchoring the state chain, modify the latest record of state chain in `long_running_task_proof` with `block_end = 0` and `proof_state = 'Failed'` to trigger recovery handling.
+The [Regtest publication fixture](../node/ssp-ci.sh) demonstrates the sequence
+with test publishers. For state-chain initialization and proof inputs, see the
+[circuits guide](../circuits/README.md#state-chain) and the
+[configuration example](proof-builder.toml.example).

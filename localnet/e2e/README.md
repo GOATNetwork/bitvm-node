@@ -1,7 +1,6 @@
 # e2e — on-demand end-to-end regression of the node
 
-Not CI: run it by hand after a change, on the localnet of [../README.md](../README.md) (five mocked nodes on
-regtest + the GOAT chain + local graph). Honours `LOCALNET_DATA` / `PORT_BASE` / `COMPOSE_PROJECT` like every other script.
+Run this suite manually after a change, or through the [Localnet e2e workflow](../../.github/workflows/e2e_localnet.yml) on pushes to `main` / `dev` and manual dispatch. It uses the [localnet](../README.md) (five mocked nodes on regtest, a GOAT chain and a local graph). `LOCALNET_DATA`, `PORT_BASE` and `COMPOSE_PROJECT` select the environment.
 
 ```
 localnet/scripts/status.sh                       # infra, chains, nodes all up
