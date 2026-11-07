@@ -15,7 +15,7 @@ pub const NODE_BITCOIN_TIMELOCK_CONFIG: TimelockConfig = TimelockConfig {
     watchtower_challenge: 144,
     operator_ack: 288,
     operator_commit: 432,
-    connector_f: 576,
+    connector_f: 600,
 };
 pub const NODE_TESTNET_TIMELOCK_CONFIG: TimelockConfig = TimelockConfig {
     connector_z: 100,
@@ -25,7 +25,7 @@ pub const NODE_TESTNET_TIMELOCK_CONFIG: TimelockConfig = TimelockConfig {
     watchtower_challenge: 20,
     operator_ack: 28,
     operator_commit: 42,
-    connector_f: 56,
+    connector_f: 66,
 };
 pub const NODE_SIGNET_TIMELOCK_CONFIG: TimelockConfig = TimelockConfig {
     connector_z: 6,
@@ -35,20 +35,23 @@ pub const NODE_SIGNET_TIMELOCK_CONFIG: TimelockConfig = TimelockConfig {
     watchtower_challenge: 6,
     operator_ack: 12,
     operator_commit: 18,
-    connector_f: 24,
+    connector_f: 28,
 };
 /// Regtest keeps `connector_z` (T0) wide on purpose: the peg-in pre-signing
 /// ceremony and the abandon buffer are measured in blocks, and a one-block T0
 /// would expire every localnet peg-in before the committee finishes signing.
+/// Its budget has no inclusion or safety blocks, so `connector_f` keeps one
+/// block above the minimum: otherwise a Commit-Timeout sent one block after T6
+/// confirms in the block where Take-2 becomes valid.
 pub const NODE_REGTEST_TIMELOCK_CONFIG: TimelockConfig = TimelockConfig {
     connector_z: 60,
     connector_a: 2,
     prover_connector: 1,
-    connector_d: 3,
+    connector_d: 5,
     watchtower_challenge: 1,
     operator_ack: 2,
     operator_commit: 3,
-    connector_f: 4,
+    connector_f: 6,
 };
 
 pub fn default_timelock_config(network: Network) -> TimelockConfig {
@@ -92,6 +95,21 @@ impl ProtocolTimingBudget {
         self.reaction_blocks
             .saturating_add(self.inclusion_blocks)
             .saturating_add(self.safety_blocks)
+    }
+
+    /// From an event that calls for a disprove until Disprove-X lands: reaction,
+    /// Verifier-Assert inclusion, Disprove-X inclusion after the prover-connector
+    /// CSV, and reorg safety. The CSV itself is added by the caller.
+    const fn disprove_window(self) -> u32 {
+        self.action_window().saturating_add(self.inclusion_blocks)
+    }
+
+    /// From an OperatorAssert until Take-2 through Connector-D, besides the
+    /// prover-connector CSV: the block the Assert is first seen in, the
+    /// Verifier-Assert's action window, Disprove-X's action window once the
+    /// CSV allows it, and one block so Disprove-X lands strictly first.
+    const fn assert_disprove_window(self) -> u32 {
+        self.action_window().saturating_mul(2).saturating_add(2)
     }
 
     const fn watchtower_proof_window(self) -> u32 {
@@ -220,12 +238,14 @@ pub fn validate_timelock_config(network: Network, config: &TimelockConfig) -> Re
         budget.confirmed_action_window(),
     )?;
     ensure_at_least("prover_connector", config.prover_connector, action_window)?;
+    // An Assert may arrive after Connector-F has matured, leaving
+    // Connector-D as Take-2's only clock.
     ensure_gap_at_least(
         "prover_connector",
         config.prover_connector,
         "connector_d",
         config.connector_d,
-        action_window,
+        budget.assert_disprove_window(),
     )?;
     ensure_gap_at_least(
         "operator_commit",
@@ -233,6 +253,16 @@ pub fn validate_timelock_config(network: Network, config: &TimelockConfig) -> Re
         "connector_f",
         config.connector_f,
         budget.confirmed_action_window(),
+    )?;
+    // A commit near T6 must still leave time for ChallengeAssert, the
+    // prover-connector CSV and Disprove-X before Take-2 becomes available
+    // through Connector-F.
+    ensure_gap_at_least(
+        "operator_commit",
+        config.operator_commit,
+        "connector_f",
+        config.connector_f,
+        config.prover_connector.saturating_add(budget.disprove_window()),
     )?;
 
     Ok(())
@@ -328,6 +358,79 @@ mod tests {
         ] {
             assert_eq!(default_timelock_config(network), config);
             validate_timelock_config(network, &config).unwrap();
+        }
+    }
+
+    #[test]
+    fn commit_to_take2_gap_covers_disprove_csv_and_action_window() {
+        for network in [
+            Network::Bitcoin,
+            Network::Testnet,
+            Network::Testnet4,
+            Network::Signet,
+            Network::Regtest,
+        ] {
+            let mut config = default_timelock_config(network);
+            let required_gap =
+                config.prover_connector + protocol_timing_budget(network).disprove_window();
+            config.connector_f = config.operator_commit + required_gap;
+            validate_timelock_config(network, &config).unwrap();
+            config.connector_f -= 1;
+            let error = validate_timelock_config(network, &config).unwrap_err();
+            assert!(
+                error.to_string().contains("connector_f - timelock_config.operator_commit"),
+                "{network:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn take2_gap_after_prover_connector_covers_both_action_windows() {
+        for network in [
+            Network::Bitcoin,
+            Network::Testnet,
+            Network::Testnet4,
+            Network::Signet,
+            Network::Regtest,
+        ] {
+            let mut config = default_timelock_config(network);
+            let budget = protocol_timing_budget(network);
+            // The block the Assert is seen in, the Verifier-Assert and
+            // Disprove-X action windows, and the block Take-2 would use.
+            let required_gap = 2 * budget.action_window() + 2;
+            config.connector_d = config.prover_connector + required_gap;
+            config.connector_f = config.connector_f.max(config.connector_d);
+            validate_timelock_config(network, &config).unwrap();
+            config.connector_d -= 1;
+            let error = validate_timelock_config(network, &config).unwrap_err();
+            assert!(
+                error.to_string().contains("connector_d - timelock_config.prover_connector"),
+                "{network:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn late_commit_leaves_time_for_challenge_and_disprove() {
+        for network in [
+            Network::Bitcoin,
+            Network::Testnet,
+            Network::Testnet4,
+            Network::Signet,
+            Network::Regtest,
+        ] {
+            let config = default_timelock_config(network);
+            let disprove_window = protocol_timing_budget(network).disprove_window();
+            // Reproduce C2: assert already confirmed, commit at the last block
+            // before T6. Even a challenge delayed until that commit must retain
+            // the full reaction/inclusion/safety allowance around the T2 CSV.
+            let commit_height = config.operator_commit - 1;
+            let disprove_height = commit_height + disprove_window + config.prover_connector;
+            let take2_height = config.connector_d.max(config.connector_f);
+            assert!(
+                disprove_height < take2_height,
+                "{network:?}: Disprove {disprove_height}, Take-2 {take2_height}"
+            );
         }
     }
 

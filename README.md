@@ -35,7 +35,8 @@ core dispute safety for Bitcoin, Testnet4, Signet and Regtest:
 The timing model is finite, init-only arithmetic. Its Disprove comparison assumes
 VerifierAssert confirms within `action_window` of OperatorAssert; earlier maturity
 does not guarantee earlier confirmation. The safety model explores transitions
-after WCI and OperatorAssert confirm in the same block, abstracts proof validity
+after WCI confirms, with OperatorAssert confirming in the same or any later
+block (including after Connector-F has matured), abstracts proof validity
 as a boolean, and assumes published pubin is consistent with the Assert. It does
 not assume pubin will be published or a watchtower branch will resolve.
 These checks do not establish end-to-end bridge safety or liveness and omit
@@ -57,10 +58,9 @@ make tla
 Every TLC failure fails CI. There are no expected-failure configurations or
 stored traces. Temporary TLC files are removed on exit. `TLA2TOOLS` overrides
 the tool jar path; `TLC_OPTS` supplies optional whitespace-separated TLC flags.
-The current implementation violates dispute safety: an unresolved watchtower
-blocks Commit-Timeout while an invalid Assert waits for Connector E, allowing
-Take-2. Consequently `make tla` fails until the implementation and its model
-are corrected; the safety requirements must not be weakened to make CI green.
+Commit-Timeout no longer waits for unresolved watchtower branches, and an
+invalid Assert is challenged without waiting for Connector E, so both safety
+requirements hold. They must not be weakened to make CI green.
 
 ## Contributing
 

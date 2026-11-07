@@ -475,6 +475,17 @@ fn is_timelock_ready(confirmed_height: i64, lock_blocks: i64, current_height: i6
     confirmed_height > 0 && confirmed_height + lock_blocks <= current_height
 }
 
+/// Whether the next block satisfies the CSV, so the mempool accepts the spend
+/// now. Disprove races Take-2 through Connector-D and is due one block before
+/// `is_timelock_ready`.
+fn is_spendable_in_next_block(
+    confirmed_height: i64,
+    lock_blocks: i64,
+    current_height: i64,
+) -> bool {
+    confirmed_height > 0 && confirmed_height + lock_blocks <= current_height + 1
+}
+
 /// Confirmation height of a transaction, cached in the graph's monitor table.
 async fn confirmed_monitor(
     btc_client: &BTCClient,
@@ -614,6 +625,7 @@ async fn watchtower_flow(
     );
     let pubin_committed = connector_e_spent.is_some() && !commit_timed_out;
 
+    let mut all_branches_confirmed = true;
     let mut all_resolved = true;
     let mut timeout_ready = false;
     let mut nack_ready = Vec::new();
@@ -638,7 +650,10 @@ async fn watchtower_flow(
             (Some(spent), Some(timeout)) if spent == timeout && watchtower_confirmed
         );
         match watchtower_spent {
-            Some(_) if !watchtower_confirmed => all_resolved = false,
+            Some(_) if !watchtower_confirmed => {
+                all_branches_confirmed = false;
+                all_resolved = false;
+            }
             Some(_) if !timed_out => {
                 signals.push(PegoutSignal::WatchtowerChallengeSent { watchtower_index: index });
                 if !ack_confirmed {
@@ -657,6 +672,7 @@ async fn watchtower_flow(
             }
             Some(_) => {}
             None => {
+                all_branches_confirmed = false;
                 all_resolved = false;
                 if ack_spent.is_none()
                     && is_timelock_ready(
@@ -676,15 +692,20 @@ async fn watchtower_flow(
     for watchtower_index in nack_ready {
         signals.push(PegoutSignal::NackReady { watchtower_index });
     }
-    if all_resolved && connector_e_spent.is_none() && connector_f_spent.is_none() {
+    // Committing the branch bitmap needs confirmed challenges/timeouts, not ACKs.
+    if all_branches_confirmed && connector_e_spent.is_none() && connector_f_spent.is_none() {
         signals.push(PegoutSignal::OperatorCommitPubinReady);
-        if is_timelock_ready(
-            monitor.height,
-            operator_commit_timelock_blocks(network, timelocks) as i64,
-            height,
-        ) {
-            signals.push(PegoutSignal::OperatorCommitPubinTimeout);
-        }
+    }
+    // T6 protects Connector-F independently of watchtower branch progress.
+    // Pending spends must not suppress the attempt to close the Take-2 path.
+    if is_timelock_ready(
+        monitor.height,
+        operator_commit_timelock_blocks(network, timelocks) as i64,
+        height,
+    ) && outpoint_spent_confirmed(btc_client, &wci_txid, connector_e).await?.is_none()
+        && outpoint_spent_confirmed(btc_client, &wci_txid, connector_f).await?.is_none()
+    {
+        signals.push(PegoutSignal::OperatorCommitPubinTimeout);
     }
     if all_resolved
         && pubin_committed
@@ -777,7 +798,7 @@ async fn wrongly_challenge_timeout(
         else {
             continue;
         };
-        if monitor.height + disprove_blocks <= height {
+        if is_spendable_in_next_block(monitor.height, disprove_blocks, height) {
             signals.push(PegoutSignal::WronglyChallengeTimeout {
                 challenge_assert_txid,
                 verifier_index: index,
@@ -848,6 +869,106 @@ mod tests {
     use crate::utils::DetectedDisprove;
     use GraphStatus::*;
 
+    #[tokio::test]
+    async fn commit_signals_do_not_wait_for_ack_or_pending_commit() {
+        use bitcoin::hashes::Hash;
+        use esplora_client::{OutputStatus, Tx, TxStatus};
+        use goat::transactions::base::output_topology::watchtower_challenge_init as topology;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = LocalDB::new_with_busy_timeout(
+            &format!("sqlite:{}", dir.path().join("scan.db").display()),
+            false,
+            store::DEFAULT_BUSY_TIMEOUT,
+        )
+        .await;
+        db.migrate().await;
+        let (btc, mock) = BTCClient::new_mock_client();
+        let wci = Txid::from_byte_array([1; 32]);
+        let spender = Txid::from_byte_array([2; 32]);
+        let row = Graph {
+            graph_id: Uuid::new_v4(),
+            watchtower_challenge_init_txid: Some(wci.into()),
+            ..Default::default()
+        };
+        db.acquire()
+            .await
+            .unwrap()
+            .upsert_graph_btc_tx_vout_monitor(&GraphBtcTxVoutMonitor {
+                graph_id: row.graph_id,
+                txid: wci.into(),
+                height: 100,
+                vout_len: topology::output_num(1) as i64,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let timelocks = bitvm_lib::timelocks::default_timelock_config(get_network());
+        let deadline = 100 + operator_commit_timelock_blocks(get_network(), &timelocks) as i64;
+        let scan = |height| watchtower_flow(&btc, &db, &row, &timelocks, height);
+        assert!(
+            !scan(deadline - 1).await.unwrap().contains(&PegoutSignal::OperatorCommitPubinTimeout)
+        );
+        let signals = scan(deadline).await.unwrap();
+        assert!(signals.contains(&PegoutSignal::OperatorCommitPubinTimeout));
+        assert!(!signals.contains(&PegoutSignal::OperatorCommitPubinReady));
+
+        let mut tx = Tx {
+            txid: spender,
+            version: 2,
+            locktime: 0,
+            vin: vec![],
+            vout: vec![],
+            size: 1,
+            weight: 1,
+            fee: 0,
+            status: TxStatus {
+                confirmed: false,
+                block_height: None,
+                block_hash: None,
+                block_time: None,
+            },
+        };
+        mock.set_tx(spender, tx.clone());
+        let spent = OutputStatus { spent: true, txid: Some(spender), vin: Some(0), status: None };
+        for vout in [topology::connector_e(1), topology::connector_f(1)] {
+            mock.set_output_status(wci, vout as u64, spent.clone());
+            assert!(
+                scan(deadline).await.unwrap().contains(&PegoutSignal::OperatorCommitPubinTimeout)
+            );
+            tx.status.confirmed = true;
+            mock.set_tx(spender, tx.clone());
+            assert!(
+                !scan(deadline).await.unwrap().contains(&PegoutSignal::OperatorCommitPubinTimeout)
+            );
+            mock.set_output_status(
+                wci,
+                vout as u64,
+                OutputStatus { spent: false, txid: None, vin: None, status: None },
+            );
+            tx.status.confirmed = false;
+            mock.set_tx(spender, tx.clone());
+        }
+        mock.set_output_status(wci, topology::watchtower_connector(0) as u64, spent);
+        assert!(!scan(deadline).await.unwrap().contains(&PegoutSignal::OperatorCommitPubinReady));
+        tx.status.confirmed = true;
+        mock.set_tx(spender, tx);
+        // Challenge confirmed, ACK absent: commit may proceed, assert may not.
+        let signals = scan(deadline).await.unwrap();
+        assert!(signals.contains(&PegoutSignal::OperatorCommitPubinReady));
+        assert!(!signals.contains(&PegoutSignal::AssertReady));
+        // A confirmed timeout also resolves the branch for the commit bitmap.
+        let timeout_row =
+            Graph { watchtower_challenge_timeout_txids: vec![spender.into()], ..row.clone() };
+        let signals = watchtower_flow(&btc, &db, &timeout_row, &timelocks, deadline).await.unwrap();
+        assert!(signals.contains(&PegoutSignal::OperatorCommitPubinReady));
+        assert!(
+            !signals
+                .iter()
+                .any(|signal| matches!(signal, PegoutSignal::WatchtowerChallengeSent { .. }))
+        );
+    }
+
     fn chain(stage: GraphStatus) -> GraphChainScan {
         GraphChainScan::for_test(stage)
     }
@@ -890,6 +1011,11 @@ mod tests {
         )));
         assert!(is_timelock_ready(10, 5, 15) && !is_timelock_ready(10, 5, 14));
         assert!(!is_timelock_ready(0, 0, 15));
+        // A ChallengeAssert in block 101 with a one-block prover-connector CSV:
+        // Disprove goes out at tip 101 and can confirm in block 102.
+        assert!(
+            is_spendable_in_next_block(101, 1, 101) && !is_spendable_in_next_block(101, 1, 100)
+        );
     }
 
     #[test]
