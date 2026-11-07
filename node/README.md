@@ -7,6 +7,7 @@ The main node implementation for GOAT Network's BitVM bridge protocol. This modu
 - [Overview](#overview)
 - [Architecture](#architecture)
 - [Actor System](#actor-system)
+- [Bitcoin Transaction Graph](#bitcoin-transaction-graph)
 - [Core Workflows](#core-workflows)
   - [Peg-in (Bridge-In)](#peg-in-bridge-in)
   - [Peg-out (Bridge-Out)](#peg-out-bridge-out)
@@ -207,6 +208,40 @@ classDiagram
 
 ---
 
+## Bitcoin Transaction Graph
+
+[![BitVM Bitcoin transaction graph with per-input sighash labels](../transaction-graph.svg)](../transaction-graph.svg)
+
+Open the [full-size SVG](../transaction-graph.svg) to follow individual inputs
+and outputs. Blue paths show operator and claim transactions; red paths show
+challenges and timeouts. A dot joins branches; a crossing without a dot does not.
+The lower strip shows PreKickoff slots and early challenge transactions.
+
+The main paths are:
+
+- **Peg-in:** PegIn-Deposit creates Connector Z. PegIn-Confirm spends Z to
+  create Connector C0; PegIn-Refund is the competing refund path.
+- **Unchallenged claim:** Kickoff creates A, B, C and Guardian output G.
+  Take-1 spends C0, A, B, C and G after A's CSV delay.
+- **Watchtower branch:** Challenge spends A, and Watchtower-Challenge-Init
+  spends B to create E, F and the indexed Watchtower and ACK outputs.
+  Operator-Commit-Pubin publishes public-input data by spending E.
+- **Verifier branch:** Operator-Assert spends C to create D and the indexed
+  Verifier outputs. Verifier-Assert, also called ChallengeAssert, creates the
+  prover output for Wrongly-Challenged or Disprove. Pubin-Disprove spends D
+  directly when the public-input evidence is invalid.
+- **Challenged claim:** Take-2 requires C0, D, F and G, and must satisfy both
+  D's and F's CSV delays. A competing transaction that spends D or F prevents
+  this claim.
+
+Each `i0`, `i1`, and subsequent label identifies a transaction input. `ALL`,
+`NONE`, and `SINGLE` abbreviate the corresponding `SIGHASH_` types; `ACP` means
+`ANYONECANPAY`. `NONE` permits output changes while retaining a valid signature.
+A dash marks an input authorized by WOTS data, a preimage, labels or evidence
+rather than a transaction signature. Extra fee inputs and their signatures are
+omitted from the drawing. The labels describe the illustrated templates, not
+every signature type that a spending script might accept.
+
 ## Core Workflows
 
 ### Peg-in (Bridge-In)
@@ -308,11 +343,13 @@ sequenceDiagram
 
     alt No challenge (Happy Path)
         Operator->>BTC: Broadcast Take1 transaction
-        BTC->>User: BTC transferred to user address
+        BTC->>Operator: Take-1 reimburses the Operator
     end
 ```
 
-**Description**: The Happy Path is the simplest route - when no Watchtower challenges the Operator's claim, the Operator completes the withdrawal via Take1 transaction after the Timelock expires.
+**Description**: If Connector A remains unchallenged until its CSV delay expires,
+Take-1 reimburses the Operator from the bridge funds. The user payment and GOAT
+settlement are separate from this Bitcoin claim path.
 
 #### Fig-03-4-Pegout-Challenge-Path
 
@@ -322,12 +359,14 @@ sequenceDiagram
     participant User
     participant GOAT as GOAT L2
     participant Operator
+    participant Challenger
     participant Watchtower
     participant Verifier
     participant BTC as Bitcoin
 
     User->>GOAT: InitWithdraw
     Operator->>BTC: Kickoff transaction
+    Challenger->>BTC: Challenge (spends A)
 
     rect rgb(255, 240, 240)
         Note over Operator,Watchtower: Challenge Phase
@@ -335,29 +374,32 @@ sequenceDiagram
 
         loop For each Watchtower index
             Watchtower->>BTC: WatchtowerChallengeTx
-            alt Operator accepts
-                Operator->>BTC: ACK response
-            else Operator rejects
-                Operator->>BTC: NACK response
-                Verifier->>BTC: DisproveTx
-            end
+            Operator->>BTC: OperatorAckTx
         end
 
-        Operator->>BTC: CommitBlockHashTx
-        Operator->>BTC: AssertInitTx
-        Operator->>BTC: AssertCommitTx
+        Operator->>BTC: OperatorCommitPubinTx
+        Operator->>BTC: OperatorAssertTx
     end
 
-    alt All challenges passed
-        Operator->>BTC: Take2 transaction
-        BTC->>User: BTC transferred to user address
-    else Challenge failed
+    alt Invalid assertion
+        Verifier->>BTC: VerifierAssertTx (ChallengeAssert)
+        Note over Verifier,BTC: Wait for the prover-output CSV delay
         Verifier->>BTC: DisproveTx
-        Note over User,BTC: User funds safe, Operator penalized
+    else Invalid public-input evidence
+        Verifier->>BTC: PubinDisproveTx (spends D)
+    else Valid assertion and public inputs
+        Note over Operator,BTC: Wait for both D and F CSV delays
+        Operator->>BTC: Take2 transaction
+        BTC->>Operator: Take-2 reimburses the Operator
     end
 ```
 
-**Description**: The Challenge Path is triggered when Watchtowers detect anomalies. It contains three sub-phases: (1) Watchtower Challenge - watchers submit challenges; (2) BlockHash Commit - Operator commits block hash; (3) Assert Commit - Operator commits assertion proofs. Failure in any phase triggers Disprove.
+**Description**: The challenged path publishes Watchtower responses, public-input
+data and the Operator's assertion. A Verifier can challenge an invalid assertion
+with Verifier-Assert and then Disprove. Invalid public-input evidence can instead
+be answered with Pubin-Disprove, which spends D directly. Watchtower and commit
+timeouts and Operator-Challenge-NACK are separate competing spends, as shown in
+the transaction graph.
 
 ### Challenge Process
 
