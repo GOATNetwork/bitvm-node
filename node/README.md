@@ -11,7 +11,6 @@ transaction graph setup and signing, P2P communication, and proof coordination.
 - [Build & Run](#build--run)
 - [Configuration](#configuration)
 - [RPC API](#rpc-api)
-- [Code map](#code-map)
 - [Related documentation](#related-documentation)
 
 ## Bitcoin transaction graph
@@ -227,19 +226,6 @@ Prometheus metrics are not served by the business RPC listener. Set
 Use `/v1/health` for readiness and backend status, and the dedicated metrics
 listener for Prometheus. The [operator tools](../scripts/ops/README.md) provide
 health triage, structured log queries, and instance or graph timelines.
-
-## Code map
-
-| Location | Purpose |
-|----------|---------|
-| [aggregates/](src/aggregates/) | Instance and graph state, scans, and jobs |
-| [engine_bridge.rs](src/engine_bridge.rs) | Execution engine assembly and transport |
-| [messages.rs](src/messages.rs) | Wire message definitions |
-| [p2p_admission/](src/p2p_admission/) | Peer admission, replay protection, and limits |
-| [middleware/](src/middleware/) | P2P swarm and direct graph requests |
-| [scheduled_tasks/](src/scheduled_tasks/) | Chain event monitoring and maintenance |
-| [rpc_service/](src/rpc_service/) | HTTP routes and handlers |
-| [env.rs](src/env.rs) | Environment configuration |
 
 ## Related documentation
 
