@@ -1,81 +1,47 @@
 # GOAT BitVM Node
 
-GOAT Network's BitVM bridge implementation. See [GOAT BitVM Whitepaper](https://www.goat.network/bitvm2-whitepaper) for more details.
-
-## Layout
-
-- `node/`: Main node implementation, including P2P, RPC, and scheduled tasks
-- `circuits/`: Circuits and proof generation logic
-- `proof-builder-rpc/`: RPC server for offloading proof generation to a separate process
-- `crates/`: Shared Rust crates for common types and utilities
-- `deployment`: Deployment scripts and documentation
-- `scripts/ops/`: Read-only operator helpers for a running node (health triage, log queries, instance / graph traces)
-- `localnet/`: clone-and-run mock testnet (five `mock-gc` nodes on regtest + anvil + graph-node) and the on-demand e2e suite, see [localnet/README.md](localnet/README.md); `make localnet-reset`, `make e2e-smoke`
-
+GOAT Network's BitVM bridge implementation connects Bitcoin and GOAT L2 through
+presigned transaction graphs, optimistic verification, and proof-based disputes.
+See the [GOAT BitVM Whitepaper](https://www.goat.network/bitvm2-whitepaper) for
+protocol background.
 
 ## Transaction graph
 
 [![BitVM Bitcoin transaction graph with per-input sighash labels](transaction-graph.svg)](transaction-graph.svg)
 
-Open the [full-size transaction graph](transaction-graph.svg) to inspect the
-connectors, competing spends, CSV paths, and per-input signature types. Blue
-paths show operator and claim transactions; red paths show challenges and
-timeouts. Dots mark connected branches; crossings without dots are not connected.
+Open the [full-size graph](transaction-graph.svg) for peg-in, Operator claims,
+Watchtower and Verifier challenges, timeouts, and PreKickoff paths. Blue lines
+show Operator and claim transactions; red lines show challenges and timeouts.
+Dots join branches; crossings without dots do not.
 
-The graph includes peg-in funding and refunds, the Take-1 and Take-2 claim
-paths, Watchtower and Verifier branches, and PreKickoff slots. See the
-[node transaction guide](node/README.md#bitcoin-transaction-graph) for the
-connector and signature notation.
+## Guides
+
+- [Node](node/README.md) — roles and execution
+- [Circuits](circuits/README.md) — proof composition and compatibility
+- [Proof Builder](proof-builder-rpc/README.md) — proof coordination and recovery
+- [Deployment](deployment/README.md) — running bridge participants
+- [Localnet](localnet/README.md) — local testing
+- [End-to-end checks](localnet/e2e/README.md) — protocol and fault scenarios
+- [Operator tools](scripts/ops/README.md) — read-only diagnosis
 
 ## Transaction graph checks
 
-The checks cover critical connector relationships, default network timing, and
-core dispute safety for Bitcoin, Testnet4, Signet and Regtest:
-
-- Rust tests construct the real transaction graph and check parent outpoints,
-  competing spends, and the CSV values in transaction inputs and scripts.
-- `audit/tla/TransactionGraph.tla` checks the Take-1 budget, ACK budget,
-  timeout order, conditional Disprove maturity, and Take-2's two CSV clocks.
-- `audit/tla/BridgeSafety.tla` checks actual dispute transitions against two
-  requirements: an invalid proof must never reach Take-2, and Take-2 must have
-  committed pubin. It models the current Commit-Timeout and verifier gates,
-  including an operator withholding evidence and a possibly offline watchtower.
-  An honest verifier's enabled defences have an explicit bounded response time.
-- `crates/bitvm-gc/tests/tla_shipped_values.rs` checks that the TLA values match Rust. A timing
-  change requires regenerating the values and rerunning the checks.
-- Every other `audit/tla/<Model>.tla` with a `<Model>.cfg` is checked as well;
-  its header states what it models and which code it follows.
-
-The timing model is finite, init-only arithmetic. Its Disprove comparison assumes
-VerifierAssert confirms within `action_window` of OperatorAssert; earlier maturity
-does not guarantee earlier confirmation. The safety model explores transitions
-after WCI confirms, with OperatorAssert confirming in the same or any later
-block (including after Connector-F has matured), abstracts proof validity
-as a boolean, and assumes published pubin is consistent with the Assert. It does
-not assume pubin will be published or a watchtower branch will resolve.
-These checks do not establish end-to-end bridge safety or liveness and omit
-cryptographic verification, fees, relay policy, reorgs, executor capacity and
-contract settlement.
-Implementation changes outside the tested structure and generated values require
-manual review of the model's assumptions.
+Rust tests check connector wiring, competing spends, and CSV values. TLA+ models
+check timing and core dispute safety, including invalid assertions, unpublished
+public inputs, and late assertions after Connector F has matured.
 
 ```bash
-# JRE 11+ is needed for TLC.
 make tla-setup
 cargo test -p bitvm-gc --test transaction_graph_invariants --test tla_shipped_values
 make tla
-# After changing Rust's timing constants:
-make tla-values
-make tla
 ```
 
-Every TLC failure fails CI. There are no expected-failure configurations or
-stored traces. Temporary TLC files are removed on exit. `TLA2TOOLS` overrides
-the tool jar path; `TLC_OPTS` supplies optional whitespace-separated TLC flags.
-Commit-Timeout no longer waits for unresolved watchtower branches, and an
-invalid Assert is challenged without waiting for Connector E, so both safety
-requirements hold. They must not be weakened to make CI green.
+After changing timing constants, run `make tla-values` before checking the models.
+Every model-checking failure fails CI. These checks rely on bounded response
+assumptions and do not establish end-to-end bridge safety or liveness; fees,
+relay policy, reorgs, cryptography, and contract settlement need separate review.
 
 ## Contributing
 
-Contributions are welcome! Please open an issue or submit a pull request for any improvements or bug fixes.
+Open an issue or pull request with a concrete problem, proposed change, and
+relevant validation.
