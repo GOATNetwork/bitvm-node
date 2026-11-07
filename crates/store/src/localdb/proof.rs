@@ -378,13 +378,18 @@ impl StorageProcessor<'_> {
         Ok(res)
     }
 
-    pub async fn find_next_operator_proof(&mut self) -> anyhow::Result<Option<OperatorProof>> {
+    /// Returns the first `New` operator task with an id above `after_id`.
+    pub async fn find_next_operator_proof(
+        &mut self,
+        after_id: i64,
+    ) -> anyhow::Result<Option<OperatorProof>> {
         let res = sqlx::query_as::<_, OperatorProof>(
             "SELECT * FROM operator_proof
-                 WHERE proof_state == 0
+                 WHERE proof_state == 0 AND id > ?
                  ORDER BY id ASC
                  LIMIT 1",
         )
+        .bind(after_id)
         .fetch_optional(self.conn())
         .await?;
         Ok(res)
@@ -511,6 +516,14 @@ impl StorageProcessor<'_> {
         Ok(res.rows_affected())
     }
 
+    pub async fn delete_watchtower_proof(&mut self, id: i64) -> anyhow::Result<u64> {
+        let res = sqlx::query("DELETE FROM watchtower_proof WHERE id = ?")
+            .bind(id)
+            .execute(self.conn())
+            .await?;
+        Ok(res.rows_affected())
+    }
+
     pub async fn find_watchtower_proof_by_instance_and_graph(
         &mut self,
         instance_id: &Uuid,
@@ -551,14 +564,19 @@ impl StorageProcessor<'_> {
         Ok(res)
     }
 
-    pub async fn find_next_watchtower_proof(&mut self) -> anyhow::Result<Option<WatchtowerProof>> {
+    /// Returns the first `New` watchtower task with an id above `after_id`.
+    pub async fn find_next_watchtower_proof(
+        &mut self,
+        after_id: i64,
+    ) -> anyhow::Result<Option<WatchtowerProof>> {
         let res = sqlx::query_as::<_, WatchtowerProof>(
             "SELECT *
                   FROM watchtower_proof
-                  WHERE proof_state == 0
+                  WHERE proof_state == 0 AND id > ?
                   ORDER BY id ASC
-                  lIMIT 1",
+                  LIMIT 1",
         )
+        .bind(after_id)
         .fetch_optional(self.conn())
         .await?;
         Ok(res)

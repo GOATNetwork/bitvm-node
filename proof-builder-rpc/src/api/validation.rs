@@ -1,7 +1,10 @@
 use crate::api::response::ErrorResponse;
 use axum::Json;
 use axum::http::StatusCode;
-use bitcoin::Txid;
+use bitcoin::hashes::Hash;
+use bitcoin::{BlockHash, Txid};
+use client::goat_chain::GraphData;
+use proof_builder::OperatorProofRequest;
 use std::str::FromStr;
 use uuid::Uuid;
 
@@ -50,6 +53,65 @@ impl InputValidator {
                 }),
             )),
         }
+    }
+
+    /// Parses a Watchtower-Challenge-Init txid and requires the graph's registered one.
+    pub(crate) fn validate_challenge_init_txid(
+        txid: &str,
+        graph_data: &GraphData,
+    ) -> ValidationResult<Txid> {
+        let txid = Self::validate_btc_txid(txid, "challenge_init_txid")?;
+        if txid.to_byte_array() != graph_data.watchtower_challenge_init_txid {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "INVALID_WATCHTOWER_CHALLENGE_INIT_TXID".to_string(),
+                    message: "challenge_init_txid does not match the graph".to_string(),
+                }),
+            ));
+        }
+        Ok(txid)
+    }
+
+    /// Checks the operator task inputs that the proof loop cannot repair later
+    /// against the graph registered on GOAT.
+    pub(crate) fn validate_operator_task(
+        request: &OperatorProofRequest,
+        graph_data: &GraphData,
+    ) -> ValidationResult<()> {
+        let invalid = |error: &str, message: String| {
+            Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse { error: error.to_string(), message }),
+            ))
+        };
+        if BlockHash::from_str(&request.operator_committed_blockhash).is_err() {
+            return invalid(
+                "INVALID_BLOCK_HASH",
+                "operator_committed_blockhash is not a valid block hash".to_string(),
+            );
+        }
+        let init_txid = Self::validate_btc_txid(
+            &request.watchtower_challenge_init_txid,
+            "watchtower_challenge_init_txid",
+        )?;
+        if init_txid.to_byte_array() != graph_data.watchtower_challenge_init_txid {
+            return invalid(
+                "INVALID_WATCHTOWER_CHALLENGE_INIT_TXID",
+                "watchtower_challenge_init_txid does not match the graph".to_string(),
+            );
+        }
+        let watchtowers = graph_data.watchtower_challenge_timeout_txids.len();
+        if watchtowers == 0 || request.watchtower_challenge_pubkeys.len() != watchtowers {
+            return invalid(
+                "INVALID_WATCHTOWER_LIST",
+                format!(
+                    "expected {watchtowers} graph watchtowers, got {}",
+                    request.watchtower_challenge_pubkeys.len()
+                ),
+            );
+        }
+        Ok(())
     }
 
     /// Validate pagination parameters

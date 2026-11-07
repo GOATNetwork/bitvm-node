@@ -13,21 +13,36 @@ use crate::api::proof_handler::{
     update_watchtower_proof_task_timeout,
 };
 use anyhow::Context;
+use axum::extract::{Request, State};
 use axum::http::{Method, StatusCode};
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Router, middleware};
 use std::sync::Arc;
 use store::localdb::LocalDB;
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::{Any, CorsLayer};
 
 pub(crate) use auth::{AuthorizationChain, AuthorizationChains};
 
+/// Requests the business routes serve at once; further requests get 503
+/// instead of queueing signature checks, GOAT queries and database work.
+const MAX_CONCURRENT_REQUESTS: usize = 64;
+
+/// Longest a request may hold a slot, body read included. Reading the body
+/// happens before authentication, so without it a client that withholds the
+/// body would keep its slot for as long as the connection stays open.
+const REQUEST_DEADLINE: std::time::Duration =
+    std::time::Duration::from_secs(if cfg!(test) { 2 } else { 30 });
+
 pub(crate) struct ApiState {
     pub local_db: LocalDB,
     pub metrics_state: ApiMetricsState,
     auth: RequestAuthorizer,
+    request_slots: Semaphore,
 }
 
 impl ApiState {
@@ -41,7 +56,24 @@ impl ApiState {
             local_db,
             metrics_state,
             auth: RequestAuthorizer::new(authorization_chains),
+            request_slots: Semaphore::new(MAX_CONCURRENT_REQUESTS),
         })
+    }
+}
+
+/// Refuses a request with 503 while `MAX_CONCURRENT_REQUESTS` are in flight,
+/// and cancels one that runs past `REQUEST_DEADLINE` with 408, freeing its slot.
+async fn limit_concurrency(
+    State(state): State<Arc<ApiState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let Ok(_slot) = state.request_slots.try_acquire() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "too many concurrent requests").into_response();
+    };
+    match tokio::time::timeout(REQUEST_DEADLINE, next.run(request)).await {
+        Ok(response) => response,
+        Err(_) => (StatusCode::REQUEST_TIMEOUT, "request deadline exceeded").into_response(),
     }
 }
 
@@ -63,6 +95,7 @@ pub(crate) async fn serve_with_app_state(
         .route(routes::v1::PROOFS_OPERATOR_PROOF_TIMEOUT, post(update_operator_proof_task_timeout))
         .route(routes::v1::PROOFS_OPERATOR_PROOF_DESC, get(get_operator_proof_task_desc))
         .fallback(|| async { StatusCode::NOT_FOUND })
+        .layer(middleware::from_fn_with_state(api_state.clone(), limit_concurrency))
         .layer(middleware::from_fn_with_state(api_state.clone(), metrics_middleware));
     let server = instrumented_routes
         .layer(CorsLayer::new().allow_headers(Any).allow_origin(Any).allow_methods(vec![
@@ -298,6 +331,8 @@ mod tests {
         let operator = keypair(7);
         let watchtower = keypair(9);
         let other_watchtower = keypair(11);
+        // The graph's own Watchtower slot; its missing proof is closed with the operator task.
+        let graph_watchtower = keypair(13);
         let instance_id = "00112233-4455-6677-8899-aabbccddeeff".to_string();
         let graph_id = "11112233-4455-6677-8899-aabbccddeeff".to_string();
         let authorization_chain = Arc::new(TestAuthorizationChain::default());
@@ -305,6 +340,19 @@ mod tests {
             Uuid::parse_str(&instance_id)?,
             Uuid::parse_str(&graph_id)?,
             operator.x_only_public_key().0,
+        );
+        authorization_chain.set_graph_watchtowers(Uuid::parse_str(&graph_id)?, [0x22; 32], 1);
+        // A second graph of the instance that has no Operator task yet.
+        let watchtower_graph_id = "22112233-4455-6677-8899-aabbccddeeff".to_string();
+        authorization_chain.set_graph(
+            Uuid::parse_str(&instance_id)?,
+            Uuid::parse_str(&watchtower_graph_id)?,
+            operator.x_only_public_key().0,
+        );
+        authorization_chain.set_graph_watchtowers(
+            Uuid::parse_str(&watchtower_graph_id)?,
+            [0x33; 32],
+            1,
         );
         authorization_chain.add_watchtower(watchtower.x_only_public_key().0);
         let gateway_address = gateway(1);
@@ -319,17 +367,44 @@ mod tests {
             tokio::spawn(serve_with_app_state(addr.clone(), api_state, cancellation_token.clone()));
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        let operator_submit = OperatorProofRequest {
-            instance_id: instance_id.clone(),
-            graph_id: graph_id.clone(),
-            gateway_address: Some(gateway_address.to_string()),
-            operator_committed_blockhash: "11".repeat(32),
-            execution_layer_block_number: 1,
-            watchtower_challenge_txids: vec![],
-            included_watchtowers: vec![],
-            watchtower_challenge_init_txid: "22".repeat(32),
-            watchtower_challenge_pubkeys: vec![],
-        };
+        let operator_request =
+            |blockhash: &str, init_txid: &str, watchtowers: usize| OperatorProofRequest {
+                instance_id: instance_id.clone(),
+                graph_id: graph_id.clone(),
+                gateway_address: Some(gateway_address.to_string()),
+                operator_committed_blockhash: blockhash.repeat(32),
+                execution_layer_block_number: 1,
+                watchtower_challenge_txids: vec![None; watchtowers],
+                included_watchtowers: vec![false; watchtowers],
+                watchtower_challenge_init_txid: init_txid.repeat(32),
+                watchtower_challenge_pubkeys: vec![
+                    graph_watchtower.public_key().to_string();
+                    watchtowers
+                ],
+            };
+        // Inputs the proof loop could never use are refused before a task exists.
+        for invalid in [
+            operator_request("zz", "22", 1),
+            operator_request("11", "33", 1),
+            operator_request("11", "22", 0),
+        ] {
+            let auth = sign_proof_builder_request(
+                &operator,
+                ProofBuilderAuthRole::Operator,
+                "POST",
+                routes::v1::PROOFS_OPERATOR_PROOF,
+                &invalid,
+            )?;
+            let response = post(
+                &addr,
+                routes::v1::PROOFS_OPERATOR_PROOF,
+                &serde_json::to_string(&invalid)?,
+                Some(&auth),
+            )
+            .await?;
+            assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+        }
+        let operator_submit = operator_request("11", "22", 1);
         let operator_submit_body = serde_json::to_string(&operator_submit)?;
         assert!(
             post(&addr, routes::v1::PROOFS_OPERATOR_PROOF, &operator_submit_body, None,)
@@ -394,36 +469,49 @@ mod tests {
         assert!(operator_timeout_response.starts_with("HTTP/1.1 200"));
         assert!(operator_timeout_response.contains("1 rows affected"));
 
-        let watchtower_submit = WatchtowerProofRequest {
+        let watchtower_request = |graph_id: &str, init_txid: &str| WatchtowerProofRequest {
             instance_id: instance_id.clone(),
-            graph_id: graph_id.clone(),
+            graph_id: graph_id.to_string(),
             gateway_address: Some(gateway_address.to_string()),
             public_key: watchtower.public_key().to_string(),
-            challenge_init_txid: "33".repeat(32),
+            challenge_init_txid: init_txid.repeat(32),
             execution_layer_block_number: 1,
         };
-        let watchtower_submit_body = serde_json::to_string(&watchtower_submit)?;
-        let watchtower_submit_auth = sign_proof_builder_request(
-            &watchtower,
-            ProofBuilderAuthRole::Watchtower,
-            "POST",
-            routes::v1::PROOFS_WATCHTOWER_PROOF,
-            &watchtower_submit,
-        )?;
-        assert!(
-            post(
-                &addr,
-                routes::v1::PROOFS_WATCHTOWER_PROOF,
-                &watchtower_submit_body,
-                Some(&watchtower_submit_auth),
-            )
-            .await?
-            .starts_with("HTTP/1.1 200")
-        );
+        let submit_watchtower = |request: WatchtowerProofRequest| {
+            let addr = addr.clone();
+            async move {
+                let auth = sign_proof_builder_request(
+                    &watchtower,
+                    ProofBuilderAuthRole::Watchtower,
+                    "POST",
+                    routes::v1::PROOFS_WATCHTOWER_PROOF,
+                    &request,
+                )?;
+                post(
+                    &addr,
+                    routes::v1::PROOFS_WATCHTOWER_PROOF,
+                    &serde_json::to_string(&request)?,
+                    Some(&auth),
+                )
+                .await
+            }
+        };
+        // Wrong Watchtower-Challenge-Init txid, unregistered graph, and a graph
+        // whose Operator task already fixed a list without this Watchtower.
+        for (request, status) in [
+            (watchtower_request(&watchtower_graph_id, "44"), "HTTP/1.1 400"),
+            (watchtower_request("33112233-4455-6677-8899-aabbccddeeff", "33"), "HTTP/1.1 403"),
+            (watchtower_request(&graph_id, "22"), "HTTP/1.1 403"),
+        ] {
+            let response = submit_watchtower(request).await?;
+            assert!(response.starts_with(status), "{response}");
+        }
+        let response = submit_watchtower(watchtower_request(&watchtower_graph_id, "33")).await?;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
 
         let watchtower_timeout = WatchtowerProofTimeoutUpdateRequest {
             instance_id,
-            graph_id,
+            graph_id: watchtower_graph_id,
             gateway_address: Some(gateway_address.to_string()),
             public_key: watchtower.public_key().to_string(),
         };
@@ -589,6 +677,52 @@ mod tests {
         cancellation_token.cancel();
         server.await??;
         metrics_server.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn requests_beyond_the_concurrency_limit_get_503() -> anyhow::Result<()> {
+        let addr = available_addr();
+        let cancellation_token = CancellationToken::new();
+        let api_state = ApiState::new(
+            store::create_local_db("sqlite::memory:").await,
+            ApiMetricsState::new(),
+            authorization_chains(gateway(1), Arc::new(TestAuthorizationChain::default())),
+        );
+        let server = tokio::spawn(serve_with_app_state(
+            addr.clone(),
+            api_state.clone(),
+            cancellation_token.clone(),
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let busy = api_state.request_slots.try_acquire_many(MAX_CONCURRENT_REQUESTS as u32)?;
+        assert!(get(&addr, routes::ROOT).await?.starts_with("HTTP/1.1 503"));
+        drop(busy);
+        assert!(get(&addr, routes::ROOT).await?.starts_with("HTTP/1.1 200"));
+
+        // A client that sends the headers but withholds the body takes the
+        // last slot only until the deadline.
+        let busy = api_state.request_slots.try_acquire_many(MAX_CONCURRENT_REQUESTS as u32 - 1)?;
+        let mut slow = tokio::net::TcpStream::connect(&addr).await?;
+        slow.write_all(
+            format!(
+                "POST {} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: 10\r\n\r\n",
+                routes::v1::PROOFS_OPERATOR_PROOF
+            )
+            .as_bytes(),
+        )
+        .await?;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(get(&addr, routes::ROOT).await?.starts_with("HTTP/1.1 503"));
+        let mut response = vec![0; 64];
+        let read = tokio::time::timeout(REQUEST_DEADLINE * 2, slow.read(&mut response)).await??;
+        assert!(String::from_utf8_lossy(&response[..read]).starts_with("HTTP/1.1 408"));
+        assert!(get(&addr, routes::ROOT).await?.starts_with("HTTP/1.1 200"));
+        drop(busy);
+
+        cancellation_token.cancel();
+        server.await??;
         Ok(())
     }
 }

@@ -1,12 +1,12 @@
 use crate::api::ApiState;
-use crate::api::auth::AuthResult;
+use crate::api::auth::{AuthResult, forbidden};
 use crate::api::metrics_service::ApiResultGuard;
 use crate::api::response::{ApiErrorExt, ApiResult, ok_response};
 use crate::api::routes;
 use crate::api::validation::InputValidator;
 use crate::task::{
     add_operator_task, add_watchtower_task, find_operator_task, find_watchtower_task,
-    update_operator_task_state, update_watchtower_task_state,
+    update_operator_task_state, update_watchtower_task_state, watchtower_task_key,
 };
 use axum::Json;
 use axum::extract::{Query, State};
@@ -189,7 +189,7 @@ pub(super) async fn post_operator_proof_task(
     Json(payload): Json<OperatorProofRequest>,
 ) -> ApiResult<OperatorProofResponse> {
     let mut api_result = api_state.metrics_state.api_result("operator_submit");
-    let signer = record_auth_result(
+    let request = record_auth_result(
         &mut api_result,
         api_state.auth.authenticate(
             &headers,
@@ -208,12 +208,12 @@ pub(super) async fn post_operator_proof_task(
         &mut api_result,
         InputValidator::validate_uuid(&payload.graph_id, "graph_id"),
     )?;
-    record_auth_result(
+    let graph_data = record_auth_result(
         &mut api_result,
         api_state
             .auth
             .authorize_operator(
-                &signer,
+                &request,
                 payload.gateway_address.as_deref(),
                 &instance_id,
                 &graph_id,
@@ -253,6 +253,10 @@ pub(super) async fn post_operator_proof_task(
         }
 
         None => {
+            record_invalid(
+                &mut api_result,
+                InputValidator::validate_operator_task(&payload, &graph_data),
+            )?;
             add_operator_task(
                 &api_state.local_db,
                 instance_id,
@@ -282,7 +286,7 @@ pub(super) async fn update_operator_proof_task_timeout(
     Json(payload): Json<OperatorProofTimeoutUpdateRequest>,
 ) -> ApiResult<OperatorProofTimeoutUpdateResponse> {
     let mut api_result = api_state.metrics_state.api_result("operator_timeout");
-    let signer = record_auth_result(
+    let request = record_auth_result(
         &mut api_result,
         api_state.auth.authenticate(
             &headers,
@@ -306,7 +310,7 @@ pub(super) async fn update_operator_proof_task_timeout(
         api_state
             .auth
             .authorize_operator(
-                &signer,
+                &request,
                 payload.gateway_address.as_deref(),
                 &instance_id,
                 &graph_id,
@@ -350,7 +354,7 @@ pub(super) async fn post_watchtower_proof_task(
     Json(payload): Json<WatchtowerProofRequest>,
 ) -> ApiResult<WatchtowerProofResponse> {
     let mut api_result = api_state.metrics_state.api_result("watchtower_submit");
-    let signer = record_auth_result(
+    let request = record_auth_result(
         &mut api_result,
         api_state.auth.authenticate(
             &headers,
@@ -369,18 +373,27 @@ pub(super) async fn post_watchtower_proof_task(
         &mut api_result,
         InputValidator::validate_uuid(&payload.graph_id, "graph_id"),
     )?;
-    record_auth_result(
+    let graph_data = record_auth_result(
         &mut api_result,
-        api_state.auth.authorize_watchtower(&signer, payload.gateway_address.as_deref()).await,
+        api_state
+            .auth
+            .authorize_watchtower(
+                &request,
+                payload.gateway_address.as_deref(),
+                &instance_id,
+                &graph_id,
+            )
+            .await,
     )?;
     let challenge_init_txid = record_invalid(
         &mut api_result,
-        InputValidator::validate_btc_txid(&payload.challenge_init_txid, "challenge_init_txid"),
+        InputValidator::validate_challenge_init_txid(&payload.challenge_init_txid, &graph_data),
     )?
     .to_string();
+    let public_key = watchtower_task_key(&request.signer);
 
     let watchtower_proof =
-        find_watchtower_task(&api_state.local_db, instance_id, graph_id, &payload.public_key)
+        find_watchtower_task(&api_state.local_db, instance_id, graph_id, &public_key)
             .await
             .api_error("POST_WATCHTOWER_PROOF_TASK_ERROR")?;
 
@@ -414,16 +427,20 @@ pub(super) async fn post_watchtower_proof_task(
         }
 
         None => {
-            add_watchtower_task(
+            let created = add_watchtower_task(
                 &api_state.local_db,
                 instance_id,
                 graph_id,
-                payload.public_key,
+                public_key,
                 challenge_init_txid,
                 payload.execution_layer_block_number,
             )
             .await
             .api_error("POST_WATCHTOWER_PROOF_TASK_ERROR")?;
+            if !created {
+                api_result.set("unauthorized");
+                return Err(forbidden("watchtower is not in the graph's watchtower list"));
+            }
             api_result.set("created");
             ok_response(WatchtowerProofResponse {
                 proof_data: None,
@@ -440,7 +457,7 @@ pub(super) async fn update_watchtower_proof_task_timeout(
     Json(payload): Json<WatchtowerProofTimeoutUpdateRequest>,
 ) -> ApiResult<WatchtowerProofTimeoutUpdateResponse> {
     let mut api_result = api_state.metrics_state.api_result("watchtower_timeout");
-    let signer = record_auth_result(
+    let request = record_auth_result(
         &mut api_result,
         api_state.auth.authenticate(
             &headers,
@@ -461,13 +478,21 @@ pub(super) async fn update_watchtower_proof_task_timeout(
     )?;
     record_auth_result(
         &mut api_result,
-        api_state.auth.authorize_watchtower(&signer, payload.gateway_address.as_deref()).await,
+        api_state
+            .auth
+            .authorize_watchtower(
+                &request,
+                payload.gateway_address.as_deref(),
+                &instance_id,
+                &graph_id,
+            )
+            .await,
     )?;
     match update_watchtower_task_state(
         &api_state.local_db,
         instance_id,
         graph_id,
-        &payload.public_key,
+        &watchtower_task_key(&request.signer),
         ProofState::New,
         ProofState::Failed,
     )
