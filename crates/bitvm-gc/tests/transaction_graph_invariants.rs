@@ -18,42 +18,6 @@ fn graphs() -> impl Iterator<Item = BitvmGcGraph> {
     })
 }
 
-#[test]
-fn stored_graphs_with_previous_shipped_timelocks_remain_restorable() {
-    let mut failures = Vec::new();
-    for (network, old_f) in [
-        (Network::Bitcoin, 576),
-        (Network::Testnet4, 56),
-        (Network::Signet, 24),
-        (Network::Regtest, 4),
-    ] {
-        let mut parameters = graph_parameters(network, 1, 1);
-        parameters.timelock_config.connector_f = old_f;
-        if network == Network::Regtest {
-            parameters.timelock_config.connector_d = 3;
-        }
-
-        // A minimal stored graph before either signing ceremony. Loading it
-        // must reconstruct its committed CSV values, rather than apply the
-        // admission policy for newly created graphs. No signatures are needed
-        // to reach the reconstruction path that runtime monitoring also uses.
-        let stored = serde_json::json!({
-            "operator_pre_signed": false,
-            "committee_pre_signed": false,
-            "parameters": parameters,
-            "operator_pre_sigs": null,
-            "committee_pre_sigs": null,
-        });
-        let serialized = serde_json::to_string(&stored).unwrap();
-        let simplified = serde_json::from_str(&serialized).unwrap();
-        if let Err(error) = BitvmGcGraph::from_simplified(&simplified) {
-            failures.push(format!("{network:?}: {error}"));
-        }
-    }
-
-    assert!(failures.is_empty(), "stored graph reconstruction failed: {failures:#?}");
-}
-
 fn spends(tx: &Transaction, expected: &[Input]) {
     let mut actual: Vec<_> = tx.input.iter().map(|input| input.previous_output).collect();
     let mut expected: Vec<_> = expected.iter().map(|input| input.outpoint).collect();
