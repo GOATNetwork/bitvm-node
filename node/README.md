@@ -10,7 +10,6 @@ transaction graph setup and signing, P2P communication, and proof coordination.
 - [Execution and storage](#execution-and-storage)
 - [Build & Run](#build--run)
 - [Configuration](#configuration)
-- [RPC API](#rpc-api)
 - [Related documentation](#related-documentation)
 
 ## Bitcoin transaction graph
@@ -194,38 +193,6 @@ export ENABLE_RELAYER=true
 export GOAT_PRIVATE_KEY='your-private-key'
 # ... other required variables
 ```
-
-## RPC API
-
-Prometheus metrics are not served by the business RPC listener. Set
-`--metrics-addr` to a private, process-unique address and scrape
-`http://<metrics-addr>/metrics`; `GET /metrics` on `--rpc-addr` returns `404`.
-
-### Endpoints
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/v1/health` | GET | Readiness and health of this node (a local database ping, nothing else is called): readiness bits, each backend's availability with its last error, event watcher state and lag, SPV lag, uptime; `200` when ready, `503` otherwise |
-| `/v1/nodes`, `/v1/nodes/:id`, `/v1/nodes/overview` | GET | Known nodes, one node, node statistics |
-| `/v1/instances`, `/v1/instances/:id`, `/v1/instances/overview`, `/v1/instances/settings` | GET | Peg-in instances, one instance, instance statistics, peg-in settings |
-| `/v1/instances/:id/unsigned-pegin-txn` | GET | Unsigned Peg-In-Prepare transaction of an instance |
-| `/v1/graphs`, `/v1/graphs/:id` | GET | List all graphs, get graph details |
-| `/v1/graphs/:id/txn?cursor=0` | GET | Get graph transaction list |
-| `/v1/graphs/:id/tx?tx_name=cur-pre-kickoff.hex` | GET | Get specific transaction hex |
-| `/v1/graphs/:id/neighbor-ids` | GET | Neighbouring graphs of the same instance |
-| `/v1/graphs/ready-to-kickoff` | GET | Get graphs ready for kickoff |
-| `/v1/graphs/pegout` | POST | Initiate a peg-out (signed request) |
-| `/v1/swaps`, `/v1/swaps/:escrow_hash` | GET | Swap bridge-out escrows, one escrow |
-| `/v1/proofs/chain_proofs_desc`, `/v1/proofs/operator_proofs_desc` | GET | Proof descriptors, forwarded to `GOAT_PROOF_BUILD_URL` |
-| `/metrics` | GET | Prometheus metrics (dedicated metrics listener only) |
-| `/v1/debug/status`, `/v1/debug/engine` | GET | Node status and the execution engine snapshot (rows by state, waiting and poisoned aggregates); `rpc-debug-endpoints` feature only |
-| `/v1/debug/engine/clear-poison`, `/v1/graphs/:id/send-challenge`, `/v1/graphs/:id/send-verifier-challenge` | POST | Release poisoned actions, send a challenge / verifier challenge (signed requests); `rpc-debug-endpoints` feature only |
-
-### Operations
-
-Use `/v1/health` for readiness and backend status, and the dedicated metrics
-listener for Prometheus. The [operator tools](../scripts/ops/README.md) provide
-health triage, structured log queries, and instance or graph timelines.
 
 ## Related documentation
 
