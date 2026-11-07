@@ -13,6 +13,20 @@ GOAT Network's BitVM bridge implementation. See [GOAT BitVM Whitepaper](https://
 - `localnet/`: clone-and-run mock testnet (five `mock-gc` nodes on regtest + anvil + graph-node) and the on-demand e2e suite, see [localnet/README.md](localnet/README.md); `make localnet-reset`, `make e2e-smoke`
 
 
+## Transaction graph
+
+[![BitVM Bitcoin transaction graph with per-input sighash labels](transaction-graph.svg)](transaction-graph.svg)
+
+Open the [full-size transaction graph](transaction-graph.svg) to inspect the
+connectors, competing spends, CSV paths, and per-input signature types. Blue
+paths show operator and claim transactions; red paths show challenges and
+timeouts. Dots mark connected branches; crossings without dots are not connected.
+
+The graph includes peg-in funding and refunds, the Take-1 and Take-2 claim
+paths, Watchtower and Verifier branches, and PreKickoff slots. See the
+[node transaction guide](node/README.md#bitcoin-transaction-graph) for the
+connector and signature notation.
+
 ## Transaction graph checks
 
 The checks cover critical connector relationships, default network timing, and
@@ -27,7 +41,7 @@ core dispute safety for Bitcoin, Testnet4, Signet and Regtest:
   committed pubin. It models the current Commit-Timeout and verifier gates,
   including an operator withholding evidence and a possibly offline watchtower.
   An honest verifier's enabled defences have an explicit bounded response time.
-- `tests/tla_shipped_values.rs` checks that the TLA values match Rust. A timing
+- `crates/bitvm-gc/tests/tla_shipped_values.rs` checks that the TLA values match Rust. A timing
   change requires regenerating the values and rerunning the checks.
 - Every other `audit/tla/<Model>.tla` with a `<Model>.cfg` is checked as well;
   its header states what it models and which code it follows.

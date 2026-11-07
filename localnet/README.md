@@ -5,7 +5,7 @@ regtest + a GOAT chain (a local anvil, or the public GOAT testnet3, see "GOAT ba
 graph-node, every endpoint on 127.0.0.1. The garbled circuits,
 soldering and proofs are deterministic mocks with configurable delays; everything on chain is
 real, so peg-in, peg-out, challenge/assert/take-2 and disprove run the genuine transaction graph
-(see `node/README.md`, "Mock build for local testnets"). The on-demand regression suite lives in
+(see the [node guide](../node/README.md#local-testnets) and [transaction graph](../transaction-graph.svg)). The on-demand regression suite lives in
 [e2e/](e2e/README.md). CI runs the whole suite after pushes to main / dev, see "CI" below.
 
 ## Host requirements
@@ -19,7 +19,7 @@ The p2p-isolation e2e case additionally needs passwordless `sudo iptables`.
 ## Quick start
 
 ```bash
-git clone --recurse-submodules <repo> && cd bitvm-node     # or: git submodule update --init --recursive
+git clone --recurse-submodules https://github.com/GOATNetwork/bitvm-node.git && cd bitvm-node     # or: git submodule update --init --recursive
 make localnet-reset          # builds the binaries if needed, then wipes+creates the whole localnet (2 min; 7 min when keys are generated; + the build)
 make localnet-status
 make e2e-smoke               # pegin_happy pegout_happy challenge_take2 (~23 min)
@@ -94,14 +94,9 @@ WronglyChallenged race.
 
 ## Contracts
 
-`contracts/` is a git submodule of the L2 contracts. It is pinned to PR #26 of
-GOATNetwork/bitvm-L2-contracts ("fix GUARDIAN_CONNECTOR_VOUT & remove debug contracts", head
-`3a679bf`, fetched from the fork `KSlashh/bitvm-L2-contracts`); once that PR is merged, point
-`.gitmodules` back at `GOATNetwork/bitvm-L2-contracts` and bump the pin. The PR sets
-`GUARDIAN_CONNECTOR_VOUT = 3`, which is what the node's kickoff topology uses (`goat`
-`output_topology::kickoff::guardian_connector()`); older contract revisions parse peg-outs wrong.
-No upstream source is patched. The localnet GOAT chain runs at chain id 48816 (= the contracts'
-testnet id, so `Constants.magicBytes()` accepts the regtest OP_RETURN magic the node emits).
+`contracts/` contains the L2 contracts used by the local deployment. The
+Gateway must recognize Guardian output index 3 in Kickoff. The local GOAT chain
+uses chain ID 48816 so it accepts the node's Regtest transaction metadata.
 
 `contracts-local/` is a second foundry project that imports the submodule (`bitvm-l2/` remapping):
 
@@ -135,18 +130,6 @@ change it there and `scripts/reset.sh --yes`.
 - Metrics `http://127.0.0.1:<METRICS_PORT_BASE+i>/metrics`: `bitvm_node_ready`, p2p peers/topics, `bitvm_node_engine_rows{table,state}`.
 - Logs: one JSON file per boot under `logs/nodes/<role>/`, `current` points at the newest; `scripts/logq.sh`, `scripts/trace.sh`.
 - DBs: `nodes/<role>/bitvm-node.db` (`sqlite3 -readonly`; UUIDs are 16-byte BLOBs, use `hex(col)`).
-
-## Measured (2026-10-16, fresh clone on a loaded 16-core host)
-
-| step | time |
-|---|---|
-| first `cargo build -r` of the mock-gc binaries (crates.io registry already cached) | 14 min |
-| `make localnet-reset`, first time (includes gen-keys: ~1 min per role for the peer-id check) | 7 min |
-| `make localnet-reset`, keys kept | 2 min |
-| `make e2e-smoke` (pegin 6.5 min, pegout 3 min, challenge_take2 13 min incl. its own peg-in) | 23 min |
-| `make e2e`, all 13 cases, fast delay tier (2 s GC / 5 s proof); three full passes on 2026-10-16 | 95–110 min |
-
-Nodes report `ready=1` two to three minutes after a reset; the suite's pre-check waits for it.
 
 ## CI
 

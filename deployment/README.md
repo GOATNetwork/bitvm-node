@@ -1,93 +1,100 @@
 # Deployment Guide
 
-This document describes how to deploy the different roles in the BitVM system: Committee, Operator, Challenger, Watchtower, and Relayer, by manually compiling and running the [node](../node/README.md).
-
-## Prerequisites
-
-Before building and running the node, ensure you have the following installed:
-
-- **Rust Toolchain**: Latest stable version.
-- **ZKM Toolchain**: Required for compiling the circuits.
-  - Ensure the toolchain is installed in `~/.zkm-toolchain`.
-  - You need to source the environment before building: `source ~/.zkm-toolchain/env`.
+Deploy Committee, Operator, Verifier and Watchtower nodes with `bitvm-noded`.
+Relayer is a Committee mode, enabled with `ENABLE_RELAYER=true`. See the
+[node guide](../node/README.md) for configuration and RPC details, and the
+[transaction graph](../transaction-graph.svg) for Bitcoin claim and dispute paths.
+For a local test environment, use the [localnet guide](../localnet/README.md).
 
 ## Build
 
-1.  **Source the ZKM Toolchain environment:**
+Run from the repository root:
 
-    ```bash
-    source ~/.zkm-toolchain/env
-    ```
+```bash
+source ~/.zkm-toolchain/env
+cargo build -r -p bitvm-noded --bin bitvm-noded
+```
 
-2.  **Build the project in release mode:**
+The binary is `target/release/bitvm-noded`.
 
-    ```bash
-    cargo build -r --all-targets
-    ```
+## Configure a node
 
-    The compiled binary will be located at `target/release/bitvm-noded`.
+The node loads `.env` from its working directory. Use a separate directory and
+SQLite database for each node.
 
-## Configuration
+```dotenv
+RUST_LOG=info
+ACTOR=Verifier
+BITCOIN_NETWORK=testnet4
+GOAT_NETWORK=test
+GOAT_CHAIN_URL=https://rpc.testnet3.goat.network
+GOAT_GATEWAY_CONTRACT_ADDRESS=<deployed-gateway-address>
+GOAT_GATEWAY_EVENT_THE_GRAPH_URL=<gateway-subgraph-query-url>
+GOAT_GATEWAY_EVENT_FILTER_FROM=<gateway-deployment-block>
+GOAT_PROOF_BUILD_URL=http://127.0.0.1:7777
+PEER_KEY=<base64-peer-key>
+BITVM_SECRET=<bitcoin-private-key-or-seed>
+GOAT_ADDRESS=<registered-goat-address>
+```
 
-The node loads environment variables from a `.env` file in the current working directory.
+Replace the placeholders with values for your deployment. Contract addresses,
+subgraph URLs and starting blocks must describe the same deployment.
+Generate peer and funding keys with the commands in the
+[node guide](../node/README.md#generate-node-keys).
 
-### Common Environment Variables
+| Role | Configuration |
+|------|---------------|
+| Committee | `ACTOR=Committee`; set `GOAT_PRIVATE_KEY` |
+| Operator | `ACTOR=Operator`; set `GOAT_ADDRESS` or `GOAT_PRIVATE_KEY`, and fund the Bitcoin signing key |
+| Verifier | `ACTOR=Verifier`; set `GOAT_ADDRESS` or `GOAT_PRIVATE_KEY`, and fund the Bitcoin signing key |
+| Watchtower | `ACTOR=Watchtower`; configure its registered Bitcoin signing key |
+| Relayer | `ACTOR=Committee`, `ENABLE_RELAYER=true`; set `GOAT_PRIVATE_KEY` |
 
-Create a `.env` file and include necessary environment variables:
+Optional settings include:
 
-| Variable | Description | Required |
-|----------|-------------|----------|
-| `ACTOR` | The role of the node (`Committee`, `Operator`, `Challenger`, `Watchtower`) | Yes |
-| `BITCOIN_NETWORK` | Bitcoin network (`bitcoin`, `testnet`, `regtest`) | Yes |
-| `GOAT_NETWORK` | Goat network (`main`, `test`) | Yes |
-| `GOAT_CHAIN_URL` | RPC URL for the Goat chain | Yes |
-| `GOAT_PROOF_BUILD_URL` | URL for the proof builder service | Yes |
-| `PROOF_SEVER_URL` | URL for the proof server | Yes |
-| `PEER_KEY` | The private key for the P2P node identity (libp2p) | Yes |
-| `GOAT_GATEWAY_CONTRACT_ADDRESS` | Address of the Gateway contract on Goat | Yes |
-| `GOAT_GATEWAY_EVENT_FILTER_FROM` | The block number to start filtering Gateway events from | Yes |
-| `GOAT_GATEWAY_EVENT_THE_GRAPH_URL` | The Graph URL for querying Gateway events | Yes |
-| `BITVM_SECRET` | Secret key or seed  for BTC interaction | Yes |
-| `GOAT_ADDRESS` | The Goat chain address of the operator/node | Yes |
-| `PROTO_NAME` | The P2P protocol name (default: `bitvm`) | Yes |
-| `GOAT_PRIVATE_KEY` | Private key for the Goat chain interaction | Optional |
-| `GOAT_SEQUENCER_SET_PUBLISHER_CONTRACT_ADDRESS` | Address of the Sequencer Set Publisher contract | Optional |
-| `GOAT_SEQUENCER_SET_MULTI_SIG_VERIFIER_ADDRESS` | Address of the MultiSig Verifier contract | Optional |
-| `GOAT_SWAP_CONTRACT_ADDRESS` | Address of the Swap contract on Goat | Optional |
-| `GOAT_SWAP_EVENT_FILTER_FROM` | The block number to start filtering Swap events from | Optional |
-| `GOAT_SWAP_EVENT_THE_GRAPH_URL` | The Graph URL for querying Swap events | Optional |
-| `BOOTNODES` | Multiaddr of bootnodes for P2P discovery | Optional |
-| `NODE_NAME` | The name of the node | Optional |
-| `MIN_REQUIRED_VERIFIER` | Positive verifier-slot count for newly created graphs (default: `1`); must be identical on all participating nodes | Optional |
+| Variable | Purpose |
+|----------|---------|
+| `BTC_CHAIN_URL` | Bitcoin Esplora endpoint |
+| `PROTO_NAME` | P2P protocol namespace; use the same value for participating nodes |
+| `NODE_NAME` | Display name |
+| `EXTERNAL_SOCKET_ADDR` | Advertised node RPC socket address; bypasses automatic discovery |
+| `GOAT_SEQUENCER_SET_PUBLISHER_CONTRACT_ADDRESS` | Sequencer-set publisher contract |
+| `ENV_GOAT_SEQUENCER_SET_MULTI_SIG_VERIFIER_ADDRESS` | Sequencer-set multisignature verifier contract |
+| `GOAT_SWAP_CONTRACT_ADDRESS` | Swap contract for swap-enabled services |
+| `GOAT_SWAP_EVENT_THE_GRAPH_URL` / `GOAT_SWAP_EVENT_FILTER_FROM` | Swap subgraph and starting block |
+| `MIN_REQUIRED_VERIFIER` | Verifier slots for new graphs; default `1` |
 
-`MIN_REQUIRED_VERIFIER` changes the transaction topology of newly created graphs. It does not add Verifier slots to existing finalized graphs, which continue to use the slots embedded when they were created. Configure the same value on every Operator, Verifier, Committee, Watchtower, and Relayer node before creating new graphs.
+Set the same positive `MIN_REQUIRED_VERIFIER` on all participating nodes before
+creating graphs. Existing finalized graphs retain their original Verifier slots.
+The [configuration reference](../node/README.md#configuration) covers engine,
+network limits, timeouts and key-retention settings.
 
-## Roles Deployment
+## Run
 
-Configure the `.env` file for the specific role and run the node.
+```bash
+./target/release/bitvm-noded \
+  --rpc-addr 0.0.0.0:9100 \
+  --metrics-addr 127.0.0.1:9108 \
+  --p2p-port 8443 \
+  --db-path 'sqlite:./node.db?mode=rwc'
+```
 
-**Common Arguments:**
+Use `--bootnodes '<multiaddr>'` to join existing peers. The Docker entrypoint
+also accepts `BOOTNODES` and passes it to this CLI option. Give each process
+its own database and listening ports.
 
-- `--rpc-addr <ADDR>`: Address for the RPC server (default: `0.0.0.0:8080`)
-- `--metrics-addr <ADDR>`: Address for the dedicated Prometheus listener (disabled when omitted)
-- `--metrics-path <PATH>`: Path served by the metrics listener (default: `/metrics`)
-- `--db-path <PATH>`: Path to the SQLite database (default: `sqlite:/tmp/bitvm-node.db`)
-- `--p2p-port <PORT>`: Port for P2P communication (default: `0`)
-- `--bootnodes <MULTIADDR>`: Bootnodes to connect to 
+## Health and metrics
 
-Bind metrics to a private interface and use a unique port for every node running
-on the same host. The business RPC listener does not serve metrics, so
-`GET /metrics` on `--rpc-addr` returns `404`. For remote Prometheus servers,
-expose the dedicated listener through a private network, proxy, or access-control
-layer instead of binding it directly to a public interface.
+`GET /v1/health` on the business RPC listener returns `200` when ready and `503`
+otherwise, with readiness and backend status. The node retries an unavailable
+GOAT RPC during startup before exiting if initialization still cannot complete.
 
-For liveness and readiness probes use `GET /v1/health` on `--rpc-addr`: it only pings the local
-database and otherwise answers from memory, `200` while the node is ready and `503` (with the same JSON body naming
-the failing component or backend) otherwise. A node whose GOAT RPC is unreachable at start-up retries
-for about a minute before exiting, so a supervisor restart during a short outage does not crash-loop.
+Prometheus uses the dedicated `--metrics-addr` listener and `/metrics` path.
+`GET /metrics` on the business RPC listener returns `404`. Bind metrics to a
+private interface and use a distinct port per process.
 
-The provided Docker Compose deployment enables the listener on port `9108`
-inside each container and publishes it only on the host loopback interface:
+The [Docker Compose configuration](docker-compose.yml) publishes metrics on
+host loopback:
 
 | Service | Host metrics endpoint |
 |---------|-----------------------|
@@ -97,156 +104,6 @@ inside each container and publishes it only on the host loopback interface:
 | `operator_0` | `http://127.0.0.1:9903/metrics` |
 | `watchtower_0` | `http://127.0.0.1:9904/metrics` |
 
-### Committee
-
-The Committee is responsible for signing presign transactions.
-
-**example `.env`:**
-
-```env
-RUST_LOG=info
-
-# required
-ACTOR=Committee
-BITCOIN_NETWORK=testnet # bitcoin / testnet / regtest
-GOAT_NETWORK=test # main / test
-GOAT_CHAIN_URL=https://rpc.testnet3.goat.network
-GOAT_PROOF_BUILD_URL=...
-PROOF_SEVER_URL=...
-PEER_KEY=...
-BITVM_SECRET=...  # committee can setup a seed string
-GOAT_ADDRESS=...
-GOAT_GATEWAY_CONTRACT_ADDRESS=0x21f619040AC2eAcacEF8Fe17Ae8bDF53ec69C66f
-GOAT_GATEWAY_EVENT_THE_GRAPH_URL=https://api.goat.0xgraph.xyz/api/public/1030419e-065f-45e9-8cf5-69c42207cbc7/subgraphs/bitvm2_gateway_ga_dev_0/0.0.3/gn
-GOAT_GATEWAY_EVENT_FILTER_FROM=9689342
-PROTO_NAME=bitvmt3
-BOOTNODES=... # empty if this is the first node
-
-# optional, relayer only
-ENABLE_RELAYER=true
-GOAT_PRIVATE_KEY=...
-
-# optional, RPC server only
-GOAT_SWAP_CONTRACT_ADDRESS=0xe510D5781C6C849284Fb25Dc20b1684cEC445C8B
-GOAT_SWAP_EVENT_THE_GRAPH_URL=https://api.goat.0xgraph.xyz/api/public/1030419e-065f-45e9-8cf5-69c42207cbc7/subgraphs/escrow_manager_ga_dev_0/0.0.1/gn
-GOAT_SWAP_EVENT_FILTER_FROM=9368978
-```
-
-**Run Command:**
-
-```bash
-./target/release/bitvm-noded \
-  --rpc-addr 0.0.0.0:9100 \
-  --metrics-addr 127.0.0.1:9108 \
-  --p2p-port 8443 \
-  --db-path ./committee.db
-```
-
-### Operator
-
-The Operator manages the bridge operations.
-
-**Add to `.env`:**
-
-```env
-RUST_LOG=info
-
-# required
-ACTOR=Operator
-BITCOIN_NETWORK=testnet # bitcoin / testnet / regtest
-GOAT_NETWORK=test # main / test
-GOAT_CHAIN_URL=https://rpc.testnet3.goat.network
-GOAT_PROOF_BUILD_URL=...
-PROOF_SEVER_URL=...
-PEER_KEY=...
-BITVM_SECRET=...  # operator should setup its BTC private key
-GOAT_ADDRESS=...
-GOAT_GATEWAY_CONTRACT_ADDRESS=0x21f619040AC2eAcacEF8Fe17Ae8bDF53ec69C66f
-GOAT_GATEWAY_EVENT_THE_GRAPH_URL=https://api.goat.0xgraph.xyz/api/public/1030419e-065f-45e9-8cf5-69c42207cbc7/subgraphs/bitvm2_gateway_ga_dev_0/0.0.3/gn
-GOAT_GATEWAY_EVENT_FILTER_FROM=9689342
-PROTO_NAME=bitvmt3
-BOOTNODES=... # empty if this is the first node
-```
-
-**Run Command:**
-
-```bash
-./target/release/bitvm-noded \
-  --rpc-addr 0.0.0.0:9100 \
-  --metrics-addr 127.0.0.1:9108 \
-  --p2p-port 8443 \
-  --db-path ./operator.db
-```
-
-### Challenger
-
-The Challenger verifies the operations and submits challenges if necessary.
-
-**Add to `.env`:**
-
-```env
-RUST_LOG=info
-
-# required
-ACTOR=Challenger
-BITCOIN_NETWORK=testnet # bitcoin / testnet / regtest
-GOAT_NETWORK=test # main / test
-GOAT_CHAIN_URL=https://rpc.testnet3.goat.network
-GOAT_PROOF_BUILD_URL=...
-PROOF_SEVER_URL=...
-PEER_KEY=...
-BITVM_SECRET=...  # operator should setup its BTC private key
-GOAT_ADDRESS=...
-GOAT_GATEWAY_CONTRACT_ADDRESS=0x21f619040AC2eAcacEF8Fe17Ae8bDF53ec69C66f
-GOAT_GATEWAY_EVENT_THE_GRAPH_URL=https://api.goat.0xgraph.xyz/api/public/1030419e-065f-45e9-8cf5-69c42207cbc7/subgraphs/bitvm2_gateway_ga_dev_0/0.0.3/gn
-GOAT_GATEWAY_EVENT_FILTER_FROM=9689342
-PROTO_NAME=bitvmt3
-BOOTNODES=... # empty if this is the first node
-```
-
-**Run Command:**
-
-```bash
-./target/release/bitvm-noded \
-  --rpc-addr 0.0.0.0:9100 \
-  --metrics-addr 127.0.0.1:9108 \
-  --p2p-port 8443 \
-  --db-path ./challenger.db
-```
-
-### Watchtower
-
-The Watchtower submit the btc-chain-proof when needed.
-
-**Add to `.env`:**
-
-```env
-RUST_LOG=info
-
-# required
-ACTOR=Watchtower
-BITCOIN_NETWORK=testnet # bitcoin / testnet / regtest
-GOAT_NETWORK=test # main / test
-GOAT_CHAIN_URL=https://rpc.testnet3.goat.network
-GOAT_PROOF_BUILD_URL=...
-PROOF_SEVER_URL=...
-PEER_KEY=...
-BITVM_SECRET=...  # operator should setup its BTC private key
-GOAT_GATEWAY_CONTRACT_ADDRESS=0x21f619040AC2eAcacEF8Fe17Ae8bDF53ec69C66f
-GOAT_GATEWAY_EVENT_THE_GRAPH_URL=https://api.goat.0xgraph.xyz/api/public/1030419e-065f-45e9-8cf5-69c42207cbc7/subgraphs/bitvm2_gateway_ga_dev_0/0.0.3/gn
-GOAT_GATEWAY_EVENT_FILTER_FROM=9689342
-PROTO_NAME=bitvmt3
-BOOTNODES=... # empty if this is the first node
-```
-
-**Run Command:**
-
-```bash
-./target/release/bitvm-noded \
-  --rpc-addr 0.0.0.0:9100 \
-  --metrics-addr 127.0.0.1:9108 \
-  --p2p-port 8443 \
-  --db-path ./watchtower.db
-```
-
-For `sequencer-set-publish` and `proof-builder-rpc` deployment and failure recovery, please refer to the [Proof Builder RPC README](../proof-builder-rpc/README.md) for detailed instructions.
+Use the [operator tools](../scripts/ops/README.md) for health triage, log queries
+and instance or graph timelines. Proof service configuration and recovery are
+covered in the [Proof Builder RPC guide](../proof-builder-rpc/README.md).
