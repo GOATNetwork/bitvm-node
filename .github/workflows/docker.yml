@@ -7,7 +7,6 @@ on:
 
 env:
   IMAGE_REPO: ${{ github.repository }}
-  ZKM_TOOLCHAIN_VERSION: '20260917'
 
 jobs:
   build-and-push:
@@ -25,17 +24,7 @@ jobs:
         uses: actions/checkout@v5
 
       - name: Install Ziren toolchain
-        run: |
-          set -euo pipefail
-          installer="$RUNNER_TEMP/zkmup"
-          curl --proto '=https' --tlsv1.2 -fsSL --retry 3 \
-            https://raw.githubusercontent.com/ProjectZKM/toolchain/582f7927cac0668883a86cbd02fbc18b500b1b6f/zkmup \
-            -o "$installer"
-          sh "$installer" install -v "$ZKM_TOOLCHAIN_VERSION"
-          SHELL=/bin/true sh "$installer" setup -v "$ZKM_TOOLCHAIN_VERSION"
-          source "$HOME/.zkm-toolchain/env"
-          rustc --version
-          cargo --version
+        run: curl --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/ProjectZKM/toolchain/refs/heads/main/setup.sh | sh
 
       - name: Extract version from Cargo.toml
         id: version
