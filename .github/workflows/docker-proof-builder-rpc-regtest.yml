@@ -10,7 +10,10 @@ env:
 
 jobs:
   build-and-push-proof-builder-rpc:
-    runs-on: ubuntu-latest
+    # Match the LLVM environment used by Cargo Build & Test for Ziren FFI.
+    runs-on: ubuntu-24.04
+    env:
+      LIBCLANG_PATH: /usr/lib/llvm-18/lib
 
     permissions:
       contents: read
@@ -37,7 +40,7 @@ jobs:
         run: curl --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/ProjectZKM/toolchain/refs/heads/main/setup.sh | sh
 
       - name: Install Dependencies
-        run: sudo apt install protobuf-compiler -y
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libclang-18-dev
 
       - name: Build binarys
         run: export BITCOIN_NETWORK=regtest && source ~/.zkm-toolchain/env && cd proof-builder-rpc && cargo build --release

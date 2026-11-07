@@ -10,7 +10,10 @@ env:
 
 jobs:
   build-and-push:
-    runs-on: ubuntu-latest
+    # Match the LLVM environment used by Cargo Build & Test for Ziren FFI.
+    runs-on: ubuntu-24.04
+    env:
+      LIBCLANG_PATH: /usr/lib/llvm-18/lib
 
     permissions:
       contents: read
@@ -31,7 +34,7 @@ jobs:
           echo "Using version: $VERSION"
 
       - name: Install Dependencies
-        run: sudo apt-get update && sudo apt install protobuf-compiler -y
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libclang-18-dev
 
       - name: Build all binaries
         run: source ~/.zkm-toolchain/env && cargo build -r --workspace
