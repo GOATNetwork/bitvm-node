@@ -15,7 +15,7 @@ pub fn verify_guest_pubin_commitment(
     guest_pubin_wots_pubkey: &OperatorCommitPubinPublicKey,
     operator_assert_wots_pubkey: &OperatorAssertPublicKey,
     constant_value: &[u8; 32],
-    hashes: &Vec<LabelHash>,
+    hashes: &[LabelHash],
 ) -> Script {
     let wots96_msg_stack_items_num = Wots96::MSG_BYTE_LEN as usize;
     let wots96_sig_stack_items_num = Wots96::TOTAL_DIGIT_LEN as usize * 2;
@@ -91,7 +91,7 @@ pub fn verify_constant_pubin_segment_dup(
 pub fn verify_constant_pubin_script_inner(constant_value: &[u8; 32]) -> Script {
     script! {
         { 1 }
-        for byte in constant_value.to_vec() {
+        for byte in *constant_value {
             OP_SWAP
             { byte }
             OP_NUMEQUAL
@@ -100,7 +100,7 @@ pub fn verify_constant_pubin_script_inner(constant_value: &[u8; 32]) -> Script {
     }
 }
 
-pub fn verify_hashlock_pubin_segment_dup(segment_index: usize, hashes: &Vec<LabelHash>) -> Script {
+pub fn verify_hashlock_pubin_segment_dup(segment_index: usize, hashes: &[LabelHash]) -> Script {
     let preimage_roll_depths = hashlock_preimage_roll_depths(hashes.len());
     script! {
         for depth in preimage_roll_depths {
@@ -136,7 +136,7 @@ fn hashlock_preimage_roll_depths(hash_count: usize) -> Vec<usize> {
         .collect()
 }
 
-fn verify_hashlock_pubin_script_inner(hashes: &Vec<LabelHash>) -> Script {
+fn verify_hashlock_pubin_script_inner(hashes: &[LabelHash]) -> Script {
     fn chunk_count(len: usize, chunk_size: usize) -> usize {
         len.div_ceil(chunk_size)
     }
@@ -462,8 +462,8 @@ mod tests {
         guest_msg: &[u8; 96],
         operator_assert_msg: &[u8; 96],
         constant: &[u8; 32],
-        hashes: &Vec<LabelHash>,
-        preimages: &Vec<Vec<u8>>,
+        hashes: &[LabelHash],
+        preimages: &[Vec<u8>],
     ) -> bool {
         let guest_secret = Wots96::generate_secret_key();
         let guest_public_key = Wots96::generate_public_key(&guest_secret);
@@ -472,7 +472,7 @@ mod tests {
 
         let s = script! {
             { Wots96::sign_to_raw_witness(&operator_assert_secret, operator_assert_msg) }
-            { preimages.clone() }
+            { preimages.to_vec() }
             { Wots96::sign_to_raw_witness(&guest_secret, guest_msg) }
             { verify_guest_pubin_commitment(
                 &guest_public_key,
@@ -521,8 +521,8 @@ mod tests {
         let guest_msg = guest_pubin(&blockhash, &wrong_constant, &included_map);
         let x_d = compute_guest_commitment(&guest_msg);
         let operator_assert_msg = operator_assert_pubin(&[0x33; 32], &[0x44; 32], &x_d);
-        let preimages = vec![b"included-watchtower".to_vec(), b"also-included".to_vec()];
-        let nil_preimages = vec![vec![], vec![]];
+        let preimages = [b"included-watchtower".to_vec(), b"also-included".to_vec()];
+        let nil_preimages: [Vec<u8>; 2] = [vec![], vec![]];
         let hashes = vec![label_hash(&preimages[0]), label_hash(&preimages[1])];
 
         assert!(run_pubin_disprove(

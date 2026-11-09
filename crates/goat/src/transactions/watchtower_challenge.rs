@@ -170,8 +170,8 @@ impl WatchtowerChallengeInitTransaction {
         connector_b: &ConnectorB,
         connector_e: &ConnectorE,
         connector_f: &ConnectorF,
-        watchtower_challenge_connectors: &Vec<WatchtowerChallengeConnector>,
-        ack_connectors: &Vec<AckConnector>,
+        watchtower_challenge_connectors: &[WatchtowerChallengeConnector],
+        ack_connectors: &[AckConnector],
         input_0: Input,
     ) -> Result<Self, Error> {
         if watchtower_challenge_connectors.len() != ack_connectors.len() {

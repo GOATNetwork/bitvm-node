@@ -53,6 +53,7 @@ impl PreSignedTransaction for Take2Transaction {
 }
 
 impl Take2Transaction {
+    #[allow(clippy::too_many_arguments)]
     pub fn new_for_validation(
         connector_0: &Connector0,
         connector_d: &ConnectorD,

@@ -36,6 +36,7 @@ pub struct ConnectorD {
 }
 
 impl ConnectorD {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         network: Network,
         operator_taproot_public_key: &XOnlyPublicKey,
@@ -43,7 +44,7 @@ impl ConnectorD {
         operator_commit_pubin_wots_public_key: &OperatorCommitPubinPublicKey,
         operator_assert_wots_public_key: &OperatorAssertPublicKey,
         pubin_constant_value: &[u8; 32],
-        watchtower_hashlocks: &Vec<LabelHash>,
+        watchtower_hashlocks: &[LabelHash],
         timelock_config: &TimelockConfig,
     ) -> Self {
         ConnectorD {
@@ -53,7 +54,7 @@ impl ConnectorD {
             operator_commit_pubin_wots_public_key: *operator_commit_pubin_wots_public_key,
             operator_assert_wots_public_key: *operator_assert_wots_public_key,
             pubin_constant_value: *pubin_constant_value,
-            watchtower_hashlocks: watchtower_hashlocks.clone(),
+            watchtower_hashlocks: watchtower_hashlocks.to_vec(),
             take2_blocks_timelock: timelock_config.connector_d,
         }
     }

@@ -299,11 +299,7 @@ pub mod output_topology {
         }
 
         pub const fn verifier_num(output_num: usize) -> usize {
-            if output_num < 2 {
-                0
-            } else {
-                output_num - 2
-            }
+            output_num.saturating_sub(2)
         }
     }
 
