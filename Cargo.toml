@@ -9,6 +9,7 @@ members = [
     "proof-builder-rpc",
     "crates/cbft-rpc",
     "crates/bitvm-gc",
+    "crates/goat",
     "crates/store",
     "crates/engine",
     "crates/node-macros",
@@ -29,8 +30,8 @@ members = [
 default-members = ["node"]
 
 [workspace.dependencies]
-bitvm = { git = "https://github.com/GOATNetwork/BitVM.git", branch = "committee-force-skip" }
-goat = { git = "https://github.com/GOATNetwork/BitVM.git", branch = "committee-force-skip" }
+bitvm = { git = "https://github.com/GOATNetwork/BitVM.git", branch = "gc-v2" }
+goat = { path = "crates/goat" }
 
 libp2p = { version = "0.57.1", features = ["tokio", "kad", "noise", "tcp", "yamux", "rsa", "ping"] }
 libp2p-swarm-derive = "0.36.0"
