@@ -10,7 +10,7 @@ use crate::clock::current_time_secs;
 use crate::engine_bridge::record_event_in;
 use crate::utils::{
     generate_instance_from_bridge_in_request_event, obsolete_instance_graphs_except,
-    reflect_goat_address, strip_hex_prefix_owned,
+    reflect_goat_address, stored_definition_committee_pre_signed, strip_hex_prefix_owned,
 };
 use alloy::primitives::U256;
 use bitvm_lib::actors::Actor;
@@ -665,10 +665,16 @@ async fn handle_post_graph_data_events<'a>(
                 )
                 .await?;
                 // Watching roles fetch a finalized definition when the posted graph is absent
-                // locally.
-                if matches!(outcome, GraphStatusTransitionOutcome::NotFound)
-                    && matches!(actor, Actor::Verifier | Actor::Watchtower)
-                {
+                // locally. Any role holding only the operator's copy fetches it too: the
+                // status just moved past OperatorPresigned, but the copy still lacks the
+                // committee pre-signatures.
+                let pull = if matches!(outcome, GraphStatusTransitionOutcome::NotFound) {
+                    matches!(actor, Actor::Verifier | Actor::Watchtower)
+                } else {
+                    stored_definition_committee_pre_signed(storage_processor, &graph_id).await?
+                        == Some(false)
+                };
+                if pull {
                     record_event_in(
                         storage_processor,
                         graph_pull_event(
@@ -761,6 +767,58 @@ mod tests {
                     .is_some(),
                 "{actor}"
             );
+        }
+    }
+
+    /// A graph row with a stored definition; only its committee flag is read.
+    async fn stored(db: &LocalDB, slot: i64, committee_pre_signed: bool) -> (Uuid, Uuid) {
+        let (instance_id, graph_id) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut storage = db.acquire().await.unwrap();
+        storage
+            .upsert_graph_definition(&store::Graph {
+                graph_id,
+                instance_id,
+                status: GraphStatus::OperatorPresigned.to_string(),
+                definition_hash: "definition".to_string(),
+                kickoff_index: slot,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let raw = serde_json::json!({ "committee_pre_signed": committee_pre_signed }).to_string();
+        storage
+            .upsert_graph_raw_data(
+                instance_id,
+                store::GraphRawData { graph_id, raw_data: raw, created_at: 0, updated_at: 0 },
+                "definition",
+            )
+            .await
+            .unwrap();
+        (instance_id, graph_id)
+    }
+
+    #[tokio::test]
+    async fn a_posted_graph_held_only_as_the_operator_copy_is_pulled_finalized() {
+        let (db, _dir) = db().await;
+        let mut slot = 0;
+        for actor in [Actor::Verifier, Actor::Watchtower, Actor::Operator, Actor::Committee] {
+            for committee_pre_signed in [false, true] {
+                slot += 1;
+                let (instance_id, graph_id) = stored(&db, slot, committee_pre_signed).await;
+                let mut tx = db.start_transaction().await.unwrap();
+                handle_post_graph_data_events(&actor, &mut tx, vec![posted(instance_id, graph_id)])
+                    .await
+                    .unwrap();
+                tx.commit().await.unwrap();
+                let mut storage = db.acquire().await.unwrap();
+                let row = storage.find_graph(&graph_id).await.unwrap().unwrap();
+                assert_eq!(row.status, GraphStatus::OperatorDataPushed.to_string());
+                let pull = storage
+                    .find_engine_inbox_event(&format!("graph:{graph_id}:pull:finalized"))
+                    .await
+                    .unwrap();
+                assert_eq!(pull.is_some(), !committee_pre_signed, "{actor}");
+            }
         }
     }
 }
