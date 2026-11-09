@@ -28,6 +28,8 @@ bitcoin-light-client-circuit = { workspace = true }
 primitives.workspace = true
 reth-chainspec.workspace = true
 url.workspace = true
+# Alloy shares this client; decode gzip responses for large execution witnesses.
+reqwest = { workspace = true, features = ["gzip"] }
 host-executor.workspace = true
 alloy-provider.workspace = true
 alloy-primitives.workspace = true

@@ -25,6 +25,7 @@ async fn main() {
         &args.blocks,
         &args.goat_network,
         &args.cosmos_rpc_url,
+        args.fetch_concurrency,
     )
     .await
     .unwrap();

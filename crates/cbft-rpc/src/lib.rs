@@ -3,7 +3,9 @@ use state_chain::parse_cbft_tx_payload;
 use tendermint::block::Height;
 use tendermint::validator::Info;
 use tendermint_light_client_verifier::types::{LightBlock, PeerId, ValidatorSet};
-use tendermint_rpc::{Client, HttpClient};
+use tendermint_rpc::Client;
+// Callers build one client per batch so its requests share connections.
+pub use tendermint_rpc::HttpClient;
 
 /// Abstraction over Cosmos RPC calls used by the sequencer set hash monitor.
 /// Enables mock-based testing of sync logic without real RPC.
@@ -91,10 +93,9 @@ pub async fn fetch_cbft_block_validators_hash_and_goat_block(
 
 // get cosmos block height from block hash: curl https://rpc.testnet3.goat.network/goat-rpc/block_by_hash?hash=0xd2e236b8f89278a527a042727cd4eebb59a566006a844f294da54ed727b95470
 pub async fn get_cosmos_block_height_at(
-    cosmos_rpc_url: &str,
+    rpc: &HttpClient,
     cosmos_block_hash: [u8; 32],
 ) -> Result<Option<u64>> {
-    let rpc = HttpClient::new(cosmos_rpc_url).unwrap();
     match rpc.block_by_hash(tendermint::Hash::Sha256(cosmos_block_hash)).await {
         Ok(resp) => match resp.block {
             Some(b) => Ok(Some(b.header.height.into())),
@@ -111,17 +112,15 @@ pub async fn get_cosmos_block_height_at(
 /// ```
 ///     curl "https://rpc.testnet3.goat.network/goat-rpcblock?height=5756784" | jq .result.block.data
 /// ```
-#[tracing::instrument(level = "info")]
+#[tracing::instrument(level = "info", skip(rpc))]
 pub async fn fetch_cbft_validator_info(
-    cosmos_rpc_url: &str,
+    rpc: &HttpClient,
     goat_block_height: u64,
     parent_cosmos_block_height: Option<u64>,
     mut max_offset: u64,
 ) -> Result<([u8; 32], u64)> {
     // Linear search starting from `parent_cosmos_block_height` (or `goat_block_height`)
     // upward until we find the CBFT transaction with matching goat_block_height.
-    let rpc = HttpClient::new(cosmos_rpc_url).unwrap();
-
     let mut block_height: u64 = match parent_cosmos_block_height {
         Some(h) => h,
         None => goat_block_height,
@@ -156,8 +155,7 @@ pub async fn fetch_cbft_validator_info(
     anyhow::bail!("Can not find the cosmos block for goat block height {goat_block_height}");
 }
 
-pub async fn fetch_cbft_tx_data(cosmos_rpc_url: &str, height: u64) -> Result<Vec<Vec<u8>>> {
-    let rpc = HttpClient::new(cosmos_rpc_url).unwrap();
+pub async fn fetch_cbft_tx_data(rpc: &HttpClient, height: u64) -> Result<Vec<Vec<u8>>> {
     let block_data = rpc
         .block(Height::from(height as u32))
         .await
@@ -167,8 +165,7 @@ pub async fn fetch_cbft_tx_data(cosmos_rpc_url: &str, height: u64) -> Result<Vec
     Ok(tx_data)
 }
 
-pub async fn fetch_cosmos_block(cosmos_rpc_url: &str, height: u64) -> Result<LightBlock> {
-    let rpc = HttpClient::new(cosmos_rpc_url).unwrap();
+pub async fn fetch_cosmos_block(rpc: &HttpClient, height: u64) -> Result<LightBlock> {
     // 1. header + commit
     let commit_resp = rpc
         .commit(Height::try_from(height).unwrap())
@@ -208,7 +205,8 @@ mod tests {
         let block_number = 10000;
         let cosmos_rpc_url = std::env::var("COSMOS_RPC_URL")
             .unwrap_or("https://rpc.testnet3.goat.network/goat-rpc".to_string());
-        let result = fetch_cbft_tx_data(&cosmos_rpc_url, block_number).await;
+        let rpc = HttpClient::new(cosmos_rpc_url.as_str()).unwrap();
+        let result = fetch_cbft_tx_data(&rpc, block_number).await;
         assert!(result.is_ok());
     }
 
@@ -217,8 +215,9 @@ mod tests {
         let cosmos_rpc_url = std::env::var("COSMOS_RPC_URL")
             .unwrap_or("https://rpc.testnet3.goat.network/goat-rpc".to_string());
         let evm_block_number = 10627151;
+        let rpc = HttpClient::new(cosmos_rpc_url.as_str()).unwrap();
         let (sequencer_hash, block_number) =
-            fetch_cbft_validator_info(&cosmos_rpc_url, evm_block_number, None, 1000).await.unwrap();
+            fetch_cbft_validator_info(&rpc, evm_block_number, None, 1000).await.unwrap();
 
         println!("hex sequencer_hash: {}", hex::encode(sequencer_hash));
         println!("cosmos block number: {}", block_number);
@@ -235,7 +234,7 @@ mod tests {
             panic!("Invalid sequencer set hash");
         }
 
-        let light_block = fetch_cosmos_block(&cosmos_rpc_url, block_number).await.unwrap();
+        let light_block = fetch_cosmos_block(&rpc, block_number).await.unwrap();
         assert_eq!(light_block.signed_header.header.validators_hash.as_bytes(), &sequencer_hash);
     }
 }
