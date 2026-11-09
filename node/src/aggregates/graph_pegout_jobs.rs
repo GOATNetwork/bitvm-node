@@ -1055,7 +1055,10 @@ async fn disprove(
     ) {
         return step;
     }
-    let disprove_tx = build_disprove_tx(graph, verifier_index, None)?;
+    // The Gateway pays the disprover named in output 0's OP_RETURN; it identifies
+    // the Disprove by its inputs, so the added output does not stop settlement.
+    let reward_address = crate::env::get_node_goat_address().map(|address| address.into_array());
+    let disprove_tx = build_disprove_tx(graph, verifier_index, reward_address)?;
     let disprove_txid = disprove_tx.compute_txid();
     let input_amount =
         graph.disproves[verifier_index].prev_outs().iter().map(|o| o.value).sum::<Amount>();

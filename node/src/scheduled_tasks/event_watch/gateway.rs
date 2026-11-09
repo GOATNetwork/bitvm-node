@@ -469,7 +469,15 @@ async fn handle_withdraw_disproved_events<'a>(
 ) -> anyhow::Result<()> {
     for event in withdraw_disproved_events {
         let graph_id = Uuid::from_str(&strip_hex_prefix_owned(&event.graph_id))?;
-        let instance_id = Uuid::from_str(&strip_hex_prefix_owned(&event.instance_id))?;
+        let mut instance_id = Uuid::from_str(&strip_hex_prefix_owned(&event.instance_id))?;
+        // A graph disproved without initWithdraw has no withdraw record on a
+        // Gateway that does not record the instance at postGraphData, and its
+        // event carries a zero instance id: take the instance from the local graph.
+        if instance_id.is_nil()
+            && let Some(graph) = storage_processor.find_graph(&graph_id).await?
+        {
+            instance_id = graph.instance_id;
+        }
         if !graph_belongs_to_instance(storage_processor, instance_id, graph_id).await? {
             continue;
         }
@@ -845,6 +853,54 @@ mod tests {
             .await
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn a_disprove_event_without_an_instance_id_is_matched_to_the_local_graph() {
+        let (db, _dir) = db().await;
+        let (instance_id, graph_id) = (Uuid::new_v4(), Uuid::new_v4());
+        db.acquire()
+            .await
+            .unwrap()
+            .upsert_graph_definition(&store::Graph {
+                graph_id,
+                instance_id,
+                status: GraphStatus::OperatorPresigned.to_string(),
+                definition_hash: "definition".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let address = format!("0x{}", "11".repeat(20));
+        let event = WithdrawDisprovedEvent {
+            id: "1".to_string(),
+            transaction_hash: "0xbb".to_string(),
+            block_number: "7".to_string(),
+            instance_id: format!("0x{}", Uuid::nil().simple()),
+            graph_id: format!("0x{}", graph_id.simple()),
+            disprove_tx_type: 0,
+            tx_index: "0".to_string(),
+            challenge_start_txid: String::new(),
+            challenge_finish_txid: String::new(),
+            challenger_addr: address.clone(),
+            challenger_amount_sats: "0".to_string(),
+            disprover_addr: address,
+            disprover_amount_sats: "0".to_string(),
+        };
+        let mut tx = db.start_transaction().await.unwrap();
+        handle_withdraw_disproved_events(&mut tx, vec![event]).await.unwrap();
+        tx.commit().await.unwrap();
+        let mut storage = db.acquire().await.unwrap();
+        let tx_type = GoatTxType::WithdrawDisproved.to_string();
+        assert!(
+            storage
+                .find_graph_goat_tx_record(&instance_id, &graph_id, &tx_type)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let graph = storage.find_graph(&graph_id).await.unwrap().unwrap();
+        assert_eq!(graph.status, GraphStatus::Disprove.to_string());
     }
 
     #[tokio::test]

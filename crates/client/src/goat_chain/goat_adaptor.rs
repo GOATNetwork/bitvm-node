@@ -124,7 +124,7 @@ sol!(
             bytes32 take2Txid;
             bytes32 watchtowerChallengeInitTxid;
             bytes32 proverAssertTxid;
-            bytes32[] disproveTxids;
+            bytes32[] verifierAssertTxids;
             bytes32[] watchtowerChallengeTimeoutTxids;
             bytes32[] operatorChallengeNackTxids;
             bytes32 operatorCommitTimeoutTxid;
@@ -876,8 +876,8 @@ impl From<GraphData> for IGateway::GraphData {
                 &value.watchtower_challenge_init_txid,
             ),
             proverAssertTxid: FixedBytes::from_slice(&value.prover_assert_txid),
-            disproveTxids: value
-                .disprove_txids
+            verifierAssertTxids: value
+                .verifier_assert_txids
                 .into_iter()
                 .map(|txid| FixedBytes::from_slice(&txid))
                 .collect::<Vec<_>>(),
@@ -907,7 +907,11 @@ impl From<IGateway::GraphData> for GraphData {
             take2_txid: value.take2Txid.0,
             watchtower_challenge_init_txid: value.watchtowerChallengeInitTxid.0,
             prover_assert_txid: value.proverAssertTxid.0,
-            disprove_txids: value.disproveTxids.into_iter().map(|txid| txid.into()).collect(),
+            verifier_assert_txids: value
+                .verifierAssertTxids
+                .into_iter()
+                .map(|txid| txid.into())
+                .collect(),
             watchtower_challenge_timeout_txids: value
                 .watchtowerChallengeTimeoutTxids
                 .into_iter()
@@ -1761,7 +1765,7 @@ mod digest_tests {
             take2_txid: word(5),
             watchtower_challenge_init_txid: word(6),
             prover_assert_txid: word(7),
-            disprove_txids: vec![word(0xd1), word(0xd2)],
+            verifier_assert_txids: vec![word(0xd1), word(0xd2)],
             watchtower_challenge_timeout_txids: vec![word(0xe1)],
             operator_challenge_nack_txids: vec![],
             operator_commit_timeout_txid: word(9),

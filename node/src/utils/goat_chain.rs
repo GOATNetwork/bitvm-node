@@ -37,8 +37,14 @@ pub fn build_graph_data(graph: &BitvmGcGraph) -> Result<GraphData> {
     let watchtower_challenge_init_txid =
         graph.watchtower_challenge_init.finalize().compute_txid().to_byte_array();
     let prover_assert_txid = graph.operator_assert.finalize().compute_txid().to_byte_array();
-    let disprove_txids: Vec<[u8; 32]> =
-        graph.disproves.iter().map(|tx| tx.finalize().compute_txid().to_byte_array()).collect();
+    // The Gateway identifies a Disprove by the outpoints it spends, output 0 of
+    // a verifier's ChallengeAssert among them: Disprove-X is pre-signed with
+    // SIGHASH_NONE, so its own txid changes with the disprover's reward output.
+    let verifier_assert_txids: Vec<[u8; 32]> = graph
+        .verifier_asserts
+        .iter()
+        .map(|tx| tx.finalize().compute_txid().to_byte_array())
+        .collect();
     let watchtower_challenge_timeout_txids: Vec<[u8; 32]> = graph
         .watchtower_challenge_timeouts
         .iter()
@@ -61,7 +67,7 @@ pub fn build_graph_data(graph: &BitvmGcGraph) -> Result<GraphData> {
         take2_txid,
         watchtower_challenge_init_txid,
         prover_assert_txid,
-        disprove_txids,
+        verifier_assert_txids,
         watchtower_challenge_timeout_txids,
         operator_challenge_nack_txids,
         operator_commit_timeout_txid,
