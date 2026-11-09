@@ -48,6 +48,10 @@ jobs:
           toolchain: stable
           override: true
       - run: rustup component add rustfmt
+      # node and GOATNetwork/bitvm-gc must pin the same GOATNetwork/BitVM rev,
+      # or Cargo builds two copies of bitvm without complaint.
+      - name: Single bitvm in Cargo.lock
+        run: test "$(grep -c '^name = "bitvm"$' Cargo.lock)" = 1
       - uses: actions-rs/cargo@v1
         with:
           command: fmt
