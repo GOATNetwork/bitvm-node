@@ -387,8 +387,10 @@ impl BitvmGcGraphParameters {
         PrekickoffConnector::new(self.network(), &self.operator_taproot_public_key())
     }
 
+    /// Output 0 of the next Pre-Kickoff. It is locked to this graph's committee,
+    /// which pre-signs its spend in Quick-Challenge and Force-Skip-Kickoff.
     pub fn force_skip_connector(&self) -> ForceSkipConnector {
-        ForceSkipConnector::new(self.network(), &self.operator_taproot_public_key())
+        ForceSkipConnector::new(self.network(), &self.n_of_n_taproot_public_key())
     }
 
     pub fn kickoff_connector(&self) -> KickoffConnector {
@@ -712,9 +714,7 @@ impl BitvmGcGraph {
         let operator_pre_sigs = if self.operator_pre_signed {
             Some(vec![
                 self.force_skip_kickoff.tx().input[0].witness.clone(),
-                self.force_skip_kickoff.tx().input[1].witness.clone(),
                 self.quick_challenge.tx().input[0].witness.clone(),
-                self.quick_challenge.tx().input[1].witness.clone(),
                 self.challenge_incomplete_kickoff.tx().input[0].witness.clone(),
                 self.challenge_incomplete_kickoff.tx().input[1].witness.clone(),
             ])
@@ -747,6 +747,10 @@ impl BitvmGcGraph {
                 disprove.push(extract_sig_from_witness(&disprove_tx.tx().input[0].witness)?);
                 disprove.push(extract_sig_from_witness(&disprove_tx.tx().input[1].witness)?);
             }
+            let force_skip_kickoff =
+                vec![extract_sig_from_witness(&self.force_skip_kickoff.tx().input[1].witness)?];
+            let quick_challenge =
+                vec![extract_sig_from_witness(&self.quick_challenge.tx().input[1].witness)?];
             Some(CommitteeSignatures {
                 take1,
                 take2,
@@ -755,6 +759,8 @@ impl BitvmGcGraph {
                 operator_challenge_nack,
                 operator_commit_timeout,
                 disprove,
+                force_skip_kickoff,
+                quick_challenge,
             })
         } else {
             None

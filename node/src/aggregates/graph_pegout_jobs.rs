@@ -523,6 +523,13 @@ async fn enforce_previous_slot(deps: &JobDeps, graph: &BitvmGcGraph) -> Result<S
     if !tx_confirmed(btc, &prekickoff_txid).await? {
         return after_blocks(deps, "pre-kickoff is not confirmed yet", 1);
     }
+    // Quick-Challenge and Force-Skip-Kickoff both spend this Pre-Kickoff's
+    // force-skip connector, so a spent connector means one of them already ran.
+    let force_skip_connector = output_topology::prekickoff::force_skip_connector() as u64;
+    let spend = spend_of(btc, &prekickoff_txid, force_skip_connector).await?;
+    if let Some(step) = settled_by(deps, &spend, "force-skip connector") {
+        return step;
+    }
     let operator_pubkey = graph.parameters.operator_pubkey.to_string();
     let previous_slot = graph_nonce - 1;
     let previous_id = deps
@@ -582,6 +589,9 @@ async fn enforce_previous_slot(deps: &JobDeps, graph: &BitvmGcGraph) -> Result<S
         if let Some(step) = settled_by(deps, &spend, "previous slot's kickoff connector") {
             return step;
         }
+        if !previous.committee_pre_signed() {
+            return Step::retry("previous graph has no committee pre-signatures", 600);
+        }
         let txid = verifier_force_skip_kickoff(btc, &previous).await?;
         info!(event = "graph_punish", graph_id = %previous_row.graph_id, txid = %txid, "Force-Skip-Kickoff broadcast");
         return broadcast_pending(deps, &format!("Force-Skip-Kickoff {txid}"));
@@ -593,6 +603,9 @@ async fn enforce_previous_slot(deps: &JobDeps, graph: &BitvmGcGraph) -> Result<S
     let spend = spend_of(btc, &previous_kickoff, guardian).await?;
     if let Some(step) = settled_by(deps, &spend, "previous slot's guardian connector") {
         return step;
+    }
+    if !previous.committee_pre_signed() {
+        return Step::retry("previous graph has no committee pre-signatures", 600);
     }
     let txid = verifier_quick_challenge(btc, &previous).await?;
     info!(event = "graph_punish", graph_id = %previous_row.graph_id, txid = %txid, "Quick-Challenge broadcast");
