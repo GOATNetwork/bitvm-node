@@ -131,10 +131,7 @@ pub fn generate_timelock_script_address(
     public_key: &PublicKey,
     num_blocks_timelock: u32,
 ) -> Address {
-    Address::p2wsh(
-        &generate_timelock_script(public_key, num_blocks_timelock),
-        network,
-    )
+    Address::p2wsh(&generate_timelock_script(public_key, num_blocks_timelock), network)
 }
 
 pub fn generate_timelock_taproot_script(
@@ -156,10 +153,7 @@ pub fn generate_timelock_taproot_script_address(
     public_key: &XOnlyPublicKey,
     num_blocks_timelock: u32,
 ) -> Address {
-    Address::p2wsh(
-        &generate_timelock_taproot_script(public_key, num_blocks_timelock),
-        network,
-    )
+    Address::p2wsh(&generate_timelock_taproot_script(public_key, num_blocks_timelock), network)
 }
 
 pub fn generate_opreturn_script(msg: Vec<u8>) -> ScriptBuf {
@@ -180,19 +174,13 @@ pub fn p2a_script() -> ScriptBuf {
 }
 
 pub fn p2a_output() -> TxOut {
-    TxOut {
-        value: p2a_amount(),
-        script_pubkey: p2a_script(),
-    }
+    TxOut { value: p2a_amount(), script_pubkey: p2a_script() }
 }
 
 pub fn generate_data_commitment_outputs(data: &[u8]) -> Vec<TxOut> {
     let data_len = data.len();
     if data_len <= 80 {
-        vec![TxOut {
-            value: Amount::ZERO,
-            script_pubkey: generate_opreturn_script(data.to_vec()),
-        }]
+        vec![TxOut { value: Amount::ZERO, script_pubkey: generate_opreturn_script(data.to_vec()) }]
     } else {
         let mut txouts = vec![];
         let mut data = data.to_vec();
@@ -236,10 +224,7 @@ pub fn extract_data_from_commitment_outputs(txouts: &[TxOut]) -> Vec<u8> {
     let mut data = vec![];
     for txout in txouts {
         let script = &txout.script_pubkey;
-        let instructions = script
-            .instructions_minimal()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
+        let instructions = script.instructions_minimal().collect::<Result<Vec<_>, _>>().unwrap();
         if let bitcoin::blockdata::script::Instruction::PushBytes(bytes) = &instructions[1] {
             data.extend_from_slice(bytes.as_bytes());
         }

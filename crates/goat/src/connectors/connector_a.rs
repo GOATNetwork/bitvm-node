@@ -83,9 +83,6 @@ impl TaprootConnector for ConnectorA {
     }
 
     fn generate_taproot_address(&self) -> Address {
-        Address::p2tr_tweaked(
-            self.generate_taproot_spend_info().output_key(),
-            self.network,
-        )
+        Address::p2tr_tweaked(self.generate_taproot_spend_info().output_key(), self.network)
     }
 }

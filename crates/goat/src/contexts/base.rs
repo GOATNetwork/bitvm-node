@@ -21,10 +21,8 @@ pub fn generate_keys_from_secret(network: Network, secret: &str) -> (Keypair, Pu
 }
 
 pub fn generate_n_of_n_public_key(n_of_n_public_keys: &[PublicKey]) -> (PublicKey, XOnlyPublicKey) {
-    let public_keys: Vec<Point> = n_of_n_public_keys
-        .iter()
-        .map(|&public_key| public_key.inner.into())
-        .collect();
+    let public_keys: Vec<Point> =
+        n_of_n_public_keys.iter().map(|&public_key| public_key.inner.into()).collect();
 
     let key_agg_context = KeyAggContext::new(public_keys).unwrap();
     let aggregated_key: Secp256k1PublicKey = key_agg_context.aggregated_pubkey();

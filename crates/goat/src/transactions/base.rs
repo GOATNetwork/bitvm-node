@@ -91,10 +91,7 @@ pub const fn connector_d_assert_output_amount() -> u64 {
             0
         };
 
-    max(
-        max(DUST_AMOUNT, disprove_connector_d_amount),
-        pubin_disprove_input_amount(),
-    )
+    max(max(DUST_AMOUNT, disprove_connector_d_amount), pubin_disprove_input_amount())
 }
 pub const fn operator_assert_input_amount(num_verifier: usize) -> u64 {
     min_relay_fee_operator_assert(num_verifier)
@@ -140,15 +137,10 @@ pub fn tx_output_input(transaction: &Transaction, vout: usize) -> Result<Input, 
         .output
         .get(vout)
         .ok_or(Error::Other("transaction output index out of bounds"))?;
-    let vout = vout
-        .try_into()
-        .map_err(|_| Error::Other("transaction output index exceeds u32"))?;
+    let vout = vout.try_into().map_err(|_| Error::Other("transaction output index exceeds u32"))?;
 
     Ok(Input {
-        outpoint: OutPoint {
-            txid: transaction.compute_txid(),
-            vout,
-        },
+        outpoint: OutPoint { txid: transaction.compute_txid(), vout },
         amount: output.value,
     })
 }
@@ -351,15 +343,10 @@ pub fn merge_transactions(
     source_transaction: &Transaction,
 ) {
     for i in destination_transaction.input.len()..source_transaction.input.len() {
-        destination_transaction
-            .input
-            .push(source_transaction.input[i].clone());
+        destination_transaction.input.push(source_transaction.input[i].clone());
     }
 
-    for i in 0..cmp::min(
-        destination_transaction.input.len(),
-        source_transaction.input.len(),
-    ) {
+    for i in 0..cmp::min(destination_transaction.input.len(), source_transaction.input.len()) {
         // TODO: takes longer witness data but should combine both
         // TODO: merge signatures after Musig2 feature is ready
         if destination_transaction.input[i].witness.len()
@@ -370,9 +357,7 @@ pub fn merge_transactions(
     }
 
     for i in destination_transaction.output.len()..source_transaction.output.len() {
-        destination_transaction
-            .output
-            .push(source_transaction.output[i].clone());
+        destination_transaction.output.push(source_transaction.output[i].clone());
     }
 }
 
@@ -385,10 +370,7 @@ pub fn merge_musig2_nonces_and_signatures(
     merge_hash_maps(nonces, source_transaction.musig2_nonces().clone());
 
     let nonce_signatures = destination_transaction.musig2_nonce_signatures_mut();
-    merge_hash_maps(
-        nonce_signatures,
-        source_transaction.musig2_nonce_signatures().clone(),
-    );
+    merge_hash_maps(nonce_signatures, source_transaction.musig2_nonce_signatures().clone());
 
     let signatures = destination_transaction.musig2_signatures_mut();
     merge_hash_maps(signatures, source_transaction.musig2_signatures().clone());
@@ -400,12 +382,7 @@ fn merge_hash_maps<T: Clone>(
     a: &mut HashMap<usize, HashMap<PublicKey, T>>,
     b: HashMap<usize, HashMap<PublicKey, T>>,
 ) {
-    let all_keys = a
-        .keys()
-        .chain(b.keys())
-        .unique()
-        .cloned()
-        .collect::<Vec<_>>();
+    let all_keys = a.keys().chain(b.keys()).unique().cloned().collect::<Vec<_>>();
     for key in all_keys {
         let q = a.entry(key).or_default();
         let w = b.get(&key).cloned().unwrap_or(HashMap::new());
@@ -469,11 +446,7 @@ fn verify_public_nonces(
 }
 
 pub fn verify_public_nonces_for_tx(tx: &impl PreSignedMusig2Transaction) -> bool {
-    verify_public_nonces(
-        tx.musig2_nonces(),
-        tx.musig2_nonce_signatures(),
-        tx.tx().compute_txid(),
-    )
+    verify_public_nonces(tx.musig2_nonces(), tx.musig2_nonce_signatures(), tx.tx().compute_txid())
 }
 
 #[cfg(test)]

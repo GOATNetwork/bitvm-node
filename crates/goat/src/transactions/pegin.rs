@@ -64,10 +64,8 @@ impl PegInDepositTransaction {
         txouts.push(output_0);
         let mut fee_amount = fee_amount;
         if change_amount > Amount::from_sat(DUST_AMOUNT) {
-            let output_1 = TxOut {
-                value: change_amount,
-                script_pubkey: change_address.script_pubkey(),
-            };
+            let output_1 =
+                TxOut { value: change_amount, script_pubkey: change_address.script_pubkey() };
             txouts.push(output_1);
         } else {
             fee_amount += change_amount;
@@ -166,10 +164,8 @@ impl PegInRefundTransaction {
         }
 
         let total_output_amount = input_0.amount - fee_amount;
-        let _output_0 = TxOut {
-            value: total_output_amount,
-            script_pubkey: refund_address.script_pubkey(),
-        };
+        let _output_0 =
+            TxOut { value: total_output_amount, script_pubkey: refund_address.script_pubkey() };
 
         Ok(PegInRefundTransaction {
             tx: Transaction {
@@ -262,10 +258,8 @@ impl PegInConfirmTransaction {
             value: total_output_amount,
             script_pubkey: connector_0.generate_taproot_address().script_pubkey(),
         };
-        let output_1 = TxOut {
-            value: Amount::ZERO,
-            script_pubkey: generate_opreturn_script(message),
-        };
+        let output_1 =
+            TxOut { value: Amount::ZERO, script_pubkey: generate_opreturn_script(message) };
 
         Ok(PegInConfirmTransaction {
             tx: Transaction {
@@ -320,10 +314,7 @@ impl PegInConfirmTransaction {
             sighash_type,
             partial_sigs,
         ) {
-            Ok(sig) => Ok(bitcoin::taproot::Signature {
-                signature: sig.into(),
-                sighash_type,
-            }),
+            Ok(sig) => Ok(bitcoin::taproot::Signature { signature: sig.into(), sighash_type }),
             Err(_) => Err(Error::Other("Failed to aggregate signatures")),
         }
     }
@@ -338,9 +329,7 @@ impl PegInConfirmTransaction {
         let spend_info = connector_z.generate_taproot_spend_info();
         let tx_mut = self.tx_mut();
         // Push signature to witness
-        tx_mut.input[input_index]
-            .witness
-            .push(input_0_sig.serialize());
+        tx_mut.input[input_index].witness.push(input_0_sig.serialize());
 
         // Push script + control block
         push_taproot_leaf_script_and_control_block_to_witness(

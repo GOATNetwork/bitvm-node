@@ -16,8 +16,7 @@ pub fn serialize_proof(proof: ark_groth16::Proof<Bn254>) -> Vec<u8> {
 }
 pub fn serialize_vk(vk: ark_groth16::VerifyingKey<Bn254>) -> Vec<u8> {
     let mut vk_sered = vec![0; vk.serialized_size(Compress::Yes)];
-    vk.serialize_with_mode(&mut vk_sered[..], Compress::Yes)
-        .expect("fail to serialize vk");
+    vk.serialize_with_mode(&mut vk_sered[..], Compress::Yes).expect("fail to serialize vk");
     vk_sered
 }
 pub fn serialize_pubin(pubin: Vec<ark_bn254::Fr>) -> Vec<u8> {
@@ -94,9 +93,7 @@ fn verify_zkm2_proof() {
     fn get_pubkeys(secret_key: Vec<String>) -> PublicKeys {
         let mut pubins = vec![];
         for secret in secret_key.iter().take(NUM_PUBS) {
-            pubins.push(Wots32::generate_public_key(&Wots32::secret_from_str(
-                secret.as_str(),
-            )));
+            pubins.push(Wots32::generate_public_key(&Wots32::secret_from_str(secret.as_str())));
         }
         let mut fq_arr = vec![];
         for i in 0..NUM_U256 {
@@ -112,11 +109,8 @@ fn verify_zkm2_proof() {
             ));
             h_arr.push(p160);
         }
-        let wotspubkey: PublicKeys = (
-            pubins.try_into().unwrap(),
-            fq_arr.try_into().unwrap(),
-            h_arr.try_into().unwrap(),
-        );
+        let wotspubkey: PublicKeys =
+            (pubins.try_into().unwrap(), fq_arr.try_into().unwrap(), h_arr.try_into().unwrap());
         wotspubkey
     }
 
@@ -143,23 +137,15 @@ fn verify_zkm2_proof() {
     let disprove_scripts = api_generate_full_tapscripts(pubkeys, &partial_scripts);
 
     println!("STEP 2 GENERATE SIGNED ASSERTIONS");
-    let proof_sigs = generate_signatures(
-        ark_proof,
-        ark_public_inputs.to_vec(),
-        &ark_vkey,
-        secrets.clone(),
-    )
-    .unwrap();
+    let proof_sigs =
+        generate_signatures(ark_proof, ark_public_inputs.to_vec(), &ark_vkey, secrets.clone())
+            .unwrap();
     println!("num assertion; 256-bit numbers {}", NUM_PUBS + NUM_U256);
     println!("num assertion; 160-bit numbers {}", NUM_HASH);
 
     println!("STEP 3 VALIDATE SIGNED ASSERTIONS");
-    let validate_res = validate_assertions(
-        &ark_vkey,
-        proof_sigs,
-        pubkeys,
-        &disprove_scripts.try_into().unwrap(),
-    );
+    let validate_res =
+        validate_assertions(&ark_vkey, proof_sigs, pubkeys, &disprove_scripts.try_into().unwrap());
     assert!(validate_res.is_none());
 }
 

@@ -26,10 +26,7 @@ pub fn generate_p2wsh_schnorr_signature(
 
     let signature = keypair.secret_key().sign_ecdsa(Message::from(sighash));
 
-    bitcoin::ecdsa::Signature {
-        signature,
-        sighash_type,
-    }
+    bitcoin::ecdsa::Signature { signature, sighash_type }
 }
 
 pub fn push_p2wsh_signature_to_witness(
@@ -43,9 +40,7 @@ pub fn push_p2wsh_signature_to_witness(
     let signature =
         generate_p2wsh_schnorr_signature(tx, input_index, sighash_type, script, value, keypair);
 
-    tx.input[input_index]
-        .witness
-        .push_ecdsa_signature(&signature);
+    tx.input[input_index].witness.push_ecdsa_signature(&signature);
 }
 
 pub fn push_p2wsh_script_to_witness(tx: &mut Transaction, input_index: usize, script: &Script) {
@@ -73,9 +68,7 @@ pub fn populate_p2wsh_witness_with_signatures(
     signatures: &Vec<bitcoin::ecdsa::Signature>,
 ) {
     for signature in signatures {
-        tx.input[input_index]
-            .witness
-            .push_ecdsa_signature(signature);
+        tx.input[input_index].witness.push_ecdsa_signature(signature);
     }
     push_p2wsh_script_to_witness(tx, input_index, script);
 }
@@ -102,10 +95,7 @@ pub fn generate_p2wpkh_schnorr_signature(
 
     let signature = keypair.secret_key().sign_ecdsa(Message::from(sighash));
 
-    bitcoin::ecdsa::Signature {
-        signature,
-        sighash_type,
-    }
+    bitcoin::ecdsa::Signature { signature, sighash_type }
 }
 
 pub fn push_p2wpkh_signature_to_witness(
@@ -127,9 +117,7 @@ pub fn push_p2wpkh_signature_to_witness(
         keypair,
     );
 
-    tx.input[input_index]
-        .witness
-        .push_ecdsa_signature(&signature);
+    tx.input[input_index].witness.push_ecdsa_signature(&signature);
 }
 
 pub fn push_p2wpkh_public_key_to_witness(
@@ -198,10 +186,7 @@ pub fn generate_taproot_leaf_schnorr_signature(
     // let signature = keypair.sign_schnorr_no_aux_rand(&Message::from(sighash));
     let signature = SECP256K1.sign_schnorr_no_aux_rand(&Message::from(sighash), keypair);
 
-    bitcoin::taproot::Signature {
-        signature,
-        sighash_type,
-    }
+    bitcoin::taproot::Signature { signature, sighash_type }
 }
 
 pub fn push_taproot_leaf_unlock_data_to_witness(
@@ -226,17 +211,12 @@ pub fn push_taproot_leaf_script_and_control_block_to_witness(
 ) {
     let prevout_leaf = (ScriptBuf::from(script), LeafVersion::TapScript);
 
-    let control_block = taproot_spend_info
-        .control_block(&prevout_leaf)
-        .expect("Unable to create Control block");
+    let control_block =
+        taproot_spend_info.control_block(&prevout_leaf).expect("Unable to create Control block");
 
-    tx.input[input_index]
-        .witness
-        .push(prevout_leaf.0.to_bytes());
+    tx.input[input_index].witness.push(prevout_leaf.0.to_bytes());
 
-    tx.input[input_index]
-        .witness
-        .push(control_block.serialize());
+    tx.input[input_index].witness.push(control_block.serialize());
 }
 
 /// Use this function to populate taproot input witness for
@@ -274,9 +254,8 @@ pub fn populate_taproot_txin_witness(
 
     // push script and control block
     let prevout_leaf = (ScriptBuf::from(script), LeafVersion::TapScript);
-    let control_block = taproot_spend_info
-        .control_block(&prevout_leaf)
-        .expect("Unable to create Control block");
+    let control_block =
+        taproot_spend_info.control_block(&prevout_leaf).expect("Unable to create Control block");
     txin.witness.push(prevout_leaf.0.to_bytes());
     txin.witness.push(control_block.serialize());
 }
@@ -358,10 +337,7 @@ fn generate_p2tr_key_spend_schnorr_signature(
     let signature =
         SECP256K1.sign_schnorr_no_aux_rand(&Message::from(sighash), &tweak_keypair.to_keypair());
 
-    bitcoin::taproot::Signature {
-        signature,
-        sighash_type,
-    }
+    bitcoin::taproot::Signature { signature, sighash_type }
 }
 
 pub fn populate_p2tr_key_spend_witness(

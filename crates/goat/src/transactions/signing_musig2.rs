@@ -63,10 +63,7 @@ pub fn generate_taproot_partial_signature(
     sighash_type: TapSighashType,
 ) -> Result<MaybeScalar, SigningError> {
     let pubkeys: Vec<Point> = Vec::from_iter(
-        context
-            .n_of_n_public_keys
-            .iter()
-            .map(|&public_key| public_key.inner.into()),
+        context.n_of_n_public_keys.iter().map(|&public_key| public_key.inner.into()),
     ); // TODO: The tests will reveal whether this conversion works as expected.
     let key_agg_ctx = KeyAggContext::new(pubkeys).unwrap();
 
@@ -93,10 +90,7 @@ pub fn generate_taproot_aggregated_signature(
     partial_signatures: Vec<PartialSignature>,
 ) -> Result<LiftedSignature, VerifyError> {
     let pubkeys: Vec<Point> = Vec::from_iter(
-        context
-            .n_of_n_public_keys()
-            .iter()
-            .map(|&public_key| public_key.inner.into()),
+        context.n_of_n_public_keys().iter().map(|&public_key| public_key.inner.into()),
     );
     let key_agg_ctx = KeyAggContext::new(pubkeys).unwrap();
 
@@ -104,10 +98,5 @@ pub fn generate_taproot_aggregated_signature(
     let sighash_cache =
         taproot_script_spend_sighash(tx, input_index, prevouts, leaf_hash, sighash_type);
 
-    aggregate_partial_signatures(
-        &key_agg_ctx,
-        aggregated_nonce,
-        partial_signatures,
-        sighash_cache,
-    )
+    aggregate_partial_signatures(&key_agg_ctx, aggregated_nonce, partial_signatures, sighash_cache)
 }

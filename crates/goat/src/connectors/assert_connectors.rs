@@ -91,10 +91,7 @@ impl TaprootConnector for VerifierConnector {
     }
 
     fn generate_taproot_address(&self) -> Address {
-        Address::p2tr_tweaked(
-            self.generate_taproot_spend_info().output_key(),
-            self.network,
-        )
+        Address::p2tr_tweaked(self.generate_taproot_spend_info().output_key(), self.network)
     }
 }
 
@@ -112,10 +109,7 @@ impl ProverConnector {
         hashlocks: Vec<LabelHash>,
         timelock_config: &TimelockConfig,
     ) -> Self {
-        assert!(
-            !hashlocks.is_empty(),
-            "ProverConnector requires at least one hashlock"
-        );
+        assert!(!hashlocks.is_empty(), "ProverConnector requires at least one hashlock");
         ProverConnector {
             network,
             n_of_n_taproot_public_key,
@@ -172,9 +166,6 @@ impl TaprootConnector for ProverConnector {
     }
 
     fn generate_taproot_address(&self) -> Address {
-        Address::p2tr_tweaked(
-            self.generate_taproot_spend_info().output_key(),
-            self.network,
-        )
+        Address::p2tr_tweaked(self.generate_taproot_spend_info().output_key(), self.network)
     }
 }

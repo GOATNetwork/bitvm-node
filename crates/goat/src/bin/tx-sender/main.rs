@@ -30,10 +30,8 @@ fn read_txns(file: &str) -> Vec<SignedTransaction> {
 
     match parsed {
         Value::Array(arr) => {
-            let res: Vec<SignedTransaction> = arr
-                .into_iter()
-                .map(|item| serde_json::from_value(item).unwrap())
-                .collect();
+            let res: Vec<SignedTransaction> =
+                arr.into_iter().map(|item| serde_json::from_value(item).unwrap()).collect();
             res
         }
 

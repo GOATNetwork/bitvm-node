@@ -44,10 +44,7 @@ where
     let now = std::time::Instant::now();
     let encoded_data: Vec<u8> = zstd::stream::decode_all(compressed_data.as_slice())?;
     let decoded = bitcode::decode(&encoded_data).map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("bitcode error: {}", e),
-        )
+        std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bitcode error: {}", e))
     })?;
     let elapsed = now.elapsed();
     println!("Decoded cache in {} ms", elapsed.as_millis());
