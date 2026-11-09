@@ -2953,7 +2953,7 @@ dependencies = [
 [[package]]
 name = "bitvm"
 version = "0.1.0"
-source = "git+https://github.com/GOATNetwork/BitVM.git?branch=committee-force-skip#c24f6cc2fb99d61f38b082202c899cf368abdae6"
+source = "git+https://github.com/GOATNetwork/BitVM.git?branch=gc-v2#bab46c2336ad98513bcb8cbaff21b5506a4dcd9a"
 dependencies = [
  "ark-bn254",
  "ark-crypto-primitives",
@@ -2995,7 +2995,7 @@ dependencies = [
  "bincode",
  "bitcoin",
  "bitcoin-script",
- "bitvm 0.1.0 (git+https://github.com/GOATNetwork/BitVM.git?branch=committee-force-skip)",
+ "bitvm 0.1.0 (git+https://github.com/GOATNetwork/BitVM.git?branch=gc-v2)",
  "chacha20poly1305",
  "clap",
  "esplora-client",
@@ -3041,7 +3041,7 @@ dependencies = [
  "bitcoin",
  "bitcoin-light-client-circuit",
  "bitcoin-script",
- "bitvm 0.1.0 (git+https://github.com/GOATNetwork/BitVM.git?branch=committee-force-skip)",
+ "bitvm 0.1.0 (git+https://github.com/GOATNetwork/BitVM.git?branch=gc-v2)",
  "bitvm-gc",
  "blake3",
  "borsh",
@@ -5341,7 +5341,6 @@ dependencies = [
 [[package]]
 name = "goat"
 version = "0.1.0"
-source = "git+https://github.com/GOATNetwork/BitVM.git?branch=committee-force-skip#c24f6cc2fb99d61f38b082202c899cf368abdae6"
 dependencies = [
  "ark-bn254",
  "ark-crypto-primitives",
@@ -5356,7 +5355,7 @@ dependencies = [
  "bitcoin",
  "bitcoin-script",
  "bitcoin-scriptexec",
- "bitvm 0.1.0 (git+https://github.com/GOATNetwork/BitVM.git?branch=committee-force-skip)",
+ "bitvm 0.1.0 (git+https://github.com/GOATNetwork/BitVM.git?branch=gc-v2)",
  "blake3",
  "clap",
  "colored",
