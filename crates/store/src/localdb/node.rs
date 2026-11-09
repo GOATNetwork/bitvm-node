@@ -164,6 +164,8 @@ impl StorageProcessor<'_> {
         Ok(res.rows_affected())
     }
 
+    /// Stores `reward` as the node's new total; the caller has already added
+    /// the increment.
     // Do not update the `updated_at` field; this field is updated based on heartbeat messages
     // and is used to determine whether a node is alive.
     pub async fn update_node_reward_by_peer_id(
@@ -171,7 +173,7 @@ impl StorageProcessor<'_> {
         peer_id: &str,
         reward: &str,
     ) -> anyhow::Result<()> {
-        sqlx::query!(r#"UPDATE node SET reward = reward + ? WHERE peer_id = ?"#, reward, peer_id)
+        sqlx::query!(r#"UPDATE node SET reward = ? WHERE peer_id = ?"#, reward, peer_id)
             .execute(self.conn())
             .await?;
         Ok(())
