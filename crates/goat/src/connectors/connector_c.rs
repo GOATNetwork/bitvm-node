@@ -79,9 +79,7 @@ impl ConnectorC {
     pub fn extract_leaf_1_raw_witness(&self, txin: &TxIn) -> Result<RawWitness, Error> {
         let witness = txin.witness.to_vec();
         if witness.len() != PROVER_SIG_LEN + 4 {
-            return Err(Error::Other(
-                "Invalid witness length for Connector-C leaf 1.",
-            ));
+            return Err(Error::Other("Invalid witness length for Connector-C leaf 1."));
         }
         Ok(remove_script_and_control_block_from_witness(witness))
     }
@@ -115,9 +113,6 @@ impl TaprootConnector for ConnectorC {
     }
 
     fn generate_taproot_address(&self) -> Address {
-        Address::p2tr_tweaked(
-            self.generate_taproot_spend_info().output_key(),
-            self.network,
-        )
+        Address::p2tr_tweaked(self.generate_taproot_spend_info().output_key(), self.network)
     }
 }

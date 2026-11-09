@@ -90,9 +90,8 @@ pub trait PreSignedMusig2Transaction: PreSignedTransaction {
             musig2_nonce_signatures.insert(input_index, HashMap::new());
         }
 
-        let nonce_signature = context
-            .committee_keypair
-            .sign_schnorr(get_nonce_message(&secret_nonce.public_nonce()));
+        let nonce_signature =
+            context.committee_keypair.sign_schnorr(get_nonce_message(&secret_nonce.public_nonce()));
 
         musig2_nonce_signatures
             .get_mut(&input_index)
@@ -127,10 +126,7 @@ pub trait PreSignedMusig2Transaction: PreSignedTransaction {
             if musig2_nonces.get(&index).is_none() {
                 musig2_nonces.insert(index, HashMap::new());
             }
-            musig2_nonces
-                .get_mut(&index)
-                .unwrap()
-                .insert(*verifier_pubkey, pub_nonce.clone());
+            musig2_nonces.get_mut(&index).unwrap().insert(*verifier_pubkey, pub_nonce.clone());
 
             // push pub_nonce_signature
             let musig2_nonce_signatures = self.musig2_nonce_signatures_mut();
@@ -153,21 +149,14 @@ pub trait PreSignedMusig2Transaction: PreSignedTransaction {
         for index in self.verifier_inputs() {
             let partial_signature = match partial_sigs.get(&index) {
                 Some(v) => v,
-                _ => {
-                    return Some(Error::Other(
-                        "partial signature for {index}'th input not found",
-                    ))
-                }
+                _ => return Some(Error::Other("partial signature for {index}'th input not found")),
             };
 
             let musig2_signatures = self.musig2_signatures_mut();
             if musig2_signatures.get(&index).is_none() {
                 musig2_signatures.insert(index, HashMap::new());
             }
-            musig2_signatures
-                .get_mut(&index)
-                .unwrap()
-                .insert(*verifier_pubkey, *partial_signature);
+            musig2_signatures.get_mut(&index).unwrap().insert(*verifier_pubkey, *partial_signature);
         }
         None
     }
@@ -261,15 +250,10 @@ pub fn finalize_musig2_taproot_input<T: PreSignedTransaction + PreSignedMusig2Tr
     )
     .unwrap(); // TODO: Add error handling.
 
-    let final_signature = bitcoin::taproot::Signature {
-        signature: signature.into(),
-        sighash_type,
-    };
+    let final_signature = bitcoin::taproot::Signature { signature: signature.into(), sighash_type };
 
     // Push signature to witness
-    tx_mut.input[input_index]
-        .witness
-        .push(final_signature.serialize());
+    tx_mut.input[input_index].witness.push(final_signature.serialize());
 
     // Push script + control block
     push_taproot_leaf_script_and_control_block_to_witness(

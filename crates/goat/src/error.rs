@@ -12,11 +12,7 @@ pub struct NamedTx {
 
 impl NamedTx {
     pub fn for_tx(tx: &(impl BaseTransaction + PreSignedTransaction), confirmed: bool) -> Self {
-        Self {
-            txid: tx.tx().compute_txid(),
-            name: tx.name(),
-            confirmed,
-        }
+        Self { txid: tx.tx().compute_txid(), name: tx.name(), confirmed }
     }
 }
 

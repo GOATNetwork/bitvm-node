@@ -85,9 +85,7 @@ impl OperatorAssertTransaction {
         for verifier_connector in verifier_connectors {
             let assert_output = TxOut {
                 value: Amount::from_sat(verifier_assert_input_amount()),
-                script_pubkey: verifier_connector
-                    .generate_taproot_address()
-                    .script_pubkey(),
+                script_pubkey: verifier_connector.generate_taproot_address().script_pubkey(),
             };
             total_output_amount -= assert_output.value;
             txouts.push(assert_output);
@@ -147,26 +145,17 @@ impl OperatorAssertTransaction {
             return Err(Error::Other("verifier connector index out of bounds"));
         }
 
-        tx_output_input(
-            &self.tx,
-            output_topology::operator_assert::verifier_connector(index),
-        )
+        tx_output_input(&self.tx, output_topology::operator_assert::verifier_connector(index))
     }
 
     pub fn connector_d_input(&self) -> Result<Input, Error> {
         let verifier_num = output_topology::operator_assert::verifier_num(self.tx.output.len());
-        tx_output_input(
-            &self.tx,
-            output_topology::operator_assert::connector_d(verifier_num),
-        )
+        tx_output_input(&self.tx, output_topology::operator_assert::connector_d(verifier_num))
     }
 
     pub fn anchor_input(&self) -> Result<Input, Error> {
         let verifier_num = output_topology::operator_assert::verifier_num(self.tx.output.len());
-        tx_output_input(
-            &self.tx,
-            output_topology::operator_assert::anchor(verifier_num),
-        )
+        tx_output_input(&self.tx, output_topology::operator_assert::anchor(verifier_num))
     }
 }
 
@@ -236,9 +225,7 @@ impl VerifierAssertTransaction {
             },
             prev_outs: vec![TxOut {
                 value: input_0.amount,
-                script_pubkey: verifier_connector
-                    .generate_taproot_address()
-                    .script_pubkey(),
+                script_pubkey: verifier_connector.generate_taproot_address().script_pubkey(),
             }],
             prev_scripts: vec![verifier_connector.generate_taproot_leaf_script(input_0_leaf)],
         })
@@ -264,10 +251,7 @@ impl VerifierAssertTransaction {
     }
 
     pub fn prover_connector_input(&self) -> Result<Input, Error> {
-        tx_output_input(
-            &self.tx,
-            output_topology::verifier_assert::prover_connector(),
-        )
+        tx_output_input(&self.tx, output_topology::verifier_assert::prover_connector())
     }
 
     pub fn anchor_input(&self) -> Result<Input, Error> {
@@ -384,9 +368,7 @@ impl DisproveTransaction {
         let spend_info = prover_connector.generate_taproot_spend_info();
         let tx_mut = self.tx_mut();
         // Push signature to witness
-        tx_mut.input[input_index]
-            .witness
-            .push(input_0_sig.serialize());
+        tx_mut.input[input_index].witness.push(input_0_sig.serialize());
 
         // Push script + control block
         push_taproot_leaf_script_and_control_block_to_witness(
@@ -427,9 +409,7 @@ impl DisproveTransaction {
         let spend_info = connector_d.generate_taproot_spend_info();
         let tx_mut = self.tx_mut();
         // Push signature to witness
-        tx_mut.input[input_index]
-            .witness
-            .push(input_1_sig.serialize());
+        tx_mut.input[input_index].witness.push(input_1_sig.serialize());
 
         // Push script + control block
         push_taproot_leaf_script_and_control_block_to_witness(
@@ -478,10 +458,7 @@ impl DisproveTransaction {
                 sighash_type,
                 partial_signatures[sig_index].clone(),
             ) {
-                Ok(sig) => bitcoin::taproot::Signature {
-                    signature: sig.into(),
-                    sighash_type,
-                },
+                Ok(sig) => bitcoin::taproot::Signature { signature: sig.into(), sighash_type },
                 Err(_) => return Err(Error::Other("Failed to aggregate signatures")),
             };
         }
@@ -499,10 +476,7 @@ impl DisproveTransaction {
                 sighash_type,
                 partial_signatures[sig_index].clone(),
             ) {
-                Ok(sig) => bitcoin::taproot::Signature {
-                    signature: sig.into(),
-                    sighash_type,
-                },
+                Ok(sig) => bitcoin::taproot::Signature { signature: sig.into(), sighash_type },
                 Err(_) => return Err(Error::Other("Failed to aggregate signatures")),
             };
         }
@@ -575,14 +549,10 @@ pub fn pubin_disprove(
         connector_d.generate_taproot_leaf_script(CONNECTOR_D_PUBIN_DISPROVE_LEAF_INDEX);
     let mut txin = connector_d
         .generate_taproot_leaf_tx_in(CONNECTOR_D_PUBIN_DISPROVE_LEAF_INDEX, connector_d_input);
-    input_script_witness
-        .into_iter()
-        .for_each(|witness_item| txin.witness.push(witness_item));
+    input_script_witness.into_iter().for_each(|witness_item| txin.witness.push(witness_item));
 
     let prevout_leaf = (input_lock_script, LeafVersion::TapScript);
-    let control_block = match connector_d
-        .generate_taproot_spend_info()
-        .control_block(&prevout_leaf)
+    let control_block = match connector_d.generate_taproot_spend_info().control_block(&prevout_leaf)
     {
         Some(control_block) => control_block,
         None => {
@@ -610,9 +580,7 @@ pub fn wrongly_challenged(
     let verification_script = witness_script.push_script(script.clone());
     let exec_result = execute_script(verification_script);
     if !exec_result.success {
-        return Err(Error::Other(
-            "Invalid hashlock preimage for ProverConnector.",
-        ));
+        return Err(Error::Other("Invalid hashlock preimage for ProverConnector."));
     }
 
     let mut txin = prover_connector.generate_taproot_leaf_tx_in(leaf_index, input_0);

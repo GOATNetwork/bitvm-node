@@ -70,9 +70,7 @@ pub fn extract_operator_preimage_from_ack_txin(ack_txin: &TxIn) -> Result<Vec<u8
         .witness
         .nth(0)
         .map(|w| w.to_vec())
-        .ok_or(Error::Other(
-            "Unable to extract preimage from ACK txin witness",
-        ))
+        .ok_or(Error::Other("Unable to extract preimage from ACK txin witness"))
 }
 
 pub fn watchtower_challenge(
@@ -101,10 +99,7 @@ pub fn watchtower_challenge(
     );
 
     let commitment_outputs = generate_data_commitment_outputs(commitment);
-    let commitment_amounts = commitment_outputs
-        .iter()
-        .map(|out| out.value)
-        .sum::<Amount>();
+    let commitment_amounts = commitment_outputs.iter().map(|out| out.value).sum::<Amount>();
 
     if total_input_amount < fee_amount + commitment_amounts {
         return Err(Error::Transaction(InsufficientInputAmount));
@@ -114,10 +109,7 @@ pub fn watchtower_challenge(
     let change_amount = total_output_amount - commitment_amounts;
     let mut txouts = commitment_outputs;
     if change_amount >= Amount::from_sat(DUST_AMOUNT) {
-        txouts.push(TxOut {
-            value: change_amount,
-            script_pubkey: change_address.script_pubkey(),
-        });
+        txouts.push(TxOut { value: change_amount, script_pubkey: change_address.script_pubkey() });
     };
 
     let mut tx = Transaction {
@@ -130,9 +122,7 @@ pub fn watchtower_challenge(
     let input_index = 0;
     let prev_outs = vec![TxOut {
         value: input_0.amount,
-        script_pubkey: watchtower_challenge_connector
-            .generate_taproot_address()
-            .script_pubkey(),
+        script_pubkey: watchtower_challenge_connector.generate_taproot_address().script_pubkey(),
     }];
     let script = watchtower_challenge_connector.generate_taproot_leaf_script(input_0_leaf);
     populate_taproot_input_witness_default(
@@ -185,18 +175,14 @@ impl WatchtowerChallengeInitTransaction {
         input_0: Input,
     ) -> Result<Self, Error> {
         if watchtower_challenge_connectors.len() != ack_connectors.len() {
-            return Err(Error::Other(
-                "watchtower challenge and ACK connector counts differ",
-            ));
+            return Err(Error::Other("watchtower challenge and ACK connector counts differ"));
         }
 
         let input_0_leaf = 0;
         let _input_0 = connector_b.generate_taproot_leaf_tx_in(input_0_leaf, &input_0);
 
         if input_0.amount
-            < Amount::from_sat(max_watchtower_challenge_cost(
-                watchtower_challenge_connectors.len(),
-            ))
+            < Amount::from_sat(max_watchtower_challenge_cost(watchtower_challenge_connectors.len()))
         {
             return Err(Error::Transaction(InsufficientInputAmount));
         }
@@ -206,9 +192,8 @@ impl WatchtowerChallengeInitTransaction {
                 watchtower_challenge_connectors.len(),
             ));
         let mut txouts = vec![];
-        for (watchtower_challenge_connector, ack_connector) in watchtower_challenge_connectors
-            .iter()
-            .zip(ack_connectors.iter())
+        for (watchtower_challenge_connector, ack_connector) in
+            watchtower_challenge_connectors.iter().zip(ack_connectors.iter())
         {
             let challenge_output = TxOut {
                 value: Amount::from_sat(watchtower_challenge_connector_output_amount()),
@@ -284,10 +269,7 @@ impl WatchtowerChallengeInitTransaction {
         if index >= watchtower_num {
             return Err(Error::Other("ACK connector index out of bounds"));
         }
-        tx_output_input(
-            &self.tx,
-            output_topology::watchtower_challenge_init::ack_connector(index),
-        )
+        tx_output_input(&self.tx, output_topology::watchtower_challenge_init::ack_connector(index))
     }
 
     pub fn connector_e_input(&self) -> Result<Input, Error> {
@@ -439,9 +421,7 @@ impl WatchtowerChallengeTimeoutTransaction {
         let script = self.prev_scripts()[input_index].clone();
         let spend_info = ack_connector.generate_taproot_spend_info();
         let tx_mut = self.tx_mut();
-        tx_mut.input[input_index]
-            .witness
-            .push(input_1_sig.serialize());
+        tx_mut.input[input_index].witness.push(input_1_sig.serialize());
         push_taproot_leaf_script_and_control_block_to_witness(
             tx_mut,
             input_index,
@@ -457,10 +437,7 @@ impl WatchtowerChallengeTimeoutTransaction {
         agg_nonces: &[AggNonce; 1],
     ) -> Result<[PartialSignature; 1], SigningError> {
         let input_1_sig = self.sign_input_1_musig2(context, &sec_nonces[0], &agg_nonces[0]);
-        match [input_1_sig]
-            .into_iter()
-            .collect::<Result<Vec<PartialSignature>, SigningError>>()
-        {
+        match [input_1_sig].into_iter().collect::<Result<Vec<PartialSignature>, SigningError>>() {
             Ok(sigs) => Ok(sigs.try_into().unwrap()),
             Err(e) => Err(e),
         }
@@ -485,10 +462,7 @@ impl WatchtowerChallengeTimeoutTransaction {
             sighash_type,
             partial_signatures[sig_index].clone(),
         ) {
-            Ok(sig) => bitcoin::taproot::Signature {
-                signature: sig.into(),
-                sighash_type,
-            },
+            Ok(sig) => bitcoin::taproot::Signature { signature: sig.into(), sighash_type },
             Err(_) => return Err(Error::Other("Failed to aggregate signatures")),
         };
         Ok([input_1_sig])
@@ -605,9 +579,7 @@ impl OperatorChallengeNackTransaction {
     ) {
         let script = self.prev_scripts()[input_index].clone();
         let tx_mut = self.tx_mut();
-        tx_mut.input[input_index]
-            .witness
-            .push(input_sig.serialize());
+        tx_mut.input[input_index].witness.push(input_sig.serialize());
         push_taproot_leaf_script_and_control_block_to_witness(
             tx_mut,
             input_index,
@@ -652,10 +624,7 @@ impl OperatorChallengeNackTransaction {
                 sighash_type,
                 partial_signatures[input_index].clone(),
             ) {
-                Ok(sig) => bitcoin::taproot::Signature {
-                    signature: sig.into(),
-                    sighash_type,
-                },
+                Ok(sig) => bitcoin::taproot::Signature { signature: sig.into(), sighash_type },
                 Err(_) => return Err(Error::Other("Failed to aggregate signatures")),
             };
             pre_sigs.push(sig);
@@ -776,9 +745,7 @@ impl OperatorCommitTimeoutTransaction {
     ) {
         let script = self.prev_scripts()[input_index].clone();
         let tx_mut = self.tx_mut();
-        tx_mut.input[input_index]
-            .witness
-            .push(input_sig.serialize());
+        tx_mut.input[input_index].witness.push(input_sig.serialize());
         push_taproot_leaf_script_and_control_block_to_witness(
             tx_mut,
             input_index,
@@ -823,10 +790,7 @@ impl OperatorCommitTimeoutTransaction {
                 sighash_type,
                 partial_signatures[input_index].clone(),
             ) {
-                Ok(sig) => bitcoin::taproot::Signature {
-                    signature: sig.into(),
-                    sighash_type,
-                },
+                Ok(sig) => bitcoin::taproot::Signature { signature: sig.into(), sighash_type },
                 Err(_) => return Err(Error::Other("Failed to aggregate signatures")),
             };
             pre_sigs.push(sig);

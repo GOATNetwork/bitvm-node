@@ -113,9 +113,7 @@ impl Take2Transaction {
                 },
                 TxOut {
                     value: input_3.amount,
-                    script_pubkey: guardian_connector
-                        .generate_taproot_address()
-                        .script_pubkey(),
+                    script_pubkey: guardian_connector.generate_taproot_address().script_pubkey(),
                 },
             ],
             prev_scripts: vec![
@@ -157,9 +155,7 @@ impl Take2Transaction {
         let spend_info = connector_0.generate_taproot_spend_info();
         let tx_mut = self.tx_mut();
         // Push signature to witness
-        tx_mut.input[input_index]
-            .witness
-            .push(input_0_sig.serialize());
+        tx_mut.input[input_index].witness.push(input_0_sig.serialize());
 
         // Push script + control block
         push_taproot_leaf_script_and_control_block_to_witness(
@@ -177,10 +173,7 @@ impl Take2Transaction {
         agg_nonces: &[AggNonce; 1],
     ) -> Result<[PartialSignature; 1], SigningError> {
         let input_0_sig = self.sign_input_0_musig2(context, &sec_nonces[0], &agg_nonces[0]);
-        match [input_0_sig]
-            .into_iter()
-            .collect::<Result<Vec<PartialSignature>, SigningError>>()
-        {
+        match [input_0_sig].into_iter().collect::<Result<Vec<PartialSignature>, SigningError>>() {
             Ok(sigs) => Ok(sigs.try_into().unwrap()),
             Err(e) => Err(e),
         }
@@ -205,10 +198,7 @@ impl Take2Transaction {
             sighash_type,
             partial_signatures[sig_index].clone(),
         ) {
-            Ok(sig) => bitcoin::taproot::Signature {
-                signature: sig.into(),
-                sighash_type,
-            },
+            Ok(sig) => bitcoin::taproot::Signature { signature: sig.into(), sighash_type },
             Err(_) => return Err(Error::Other("Failed to aggregate signatures")),
         };
         Ok([input_0_sig])

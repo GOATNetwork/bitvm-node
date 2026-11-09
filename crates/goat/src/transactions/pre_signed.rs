@@ -26,14 +26,7 @@ pub fn pre_sign_p2wsh_input<T: PreSignedTransaction>(
     let script = &tx.prev_scripts()[input_index].clone();
     let value = tx.prev_outs()[input_index].value;
 
-    populate_p2wsh_witness(
-        tx.tx_mut(),
-        input_index,
-        sighash_type,
-        script,
-        value,
-        keypairs,
-    );
+    populate_p2wsh_witness(tx.tx_mut(), input_index, sighash_type, script, value, keypairs);
 }
 
 pub fn pre_sign_p2wpkh_input<T: PreSignedTransaction>(

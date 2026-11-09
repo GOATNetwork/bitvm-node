@@ -18,10 +18,7 @@ pub struct GuardianConnector {
 
 impl GuardianConnector {
     pub fn new(network: Network, operator_taproot_public_key: &XOnlyPublicKey) -> Self {
-        GuardianConnector {
-            network,
-            operator_taproot_public_key: *operator_taproot_public_key,
-        }
+        GuardianConnector { network, operator_taproot_public_key: *operator_taproot_public_key }
     }
 
     fn generate_taproot_leaf_0_script(&self) -> ScriptBuf {
@@ -57,10 +54,7 @@ impl TaprootConnector for GuardianConnector {
     }
 
     fn generate_taproot_address(&self) -> Address {
-        Address::p2tr_tweaked(
-            self.generate_taproot_spend_info().output_key(),
-            self.network,
-        )
+        Address::p2tr_tweaked(self.generate_taproot_spend_info().output_key(), self.network)
     }
 }
 
@@ -72,10 +66,7 @@ pub struct PrekickoffConnector {
 
 impl PrekickoffConnector {
     pub fn new(network: Network, operator_taproot_public_key: &XOnlyPublicKey) -> Self {
-        PrekickoffConnector {
-            network,
-            operator_taproot_public_key: *operator_taproot_public_key,
-        }
+        PrekickoffConnector { network, operator_taproot_public_key: *operator_taproot_public_key }
     }
 
     fn generate_taproot_leaf_0_script(&self) -> ScriptBuf {
@@ -111,10 +102,7 @@ impl TaprootConnector for PrekickoffConnector {
     }
 
     fn generate_taproot_address(&self) -> Address {
-        Address::p2tr_tweaked(
-            self.generate_taproot_spend_info().output_key(),
-            self.network,
-        )
+        Address::p2tr_tweaked(self.generate_taproot_spend_info().output_key(), self.network)
     }
 }
 
@@ -126,10 +114,7 @@ pub struct KickoffConnector {
 
 impl KickoffConnector {
     pub fn new(network: Network, operator_taproot_public_key: &XOnlyPublicKey) -> Self {
-        KickoffConnector {
-            network,
-            operator_taproot_public_key: *operator_taproot_public_key,
-        }
+        KickoffConnector { network, operator_taproot_public_key: *operator_taproot_public_key }
     }
 
     fn generate_taproot_leaf_0_script(&self) -> ScriptBuf {
@@ -165,10 +150,7 @@ impl TaprootConnector for KickoffConnector {
     }
 
     fn generate_taproot_address(&self) -> Address {
-        Address::p2tr_tweaked(
-            self.generate_taproot_spend_info().output_key(),
-            self.network,
-        )
+        Address::p2tr_tweaked(self.generate_taproot_spend_info().output_key(), self.network)
     }
 }
 
@@ -183,10 +165,7 @@ pub struct ForceSkipConnector {
 
 impl ForceSkipConnector {
     pub fn new(network: Network, n_of_n_taproot_public_key: &XOnlyPublicKey) -> Self {
-        ForceSkipConnector {
-            network,
-            n_of_n_taproot_public_key: *n_of_n_taproot_public_key,
-        }
+        ForceSkipConnector { network, n_of_n_taproot_public_key: *n_of_n_taproot_public_key }
     }
 
     fn generate_taproot_leaf_0_script(&self) -> ScriptBuf {
@@ -222,9 +201,6 @@ impl TaprootConnector for ForceSkipConnector {
     }
 
     fn generate_taproot_address(&self) -> Address {
-        Address::p2tr_tweaked(
-            self.generate_taproot_spend_info().output_key(),
-            self.network,
-        )
+        Address::p2tr_tweaked(self.generate_taproot_spend_info().output_key(), self.network)
     }
 }

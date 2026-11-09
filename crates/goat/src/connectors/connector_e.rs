@@ -77,18 +77,16 @@ impl ConnectorE {
         let exec_result = execute_script(verification_script);
         match exec_result.success {
             true => Ok(witness.to_vec()),
-            false => Err(Error::Other(
-                "Invalid operator-commit-pubin WOTS secret-key for Connector-E.",
-            )),
+            false => {
+                Err(Error::Other("Invalid operator-commit-pubin WOTS secret-key for Connector-E."))
+            }
         }
     }
 
     pub fn extract_leaf_0_raw_witness(&self, txin: &TxIn) -> Result<RawWitness, Error> {
         let witness = txin.witness.to_vec();
         if witness.len() != PROVER_SIG_LEN + 2 {
-            return Err(Error::Other(
-                "Invalid witness length for Connector-E leaf 0.",
-            ));
+            return Err(Error::Other("Invalid witness length for Connector-E leaf 0."));
         }
         Ok(remove_script_and_control_block_from_witness(witness))
     }
@@ -122,9 +120,6 @@ impl TaprootConnector for ConnectorE {
     }
 
     fn generate_taproot_address(&self) -> Address {
-        Address::p2tr_tweaked(
-            self.generate_taproot_spend_info().output_key(),
-            self.network,
-        )
+        Address::p2tr_tweaked(self.generate_taproot_spend_info().output_key(), self.network)
     }
 }

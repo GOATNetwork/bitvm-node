@@ -75,9 +75,7 @@ impl KickoffTransaction {
         };
         let output_3 = TxOut {
             value: Amount::from_sat(DUST_AMOUNT),
-            script_pubkey: guardian_connector
-                .generate_taproot_address()
-                .script_pubkey(),
+            script_pubkey: guardian_connector.generate_taproot_address().script_pubkey(),
         };
         let anchor_output = p2a_output();
         let output_2 = TxOut {

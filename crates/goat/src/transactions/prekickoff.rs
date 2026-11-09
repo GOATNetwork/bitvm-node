@@ -113,10 +113,8 @@ impl PrekickoffTransaction {
         verifier_num: usize,
     ) -> Result<Self, Error> {
         let mut input_amounts = vec![input_0.amount];
-        let replenish_fee_input_amounts: Vec<Amount> = replenish_fee_inputs
-            .iter()
-            .map(|input| input.amount)
-            .collect();
+        let replenish_fee_input_amounts: Vec<Amount> =
+            replenish_fee_inputs.iter().map(|input| input.amount).collect();
         input_amounts.extend(replenish_fee_input_amounts);
 
         let input_0_leaf = 0;
@@ -148,9 +146,7 @@ impl PrekickoffTransaction {
         let total_output_amount = total_input_amount - Amount::from_sat(fee_amount);
         let output_0 = TxOut {
             value: Amount::from_sat(DUST_AMOUNT),
-            script_pubkey: force_skip_connector
-                .generate_taproot_address()
-                .script_pubkey(),
+            script_pubkey: force_skip_connector.generate_taproot_address().script_pubkey(),
         };
         let output_1 = TxOut {
             value: Amount::from_sat(max_pegout_cost(watchtower_num, verifier_num)),
@@ -159,16 +155,12 @@ impl PrekickoffTransaction {
         let output_3 = p2a_output();
         let output_2 = TxOut {
             value: total_output_amount - output_0.value - output_1.value - output_3.value,
-            script_pubkey: prekickoff_connector
-                .generate_taproot_address()
-                .script_pubkey(),
+            script_pubkey: prekickoff_connector.generate_taproot_address().script_pubkey(),
         };
 
         let mut prev_outs = vec![TxOut {
             value: input_0.amount,
-            script_pubkey: prev_prekickoff_connector
-                .generate_taproot_address()
-                .script_pubkey(),
+            script_pubkey: prev_prekickoff_connector.generate_taproot_address().script_pubkey(),
         }];
         prev_outs.extend(replenish_fee_prev_outs);
 
@@ -205,10 +197,7 @@ impl PrekickoffTransaction {
     }
 
     pub fn force_skip_connector_input(&self) -> Result<Input, Error> {
-        tx_output_input(
-            &self.tx,
-            output_topology::prekickoff::force_skip_connector(),
-        )
+        tx_output_input(&self.tx, output_topology::prekickoff::force_skip_connector())
     }
 
     pub fn kickoff_connector_input(&self) -> Result<Input, Error> {
@@ -216,10 +205,7 @@ impl PrekickoffTransaction {
     }
 
     pub fn prekickoff_connector_input(&self) -> Result<Input, Error> {
-        tx_output_input(
-            &self.tx,
-            output_topology::prekickoff::prekickoff_connector(),
-        )
+        tx_output_input(&self.tx, output_topology::prekickoff::prekickoff_connector())
     }
 
     pub fn anchor_input(&self) -> Result<Input, Error> {
@@ -363,9 +349,7 @@ impl ForceSkipKickoffTransaction {
         let script = self.prev_scripts()[input_index].clone();
         let spend_info = next_force_skip_connector.generate_taproot_spend_info();
         let tx_mut = self.tx_mut();
-        tx_mut.input[input_index]
-            .witness
-            .push(input_1_sig.serialize());
+        tx_mut.input[input_index].witness.push(input_1_sig.serialize());
         push_taproot_leaf_script_and_control_block_to_witness(
             tx_mut,
             input_index,
@@ -381,10 +365,7 @@ impl ForceSkipKickoffTransaction {
         agg_nonces: &[AggNonce; 1],
     ) -> Result<[PartialSignature; 1], SigningError> {
         let input_1_sig = self.sign_input_1_musig2(context, &sec_nonces[0], &agg_nonces[0]);
-        match [input_1_sig]
-            .into_iter()
-            .collect::<Result<Vec<PartialSignature>, SigningError>>()
-        {
+        match [input_1_sig].into_iter().collect::<Result<Vec<PartialSignature>, SigningError>>() {
             Ok(sigs) => Ok(sigs.try_into().unwrap()),
             Err(e) => Err(e),
         }
@@ -409,10 +390,7 @@ impl ForceSkipKickoffTransaction {
             sighash_type,
             partial_signatures[sig_index].clone(),
         ) {
-            Ok(sig) => bitcoin::taproot::Signature {
-                signature: sig.into(),
-                sighash_type,
-            },
+            Ok(sig) => bitcoin::taproot::Signature { signature: sig.into(), sighash_type },
             Err(_) => return Err(Error::Other("Failed to aggregate signatures")),
         };
         Ok([input_1_sig])
@@ -513,9 +491,7 @@ impl QuickChallengeTransaction {
             prev_outs: vec![
                 TxOut {
                     value: input_0.amount,
-                    script_pubkey: guardian_connector
-                        .generate_taproot_address()
-                        .script_pubkey(),
+                    script_pubkey: guardian_connector.generate_taproot_address().script_pubkey(),
                 },
                 TxOut {
                     value: input_1.amount,
@@ -575,9 +551,7 @@ impl QuickChallengeTransaction {
         let script = self.prev_scripts()[input_index].clone();
         let spend_info = next_force_skip_connector.generate_taproot_spend_info();
         let tx_mut = self.tx_mut();
-        tx_mut.input[input_index]
-            .witness
-            .push(input_1_sig.serialize());
+        tx_mut.input[input_index].witness.push(input_1_sig.serialize());
         push_taproot_leaf_script_and_control_block_to_witness(
             tx_mut,
             input_index,
@@ -593,10 +567,7 @@ impl QuickChallengeTransaction {
         agg_nonces: &[AggNonce; 1],
     ) -> Result<[PartialSignature; 1], SigningError> {
         let input_1_sig = self.sign_input_1_musig2(context, &sec_nonces[0], &agg_nonces[0]);
-        match [input_1_sig]
-            .into_iter()
-            .collect::<Result<Vec<PartialSignature>, SigningError>>()
-        {
+        match [input_1_sig].into_iter().collect::<Result<Vec<PartialSignature>, SigningError>>() {
             Ok(sigs) => Ok(sigs.try_into().unwrap()),
             Err(e) => Err(e),
         }
@@ -621,10 +592,7 @@ impl QuickChallengeTransaction {
             sighash_type,
             partial_signatures[sig_index].clone(),
         ) {
-            Ok(sig) => bitcoin::taproot::Signature {
-                signature: sig.into(),
-                sighash_type,
-            },
+            Ok(sig) => bitcoin::taproot::Signature { signature: sig.into(), sighash_type },
             Err(_) => return Err(Error::Other("Failed to aggregate signatures")),
         };
         Ok([input_1_sig])
@@ -725,9 +693,7 @@ impl ChallengeIncompleteKickoffTransaction {
             prev_outs: vec![
                 TxOut {
                     value: input_0.amount,
-                    script_pubkey: guardian_connector
-                        .generate_taproot_address()
-                        .script_pubkey(),
+                    script_pubkey: guardian_connector.generate_taproot_address().script_pubkey(),
                 },
                 TxOut {
                     value: input_1.amount,

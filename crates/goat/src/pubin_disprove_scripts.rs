@@ -1,6 +1,6 @@
 use crate::{
     assert_scripts::{
-        LabelHash, OPERATOR_ASSERT_X_D_INDEX, OperatorAssertPublicKey, OperatorCommitPubinPublicKey,
+        LabelHash, OperatorAssertPublicKey, OperatorCommitPubinPublicKey, OPERATOR_ASSERT_X_D_INDEX,
     },
     wots::{Wots, Wots96},
 };
@@ -350,10 +350,10 @@ fn zip_nibbles_bytes32() -> Script {
 mod tests {
     use super::*;
     use crate::{
-        assert_scripts::{OPERATOR_ASSERT_X_D_INDEX, label_hash},
+        assert_scripts::{label_hash, OPERATOR_ASSERT_X_D_INDEX},
         wots::Wots96,
     };
-    use bitvm::{FmtStack, execute_script};
+    use bitvm::{execute_script, FmtStack};
 
     fn guest_pubin(blockhash: &[u8; 32], constant: &[u8; 32], included_map: &[u8; 32]) -> [u8; 96] {
         let mut msg = [0u8; 96];
@@ -451,7 +451,11 @@ mod tests {
 
     fn stack_value_from_bottom(stack: &FmtStack, index_from_bottom: usize) -> u8 {
         let element = stack.get(index_from_bottom);
-        if element.is_empty() { 0 } else { element[0] }
+        if element.is_empty() {
+            0
+        } else {
+            element[0]
+        }
     }
 
     fn run_pubin_disprove(
@@ -496,10 +500,7 @@ mod tests {
         let guest_msg = guest_pubin(&blockhash, &constant, &included_map);
         let x_d = compute_guest_commitment(&guest_msg);
         let operator_assert_msg = operator_assert_pubin(&[0x33; 32], &[0x44; 32], &x_d);
-        let preimages = vec![
-            b"included-watchtower".to_vec(),
-            b"missing-watchtower".to_vec(),
-        ];
+        let preimages = vec![b"included-watchtower".to_vec(), b"missing-watchtower".to_vec()];
         let hashes = vec![label_hash(&preimages[0]), label_hash(&preimages[1])];
 
         assert!(!run_pubin_disprove(
@@ -562,9 +563,8 @@ mod tests {
         let guest_msg = guest_pubin(&blockhash, &constant, &included_map);
         let x_d = compute_guest_commitment(&guest_msg);
         let operator_assert_msg = operator_assert_pubin(&[0x33; 32], &[0x44; 32], &x_d);
-        let preimages = (0..10)
-            .map(|index| format!("watchtower-{index}").into_bytes())
-            .collect::<Vec<_>>();
+        let preimages =
+            (0..10).map(|index| format!("watchtower-{index}").into_bytes()).collect::<Vec<_>>();
         let hashes = preimages.iter().map(label_hash).collect::<Vec<_>>();
 
         assert!(run_pubin_disprove(

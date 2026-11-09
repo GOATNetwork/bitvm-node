@@ -32,10 +32,7 @@ fn label_hash_script() -> Script {
 }
 
 pub fn wrongly_challenged_hashlocks_script(hashlocks: &[LabelHash]) -> Script {
-    assert!(
-        !hashlocks.is_empty(),
-        "wrongly challenged script requires at least one hashlock"
-    );
+    assert!(!hashlocks.is_empty(), "wrongly challenged script requires at least one hashlock");
     script! {
         { label_hash_script() }
         { 0 }
@@ -108,11 +105,8 @@ mod tests {
 
     #[test]
     fn test_wrongly_challenged_script_accepts_any_hashlock_preimage() {
-        let labels = [
-            b"first preimage".to_vec(),
-            b"second preimage".to_vec(),
-            b"third preimage".to_vec(),
-        ];
+        let labels =
+            [b"first preimage".to_vec(), b"second preimage".to_vec(), b"third preimage".to_vec()];
         let hashlocks: Vec<LabelHash> = labels.iter().map(label_hash).collect();
 
         for label in labels {
@@ -128,11 +122,8 @@ mod tests {
 
     #[test]
     fn test_wrongly_challenged_script_rejects_unknown_preimage() {
-        let labels = [
-            b"first preimage".to_vec(),
-            b"second preimage".to_vec(),
-            b"third preimage".to_vec(),
-        ];
+        let labels =
+            [b"first preimage".to_vec(), b"second preimage".to_vec(), b"third preimage".to_vec()];
         let hashlocks: Vec<LabelHash> = labels.iter().map(label_hash).collect();
 
         let s = script! {
@@ -178,13 +169,7 @@ mod tests {
             false_label_hash: label_hash(&false_labels[i]),
         });
         let selected_labels: Vec<Vec<u8>> = (0..768)
-            .map(|i| {
-                if bits[i] {
-                    true_labels[i].clone()
-                } else {
-                    false_labels[i].clone()
-                }
-            })
+            .map(|i| if bits[i] { true_labels[i].clone() } else { false_labels[i].clone() })
             .collect();
 
         let s = script! {
@@ -196,10 +181,7 @@ mod tests {
         };
         println!("verifier assert full script size: {}", s.len());
         let result = execute_script(s);
-        println!(
-            "verifier assert max stack item size: {:?}",
-            result.stats.max_nb_stack_items
-        );
+        println!("verifier assert max stack item size: {:?}", result.stats.max_nb_stack_items);
         assert!(result.success);
         assert_eq!(result.final_stack.len(), 1);
     }

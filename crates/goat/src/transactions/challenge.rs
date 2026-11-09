@@ -56,10 +56,8 @@ impl ChallengeTransaction {
         let input_0_leaf = 1;
         let _input_0 = connector_a.generate_taproot_leaf_tx_in(input_0_leaf, &input_0);
 
-        let _output_0 = TxOut {
-            value: challenge_amount,
-            script_pubkey: operator_address.script_pubkey(),
-        };
+        let _output_0 =
+            TxOut { value: challenge_amount, script_pubkey: operator_address.script_pubkey() };
 
         ChallengeTransaction {
             tx: Transaction {
@@ -113,9 +111,7 @@ impl ChallengeTransaction {
         let spend_info = connector_a.generate_taproot_spend_info();
         let tx_mut = self.tx_mut();
         // Push signature to witness
-        tx_mut.input[input_index]
-            .witness
-            .push(input_0_sig.serialize());
+        tx_mut.input[input_index].witness.push(input_0_sig.serialize());
 
         // Push script + control block
         push_taproot_leaf_script_and_control_block_to_witness(
@@ -133,10 +129,7 @@ impl ChallengeTransaction {
         agg_nonces: &[AggNonce; 1],
     ) -> Result<[PartialSignature; 1], SigningError> {
         let input_0_sig = self.sign_input_0_musig2(context, &sec_nonces[0], &agg_nonces[0]);
-        match [input_0_sig]
-            .into_iter()
-            .collect::<Result<Vec<PartialSignature>, SigningError>>()
-        {
+        match [input_0_sig].into_iter().collect::<Result<Vec<PartialSignature>, SigningError>>() {
             Ok(sigs) => Ok(sigs.try_into().unwrap()),
             Err(e) => Err(e),
         }
@@ -161,10 +154,7 @@ impl ChallengeTransaction {
             sighash_type,
             partial_signatures[sig_index].clone(),
         ) {
-            Ok(sig) => bitcoin::taproot::Signature {
-                signature: sig.into(),
-                sighash_type,
-            },
+            Ok(sig) => bitcoin::taproot::Signature { signature: sig.into(), sighash_type },
             Err(_) => return Err(Error::Other("Failed to aggregate signatures")),
         };
         Ok([input_0_sig])

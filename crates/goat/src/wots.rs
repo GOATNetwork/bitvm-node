@@ -27,11 +27,7 @@ impl Wots for Wots96 {
 
         let mut digit_signatures = Vec::with_capacity(Self::TOTAL_DIGIT_LEN as usize);
         for i in (0..witness.len()).step_by(2) {
-            assert_eq!(
-                witness[i].len(),
-                20,
-                "the digit signature should be constant 20 bytes"
-            );
+            assert_eq!(witness[i].len(), 20, "the digit signature should be constant 20 bytes");
             assert!(
                 witness[i + 1].len() <= 2,
                 "the base256 digit should fit in minimally encoded script bytes"
