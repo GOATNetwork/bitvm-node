@@ -6,6 +6,9 @@ edition.workspace = true
 [dependencies]
 bitcoin = { workspace = true }
 esplora-client = { workspace = true }
+# esplora-client uses reqwest 0.11. These features used to arrive through goat;
+# keeping them keeps its default TLS backend (native-tls, OS trust store).
+reqwest-0-11 = { package = "reqwest", version = "0.11", features = ["blocking", "rustls-tls"] }
 alloy = { workspace = true, features = ["full", "serde"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
