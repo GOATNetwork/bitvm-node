@@ -417,6 +417,12 @@ impl WithdrawPathsEvent {
             WithdrawPathsEvent::WithdrawUnhappyEvent(v) => v.transaction_hash.clone(),
         }
     }
+    pub fn graph_id(&self) -> &str {
+        match self {
+            WithdrawPathsEvent::WithdrawHappyEvent(v) => &v.graph_id,
+            WithdrawPathsEvent::WithdrawUnhappyEvent(v) => &v.graph_id,
+        }
+    }
 }
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WithdrawDisprovedEvent {
