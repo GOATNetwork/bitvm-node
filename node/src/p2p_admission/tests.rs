@@ -146,19 +146,19 @@ fn envelope_limits_depend_on_the_encoding_and_the_sender() {
 /// Verify GenCircuits fits the binary transport ceiling.
 #[tokio::test]
 async fn gen_circuits_fits_the_binary_envelope() {
-    use crate::messages::GenCircuits;
     use bitvm_lib::babe_adapter::{BABE_N_CC, build_setup_package};
 
     let secp = bitcoin::secp256k1::Secp256k1::new();
     let secret = bitcoin::secp256k1::SecretKey::from_slice(&[7; 32]).unwrap();
     let message = GOATMessage::new(
         Actor::Operator,
-        GOATMessageContent::GenCircuits(GenCircuits {
-            instance_id: Uuid::new_v4(),
-            graph_id: Uuid::new_v4(),
-            verifier_pubkey: bitcoin::PublicKey::new(secret.public_key(&secp)),
-            setup_package: build_setup_package(BABE_N_CC).unwrap(),
-        }),
+        GOATMessageContent::GenCircuits(crate::messages::sign_gen_circuits(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            &bitcoin::secp256k1::Keypair::from_secret_key(&secp, &secret),
+            &libp2p::PeerId::random().to_bytes(),
+            build_setup_package(BABE_N_CC).unwrap(),
+        )),
     );
     let bytes = message.serialize_message().await.unwrap();
     assert!(GOATMessage::is_binary_envelope(&bytes));

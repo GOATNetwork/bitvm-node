@@ -41,7 +41,8 @@ use crate::error::{FailureClass, SpecialError, classify_failure};
 use crate::messages::{
     AggNonceConsensus, CommitteePresign, CreateGraph, CutCircuits, EndorseGraph, GOATMessage,
     GOATMessageContent, GenCircuits, GraphFinalize, NonceGeneration,
-    VerifierGraphParamsEndorsement, verify_init_graph_signature,
+    VerifierGraphParamsEndorsement, sign_gen_circuits, verify_gen_circuits_signature,
+    verify_init_graph_signature,
 };
 use crate::soldering_payload_store::{
     read_soldering_proof_store_payload, soldering_proof_payload_store_path,
@@ -324,15 +325,27 @@ async fn operator_init_graph(_deps: &JobDeps, graph_id: Uuid, params: &[u8]) -> 
 
 async fn ingest_gen_circuits(deps: &JobDeps, graph_id: Uuid, params: &[u8]) -> Result<Step> {
     let (inbound, message) = decode_inbound(params).await?;
-    let GOATMessageContent::GenCircuits(GenCircuits {
+    let GOATMessageContent::GenCircuits(gen_circuits) = message.content else {
+        return invalid("not a GenCircuits message");
+    };
+    let verifier_peer = author_peer(&inbound)?;
+    let verifier_peer_id = verifier_peer.to_bytes();
+    // Without the key holder's signature for this peer, a registered verifier
+    // could claim another verifier's key first, and the real holder would be
+    // refused as "bound to another peer".
+    if !verify_gen_circuits_signature(&gen_circuits, &verifier_peer_id) {
+        return Step::ignore(format!(
+            "GenCircuits from {verifier_peer} is not signed by verifier key {} for that peer",
+            gen_circuits.verifier_pubkey
+        ));
+    }
+    let GenCircuits {
         instance_id,
         graph_id: message_graph_id,
         verifier_pubkey,
         setup_package,
-    }) = message.content
-    else {
-        return invalid("not a GenCircuits message");
-    };
+        signature: _,
+    } = gen_circuits;
     if message_graph_id != graph_id || instance_id != inbound.instance_id {
         return invalid("GenCircuits identity mismatch");
     }
@@ -353,8 +366,6 @@ async fn ingest_gen_circuits(deps: &JobDeps, graph_id: Uuid, params: &[u8]) -> R
             setup_package.commits.len()
         ));
     }
-    let verifier_peer = author_peer(&inbound)?;
-    let verifier_peer_id = verifier_peer.to_bytes();
     if !crate::p2p_admission::peer_registry().is_verifier(&verifier_peer)
         && !deps.goat_client.committee_mana_is_verifier(&verifier_peer_id).await.with_context(
             || format!("validate GenCircuits sender {verifier_peer} against the verifier registry"),
@@ -1315,7 +1326,16 @@ async fn verifier_setup(deps: &JobDeps, graph_id: Uuid, params: &[u8]) -> Result
             soldering_proof_ready: None,
         }
     };
-    let setup_package = verifier_state.setup_package.clone();
+    let local_peer_id = PeerId::from_str(&get_peer_id())
+        .context("decode local verifier peer id for GenCircuits")?
+        .to_bytes();
+    let gen_circuits = sign_gen_circuits(
+        instance_id,
+        graph_id,
+        &verifier_master_key.master_keypair(),
+        &local_peer_id,
+        verifier_state.setup_package.clone(),
+    );
     update_babe_setup_state(&deps.local_db, instance_id, graph_id, |state| {
         state.verifier = Some(verifier_state);
     })?;
@@ -1326,12 +1346,7 @@ async fn verifier_setup(deps: &JobDeps, graph_id: Uuid, params: &[u8]) -> Result
             graph_id,
             PHASE_SETUP,
             Actor::Operator,
-            GOATMessageContent::GenCircuits(GenCircuits {
-                instance_id,
-                graph_id,
-                verifier_pubkey,
-                setup_package,
-            }),
+            GOATMessageContent::GenCircuits(gen_circuits),
             std::slice::from_ref(&operator_peer),
             None,
         )

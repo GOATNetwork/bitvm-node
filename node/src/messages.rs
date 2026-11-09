@@ -206,6 +206,62 @@ pub struct GenCircuits {
     pub graph_id: Uuid,
     pub verifier_pubkey: PublicKey,
     pub setup_package: CACSetupPackage,
+    /// `verifier_pubkey`'s signature binding it to the sending peer for this
+    /// graph; see [`sign_gen_circuits`].
+    pub signature: SchnorrSignature,
+}
+
+const GEN_CIRCUITS_SIGNATURE_DOMAIN: &[u8] = b"bitvm2-node/gen-circuits/v1";
+
+/// The setup package is not signed: gossip already authenticates the sending
+/// peer. What needs the key holder's consent is the claim that this peer
+/// speaks for `verifier_pubkey` in this graph; without it a registered
+/// verifier could claim another verifier's key first.
+fn gen_circuits_signature_message(
+    instance_id: Uuid,
+    graph_id: Uuid,
+    verifier_pubkey: &PublicKey,
+    verifier_peer_id: &[u8],
+) -> SecpMessage {
+    let mut hasher = Sha256::new();
+    hasher.update(GEN_CIRCUITS_SIGNATURE_DOMAIN);
+    hasher.update(instance_id.as_bytes());
+    hasher.update(graph_id.as_bytes());
+    hasher.update(verifier_pubkey.to_bytes());
+    hasher.update((verifier_peer_id.len() as u32).to_be_bytes());
+    hasher.update(verifier_peer_id);
+    SecpMessage::from_digest(hasher.finalize().into())
+}
+
+pub fn sign_gen_circuits(
+    instance_id: Uuid,
+    graph_id: Uuid,
+    verifier_keypair: &Keypair,
+    verifier_peer_id: &[u8],
+    setup_package: CACSetupPackage,
+) -> GenCircuits {
+    let verifier_pubkey = verifier_keypair.public_key().into();
+    let signature = SECP256K1.sign_schnorr(
+        &gen_circuits_signature_message(instance_id, graph_id, &verifier_pubkey, verifier_peer_id),
+        verifier_keypair,
+    );
+    GenCircuits { instance_id, graph_id, verifier_pubkey, setup_package, signature }
+}
+
+/// Whether `message.verifier_pubkey` signed its binding to `sender`.
+pub fn verify_gen_circuits_signature(message: &GenCircuits, sender: &[u8]) -> bool {
+    SECP256K1
+        .verify_schnorr(
+            &message.signature,
+            &gen_circuits_signature_message(
+                message.instance_id,
+                message.graph_id,
+                &message.verifier_pubkey,
+                sender,
+            ),
+            &XOnlyPublicKey::from(message.verifier_pubkey),
+        )
+        .is_ok()
 }
 #[derive(Serialize, Deserialize, Clone)]
 pub struct CutCircuits {
@@ -447,6 +503,28 @@ mod tests {
         assert!(!object.contains_key("payload"));
         assert!(!object.contains_key("setup_package"));
         assert!(!object.contains_key("verifier_pubkey"));
+    }
+
+    #[test]
+    fn gen_circuits_binds_the_verifier_key_to_its_sender() {
+        let keypair = |seed| Keypair::from_seckey_slice(SECP256K1, &[seed; 32]).unwrap();
+        let (instance_id, graph_id) = (Uuid::new_v4(), Uuid::new_v4());
+        let (holder, other) = (libp2p::PeerId::random(), libp2p::PeerId::random());
+        let package = || bitvm_lib::babe_adapter::build_setup_package(1).unwrap();
+        let message =
+            sign_gen_circuits(instance_id, graph_id, &keypair(1), &holder.to_bytes(), package());
+        assert!(verify_gen_circuits_signature(&message, &holder.to_bytes()));
+        // The holder's message relayed or replayed by another peer.
+        assert!(!verify_gen_circuits_signature(&message, &other.to_bytes()));
+        // Another peer claiming the holder's key with its own signature.
+        let mut squatted =
+            sign_gen_circuits(instance_id, graph_id, &keypair(2), &other.to_bytes(), package());
+        squatted.verifier_pubkey = message.verifier_pubkey;
+        assert!(!verify_gen_circuits_signature(&squatted, &other.to_bytes()));
+        // The holder's signature reused for another graph.
+        let mut moved = message.clone();
+        moved.graph_id = Uuid::new_v4();
+        assert!(!verify_gen_circuits_signature(&moved, &holder.to_bytes()));
     }
 
     #[test]
