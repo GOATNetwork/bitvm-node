@@ -16,6 +16,7 @@ pub struct TimelockConfig {
 }
 
 impl TimelockConfig {
+    #[allow(clippy::too_many_arguments)]
     pub const fn new(
         connector_z: u32,
         connector_a: u32,

@@ -486,7 +486,7 @@ mod tests {
             &guest_public_key,
             &assert_public_key,
             &expected_constant,
-            &vec![],
+            &[],
             &default_timelock_config(Network::Testnet4),
         );
         let assert_witness =

@@ -508,7 +508,7 @@ pub fn pubin_disprove_script(
     guest_pubin_wots_pubkey: &OperatorCommitPubinPublicKey,
     operator_assert_wots_pubkey: &OperatorAssertPublicKey,
     constant_value: &[u8; 32],
-    watchtower_hashelocks: &Vec<LabelHash>,
+    watchtower_hashelocks: &[LabelHash],
 ) -> Script {
     verify_guest_pubin_commitment(
         guest_pubin_wots_pubkey,
