@@ -29,7 +29,7 @@ use super::graph_setup::{
 use super::jobs::{
     JobDeps, Plan, aggregate_uuid, author_peer, committee_pubkeys, decode_inbound,
     ensure_committee_sender, gate_closed, instance_status, local_member, local_operator,
-    plan_outcome, signing_nonce_id,
+    plan_outcome, retry_contract_revert, signing_nonce_id,
 };
 use crate::clock::current_time_secs;
 use crate::engine_bridge::submit_event;
@@ -124,14 +124,27 @@ impl JobRunner for GraphJobRunner {
         let action = ctx.job.action.clone();
         let attempts = ctx.job.attempts;
         let pegout = PEGOUT_JOBS.contains(&action.as_str());
-        match run_step(&self.deps, &action, graph_id, &params, attempts).await {
+        let result = run_step(&self.deps, &action, graph_id, &params, attempts).await;
+        if let Err(error) = &result
+            && let Some(retry) = retry_contract_revert(error, ctx.job.last_error.as_deref())
+        {
+            warn!(event = "graph_job", graph_id = %graph_id, action = %action, error = %format!("{error:#}"), "contract call reverted; re-reading the chain before giving up");
+            return retry;
+        }
+        match result {
             Ok(step) => step.into_outcome(),
             Err(error) => match classify_failure(&error) {
                 FailureClass::Permanent(reason) if pegout => {
-                    // A Goat revert on a peg-out call: retrying cannot help.
+                    // A Goat revert that persisted, on a peg-out call.
                     warn!(event = "graph_job", graph_id = %graph_id, action = %action, reason = %reason, "peg-out action rejected");
                     self.deps.metrics_state.record_instance_alert("pegout_action_rejected");
                     plan_outcome(&GraphPlan::noted(format!("rejected: {reason}")))
+                }
+                // Goat refused the graph: fail the job, which raises
+                // post_graph_data_rejected.
+                FailureClass::Permanent(reason) if action == JOB_POST_GRAPH_DATA => {
+                    warn!(event = "graph_job", graph_id = %graph_id, action = %action, reason = %reason, "postGraphData rejected");
+                    JobOutcome::Failed(format!("rejected: {reason}"))
                 }
                 FailureClass::Permanent(reason) => {
                     warn!(event = "graph_job", graph_id = %graph_id, action = %action, reason = %reason, "message rejected");
