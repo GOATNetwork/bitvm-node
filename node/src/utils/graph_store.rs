@@ -508,6 +508,43 @@ pub(crate) async fn load_validated_graph_definition(
     instance_id: Uuid,
     graph_id: Uuid,
 ) -> Result<Option<SimplifiedBitvmGcGraph>> {
+    let Some(stored) = read_graph_definition(storage_processor, instance_id, graph_id).await?
+    else {
+        return Ok(None);
+    };
+    let simplified_graph = parse_graph_raw_data(stored.raw_data, graph_id).await?;
+    check_graph_definition(instance_id, graph_id, &stored.definition_hash, &simplified_graph)?;
+    Ok(Some(simplified_graph))
+}
+
+/// A raw definition read with its row, not yet parsed or checked.
+pub(crate) struct StoredGraphDefinition {
+    instance_id: Uuid,
+    graph_id: Uuid,
+    definition_hash: String,
+    raw_data: String,
+}
+
+impl StoredGraphDefinition {
+    /// The checks of `load_validated_graph_definition` past the database
+    /// read, returning the rebuilt graph. CPU-bound.
+    pub(crate) fn build(self) -> Result<BitvmGcGraph> {
+        let simplified_graph: SimplifiedBitvmGcGraph = serde_json::from_str(&self.raw_data)?;
+        check_graph_definition(
+            self.instance_id,
+            self.graph_id,
+            &self.definition_hash,
+            &simplified_graph,
+        )
+    }
+}
+
+/// The database half of `load_validated_graph_definition`.
+pub(crate) async fn read_graph_definition(
+    storage_processor: &mut StorageProcessor<'_>,
+    instance_id: Uuid,
+    graph_id: Uuid,
+) -> Result<Option<StoredGraphDefinition>> {
     let Some(graph_row) = storage_processor.find_graph(&graph_id).await? else {
         return Ok(None);
     };
@@ -531,7 +568,22 @@ pub(crate) async fn load_validated_graph_definition(
                 "graph {graph_id} has a runtime row but no raw definition; explicit repair is required"
             ))
         })?;
-    let simplified_graph = parse_graph_raw_data(graph_raw_data.raw_data, graph_id).await?;
+    Ok(Some(StoredGraphDefinition {
+        instance_id,
+        graph_id,
+        definition_hash: graph_row.definition_hash,
+        raw_data: graph_raw_data.raw_data,
+    }))
+}
+
+/// Bind a parsed definition to its row and rebuild it with its pre-signatures
+/// verified.
+fn check_graph_definition(
+    instance_id: Uuid,
+    graph_id: Uuid,
+    stored_definition_hash: &str,
+    simplified_graph: &SimplifiedBitvmGcGraph,
+) -> Result<BitvmGcGraph> {
     if simplified_graph.parameters.graph_id != graph_id
         || simplified_graph.parameters.instance_parameters.instance_id != instance_id
     {
@@ -540,13 +592,13 @@ pub(crate) async fn load_validated_graph_definition(
         )));
     }
     let definition_hash = hex::encode(simplified_graph.parameters_hash()?);
-    if definition_hash != graph_row.definition_hash {
+    if definition_hash != stored_definition_hash {
         bail!(SpecialError::InvalidGraph(format!(
             "stored raw definition hash does not match graph row for {instance_id}:{graph_id}"
         )));
     }
 
-    let full_graph = BitvmGcGraph::from_simplified(&simplified_graph).map_err(|error| {
+    let full_graph = BitvmGcGraph::from_simplified(simplified_graph).map_err(|error| {
         SpecialError::InvalidGraph(format!(
             "stored raw definition cannot rebuild graph for {instance_id}:{graph_id}: {error}"
         ))
@@ -563,8 +615,7 @@ pub(crate) async fn load_validated_graph_definition(
             ))
         })?;
     }
-
-    Ok(Some(simplified_graph))
+    Ok(full_graph)
 }
 
 pub async fn get_graph(
@@ -697,4 +748,65 @@ pub(crate) async fn pending_graph_belongs_to_operator(
     Ok(storage.find_pending_graph_init_by_graph_id(&graph_id).await?.is_some_and(|pending| {
         pending.instance_id == instance_id && pending.operator_pubkey == operator_pubkey.to_string()
     }))
+}
+
+#[cfg(test)]
+mod definition_tests {
+    use super::*;
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../crates/bitvm-gc/tests/fixtures/admission.rs"
+    ));
+
+    #[tokio::test]
+    async fn the_public_build_checks_what_the_validated_load_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        let db =
+            LocalDB::new(&format!("sqlite:{}", dir.path().join("defs.db").display()), false).await;
+        db.migrate().await;
+        let parameters =
+            admission_parameters(crate::env::get_network(), crate::utils::min_required_verifier());
+        let (instance_id, graph_id) =
+            (parameters.instance_parameters.instance_id, parameters.graph_id);
+        let raw_data = serde_json::json!({"parameters":parameters,"operator_pre_signed":false,"committee_pre_signed":false,"operator_pre_sigs":null,"committee_pre_sigs":null}).to_string();
+        let simplified: SimplifiedBitvmGcGraph = serde_json::from_str(&raw_data).unwrap();
+        let definition_hash = hex::encode(simplified.parameters_hash().unwrap());
+        let mut storage = db.acquire().await.unwrap();
+        storage
+            .upsert_graph_definition(&Graph {
+                graph_id,
+                instance_id,
+                status: GraphStatus::OperatorPresigned.to_string(),
+                definition_hash: definition_hash.clone(),
+                operator_pubkey: parameters.operator_pubkey.to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        storage
+            .upsert_graph_raw_data(
+                instance_id,
+                GraphRawData { graph_id, raw_data, created_at: 0, updated_at: 0 },
+                &definition_hash,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            read_graph_definition(&mut storage, instance_id, Uuid::new_v4())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(read_graph_definition(&mut storage, Uuid::new_v4(), graph_id).await.is_err());
+        // Without its operator pre-signatures the graph fails both ways alike.
+        let stored = read_graph_definition(&mut storage, instance_id, graph_id).await.unwrap();
+        let built = stored.unwrap().build().err().unwrap();
+        let loaded = load_validated_graph_definition(&mut storage, instance_id, graph_id)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(format!("{built:#}"), format!("{loaded:#}"));
+        assert!(format!("{built:#}").contains("operator pre-signatures"), "{built:#}");
+    }
 }
