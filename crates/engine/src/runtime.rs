@@ -436,11 +436,11 @@ async fn run_recheck(inner: Arc<EngineInner>, cancel: CancellationToken) {
                     }
                 }
                 match storage.engine_state_counts().await {
-                    Ok(counts) => {
-                        for count in counts {
-                            inner.metrics.set_rows(&count.table, &count.state, count.count);
-                        }
-                    }
+                    Ok(counts) => inner.metrics.set_row_counts(
+                        counts
+                            .iter()
+                            .map(|count| (count.table.as_str(), count.state.as_str(), count.count)),
+                    ),
                     Err(error) => {
                         warn!(event = "engine_recheck", error = %error, "row count refresh failed")
                     }
