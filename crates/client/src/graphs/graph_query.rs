@@ -461,7 +461,7 @@ pub struct UserInput {
     pub amount_sats: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BridgeInRequestEvent {
     pub id: String,
     #[serde(rename = "transactionHash")]

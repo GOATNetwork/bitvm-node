@@ -2,7 +2,10 @@
 
 use crate::env::get_network;
 use crate::scheduled_tasks::get_timestamp_from_contract_data;
-use crate::utils::evm_swap_utils::{extract_claim_data_from_tx, extract_escrow_data_from_tx};
+use crate::utils::evm_swap_utils::IEscrowManager::EscrowData;
+use crate::utils::evm_swap_utils::{
+    ClaimData, extract_claim_data_from_tx, extract_escrow_data_from_tx,
+};
 use crate::utils::{get_bridge_out_global_stats, strip_hex_prefix_owned};
 use alloy::primitives::{Address as EvmAddress, U256};
 use alloy::sol_types::SolValue;
@@ -14,63 +17,107 @@ use client::graphs::graph_query::{
 };
 use std::ops::AddAssign;
 use std::str::FromStr;
-use std::sync::Arc;
 use store::localdb::{StorageProcessor, SwapEscrowUpdate};
 use store::{SwapEscrow, SwapEscrowStatus, normalize_escrow_hash};
 use tracing::{info, warn};
 
-#[allow(clippy::too_many_arguments)]
-pub async fn fetch_and_handle_bridge_out_events<'a>(
-    goat_client: Arc<GOATClient>,
+/// The swap events of a block range. The init and claim transactions are
+/// traced while fetching, so applying them only writes.
+#[derive(Default)]
+pub struct SwapRange {
+    entities: Vec<SwapEventEntity>,
+    inits: Vec<(SwapInitializeEvent, Option<EscrowData>)>,
+    claims: Vec<(SwapClaimEvent, Option<ClaimData>)>,
+    refunds: Vec<SwapRefundEvent>,
+}
+
+fn escrow_hash_bytes(escrow_hash: &str) -> anyhow::Result<[u8; 32]> {
+    hex::decode(strip_hex_prefix_owned(escrow_hash))?
+        .try_into()
+        .map_err(|v: Vec<u8>| anyhow::anyhow!("escrow_hash length is {}, expected 32", v.len()))
+}
+
+/// Query the range and trace its init and claim transactions; no database
+/// access. Anyone can create an escrow, so the number of traces is not ours to
+/// bound, and none of them may run inside the write transaction.
+pub async fn fetch_bridge_out_events(
+    goat_client: &GOATClient,
     client: &GraphQueryClient,
-    storage_processor: &mut StorageProcessor<'a>,
     contract_addr: &EvmAddress,
     graph_url: &str,
     event_entities: &[SwapEventEntity],
     from_height: i64,
     to_height: i64,
+) -> anyhow::Result<SwapRange> {
+    let query_res = client.get_events(graph_url, event_entities, from_height, to_height).await?;
+    let mut range = SwapRange { entities: event_entities.to_vec(), ..Default::default() };
+    for entity in event_entities {
+        let Some(value_vec) = query_res[entity.to_string()].as_array() else {
+            continue;
+        };
+        let values = serde_json::Value::Array(value_vec.clone());
+        match entity {
+            SwapEventEntity::Initializes => {
+                for event in serde_json::from_value::<Vec<SwapInitializeEvent>>(values)? {
+                    let escrow_data = extract_escrow_data_from_tx(
+                        goat_client,
+                        &event.transaction_hash,
+                        contract_addr,
+                        &escrow_hash_bytes(&event.escrow_hash)?,
+                    )
+                    .await?;
+                    range.inits.push((event, escrow_data));
+                }
+            }
+            SwapEventEntity::Claims => {
+                for event in serde_json::from_value::<Vec<SwapClaimEvent>>(values)? {
+                    let claim_data = extract_claim_data_from_tx(
+                        goat_client,
+                        &event.transaction_hash,
+                        contract_addr,
+                        &escrow_hash_bytes(&event.escrow_hash)?,
+                    )
+                    .await?;
+                    range.claims.push((event, claim_data));
+                }
+            }
+            SwapEventEntity::Refunds => {
+                range.refunds = serde_json::from_value(values)?;
+            }
+        }
+    }
+    Ok(range)
+}
+
+/// Write a fetched range, entity by entity in the configured order: a claim
+/// needs the escrow its init created.
+pub async fn apply_bridge_out_events<'a>(
+    storage_processor: &mut StorageProcessor<'a>,
+    range: SwapRange,
     gateway_peg_btc_address: EvmAddress,
 ) -> anyhow::Result<()> {
-    let query_res = client.get_events(graph_url, event_entities, from_height, to_height).await?;
-    for event_entity in event_entities {
-        let entity = event_entity.clone();
-        if let Some(value_vec) = query_res[entity.to_string()].as_array() {
-            match entity {
-                SwapEventEntity::Initializes => {
-                    handle_swap_init_events(
-                        storage_processor,
-                        goat_client.clone(),
-                        contract_addr,
-                        &gateway_peg_btc_address,
-                        serde_json::from_value::<Vec<SwapInitializeEvent>>(
-                            serde_json::Value::Array(value_vec.clone()),
-                        )?,
-                    )
-                    .await?;
+    let SwapRange { entities, inits, claims, refunds } = range;
+    let (mut inits, mut claims, mut refunds) = (Some(inits), Some(claims), Some(refunds));
+    for entity in entities {
+        match entity {
+            SwapEventEntity::Initializes => {
+                if let Some(inits) = inits.take() {
+                    handle_swap_init_events(storage_processor, &gateway_peg_btc_address, inits)
+                        .await?;
                 }
-                SwapEventEntity::Claims => {
-                    handle_swap_claim_events(
-                        storage_processor,
-                        goat_client.clone(),
-                        contract_addr,
-                        &gateway_peg_btc_address,
-                        serde_json::from_value::<Vec<SwapClaimEvent>>(serde_json::Value::Array(
-                            value_vec.clone(),
-                        ))?,
-                    )
-                    .await?;
+            }
+            SwapEventEntity::Claims => {
+                if let Some(claims) = claims.take() {
+                    handle_swap_claim_events(storage_processor, &gateway_peg_btc_address, claims)
+                        .await?;
                 }
-                SwapEventEntity::Refunds => {
-                    handle_swap_refund_events(
-                        storage_processor,
-                        &gateway_peg_btc_address,
-                        serde_json::from_value::<Vec<SwapRefundEvent>>(serde_json::Value::Array(
-                            value_vec.clone(),
-                        ))?,
-                    )
-                    .await?;
+            }
+            SwapEventEntity::Refunds => {
+                if let Some(refunds) = refunds.take() {
+                    handle_swap_refund_events(storage_processor, &gateway_peg_btc_address, refunds)
+                        .await?;
                 }
-            };
+            }
         }
     }
     Ok(())
@@ -78,22 +125,11 @@ pub async fn fetch_and_handle_bridge_out_events<'a>(
 
 async fn handle_swap_init_events<'a>(
     storage_processor: &mut StorageProcessor<'a>,
-    goat_client: Arc<GOATClient>,
-    swap_contract_address: &EvmAddress,
     gateway_peg_btc_address: &EvmAddress,
-    init_events: Vec<SwapInitializeEvent>,
+    init_events: Vec<(SwapInitializeEvent, Option<EscrowData>)>,
 ) -> anyhow::Result<()> {
-    for event in init_events {
-        let Some(escrow_data) = extract_escrow_data_from_tx(
-            &goat_client,
-            &event.transaction_hash,
-            swap_contract_address,
-            &hex::decode(strip_hex_prefix_owned(&event.escrow_hash))?.try_into().map_err(
-                |v: Vec<u8>| anyhow::anyhow!("escrow_hash length is {}, expected 32", v.len()),
-            )?,
-        )
-        .await?
-        else {
+    for (event, escrow_data) in init_events {
+        let Some(escrow_data) = escrow_data else {
             warn!("failed to parse escrow_data for event:{event:?}");
             continue;
         };
@@ -148,22 +184,11 @@ async fn handle_swap_init_events<'a>(
 
 async fn handle_swap_claim_events<'a>(
     storage_processor: &mut StorageProcessor<'a>,
-    goat_client: Arc<GOATClient>,
-    swap_contract_address: &EvmAddress,
     gateway_peg_btc_address: &EvmAddress,
-    claim_events: Vec<SwapClaimEvent>,
+    claim_events: Vec<(SwapClaimEvent, Option<ClaimData>)>,
 ) -> anyhow::Result<()> {
-    for event in claim_events {
-        let Some(claim_data) = extract_claim_data_from_tx(
-            &goat_client,
-            &event.transaction_hash,
-            swap_contract_address,
-            &hex::decode(strip_hex_prefix_owned(&event.escrow_hash))?.try_into().map_err(
-                |v: Vec<u8>| anyhow::anyhow!("escrow_hash length is {}, expected 32", v.len()),
-            )?,
-        )
-        .await?
-        else {
+    for (event, claim_data) in claim_events {
+        let Some(claim_data) = claim_data else {
             warn!("failed to parse claim_data for event:{event:?}");
             continue;
         };
