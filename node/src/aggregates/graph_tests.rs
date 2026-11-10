@@ -1009,6 +1009,42 @@ async fn a_session_unfinished_at_the_abandon_height_is_released() {
     t.stop().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_watched_graph_unfinished_at_the_abandon_height_closes_its_deliveries() {
+    let t = start(Actor::Committee, false).await;
+    // The operator went offline mid-round: this member's nonces would be
+    // resent forever. Past the abandon height the graph turns Obsoleted,
+    // which closes them.
+    let instance_id = t.insert_instance(InstanceBridgeInStatus::Presigned).await;
+    let stalled = t.insert_graph(instance_id, 0, GraphStatus::OperatorPresigned).await;
+    t.script(
+        JOB_INGEST_NONCES,
+        GraphPlan {
+            messages: vec![planned(stalled, "NonceGeneration", PHASE_SIGNING, None)],
+            ..Default::default()
+        },
+    );
+    let nonce = t.submit(t.message("NonceGeneration", "peer-c", instance_id, stalled, None)).await;
+    t.wait_inbox(&nonce, EngineInboxState::Applied).await;
+    let sent = outbox_id(stalled, "NonceGeneration", None);
+    t.wait_outbox(&sent, EngineOutboxState::Open).await;
+    let finalized = t.insert_graph(instance_id, 1, GraphStatus::CommitteePresigned).await;
+    assert_eq!(t.watched().await, BTreeMap::from([(stalled, instance_id)]));
+
+    // A finalized graph is left alone.
+    let abandoned = SetupAbandoned { instance_id, abandon_height: 166, height: 167 };
+    for graph_id in [stalled, finalized] {
+        let event_id = t.submit(setup_abandoned_event(graph_id, &abandoned).unwrap()).await;
+        t.wait_inbox(&event_id, EngineInboxState::Applied).await;
+    }
+    t.wait_status(stalled, GraphStatus::Obsoleted).await;
+    t.wait_outbox(&sent, EngineOutboxState::Closed).await;
+    assert!(t.graph_state(stalled).await.abandoned);
+    assert_eq!(t.status(finalized).await, GraphStatus::CommitteePresigned);
+    assert!(t.watched().await.is_empty());
+    t.stop().await;
+}
+
 // ------------------------------------------------------------------ peg-out
 
 const OTHER_OPERATOR: &str = "02other";
@@ -1049,6 +1085,12 @@ impl Harness {
 
     async fn wait_status(&self, graph_id: Uuid, status: GraphStatus) {
         wait_for(|| async { (self.status(graph_id).await == status).then_some(()) }).await
+    }
+
+    /// What the abandon scan of a non-operator would look at.
+    async fn watched(&self) -> BTreeMap<Uuid, Uuid> {
+        let mut storage = self.db.acquire().await.unwrap();
+        super::graph_scan::watched_setups(&mut storage).await.unwrap()
     }
 
     async fn graph_state(&self, graph_id: Uuid) -> GraphState {
