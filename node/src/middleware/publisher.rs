@@ -6,7 +6,7 @@ use futures::future::BoxFuture;
 use libp2p::request_response::{OutboundRequestId, ResponseChannel};
 use libp2p::{
     PeerId, Swarm,
-    gossipsub::{IdentTopic, MessageId},
+    gossipsub::{self, IdentTopic, MessageId},
 };
 use std::collections::HashMap;
 use tokio::sync::{mpsc, oneshot};
@@ -65,6 +65,13 @@ pub enum PublishCommand {
         channel: ResponseChannel<GetGraphResponse>,
         response: GetGraphResponse,
     },
+    /// The forwarding verdict on a gossip message whose inbox write ran off the
+    /// network loop; only the swarm can report it.
+    GossipValidation {
+        id: MessageId,
+        propagation_source: PeerId,
+        acceptance: gossipsub::MessageAcceptance,
+    },
 }
 
 impl PublishCommand {
@@ -87,6 +94,14 @@ impl PublishCommand {
             PublishCommand::GetGraphResponse { channel, response } => {
                 // The requester may have given up meanwhile; nothing to do then.
                 let _ = swarm.behaviour_mut().get_graph.send_response(channel, response);
+            }
+            PublishCommand::GossipValidation { id, propagation_source, acceptance } => {
+                crate::p2p_msg_handler::report_gossip_validation(
+                    swarm,
+                    &id,
+                    &propagation_source,
+                    acceptance,
+                );
             }
         }
     }
@@ -116,6 +131,21 @@ impl NetworkPublisher {
             .map_err(|_| {
                 anyhow::anyhow!("network task did not take the GetGraph response in time")
             })?
+            .map_err(|_| anyhow::anyhow!("network publisher stopped"))
+    }
+
+    /// Hand the swarm the verdict on a gossip message recorded off the loop.
+    pub async fn report_validation(
+        &self,
+        id: MessageId,
+        propagation_source: PeerId,
+        acceptance: gossipsub::MessageAcceptance,
+    ) -> anyhow::Result<()> {
+        let send =
+            self.0.send(PublishCommand::GossipValidation { id, propagation_source, acceptance });
+        tokio::time::timeout(PUBLISH_TIMEOUT, send)
+            .await
+            .map_err(|_| anyhow::anyhow!("network task did not take the gossip verdict in time"))?
             .map_err(|_| anyhow::anyhow!("network publisher stopped"))
     }
 
