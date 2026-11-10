@@ -43,7 +43,42 @@ pub struct ImmediateMessage {
 pub struct WorkerControl {
     immediate: mpsc::Sender<ImmediateMessage>,
     bytes: Arc<Semaphore>,
+    inbox: InboxQueue,
     joins: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+}
+
+/// A durable message to record, with what its gossip verdict needs.
+pub struct InboxRecord {
+    event: engine::NewEvent,
+    message_type: &'static str,
+    from_peer_id: PeerId,
+    propagation_source: PeerId,
+    id: MessageId,
+    content_size: usize,
+    _bytes: OwnedSemaphorePermit,
+}
+
+/// Database writes of the network handler, run by the inbox writer so that a
+/// long write lock never stalls the network loop.
+pub enum InboxJob {
+    Record(Box<InboxRecord>),
+    TouchPeer(PeerId),
+}
+
+/// The bounded queue in front of the inbox writer, by rows and by bytes.
+pub struct InboxQueue {
+    jobs: mpsc::Sender<InboxJob>,
+    bytes: Arc<Semaphore>,
+}
+
+const INBOX_QUEUE_ROWS: usize = 64;
+const INBOX_QUEUE_BYTES: usize = 64 * 1024 * 1024;
+
+impl InboxQueue {
+    fn new() -> (Self, mpsc::Receiver<InboxJob>) {
+        let (jobs, rx) = mpsc::channel(INBOX_QUEUE_ROWS);
+        (Self { jobs, bytes: Arc::new(Semaphore::new(INBOX_QUEUE_BYTES)) }, rx)
+    }
 }
 
 fn spawn_isolated_worker<F, Fut>(
@@ -91,6 +126,42 @@ impl WorkerControl {
         let Ok(permit) = self.bytes.clone().try_acquire_many_owned(bytes) else { return false };
         self.immediate.try_send(ImmediateMessage { source, message, _bytes: permit }).is_ok()
     }
+
+    /// Queue a durable message for the inbox writer; `false` when the queue
+    /// has no room.
+    #[allow(clippy::too_many_arguments)]
+    fn record(
+        &self,
+        event: engine::NewEvent,
+        message_type: &'static str,
+        from_peer_id: PeerId,
+        propagation_source: PeerId,
+        id: MessageId,
+        content_size: usize,
+    ) -> bool {
+        let Ok(bytes) = u32::try_from(content_size.max(1)) else { return false };
+        let Ok(permit) = self.inbox.bytes.clone().try_acquire_many_owned(bytes) else {
+            return false;
+        };
+        let record = InboxRecord {
+            event,
+            message_type,
+            from_peer_id,
+            propagation_source,
+            id,
+            content_size,
+            _bytes: permit,
+        };
+        self.inbox.jobs.try_send(InboxJob::Record(Box::new(record))).is_ok()
+    }
+
+    /// Refresh a peer's liveness at most once per cooldown; skipped when the
+    /// writer is behind.
+    fn touch_peer(&self, peer: PeerId, now: Instant) {
+        if crate::p2p_admission::peer_timestamp_gate().allow(&peer.to_string(), now) {
+            let _ = self.inbox.jobs.try_send(InboxJob::TouchPeer(peer));
+        }
+    }
 }
 
 impl BitvmNodeProcessor {
@@ -121,11 +192,15 @@ impl BitvmNodeProcessor {
                     control_processor.run_immediate_worker(control_publisher, rx).await;
                 },
             );
+            let (inbox, inbox_jobs) = InboxQueue::new();
+            let inbox_join =
+                tokio::spawn(processor.clone().run_inbox_writer(publisher.clone(), inbox_jobs));
             let maintenance_join = tokio::spawn(processor.run_admission_maintenance(publisher));
             WorkerControl {
                 immediate: tx,
                 bytes: Arc::new(Semaphore::new(16 * 1024 * 1024)),
-                joins: tokio::sync::Mutex::new(vec![control_join, maintenance_join]),
+                inbox,
+                joins: tokio::sync::Mutex::new(vec![control_join, inbox_join, maintenance_join]),
             }
         }
     }
@@ -147,6 +222,61 @@ impl BitvmNodeProcessor {
             .await
             {
                 tracing::debug!(event = "p2p_control_worker", error = %error, "control message failed");
+            }
+        }
+    }
+
+    /// Record durable messages and refresh peer liveness, then hand the swarm
+    /// each message's forwarding verdict: Accept once recorded, Ignore when
+    /// the write failed (the sender's outbox sends again).
+    async fn run_inbox_writer(
+        self,
+        publisher: NetworkPublisher,
+        mut jobs: mpsc::Receiver<InboxJob>,
+    ) {
+        loop {
+            let job = tokio::select! {
+                biased;
+                _ = self.shutdown_token.cancelled() => return,
+                job = jobs.recv() => match job {
+                    Some(job) => job,
+                    None => return,
+                },
+            };
+            match job {
+                InboxJob::Record(record) => {
+                    let result = record_engine_message(
+                        &self.local_db,
+                        record.event,
+                        record.message_type,
+                        record.from_peer_id,
+                        record.content_size,
+                    )
+                    .await;
+                    let acceptance = match &result {
+                        Ok(()) => gossipsub::MessageAcceptance::Accept,
+                        Err(error) => {
+                            tracing::warn!(event = "engine_inbox", outcome = "record_failed", message_type = record.message_type, from_peer_id = %record.from_peer_id, error = %format!("{error:#}"), "could not record a durable message");
+                            gossipsub::MessageAcceptance::Ignore
+                        }
+                    };
+                    if let Err(error) = publisher
+                        .report_validation(record.id, record.propagation_source, acceptance)
+                        .await
+                    {
+                        tracing::debug!(event = "p2p_message", outcome = "validation_report_failed", error = %error, "could not hand the gossip verdict to the swarm");
+                    }
+                    if result.is_ok() {
+                        self.metrics_state.record_p2p_receive(true);
+                        refresh_peer_timestamp_throttled(
+                            &self.local_db,
+                            record.from_peer_id,
+                            Instant::now(),
+                        )
+                        .await;
+                    }
+                }
+                InboxJob::TouchPeer(peer) => update_peer_timestamp(&self.local_db, peer).await,
             }
         }
     }
@@ -315,7 +445,7 @@ impl P2pMessageHandler for BitvmNodeProcessor {
 const IMMEDIATE_DISPATCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Report exactly one forwarding verdict for each received gossipsub message.
-fn report_gossip_validation(
+pub(crate) fn report_gossip_validation(
     swarm: &mut Swarm<AllBehaviours>,
     id: &MessageId,
     propagation_source: &PeerId,
@@ -393,48 +523,61 @@ pub async fn handle_inbound_p2p_message(
         InboundVerdict::Forward => {
             report_gossip_validation(swarm, &id, &propagation_source, MessageAcceptance::Accept);
             metrics_state.record_p2p_receive(true);
-            refresh_peer_timestamp_throttled(local_db, from_peer_id, now).await;
+            worker.touch_peer(from_peer_id, now);
             Ok(())
         }
         // Record durable messages before allowing forwarding: graph-phase
         // messages for the Graph aggregate, PeginConfirm round messages for
         // the Instance aggregate. The engine deduplicates by content id and
-        // ACKs heavy messages once they are durably applied.
+        // ACKs heavy messages once they are durably applied. The write and the
+        // verdict run on the inbox writer, off the network loop.
         InboundVerdict::Enqueue { message: decoded, class } => {
             let author = from_peer_id.to_string();
             let event =
                 inbound_event(&actor, &author, &crate::env::get_peer_id(), &decoded, message);
-            let recorded = match event {
-                Ok(Some(event)) => {
-                    record_engine_message(
-                        local_db,
-                        event.with_admission_class(class.to_string()),
-                        &decoded,
-                        from_peer_id,
-                        message.len(),
-                    )
-                    .await
-                }
+            let event = match event {
+                Ok(Some(event)) => event.with_admission_class(class.to_string()),
                 // Kept by `handled_by` but routed by no aggregate: a table
                 // mismatch, not a bad message.
-                Ok(None) => Err(anyhow::anyhow!(
-                    "{} is handled by {actor} but no aggregate routes it",
-                    decoded.content.event_type()
-                )),
-                Err(error) => Err(error),
+                Ok(None) => {
+                    report_gossip_validation(
+                        swarm,
+                        &id,
+                        &propagation_source,
+                        MessageAcceptance::Ignore,
+                    );
+                    return Err(anyhow::anyhow!(
+                        "{} is handled by {actor} but no aggregate routes it",
+                        decoded.content.event_type()
+                    ));
+                }
+                Err(error) => {
+                    report_gossip_validation(
+                        swarm,
+                        &id,
+                        &propagation_source,
+                        MessageAcceptance::Ignore,
+                    );
+                    return Err(error);
+                }
             };
-            if let Err(error) = recorded {
+            let queued = worker.record(
+                event,
+                decoded.content.event_type(),
+                from_peer_id,
+                propagation_source,
+                id.clone(),
+                message.len(),
+            );
+            if !queued {
                 report_gossip_validation(
                     swarm,
                     &id,
                     &propagation_source,
                     MessageAcceptance::Ignore,
                 );
-                return Err(error);
+                p2p_admission::record_drop(p2p_admission::DropReason::InboxQueueFull);
             }
-            report_gossip_validation(swarm, &id, &propagation_source, MessageAcceptance::Accept);
-            metrics_state.record_p2p_receive(true);
-            refresh_peer_timestamp_throttled(local_db, from_peer_id, now).await;
             Ok(())
         }
         InboundVerdict::Immediate(decoded) => {
@@ -450,7 +593,7 @@ pub async fn handle_inbound_p2p_message(
             }
             report_gossip_validation(swarm, &id, &propagation_source, MessageAcceptance::Accept);
             metrics_state.record_p2p_receive(true);
-            refresh_peer_timestamp_throttled(local_db, from_peer_id, now).await;
+            worker.touch_peer(from_peer_id, now);
             Ok(())
         }
     }
@@ -531,10 +674,13 @@ fn strike_direct_peer(
 
 /// Refresh peer liveness at most once per cooldown.
 async fn refresh_peer_timestamp_throttled(local_db: &LocalDB, from_peer_id: PeerId, now: Instant) {
-    let peer = from_peer_id.to_string();
-    if !crate::p2p_admission::peer_timestamp_gate().allow(&peer, now) {
-        return;
+    if crate::p2p_admission::peer_timestamp_gate().allow(&from_peer_id.to_string(), now) {
+        update_peer_timestamp(local_db, from_peer_id).await;
     }
+}
+
+async fn update_peer_timestamp(local_db: &LocalDB, from_peer_id: PeerId) {
+    let peer = from_peer_id.to_string();
     if let Err(error) = update_node_timestamp(local_db, &peer).await {
         tracing::debug!(
             event = "p2p_message",
@@ -552,7 +698,7 @@ async fn refresh_peer_timestamp_throttled(local_db: &LocalDB, from_peer_id: Peer
 async fn record_engine_message(
     local_db: &LocalDB,
     event: engine::NewEvent,
-    decoded: &GOATMessage,
+    message_type: &str,
     from_peer_id: PeerId,
     content_size: usize,
 ) -> Result<()> {
@@ -565,7 +711,7 @@ async fn record_engine_message(
     tracing::info!(
         event = "engine_inbox",
         outcome = ?outcome,
-        message_type = decoded.content.event_type(),
+        message_type,
         from_peer_id = %from_peer_id,
         content_size,
         "received durable message"
@@ -604,11 +750,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_inbox_writer_records_off_the_network_loop_and_hands_back_the_verdict() {
+        use crate::middleware::publisher::PublishCommand;
+        use std::sync::{Arc, Mutex};
+        let dir = tempfile::tempdir().unwrap();
+        let db = store::localdb::LocalDB::new_with_busy_timeout(
+            &format!("sqlite:{}", dir.path().join("inbox.db").display()),
+            false,
+            store::DEFAULT_BUSY_TIMEOUT,
+        )
+        .await;
+        db.migrate().await;
+        let (goat, _) = client::goat_chain::GOATClient::new_mock_client();
+        let processor = super::BitvmNodeProcessor {
+            local_db: db.clone(),
+            goat_client: Arc::new(goat),
+            metrics_state: crate::metrics_service::MetricsState::new(Arc::new(Mutex::new(
+                prometheus_client::registry::Registry::default(),
+            ))),
+            shutdown_token: tokio_util::sync::CancellationToken::new(),
+            worker: Default::default(),
+        };
+        let (publisher, mut commands) = crate::middleware::publisher::channel();
+        let (inbox, jobs) = super::InboxQueue::new();
+        let writer = tokio::spawn(processor.clone().run_inbox_writer(publisher, jobs));
+        let control = super::WorkerControl {
+            immediate: tokio::sync::mpsc::channel(1).0,
+            bytes: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            inbox,
+            joins: Default::default(),
+        };
+
+        let event = crate::aggregates::graph::graph_posted_event(uuid::Uuid::new_v4()).unwrap();
+        let event_id = event.event_id.clone();
+        let (id, source) = (libp2p::gossipsub::MessageId::new(b"m"), libp2p::PeerId::random());
+        // Queuing returns at once; the write and the verdict follow on the writer.
+        assert!(control.record(event, "GraphPosted", source, source, id.clone(), 10));
+        match commands.recv().await.unwrap() {
+            PublishCommand::GossipValidation { id: reported, propagation_source, acceptance } => {
+                assert_eq!(reported, id);
+                assert_eq!(propagation_source, source);
+                assert!(matches!(acceptance, libp2p::gossipsub::MessageAcceptance::Accept));
+            }
+            _ => panic!("expected a gossip verdict"),
+        }
+        let mut storage = db.acquire().await.unwrap();
+        assert!(storage.find_engine_inbox_event(&event_id).await.unwrap().is_some());
+        processor.shutdown_token.cancel();
+        writer.await.unwrap();
+    }
+
+    #[test]
+    fn a_full_inbox_queue_refuses_instead_of_waiting() {
+        let (jobs, _rx) = tokio::sync::mpsc::channel(1);
+        let control = super::WorkerControl {
+            immediate: tokio::sync::mpsc::channel(1).0,
+            bytes: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            inbox: super::InboxQueue {
+                jobs,
+                bytes: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
+            },
+            joins: Default::default(),
+        };
+        let event = || crate::aggregates::graph::graph_posted_event(uuid::Uuid::new_v4()).unwrap();
+        let (id, source) = (libp2p::gossipsub::MessageId::new(b"m"), libp2p::PeerId::random());
+        assert!(
+            !control.record(event(), "GraphPosted", source, source, id.clone(), 9),
+            "over the byte budget"
+        );
+        assert!(control.record(event(), "GraphPosted", source, source, id.clone(), 4));
+        assert!(
+            !control.record(event(), "GraphPosted", source, source, id.clone(), 1),
+            "no row left"
+        );
+        assert_eq!(
+            control.inbox.bytes.available_permits(),
+            4,
+            "a refused record releases its bytes"
+        );
+    }
+
+    #[tokio::test]
     async fn ephemeral_queue_is_bounded_by_rows_and_bytes() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let control = super::WorkerControl {
             immediate: tx,
             bytes: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
+            inbox: super::InboxQueue::new().0,
             joins: Default::default(),
         };
         let source = libp2p::PeerId::random();
