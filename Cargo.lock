@@ -2922,7 +2922,7 @@ dependencies = [
 [[package]]
 name = "bitvm"
 version = "0.1.0"
-source = "git+https://github.com/GOATNetwork/BitVM.git?rev=26b0bd61b61b24b50b2d2443a7fda8e58412edfa#26b0bd61b61b24b50b2d2443a7fda8e58412edfa"
+source = "git+https://github.com/BitVM/BitVM.git?rev=c620dbfaacebdf778e765a6681985350389973b1#c620dbfaacebdf778e765a6681985350389973b1"
 dependencies = [
  "ark-bn254",
  "ark-crypto-primitives",
@@ -5154,7 +5154,7 @@ checksum = "42012b0f064e01aa58b545fe3727f90f7dd4020f4a3ea735b50344965f5a57e9"
 [[package]]
 name = "garbled-snark-verifier"
 version = "0.1.0"
-source = "git+https://github.com/GOATNetwork/bitvm-gc?rev=e96a54bae821cedc3a16e994b7a5aa892b9e0f78#e96a54bae821cedc3a16e994b7a5aa892b9e0f78"
+source = "git+https://github.com/GOATNetwork/bitvm-gc?rev=8e9a7aceb9d3b016d31eccb64c1fcf51fc139704#8e9a7aceb9d3b016d31eccb64c1fcf51fc139704"
 dependencies = [
  "aes",
  "ark-bn254",
@@ -11513,7 +11513,7 @@ dependencies = [
 [[package]]
 name = "soldering-host"
 version = "1.1.0"
-source = "git+https://github.com/GOATNetwork/bitvm-gc?rev=e96a54bae821cedc3a16e994b7a5aa892b9e0f78#e96a54bae821cedc3a16e994b7a5aa892b9e0f78"
+source = "git+https://github.com/GOATNetwork/bitvm-gc?rev=8e9a7aceb9d3b016d31eccb64c1fcf51fc139704#8e9a7aceb9d3b016d31eccb64c1fcf51fc139704"
 dependencies = [
  "ark-bn254",
  "ark-crypto-primitives",
@@ -13087,7 +13087,7 @@ dependencies = [
 [[package]]
 name = "verifiable-circuit-babe"
 version = "0.0.1"
-source = "git+https://github.com/GOATNetwork/bitvm-gc?rev=e96a54bae821cedc3a16e994b7a5aa892b9e0f78#e96a54bae821cedc3a16e994b7a5aa892b9e0f78"
+source = "git+https://github.com/GOATNetwork/bitvm-gc?rev=8e9a7aceb9d3b016d31eccb64c1fcf51fc139704#8e9a7aceb9d3b016d31eccb64c1fcf51fc139704"
 dependencies = [
  "aes",
  "ark-bn254",

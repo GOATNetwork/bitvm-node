@@ -30,7 +30,7 @@ members = [
 default-members = ["node"]
 
 [workspace.dependencies]
-bitvm = { git = "https://github.com/GOATNetwork/BitVM.git", rev = "26b0bd61b61b24b50b2d2443a7fda8e58412edfa" }
+bitvm = { git = "https://github.com/BitVM/BitVM.git", rev = "c620dbfaacebdf778e765a6681985350389973b1" }
 goat = { path = "crates/goat" }
 
 libp2p = { version = "0.57.1", features = ["tokio", "kad", "noise", "tcp", "yamux", "rsa", "ping"] }
@@ -112,9 +112,9 @@ p3-field = { git = "https://github.com/ProjectZKM/Plonky3" }
 #zkm-verifier = { path = "../Ziren/crates/verifier" }
 
 bitvm-lib = { package = "bitvm-gc", path = "crates/bitvm-gc" }
-verifiable-circuit-babe = { git = "https://github.com/GOATNetwork/bitvm-gc", rev = "e96a54bae821cedc3a16e994b7a5aa892b9e0f78", features = ["aes"] }
-garbled-snark-verifier = { git = "https://github.com/GOATNetwork/bitvm-gc", rev = "e96a54bae821cedc3a16e994b7a5aa892b9e0f78", features = ["_aes"] }
-soldering-host = { git = "https://github.com/GOATNetwork/bitvm-gc", rev = "e96a54bae821cedc3a16e994b7a5aa892b9e0f78", features = ["aes"] }
+verifiable-circuit-babe = { git = "https://github.com/GOATNetwork/bitvm-gc", rev = "8e9a7aceb9d3b016d31eccb64c1fcf51fc139704", features = ["aes"] }
+garbled-snark-verifier = { git = "https://github.com/GOATNetwork/bitvm-gc", rev = "8e9a7aceb9d3b016d31eccb64c1fcf51fc139704", features = ["_aes"] }
+soldering-host = { git = "https://github.com/GOATNetwork/bitvm-gc", rev = "8e9a7aceb9d3b016d31eccb64c1fcf51fc139704", features = ["aes"] }
 
 #verifiable-circuit-babe = { path = "../bitvm-gc/verifiable-circuit-babe"}
 #garbled-snark-verifier = { path = "../bitvm-gc/garbled-snark-verifier"}
