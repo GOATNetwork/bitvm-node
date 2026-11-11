@@ -38,33 +38,33 @@ pub(crate) fn spawn_commit_chain_proof_task(
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(interval)) => {
-                    let init_input = args.init_input;
-                    if !init_input {
-                        let next_task = fetch_latest_long_running_task(&local_db, CommitChainProofBuilder::name()).await?;
-                        if let Some(next_task) = next_task {
-                            info!("Commit chain's next task: {next_task:?}");
-                            args.start = fetch_next_commit_task_index(&local_db).await?;
-                            args.input_proof = next_task.path_to_proof.unwrap();
-                            args.commit_info = format!(
-                                "{}/commit_info.json.{}",
-                                std::path::Path::new(&args.output_proof).parent().unwrap().to_str().unwrap(),
-                                args.start,
-                            );
-                            args.output_proof = format!(
-                                "{}/{}-{}.bin",
-                                std::path::Path::new(&args.output_proof).parent().unwrap().to_str().unwrap(),
-                                args.start,
-                                args.batch_size
-                            );
-                            args.commits = format!(
-                                "{}/{}-{}.bin.commits",
-                                std::path::Path::new(&args.output_proof).parent().unwrap().to_str().unwrap(),
-                                args.start,
-                                args.batch_size
-                            );
-                            args.init_input = false;
-                        }
+                    // Stored progress wins over `init_input`, as for the header chain: a
+                    // restart must not prove from Genesis again and replace the chain.
+                    let next_task = fetch_latest_long_running_task(&local_db, CommitChainProofBuilder::name()).await?;
+                    if let Some(next_task) = next_task {
+                        info!("Commit chain's next task: {next_task:?}");
+                        args.start = fetch_next_commit_task_index(&local_db).await?;
+                        args.input_proof = next_task.path_to_proof.unwrap();
+                        args.commit_info = format!(
+                            "{}/commit_info.json.{}",
+                            std::path::Path::new(&args.output_proof).parent().unwrap().to_str().unwrap(),
+                            args.start,
+                        );
+                        args.output_proof = format!(
+                            "{}/{}-{}.bin",
+                            std::path::Path::new(&args.output_proof).parent().unwrap().to_str().unwrap(),
+                            args.start,
+                            args.batch_size
+                        );
+                        args.commits = format!(
+                            "{}/{}-{}.bin.commits",
+                            std::path::Path::new(&args.output_proof).parent().unwrap().to_str().unwrap(),
+                            args.start,
+                            args.batch_size
+                        );
+                        args.init_input = false;
                     }
+                    let init_input = args.init_input;
                     info!("Commit chain proof generate task: generate proof, args: {args:?}");
 
                     let commits = match fetch_commit_chain(&args.esplora_url, &args.commit_info, &args.commits, args.bitcoin_network).await {
