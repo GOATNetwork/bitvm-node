@@ -1,7 +1,7 @@
 use anyhow::Result;
 use bitcoin::{Block, BlockHash, Transaction, Txid};
 use commit_chain::CircuitCommit;
-use header_chain::CircuitBlockHeader;
+use header_chain::{CircuitBlockHeader, MMRInclusionProof};
 use serde::{Deserialize, Serialize};
 use state_chain::CircuitStateBlock;
 use std::fs;
@@ -14,6 +14,8 @@ use zkm_sdk::{Prover, ZKMProofKind, ZKMProvingKey, ZKMStdin, ZKMVerifyingKey};
 pub mod api_auth;
 pub mod artifacts;
 
+// Every variant carries a batch of inputs; the request is built once per proof.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ProofRequest {
     HeaderChainProofRequest {
@@ -55,6 +57,10 @@ pub enum ProofRequest {
         included_watchtowers: String,
         graph_id: [u8; 16],
         genesis_sequencer_commit_txid: String,
+        /// The Gateway that processed the graph's withdrawal; part of the constant.
+        gateway_address: [u8; 20],
+        /// Inclusion of that withdrawal in the state-chain proof's accumulator.
+        withdrawal_proof: MMRInclusionProof,
         header_chain_input_proof: String,
         commit_chain_input_proof: String,
         state_chain_input_proof: String,
@@ -208,6 +214,9 @@ pub struct OnDemandTask {
     pub watchtower_public_keys: Vec<String>,
     pub graph_id: Option<String>,
     pub operator_committed_blockhash: Option<String>,
+    /// Operator tasks only: the Gateway of the withdrawal and its inclusion proof.
+    pub gateway_address: Option<[u8; 20]>,
+    pub withdrawal_proof: Option<MMRInclusionProof>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Display, EnumString)]

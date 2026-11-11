@@ -842,6 +842,8 @@ pub struct OperatorProof {
     pub id: i64,
     pub instance_id: Uuid,
     pub graph_id: Uuid,
+    /// Checksummed hex of the Gateway the proof must show a withdrawal from.
+    pub gateway_address: String,
     pub operator_committed_blockhash: String,
     pub execution_layer_block_number: i64,
     pub path_to_proof: Option<String>,
@@ -861,6 +863,16 @@ pub struct OperatorProof {
     pub extra: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+/// One leaf of the state chain's withdrawal accumulator.
+#[derive(Clone, FromRow, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StateChainWithdrawal {
+    pub leaf_index: i64,
+    pub block_number: i64,
+    /// Checksummed hex Gateway address.
+    pub gateway_address: String,
+    pub graph_id: Uuid,
 }
 
 #[derive(Clone, FromRow, Debug, Serialize, Deserialize, Default)]

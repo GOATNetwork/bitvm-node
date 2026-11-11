@@ -14,9 +14,11 @@ use commit_chain::{
 };
 use header_chain::{
     BitcoinMerkleTree, BlockHeaderCircuitOutput, CircuitBlockHeader, CircuitTransaction,
-    HeaderChainCircuitInput, MMRHost, SPV, verify_merkle_proof,
+    HeaderChainCircuitInput, MMRHost, MMRInclusionProof, SPV, verify_merkle_proof,
 };
-use state_chain::{StateChainCircuitInput, StateChainCircuitOutput, verify_sequencer_commit};
+use state_chain::{
+    StateChainCircuitInput, StateChainCircuitOutput, verify_sequencer_commit, withdrawal_leaf,
+};
 use zkm_primitives::io::ZKMPublicValues;
 
 use bitcoin::{Transaction, secp256k1::XOnlyPublicKey};
@@ -380,6 +382,8 @@ pub fn propose_longest_chain(
     included_watchtowers: U256,                       //pis
     graph_id: [u8; GRAPH_ID_SIZE],                    // pis
     operator_genesis_sequencer_commit_txid: [u8; 32], // pis
+    gateway_address: [u8; 20],                        // bound by the constant
+    withdrawal_proof: MMRInclusionProof,
 
     watchtower_challenge_init_txid: [u8; 32],
     watchtower_challenge_init_txn: Option<Transaction>,
@@ -561,14 +565,14 @@ pub fn propose_longest_chain(
         .expect("watchtower challenge defeats operator chain");
     }
 
-    let mut is_found = false;
-    for withdrawal in &state_chain_output.chain_state.withdrawals {
-        if withdrawal.2.contains(&graph_id) {
-            is_found = true;
-            break;
-        }
-    }
-    assert!(is_found, "Graph id {graph_id:?} is not included in current state chain");
+    // The Gateway named by the constant processed a withdrawal for this graph.
+    assert!(
+        state_chain_output
+            .chain_state
+            .withdrawals
+            .verify_proof(withdrawal_leaf(&gateway_address, &graph_id), &withdrawal_proof),
+        "Graph id {graph_id:?} has no withdrawal from the Gateway in the state chain"
+    );
 
     // (operator_total_work, included_watchtowers, graph_id, operator_genesis_sequencer_commit_txid, btc_best_block_hash)
     //(hash_operator_inputs(graph_id, operator_genesis_sequencer_commit_txid), btc_best_block_hash)
@@ -580,6 +584,7 @@ pub fn propose_longest_chain(
     let constant = hash_operator_constant(
         graph_id,
         operator_genesis_sequencer_commit_txid,
+        gateway_address,
         watchtower_challenge_init_txid,
         graph_watchtower_xonly_public_keys,
     );
@@ -601,16 +606,21 @@ pub fn propose_longest_chain(
     (operator_committed_blockhash, constant, included_watchtowers.to_le_bytes::<32>())
 }
 
+/// The graph constant committed by the Operator proof and Connector D. It names the
+/// Gateway whose withdrawal the proof must show, so a withdrawal for the same graph id
+/// recorded by another contract cannot satisfy it.
 pub fn hash_operator_constant(
     graph_id: [u8; GRAPH_ID_SIZE],
     operator_genesis_sequencer_commit_txid: [u8; 32],
+    gateway_address: [u8; 20],
     watchtower_challenge_init_txid: [u8; 32],
     watchtower_xonly_public_keys: &[[u8; 32]],
 ) -> [u8; 32] {
     let mut engine = sha256::HashEngine::default();
-    engine.input(b"bitvm/operator-constant/v3");
+    engine.input(b"bitvm/operator-constant/v4");
     engine.input(&graph_id);
     engine.input(&operator_genesis_sequencer_commit_txid);
+    engine.input(&gateway_address);
     engine.input(&watchtower_challenge_init_txid);
     engine.input(&(watchtower_xonly_public_keys.len() as u16).to_be_bytes());
     for key in watchtower_xonly_public_keys {
@@ -1036,9 +1046,11 @@ mod tests {
         let genesis_txid = [2u8; 32];
         let watchtower_keys = [[3u8; 32], [4u8; 32]];
         let challenge_init_txid = [5u8; 32];
-        let mut input = b"bitvm/operator-constant/v3".to_vec();
+        let gateway = [6u8; 20];
+        let mut input = b"bitvm/operator-constant/v4".to_vec();
         input.extend_from_slice(&graph_id);
         input.extend_from_slice(&genesis_txid);
+        input.extend_from_slice(&gateway);
         input.extend_from_slice(&challenge_init_txid);
         input.extend_from_slice(&(watchtower_keys.len() as u16).to_be_bytes());
         for key in &watchtower_keys {
@@ -1047,15 +1059,32 @@ mod tests {
         let expected = bitcoin::hashes::sha256::Hash::hash(&input);
 
         assert_eq!(
-            hash_operator_constant(graph_id, genesis_txid, challenge_init_txid, &watchtower_keys),
+            hash_operator_constant(
+                graph_id,
+                genesis_txid,
+                gateway,
+                challenge_init_txid,
+                &watchtower_keys
+            ),
             *expected.as_byte_array()
         );
         assert_ne!(
             hash_operator_constant(
                 graph_id,
                 genesis_txid,
+                gateway,
                 challenge_init_txid,
                 &[watchtower_keys[1], watchtower_keys[0]],
+            ),
+            *expected.as_byte_array()
+        );
+        assert_ne!(
+            hash_operator_constant(
+                graph_id,
+                genesis_txid,
+                [7u8; 20],
+                challenge_init_txid,
+                &watchtower_keys
             ),
             *expected.as_byte_array()
         );

@@ -1,7 +1,11 @@
 //! Generate operator proof
 use clap::Parser;
-use operator_proof::{Args, OperatorProofBuilder, fetch_target_block_and_watchtower_tx};
+use operator_proof::{
+    Args, OperatorProofBuilder, build_withdrawal_proof, fetch_target_block_and_watchtower_tx,
+};
 use proof_builder::{ProofBuilder, ProofRequest};
+use state_chain::WithdrawalRecord;
+use std::str::FromStr;
 use util::hex_parse;
 use zkm_sdk::HashableKey;
 
@@ -40,10 +44,19 @@ async fn main() {
     .await
     .unwrap();
 
+    let graph_id = hex_parse::<16>(&args.graph_id).unwrap();
+    let gateway_address =
+        alloy_primitives::Address::from_str(&args.gateway_address).unwrap().into_array();
+    let records: Vec<WithdrawalRecord> =
+        serde_json::from_slice(&std::fs::read(&args.withdrawal_records).unwrap()).unwrap();
+    let withdrawal_proof = build_withdrawal_proof(&records, gateway_address, graph_id).unwrap();
+
     let ctx = ProofRequest::OperatorProofRequest {
         included_watchtowers: args.included_watchtowers.clone(),
-        graph_id: hex_parse::<16>(&args.graph_id).unwrap(),
+        graph_id,
         genesis_sequencer_commit_txid: args.genesis_sequencer_commit_txid.clone(),
+        gateway_address,
+        withdrawal_proof,
 
         header_chain_input_proof: args.header_chain_input_proof.clone(),
         commit_chain_input_proof: args.commit_chain_input_proof.clone(),

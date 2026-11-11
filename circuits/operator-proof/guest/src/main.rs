@@ -4,7 +4,7 @@ use alloy_primitives::U256;
 use bitcoin::Transaction;
 use bitcoin_light_client_circuit::IndexedWatchtowerChallenge;
 use commit_chain::CommitChainCircuitInput;
-use header_chain::{HeaderChainCircuitInput, SPV};
+use header_chain::{HeaderChainCircuitInput, MMRInclusionProof, SPV};
 use state_chain::StateChainCircuitInput;
 
 pub fn main() {
@@ -12,6 +12,8 @@ pub fn main() {
     let included_watchtowers: U256 = zkm_zkvm::io::read::<U256>();
     let graph_id: [u8; 16] = zkm_zkvm::io::read::<[u8; 16]>();
     let operator_genesis_sequencer_commit_txid: [u8; 32] = zkm_zkvm::io::read();
+    let gateway_address: [u8; 20] = zkm_zkvm::io::read();
+    let withdrawal_proof: MMRInclusionProof = zkm_zkvm::io::read();
 
     // https://github.com/KSlashh/BitVM/blob/v2/goat/src/transactions/watchtower_challenge.rs#L128
     let watchtower_challenge_init_txid: [u8; 32] = zkm_zkvm::io::read();
@@ -30,6 +32,8 @@ pub fn main() {
             included_watchtowers,
             graph_id,
             operator_genesis_sequencer_commit_txid,
+            gateway_address,
+            withdrawal_proof,
             watchtower_challenge_init_txid,
             watchtower_challenge_init_txn,
             watchtower_challenges,

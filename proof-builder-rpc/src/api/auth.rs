@@ -208,8 +208,8 @@ impl RequestAuthorizer {
         Ok(graph_data)
     }
 
-    /// Selects the configured contract set identified by the signed request body.
-    fn chain_for_gateway(&self, gateway_address: Option<&str>) -> AuthResult<&ChainEntry> {
+    /// The configured Gateway a request names, or the only one when it names none.
+    pub(crate) fn resolve_gateway(&self, gateway_address: Option<&str>) -> AuthResult<Address> {
         let gateway_address = match gateway_address {
             Some(value) => {
                 let address = value
@@ -221,7 +221,7 @@ impl RequestAuthorizer {
                 address
             }
             None if self.chains.len() == 1 => {
-                return Ok(self.chains.values().next().expect("one chain is configured"));
+                return Ok(*self.chains.keys().next().expect("one chain is configured"));
             }
             None => {
                 return Err(bad_request(
@@ -229,10 +229,16 @@ impl RequestAuthorizer {
                 ));
             }
         };
+        if !self.chains.contains_key(&gateway_address) {
+            return Err(forbidden("gateway_address is not configured"));
+        }
+        Ok(gateway_address)
+    }
 
-        self.chains
-            .get(&gateway_address)
-            .ok_or_else(|| forbidden("gateway_address is not configured"))
+    /// Selects the configured contract set identified by the signed request body.
+    fn chain_for_gateway(&self, gateway_address: Option<&str>) -> AuthResult<&ChainEntry> {
+        let gateway_address = self.resolve_gateway(gateway_address)?;
+        Ok(self.chains.get(&gateway_address).expect("resolved gateway is configured"))
     }
 
     /// Atomically records an authorized request's nonce, rejecting a

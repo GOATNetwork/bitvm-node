@@ -51,6 +51,8 @@ pub(crate) fn spawn_operator_proof_task(
                 _ = tokio::time::sleep(Duration::from_secs(interval)) => {
                     // fetch args from the database.
                     let task_index;
+                    let gateway_address;
+                    let withdrawal_proof;
                     match fetch_on_demand_task(
                         &local_db, false, cursor.after_id(), args.bitcoin_network, &args.esplora_url,
                     ).await {
@@ -77,6 +79,8 @@ pub(crate) fn spawn_operator_proof_task(
                             // LE array to string, e.g. [1, 1, 1, 0] => 7
                             args.included_watchtowers = le_bits_to_u256(&next_task.included_watchtowers).to_string();
                             task_index = next_task.task_index;
+                            gateway_address = next_task.gateway_address.expect("operator task names its gateway");
+                            withdrawal_proof = next_task.withdrawal_proof.expect("operator task carries its withdrawal proof");
                         }
                         Ok(Some(OnDemandFetch::NotReady(task_index))) => {
                             cursor.advance(task_index);
@@ -135,6 +139,8 @@ pub(crate) fn spawn_operator_proof_task(
                         included_watchtowers: args.included_watchtowers.clone(),
                         graph_id: hex_parse::<16>(&args.graph_id).unwrap(),
                         genesis_sequencer_commit_txid: args.genesis_sequencer_commit_txid.clone(),
+                        gateway_address,
+                        withdrawal_proof,
 
                         header_chain_input_proof: args.header_chain_input_proof.clone(),
                         commit_chain_input_proof: args.commit_chain_input_proof.clone(),

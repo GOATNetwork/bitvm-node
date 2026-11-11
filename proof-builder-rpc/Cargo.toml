@@ -37,9 +37,11 @@ hex = { workspace = true }
 
 # proofs
 proof-builder = { workspace = true }
+header-chain = { workspace = true }
 header-chain-proof = { workspace = true }
 commit-chain-proof = { workspace = true }
 commit-chain = { workspace = true }
+state-chain = { workspace = true }
 state-chain-proof = { workspace = true }
 watchtower-proof = { workspace = true }
 operator-proof = { workspace = true }

@@ -7,8 +7,10 @@ use crate::task::{
 };
 use crate::{ProofBuilderConfig, task::fetch_latest_long_running_task};
 use proof_builder::{ProofBuilder, ProofRequest};
+use state_chain::block_withdrawal_records;
 use state_chain_proof::{StateChainProofBuilder, fetch_state_chain};
 use std::time::Duration;
+use store::StateChainWithdrawal;
 use store::localdb::LocalDB;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -154,6 +156,25 @@ async fn spawn_state_chain_ctx_builder(
     }
 }
 
+/// The withdrawals the circuit appends for this batch, in leaf order. The genesis batch
+/// starts at its first block, whose withdrawals the circuit does not accumulate.
+fn batch_withdrawals(ctx: &ProofRequest) -> Vec<StateChainWithdrawal> {
+    let ProofRequest::StateChainProofRequest { init_input, blocks, .. } = ctx else {
+        return Vec::new();
+    };
+    blocks
+        .iter()
+        .skip(usize::from(*init_input))
+        .flat_map(block_withdrawal_records)
+        .map(|record| StateChainWithdrawal {
+            leaf_index: 0,
+            block_number: record.block_number as i64,
+            gateway_address: alloy_primitives::Address::from(record.gateway).to_string(),
+            graph_id: uuid::Uuid::from_bytes(record.graph_id),
+        })
+        .collect()
+}
+
 #[tracing::instrument(level = "info", skip(runtime, local_db, metrics_state, cancellation_token))]
 async fn spawn_state_chain_prover(
     runtime: ProverRuntime,
@@ -224,6 +245,7 @@ async fn spawn_state_chain_prover(
                 };
                 tracing::info!("Updated long running task to proving state, affected rows: {affteced}");
 
+                let withdrawals = batch_withdrawals(&ctx);
                 let attempt_start = tokio::time::Instant::now();
                 let unit = {
                     let (runtime, local_db, builder) = (runtime.clone(), local_db.clone(), builder.clone());
@@ -233,6 +255,12 @@ async fn spawn_state_chain_prover(
                             Ok(proved) => proved,
                             Err(error) => return Ok(Err(error)),
                         };
+                        // Operator tasks prove withdrawals against this batch's accumulator.
+                        let mut storage_processor = local_db.start_transaction().await?;
+                        storage_processor
+                            .replace_state_chain_withdrawals(start_index as i64, &withdrawals)
+                            .await?;
+                        storage_processor.commit().await?;
                         let affected = update_long_running_task(
                             &local_db,
                             start_index as i64,

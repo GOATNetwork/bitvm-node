@@ -639,6 +639,40 @@ async fn watchtower_key_migration_keeps_one_task_per_key() {
 }
 
 #[tokio::test]
+async fn state_chain_withdrawals_are_numbered_in_order_and_rebuilt_from_a_block() {
+    use crate::StateChainWithdrawal;
+    let local_db = create_local_db("sqlite::memory:").await;
+    let mut storage = local_db.acquire().await.unwrap();
+    let row = |block_number, graph| StateChainWithdrawal {
+        leaf_index: 0,
+        block_number,
+        gateway_address: "0x1111111111111111111111111111111111111111".to_string(),
+        graph_id: Uuid::from_bytes([graph; 16]),
+    };
+    storage.replace_state_chain_withdrawals(10, &[row(10, 1), row(12, 2)]).await.unwrap();
+    storage.replace_state_chain_withdrawals(20, &[row(21, 3)]).await.unwrap();
+    let leaves = storage.list_state_chain_withdrawals_before(30).await.unwrap();
+    assert_eq!(
+        leaves.iter().map(|leaf| (leaf.leaf_index, leaf.block_number)).collect::<Vec<_>>(),
+        [(0, 10), (1, 12), (2, 21)]
+    );
+    assert_eq!(storage.list_state_chain_withdrawals_before(21).await.unwrap().len(), 2);
+
+    // Proving batch 20 again replaces its leaves and keeps the numbering.
+    storage.replace_state_chain_withdrawals(20, &[row(20, 4), row(22, 5)]).await.unwrap();
+    let leaves = storage.list_state_chain_withdrawals_before(30).await.unwrap();
+    assert_eq!(
+        leaves
+            .iter()
+            .map(|leaf| (leaf.leaf_index, leaf.graph_id.as_bytes()[0]))
+            .collect::<Vec<_>>(),
+        [(0, 1), (1, 2), (2, 4), (3, 5)]
+    );
+    // A leaf before the batch start is a caller error.
+    assert!(storage.replace_state_chain_withdrawals(20, &[row(19, 6)]).await.is_err());
+}
+
+#[tokio::test]
 async fn test_list_recent_committee_addresses_dedupes_recent_instances() {
     let local_db = create_local_db("sqlite::memory:").await;
     let mut storage = local_db.acquire().await.unwrap();
