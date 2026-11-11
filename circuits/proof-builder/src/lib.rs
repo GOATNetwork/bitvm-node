@@ -13,6 +13,7 @@ use zkm_sdk::{Prover, ZKMProofKind, ZKMProvingKey, ZKMStdin, ZKMVerifyingKey};
 
 pub mod api_auth;
 pub mod artifacts;
+pub mod headers;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ProofRequest {

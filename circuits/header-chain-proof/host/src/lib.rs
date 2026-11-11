@@ -226,6 +226,7 @@ async fn fetch_header_chain_with_client(
 
     let mut i = block_headers.len();
     let mut retries = 9;
+    let mut reorgs = 0;
     while i < end {
         tracing::info!("get block by height: {i}");
         let tip_height = btc_client.get_height().await?;
@@ -238,6 +239,25 @@ async fn fetch_header_chain_with_client(
             Ok(block) => {
                 tracing::info!("block_id {i}: {}", block.block_hash().to_string());
                 let header: header_chain::CircuitBlockHeader = block.header.into();
+                if let Some(last) = block_headers.last()
+                    && header.prev_block_hash != last.compute_block_hash()
+                {
+                    // A reorg replaced headers fetched for this batch: drop them and fetch
+                    // again. Below `start` they are proven, and only a human can sort that out.
+                    block_headers.truncate(start);
+                    writer.set_len((start * 80) as u64)?;
+                    anyhow::ensure!(
+                        i > start && reorgs < MAX_BATCH_REORGS,
+                        "header {i} does not extend header {}; the proven chain or the \
+                         Bitcoin source changed",
+                        i - 1
+                    );
+                    tracing::warn!(height = i, start, "Bitcoin reorg inside the batch; refetching");
+                    reorgs += 1;
+                    writer.seek(std::io::SeekFrom::Start((start * 80) as u64))?;
+                    i = start;
+                    continue;
+                }
                 block_headers.push(header.clone());
                 header.serialize(&mut writer)?;
                 retries = 3;
@@ -255,12 +275,15 @@ async fn fetch_header_chain_with_client(
         };
     }
     writer.set_len((block_headers.len() * 80) as u64)?;
-    // The proof's `.blocks` sidecar is published with the proof (see `save_proof`).
+    // The proven headers are archived with the proof (see `save_proof`).
     Ok(block_headers)
 }
 
-/// The `.blocks` sidecar of a header-chain proof: every header up to the proof's last
-/// block, 80 bytes each. Operator and watchtower proofs read it to build SPV proofs.
+/// Reorgs one batch fetch rides out before it gives up.
+const MAX_BATCH_REORGS: usize = 3;
+
+/// Headers as the header cache, the header archive and the Genesis seed sidecar hold
+/// them: 80 bytes each.
 pub fn proof_block_headers(headers: &[CircuitBlockHeader]) -> anyhow::Result<Vec<u8>> {
     let mut bytes = Vec::with_capacity(headers.len() * 80);
     for header in headers {
@@ -437,10 +460,12 @@ impl ProofBuilder for HeaderChainProofBuilder {
         else {
             anyhow::bail!("invalid context");
         };
-        let proven_headers = total_block_headers
-            .get(..start + batch_size)
-            .context("block headers do not cover the proven batch")?;
-        let blocks = proof_block_headers(proven_headers)?;
+        // Headers go to the shared archive, durably, before the proof that needs them.
+        proof_builder::headers::extend_header_archive(
+            proof_builder::headers::header_archive_path(output_proof),
+            total_block_headers,
+            start + batch_size,
+        )?;
         //fs::write(&output_proof, bincode::serialize(&proof)?)?;
         //let public_value_hex = hex::encode(proof.public_values.as_slice());
         //let proof_size = proof.bytes().len();
@@ -459,9 +484,15 @@ impl ProofBuilder for HeaderChainProofBuilder {
                 (".public_inputs.bin", public_values.as_slice()),
                 (".vk_hash.bin", vk_hash.as_bytes()),
                 (".zkm_version.bin", proof.zkm_version.as_bytes()),
-                (".blocks", blocks.as_slice()),
             ],
         )?;
+        if let Some(dir) = std::path::Path::new(output_proof).parent() {
+            match proof_builder::headers::remove_superseded_sidecars(dir) {
+                Ok(0) => {}
+                Ok(removed) => tracing::info!(removed, "removed per-proof header sidecars"),
+                Err(error) => tracing::warn!("remove per-proof header sidecars: {error:#}"),
+            }
+        }
 
         tracing::info!("Generate proof successfully, proof: {:?}", proof);
         Ok((public_value_hex, proof_size))
@@ -666,6 +697,40 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn a_header_that_does_not_extend_the_chain_is_refetched_or_refused() {
+        let blocks = test_blocks();
+        let mut fork = blocks[2].clone();
+        fork.header.prev_blockhash = blocks[0].block_hash();
+        for start in [1, 2] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("headers.bin");
+            let cached: Vec<CircuitBlockHeader> =
+                blocks[..start].iter().map(|b| b.header.into()).collect();
+            fs::write(&path, proof_block_headers(&cached).unwrap()).unwrap();
+            let (client, mock) = BTCClient::new_mock_client();
+            mock.set_height(100);
+            for (height, block) in [(1, &blocks[1]), (2, &fork)] {
+                mock.set_block_hash(height, block.block_hash());
+                mock.set_block(block.block_hash(), block.clone());
+            }
+            // From 1, height 2 never extends the batch's own height 1: refetched, then
+            // given up. From 2, it does not extend the proven chain: refused at once.
+            let error = fetch_header_chain_with_client(
+                &client,
+                start,
+                3 - start,
+                path.to_str().unwrap(),
+                false,
+                false,
+            )
+            .await
+            .unwrap_err();
+            assert!(format!("{error:#}").contains("does not extend header 1"), "{error:#}");
+            assert_eq!(fs::metadata(&path).unwrap().len(), (start * 80) as u64);
+        }
+    }
+
     #[test]
     fn genesis_batch_rotates_to_single_block_batches() {
         let mut args = Args::try_parse_from([
@@ -709,7 +774,7 @@ mod tests {
         let headers = vec![genesis.clone(), regtest, genesis];
         let bytes = proof_block_headers(&headers).unwrap();
         assert_eq!(bytes.len(), 3 * 80);
-        // Operator and watchtower proofs parse the sidecar 80 bytes at a time.
+        // Operator and watchtower proofs parse the headers 80 bytes at a time.
         let parsed: Vec<_> = bytes
             .chunks(80)
             .map(|header| CircuitBlockHeader::try_from_slice(header).unwrap())

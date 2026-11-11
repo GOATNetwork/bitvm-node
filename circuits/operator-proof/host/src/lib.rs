@@ -3,7 +3,6 @@ use alloy_primitives::U256;
 use anyhow::Context;
 use bitcoin::{Block, BlockHash, Network, Transaction, Txid, hashes::Hash, secp256k1::PublicKey};
 use bitcoin_light_client_circuit::{IndexedWatchtowerChallenge, build_spv};
-use borsh::BorshDeserialize;
 use clap::Parser;
 use client::btc_chain::BTCClient;
 use commit_chain::{CommitChainCircuitInput, CommitChainPrevProofType};
@@ -502,14 +501,9 @@ impl ProofBuilder for OperatorProofBuilder {
 
         let operator_genesis_sequencer_commit_txid = Txid::from_str(genesis_sequencer_commit_txid)?;
 
-        let bitcoin_block_headers = {
-            let headers: Vec<u8> = std::fs::read(format!("{header_chain_input_proof}.blocks"))
-                .context("read header chain blocks error")?;
-            headers
-                .chunks(80)
-                .map(|header| CircuitBlockHeader::try_from_slice(header).unwrap())
-                .collect::<Vec<CircuitBlockHeader>>()
-        };
+        let bitcoin_block_headers =
+            proof_builder::headers::proven_headers(&header_chain_input_proof)
+                .context("read the headers of the header-chain proof")?;
 
         let found = bitcoin_block_headers.iter().position(|h| {
             h.compute_block_hash() == *target_block_ss_commit.block_hash().as_byte_array()
