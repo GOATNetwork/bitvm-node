@@ -71,32 +71,51 @@ do_install() {
     local platform
     platform="$(detect_platform)"
 
-    local tarball="bitvm-node-${version}-${platform}.tar.gz"
     local base_url="https://github.com/${REPO}/releases/download/${version}"
-    local url="${base_url}/${tarball}"
-    local sha_url="${url}.sha256"
 
     echo "Platform : $(uname -s) $(uname -m) -> ${platform}"
     echo "Version  : ${version}"
     echo "Install  : ${INSTALL_DIR}"
     echo ""
-    echo "Downloading ${tarball} ..."
 
     local tmpdir
     tmpdir="$(mktemp -d)"
-    trap 'rm -rf "${tmpdir}"' EXIT
+    # Expanded now: the local is gone when the EXIT trap runs.
+    trap "rm -rf -- '${tmpdir}'" EXIT
 
-    curl -fSL -o "${tmpdir}/${tarball}" "${url}"
-    curl -fSL -o "${tmpdir}/${tarball}.sha256" "${sha_url}"
+    # Releases up to v0.3.3 still carry the repository's former name.
+    local tarball="" candidate
+    for candidate in "bitvm-node-${version}-${platform}.tar.gz" \
+        "bitvm2-node-${version}-${platform}.tar.gz"; do
+        echo "Downloading ${candidate} ..."
+        if curl -fsSL -o "${tmpdir}/${candidate}" "${base_url}/${candidate}"; then
+            tarball="${candidate}"
+            break
+        fi
+    done
+    if [[ -z "${tarball}" ]]; then
+        echo "Error: no ${platform} archive in release ${version}" >&2
+        exit 1
+    fi
+    curl -fSL -o "${tmpdir}/${tarball}.sha256" "${base_url}/${tarball}.sha256"
 
     echo "Verifying checksum ..."
     cd "${tmpdir}"
+    # Compare the hash only: older releases list the archive under
+    # release-artifacts/, which `-c` cannot find here.
+    local expected actual
+    expected="$(awk '{print $1}' "${tarball}.sha256")"
     if command -v sha256sum &>/dev/null; then
-        sha256sum -c "${tarball}.sha256"
+        actual="$(sha256sum "${tarball}" | awk '{print $1}')"
     elif command -v shasum &>/dev/null; then
-        shasum -a 256 -c "${tarball}.sha256"
+        actual="$(shasum -a 256 "${tarball}" | awk '{print $1}')"
     else
         echo "Warning: no sha256sum or shasum found, skipping checksum verification" >&2
+        actual="${expected}"
+    fi
+    if [[ -z "${expected}" || "${actual}" != "${expected}" ]]; then
+        echo "Error: checksum mismatch for ${tarball}" >&2
+        exit 1
     fi
 
     mkdir -p "${INSTALL_DIR}"
@@ -174,6 +193,12 @@ while [[ $# -gt 0 ]]; do
         *)     break ;;
     esac
 done
+
+# Absolute, since the install runs from a temporary directory.
+case "${INSTALL_DIR}" in
+    /*) ;;
+    *)  INSTALL_DIR="${PWD}/${INSTALL_DIR#./}" ;;
+esac
 
 COMMAND="${1:-}"
 shift || true

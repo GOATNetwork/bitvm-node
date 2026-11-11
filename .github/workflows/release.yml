@@ -107,7 +107,8 @@ jobs:
 
           ARCHIVE_NAME="bitvm-node-${VERSION}-${PLATFORM}.tar.gz"
           tar -czf "release-artifacts/${ARCHIVE_NAME}" -C "$STAGING_DIR" .
-          $CHECKSUM_CMD "release-artifacts/${ARCHIVE_NAME}" > "release-artifacts/${ARCHIVE_NAME}.sha256"
+          # Name only: the checksum is checked next to the downloaded archive.
+          (cd release-artifacts && $CHECKSUM_CMD "${ARCHIVE_NAME}" > "${ARCHIVE_NAME}.sha256")
 
           echo "Archive created:"
           ls -lh release-artifacts/
