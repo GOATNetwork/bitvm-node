@@ -39,9 +39,7 @@ jobs:
           echo "CGO_ENABLED=1" >> $GITHUB_ENV        
 
       - name: Install Ziren toolchain
-        run: |
-          curl --proto '=https' --tlsv1.2 -sSf \
-            https://raw.githubusercontent.com/ProjectZKM/toolchain/refs/heads/main/setup.sh | sh
+        uses: ./.github/actions/install-ziren
 
       # Install Go for all platforms (required for zkm-recursion-gnark-ffi)
       - name: Install Go (Ubuntu, macOS)

@@ -37,7 +37,7 @@ jobs:
           sudo docker builder prune -a
 
       - name: Install Ziren toolchain
-        run: curl --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/ProjectZKM/toolchain/refs/heads/main/setup.sh | sh
+        uses: ./.github/actions/install-ziren
 
       - name: Install Dependencies
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libclang-18-dev
@@ -50,6 +50,13 @@ jobs:
         run: |
           VERSION=$(grep '^version =' ./Cargo.toml | head -n1 | sed -E 's/version = "(.*)"/\1/')
           echo "CARGO_VERSION=$VERSION" >> $GITHUB_ENV
+          # The release version is tagged from main only; dev builds are
+          # dev-<sha>, so a pinned version never pulls an unreleased build.
+          if [ "$GITHUB_REF" = "refs/heads/main" ]; then
+            echo "VERSION_TAG=$VERSION" >> $GITHUB_ENV
+          else
+            echo "VERSION_TAG=dev-${GITHUB_SHA::12}" >> $GITHUB_ENV
+          fi
           echo "Using version: $VERSION"
 
       - name: Set lowercase repo name
@@ -74,4 +81,4 @@ jobs:
           push: true
           tags: |
             ghcr.io/${{ env.REPO_LOWER }}-proof-builder-rpc:latest
-            ghcr.io/${{ env.REPO_LOWER }}-proof-builder-rpc:${{ env.CARGO_VERSION }}
+            ghcr.io/${{ env.REPO_LOWER }}-proof-builder-rpc:${{ env.VERSION_TAG }}
