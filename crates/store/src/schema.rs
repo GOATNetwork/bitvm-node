@@ -753,6 +753,9 @@ pub enum ProofState {
     Proving,
     Proven,
     Failed,
+    /// No longer wanted: the request timed out, or (for a Watchtower task) the
+    /// Operator task fixed the graph's list without a proof from this Watchtower.
+    Cancelled,
 }
 impl ProofState {
     pub fn to_i64(&self) -> i64 {
@@ -761,6 +764,7 @@ impl ProofState {
             Self::Proving => 1,
             Self::Proven => 2,
             Self::Failed => 3,
+            Self::Cancelled => 4,
         }
     }
 
@@ -770,6 +774,7 @@ impl ProofState {
             1 => Some(Self::Proving),
             2 => Some(Self::Proven),
             3 => Some(Self::Failed),
+            4 => Some(Self::Cancelled),
             _ => None,
         }
     }
@@ -823,6 +828,10 @@ pub struct WatchtowerProof {
     pub zkm_version: String,
     pub node_index: i32,
     pub included: bool,
+    /// How often the task owner restarted the failed task.
+    pub reset_count: i64,
+    /// Why the task inputs can never be proven; `None` when the proof itself failed.
+    pub invalid_reason: Option<String>,
     pub extra: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
@@ -843,6 +852,12 @@ pub struct OperatorProof {
     pub total_time_to_proof: i64,
     pub proving_time: i64,
     pub zkm_version: String,
+    /// How often the task owner restarted the failed task.
+    pub reset_count: i64,
+    /// Why the task inputs can never be proven; `None` when the proof itself failed.
+    pub invalid_reason: Option<String>,
+    /// Hash of the request inputs, to tell a resubmission with new inputs from a retry.
+    pub input_hash: Option<String>,
     pub extra: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,

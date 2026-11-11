@@ -663,6 +663,111 @@ impl StorageProcessor<'_> {
         Ok(res.rows_affected())
     }
 
+    /// Fails an on-demand task whose inputs can never be proven, only while it is still
+    /// `New`, and records why.
+    pub async fn fail_invalid_on_demand_proof(
+        &mut self,
+        table: OnDemandProofTable,
+        id: i64,
+        reason: &str,
+    ) -> anyhow::Result<u64> {
+        let sql = format!(
+            "UPDATE {} SET proof_state = ?, invalid_reason = ?, updated_at = ?
+             WHERE id = ? AND proof_state = ?",
+            table.table_name()
+        );
+        let res = sqlx::query(&sql)
+            .bind(crate::ProofState::Failed.to_i64())
+            .bind(reason)
+            .bind(get_current_timestamp_secs())
+            .bind(id)
+            .bind(crate::ProofState::New.to_i64())
+            .execute(self.conn())
+            .await?;
+        Ok(res.rows_affected())
+    }
+
+    /// Puts a failed on-demand task back to `New` and clears its result.
+    ///
+    /// `max_resets` is a restart with the same inputs: it counts, and it is refused once
+    /// `max_resets` restarts were made or when the inputs are invalid. `None` follows new
+    /// inputs, which start the count over.
+    pub async fn reset_failed_on_demand_proof(
+        &mut self,
+        table: OnDemandProofTable,
+        id: i64,
+        max_resets: Option<i64>,
+    ) -> anyhow::Result<u64> {
+        let (reset_count, guard) = match max_resets {
+            Some(_) => ("reset_count + 1", "AND invalid_reason IS NULL AND reset_count < ?"),
+            None => ("0", ""),
+        };
+        let sql = format!(
+            "UPDATE {}
+             SET proof_state = ?, reset_count = {reset_count}, invalid_reason = NULL,
+                 path_to_proof = NULL, public_value_hex = NULL, proof_size = 0, cycles = 0,
+                 total_time_to_proof = 0, proving_time = 0, zkm_version = '', updated_at = ?
+             WHERE id = ? AND proof_state = ? {guard}",
+            table.table_name()
+        );
+        let mut query = sqlx::query(&sql)
+            .bind(crate::ProofState::New.to_i64())
+            .bind(get_current_timestamp_secs())
+            .bind(id)
+            .bind(crate::ProofState::Failed.to_i64());
+        if let Some(max_resets) = max_resets {
+            query = query.bind(max_resets);
+        }
+        Ok(query.execute(self.conn()).await?.rows_affected())
+    }
+
+    /// Sets the inputs of a graph's Operator task.
+    pub async fn update_operator_proof_inputs(
+        &mut self,
+        instance_id: &Uuid,
+        graph_id: &Uuid,
+        operator_committed_blockhash: &str,
+        execution_layer_block_number: i64,
+        input_hash: &str,
+    ) -> anyhow::Result<u64> {
+        let res = sqlx::query(
+            "UPDATE operator_proof
+             SET operator_committed_blockhash = ?, execution_layer_block_number = ?,
+                 input_hash = ?, updated_at = ?
+             WHERE instance_id = ? AND graph_id = ?",
+        )
+        .bind(operator_committed_blockhash)
+        .bind(execution_layer_block_number)
+        .bind(input_hash)
+        .bind(get_current_timestamp_secs())
+        .bind(instance_id)
+        .bind(graph_id)
+        .execute(self.conn())
+        .await?;
+        Ok(res.rows_affected())
+    }
+
+    /// Sets the inputs of a Watchtower task.
+    pub async fn update_watchtower_proof_inputs(
+        &mut self,
+        id: i64,
+        challenge_init_txid: &crate::SerializableTxid,
+        execution_layer_block_number: i64,
+    ) -> anyhow::Result<u64> {
+        let res = sqlx::query(
+            "UPDATE watchtower_proof
+             SET challenge_init_txid = ?, execution_layer_block_number = ?, updated_at = ?
+             WHERE id = ?",
+        )
+        .bind(challenge_init_txid)
+        .bind(execution_layer_block_number)
+        .bind(get_current_timestamp_secs())
+        .bind(id)
+        .execute(self.conn())
+        .await?;
+        Ok(res.rows_affected())
+    }
+
     /// Returns the current proof state of an on-demand proof task.
     pub async fn get_on_demand_proof_state(
         &mut self,

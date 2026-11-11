@@ -1,4 +1,5 @@
 use crate::api::response::ErrorResponse;
+use crate::task::validate_indexed_watchtower_challenges;
 use axum::Json;
 use axum::http::StatusCode;
 use bitcoin::hashes::Hash;
@@ -111,6 +112,13 @@ impl InputValidator {
                 ),
             );
         }
+        if let Err(error) = validate_indexed_watchtower_challenges(
+            &request.watchtower_challenge_txids,
+            &request.included_watchtowers,
+            &request.watchtower_challenge_pubkeys,
+        ) {
+            return invalid("INVALID_WATCHTOWER_CHALLENGES", format!("{error:#}"));
+        }
         Ok(())
     }
 
@@ -171,5 +179,49 @@ impl InputValidator {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_bad_watchtower_list_is_a_bad_request() {
+        let graph_data = GraphData {
+            operator_pubkey_prefix: 0,
+            operator_pubkey: [0; 32],
+            pegin_txid: [0; 32],
+            kickoff_txid: [0; 32],
+            take1_txid: [0; 32],
+            take2_txid: [0; 32],
+            watchtower_challenge_init_txid: [0x22; 32],
+            prover_assert_txid: [0; 32],
+            disprove_txids: vec![],
+            watchtower_challenge_timeout_txids: vec![[0; 32]],
+            operator_challenge_nack_txids: vec![],
+            operator_commit_timeout_txid: [0; 32],
+        };
+        let mut request = OperatorProofRequest {
+            instance_id: Uuid::nil().to_string(),
+            graph_id: Uuid::nil().to_string(),
+            gateway_address: None,
+            operator_committed_blockhash: "11".repeat(32),
+            execution_layer_block_number: 1,
+            watchtower_challenge_txids: vec![None],
+            included_watchtowers: vec![false],
+            watchtower_challenge_init_txid: "22".repeat(32),
+            watchtower_challenge_pubkeys: vec![
+                "0272efe7ccae21d2541ad85d4f2961f2e5593c29dc8bc37bf87035fc2d5527a651".to_string(),
+            ],
+        };
+        assert!(InputValidator::validate_operator_task(&request, &graph_data).is_ok());
+
+        // Included, but no challenge txid.
+        request.included_watchtowers = vec![true];
+        let (status, Json(error)) =
+            InputValidator::validate_operator_task(&request, &graph_data).unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(error.error, "INVALID_WATCHTOWER_CHALLENGES");
     }
 }

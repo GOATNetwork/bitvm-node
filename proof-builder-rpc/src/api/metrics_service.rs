@@ -319,6 +319,7 @@ fn proof_state_label(state: &str) -> &'static str {
         "1" => "proving",
         "2" => "proven",
         "3" => "failed",
+        "4" => "cancelled",
         _ => "unknown",
     }
 }
@@ -390,7 +391,7 @@ mod tests {
                     },
                     store::MetricsStateCount {
                         category: "operator".to_owned(),
-                        state: "4".to_owned(),
+                        state: "5".to_owned(),
                         count: 2,
                         oldest_created_at: Some(70),
                         last_success_at: None,

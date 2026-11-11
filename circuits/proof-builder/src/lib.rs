@@ -324,8 +324,24 @@ impl ProofData {
     }
 }
 
+/// Where an Operator or Watchtower proof task stands, as a submission reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProofTaskState {
+    /// The task is queued or being proven; submit again later.
+    Pending,
+    /// The proof is in `proof_data`.
+    Proven,
+    /// The task failed for good: its inputs can never be proven, or it failed again
+    /// after the restarts a resubmission allows. `error` says why.
+    Failed,
+    /// The task is no longer wanted (its request timed out).
+    Cancelled,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct OperatorProofResponse {
+    pub state: ProofTaskState,
     pub proof_data: Option<ProofData>,
     pub error: Option<String>,
 }
@@ -343,6 +359,7 @@ pub struct WatchtowerProofRequest {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WatchtowerProofResponse {
+    pub state: ProofTaskState,
     pub proof_data: Option<ProofData>,
     pub error: Option<String>,
 }

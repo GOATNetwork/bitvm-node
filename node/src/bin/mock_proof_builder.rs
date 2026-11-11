@@ -36,7 +36,7 @@ use axum::response::Json;
 use axum::routing::{get, post};
 use clap::Parser;
 use proof_builder::{
-    OperatorProofRequest, OperatorProofResponse, ProofData, ProofDescResponse,
+    OperatorProofRequest, OperatorProofResponse, ProofData, ProofDescResponse, ProofTaskState,
     WatchtowerProofRequest, WatchtowerProofResponse, WatchtowerProofTimeoutUpdateRequest,
     WatchtowerProofTimeoutUpdateResponse,
 };
@@ -82,8 +82,8 @@ struct Args {
 struct AppState {
     /// First-seen instant per proof task key -> used to gate readiness.
     seen: Mutex<HashMap<String, Instant>>,
-    /// Watchtower task keys marked failed by the timeout endpoint (stay "not ready" forever).
-    failed_watchtower: Mutex<HashSet<String>>,
+    /// Watchtower task keys cancelled by the timeout endpoint.
+    cancelled_watchtower: Mutex<HashSet<String>>,
     /// Pre-parsed operator proof template.
     operator_template: ZKMProofWithPublicValues,
     operator_vk: String,
@@ -254,6 +254,7 @@ async fn handle_operator_proof(
     let key = format!("operator:{}:{}", req.instance_id, req.graph_id);
     if !task_ready(&state, &key, operator_delay()) {
         return Json(OperatorProofResponse {
+            state: ProofTaskState::Pending,
             proof_data: None,
             error: Some("operator proof is not ready".to_string()),
         });
@@ -261,11 +262,19 @@ async fn handle_operator_proof(
     match operator_proof_data(&state, &req) {
         Ok(proof_data) => {
             tracing::info!(graph_id = %req.graph_id, "serving mock operator proof");
-            Json(OperatorProofResponse { proof_data: Some(proof_data), error: None })
+            Json(OperatorProofResponse {
+                state: ProofTaskState::Proven,
+                proof_data: Some(proof_data),
+                error: None,
+            })
         }
         Err(error) => {
             tracing::warn!(graph_id = %req.graph_id, %error, "cannot build mock operator proof");
-            Json(OperatorProofResponse { proof_data: None, error: Some(error) })
+            Json(OperatorProofResponse {
+                state: ProofTaskState::Pending,
+                proof_data: None,
+                error: Some(error),
+            })
         }
     }
 }
@@ -278,22 +287,32 @@ async fn handle_watchtower_proof(
     log_auth_headers("watchtower", &headers);
     response_latency().await;
     let key = format!("watchtower:{}:{}:{}", req.instance_id, req.graph_id, req.public_key);
-    if state.failed_watchtower.lock().expect("failed set poisoned").contains(&key) {
+    if state.cancelled_watchtower.lock().expect("cancelled set poisoned").contains(&key) {
         return Json(WatchtowerProofResponse {
+            state: ProofTaskState::Cancelled,
             proof_data: None,
-            error: Some("watchtower proof task was marked failed".to_string()),
+            error: Some("watchtower proof task was cancelled".to_string()),
         });
     }
     if !task_ready(&state, &key, watchtower_delay()) {
         return Json(WatchtowerProofResponse {
+            state: ProofTaskState::Pending,
             proof_data: None,
             error: Some("watchtower proof is not ready".to_string()),
         });
     }
     tracing::info!(graph_id = %req.graph_id, "serving mock watchtower proof");
     match watchtower_proof_data(&state, &key) {
-        Ok(data) => Json(WatchtowerProofResponse { proof_data: Some(data), error: None }),
-        Err(error) => Json(WatchtowerProofResponse { proof_data: None, error: Some(error) }),
+        Ok(data) => Json(WatchtowerProofResponse {
+            state: ProofTaskState::Proven,
+            proof_data: Some(data),
+            error: None,
+        }),
+        Err(error) => Json(WatchtowerProofResponse {
+            state: ProofTaskState::Pending,
+            proof_data: None,
+            error: Some(error),
+        }),
     }
 }
 
@@ -304,7 +323,7 @@ async fn handle_watchtower_timeout(
 ) -> Json<WatchtowerProofTimeoutUpdateResponse> {
     log_auth_headers("watchtower-timeout", &headers);
     let key = format!("watchtower:{}:{}:{}", req.instance_id, req.graph_id, req.public_key);
-    state.failed_watchtower.lock().expect("failed set poisoned").insert(key);
+    state.cancelled_watchtower.lock().expect("cancelled set poisoned").insert(key);
     Json(WatchtowerProofTimeoutUpdateResponse {
         instance_id: req.instance_id,
         graph_id: req.graph_id,
@@ -353,7 +372,7 @@ fn build_state() -> AppState {
 
     AppState {
         seen: Mutex::new(HashMap::new()),
-        failed_watchtower: Mutex::new(HashSet::new()),
+        cancelled_watchtower: Mutex::new(HashSet::new()),
         operator_template,
         operator_vk,
         operator_zkm_version,
@@ -401,7 +420,7 @@ mod tests {
         let operator_template = mock_operator_template();
         AppState {
             seen: Mutex::new(HashMap::new()),
-            failed_watchtower: Mutex::new(HashSet::new()),
+            cancelled_watchtower: Mutex::new(HashSet::new()),
             operator_template,
             operator_vk: DEFAULT_OPERATOR_VK.to_string(),
             operator_zkm_version: zkm_sdk::ZKM_CIRCUIT_VERSION.to_string(),
