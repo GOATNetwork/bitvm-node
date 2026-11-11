@@ -555,6 +555,15 @@ async fn test_count_pending_long_running_task_proofs() {
     assert_eq!(s.count_pending_long_running_task_proofs(&chain, 20).await.unwrap(), 2);
     assert_eq!(s.count_pending_long_running_task_proofs(&chain, 0).await.unwrap(), 3);
     assert_eq!(s.count_pending_long_running_task_proofs("header-chain", 0).await.unwrap(), 0);
+
+    // A batch reset drops every unproven batch from its start, of its own chain only.
+    let mut deleted = s.delete_unproven_long_running_task_proofs(&chain, 10).await.unwrap();
+    deleted.sort();
+    assert_eq!(deleted, [20, 30, 40]);
+    assert_eq!(s.count_pending_long_running_task_proofs(&chain, 0).await.unwrap(), 1);
+    assert!(
+        s.delete_unproven_long_running_task_proofs("header-chain", 0).await.unwrap().is_empty()
+    );
 }
 
 #[tokio::test]
