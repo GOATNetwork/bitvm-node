@@ -43,6 +43,7 @@ pub(crate) enum ProcessOutcome {
     TimedOut,
     Poisoned,
     NoHandler,
+    GaveUp,
 }
 
 impl ProcessOutcome {
@@ -55,6 +56,7 @@ impl ProcessOutcome {
             ProcessOutcome::TimedOut => "timed_out",
             ProcessOutcome::Poisoned => "poisoned",
             ProcessOutcome::NoHandler => "no_handler",
+            ProcessOutcome::GaveUp => "gave_up",
         }
     }
 }
@@ -245,11 +247,14 @@ pub(crate) async fn process_event(
             if is_busy_error(&error) {
                 // Lock contention is not a business failure: try again shortly.
                 schedule_retry_at(deps, &event, &error.to_string(), deps.clock.now() + 1).await?;
+                warn!(event = "engine_apply", outcome = "transient", event_id = %event.event_id, aggregate = %aggregate, kind = %kind, attempt = event.attempts + 1, error = %error, "event apply failed transiently; will retry");
+                ProcessOutcome::Transient
+            } else if retry_or_give_up(deps, &event, &aggregate, &error.to_string()).await? {
+                warn!(event = "engine_apply", outcome = "transient", event_id = %event.event_id, aggregate = %aggregate, kind = %kind, attempt = event.attempts + 1, error = %error, "event apply failed transiently; will retry");
+                ProcessOutcome::Transient
             } else {
-                schedule_retry(deps, &event, &error.to_string()).await?;
+                ProcessOutcome::GaveUp
             }
-            warn!(event = "engine_apply", outcome = "transient", event_id = %event.event_id, aggregate = %aggregate, kind = %kind, attempt = event.attempts + 1, error = %error, "event apply failed transiently; will retry");
-            ProcessOutcome::Transient
         }
         Ok(Ok(Err(ApplyError::Invariant(error)))) => {
             drop(tx);
@@ -259,9 +264,12 @@ pub(crate) async fn process_event(
         Ok(Err(_elapsed)) => {
             drop(tx);
             let message = format!("apply timed out after {:?}", deps.config.apply_timeout);
-            schedule_retry(deps, &event, &message).await?;
-            warn!(event = "engine_apply", outcome = "timed_out", event_id = %event.event_id, aggregate = %aggregate, kind = %kind, "event apply timed out; will retry");
-            ProcessOutcome::TimedOut
+            if retry_or_give_up(deps, &event, &aggregate, &message).await? {
+                warn!(event = "engine_apply", outcome = "timed_out", event_id = %event.event_id, aggregate = %aggregate, kind = %kind, "event apply timed out; will retry");
+                ProcessOutcome::TimedOut
+            } else {
+                ProcessOutcome::GaveUp
+            }
         }
         Err(payload) => {
             drop(tx);
@@ -411,6 +419,48 @@ async fn commit_apply(
     })
 }
 
+/// An apply that keeps failing transiently this often and this long is a
+/// deterministic fault (the apply only touches local state), not a passing one.
+/// Both bounds must hold: lock contention retries every second, and an event
+/// may have waited on a dependency for days before its first attempt.
+const INBOX_GIVE_UP_ATTEMPTS: i64 = 150;
+const INBOX_GIVE_UP_AGE_SECS: i64 = 24 * 3600;
+
+fn inbox_gives_up(event: &EngineInboxEvent, now: i64) -> bool {
+    event.attempts + 1 >= INBOX_GIVE_UP_ATTEMPTS
+        && now.saturating_sub(event.created_at) >= INBOX_GIVE_UP_AGE_SECS
+}
+
+/// Schedule the next attempt, or record the event as `Failed` once it ran out
+/// of them. Returns whether a retry was scheduled. A failed network event is
+/// not ACKed, so its sender's resend re-arms it (after a fix, for instance).
+async fn retry_or_give_up(
+    deps: &WorkerDeps,
+    event: &EngineInboxEvent,
+    aggregate: &AggregateRef,
+    error: &str,
+) -> anyhow::Result<bool> {
+    let now = deps.clock.now();
+    if !inbox_gives_up(event, now) {
+        schedule_retry(deps, event, error).await?;
+        return Ok(true);
+    }
+    let reason = format!("gave up after {} transient failures: {error}", event.attempts + 1);
+    let mut storage = deps.db.acquire().await?;
+    storage.mark_engine_inbox_failed(&event.event_id, &reason, now).await?;
+    error!(
+        event = "engine_apply",
+        outcome = "gave_up",
+        event_id = %event.event_id,
+        aggregate = %aggregate,
+        kind = %event.kind,
+        attempts = event.attempts + 1,
+        error = %error,
+        "event kept failing transiently; recorded as failed"
+    );
+    Ok(false)
+}
+
 async fn schedule_retry(
     deps: &WorkerDeps,
     event: &EngineInboxEvent,
@@ -475,5 +525,14 @@ async fn poison(
         reason = %reason,
         "event poisoned; later events of this kind wait for the backoff, a clean apply or a manual clear"
     );
+    // The event is stored and terminal: a resend changes nothing, so the
+    // sender may stop.
+    PostCommit {
+        acks: event.ack_target().into_iter().collect(),
+        woke: false,
+        outbox: false,
+        jobs: false,
+    }
+    .dispatch(deps);
     Ok(())
 }

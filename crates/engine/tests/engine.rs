@@ -574,6 +574,44 @@ async fn transient_failures_back_off_and_never_poison() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_event_failing_transiently_for_a_day_is_given_up() {
+    // Recorded 25 hours before the engine's clock, 148 attempts in.
+    let t = start_with(fast_config(), async |db: &LocalDB| {
+        let mut s = db.acquire().await.unwrap();
+        let recorded = 1_000_000 - 25 * 3600;
+        s.insert_engine_inbox_event(
+            &store::NewEngineInboxEvent {
+                event_id: "stuck".into(),
+                aggregate_kind: KIND.into(),
+                aggregate_id: "a".into(),
+                kind: "transient".into(),
+                source: "local".into(),
+                author: String::new(),
+                admission_class: String::new(),
+                payload: b"1000".to_vec(),
+                ack: None,
+            },
+            recorded,
+        )
+        .await
+        .unwrap();
+        for _ in 0..148 {
+            s.mark_engine_inbox_retry("stuck", "flaky", recorded, recorded).await.unwrap();
+        }
+    })
+    .await;
+    // Attempt 149 is still retried; attempt 150 gives up.
+    let row = t.wait_inbox_attempts("stuck", 149).await;
+    assert_eq!(row.state, "Pending");
+    t.clock.advance(1);
+    let row = t.wait_inbox_state("stuck", EngineInboxState::Failed).await;
+    assert_eq!(row.attempts, 150);
+    assert!(row.last_error.as_deref().unwrap_or("").contains("gave up after 150"));
+    assert!(t.handle.snapshot().await.unwrap().poisoned.is_empty());
+    t.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn apply_timeout_is_a_transient_failure() {
     let t = start().await;
     t.submit("a", "e1", "slow", "2000").await;
@@ -666,6 +704,24 @@ async fn panics_and_invariants_poison_their_kind() {
             rearmed: false
         }
     );
+    t.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_poisoned_network_event_is_acked_and_so_is_its_resend() {
+    let mut t = start().await;
+    t.submit_acked("a", "e1", "panic", "", "peer-1", "d-1").await;
+    t.wait_inbox_state("e1", EngineInboxState::Poisoned).await;
+    assert_eq!(t.wait_ack().await.delivery_id, "d-1");
+    assert_eq!(
+        t.submit_acked("a", "e1", "panic", "", "peer-1", "d-1").await,
+        SubmitOutcome::Duplicate {
+            state: EngineInboxState::Poisoned,
+            ack_sent: true,
+            rearmed: false
+        }
+    );
+    assert_eq!(t.wait_ack().await.delivery_id, "d-1");
     t.stop().await;
 }
 
