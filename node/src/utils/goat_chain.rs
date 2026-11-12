@@ -8,7 +8,7 @@ use anyhow::{Result, anyhow, bail};
 use bitcoin::hashes::Hash;
 use bitcoin::{Address, Amount, OutPoint, PublicKey, Txid, XOnlyPublicKey};
 use bitvm_lib::types::{BitvmGcGraph, BitvmGcInstanceParameters, UserInfo};
-use client::{btc_chain::BTCClient, goat_chain::GOATClient};
+use client::goat_chain::GOATClient;
 use goat::transactions::base::Input;
 use libp2p::PeerId;
 use std::str::FromStr;
@@ -19,8 +19,6 @@ use bitvm_lib::transactions::base::BaseTransaction;
 use client::goat_chain::{GraphData, PeginStatus};
 use store::GraphStatus;
 use uuid::Uuid;
-
-use super::btc::outpoint_available;
 
 pub fn build_graph_data(graph: &BitvmGcGraph) -> Result<GraphData> {
     // operator pubkey: first byte is prefix, next 32 bytes are key
@@ -138,8 +136,9 @@ pub async fn validate_committee_with_evm_address(
     ))
 }
 
+/// The pending request on Goat, parsed. Its inputs are checked on Bitcoin by
+/// the caller ([`crate::utils::pegin_inputs_answerable`]).
 pub async fn read_pegin_request(
-    btc_client: &BTCClient,
     goat_client: &GOATClient,
     instance_id: Uuid,
 ) -> Result<(UserInfo, Amount, Vec<EvmAddress>)> {
@@ -175,16 +174,6 @@ pub async fn read_pegin_request(
             amount: Amount::from_sat(u.amount_sats),
         })
         .collect();
-    // TODO: we need to run our own bitcoin node in case of downtime or ddos attack.
-    for input in &inputs {
-        if !outpoint_available(btc_client, &input.outpoint.txid, input.outpoint.vout.into()).await?
-        {
-            bail!(SpecialError::InvalidPeginRequest(format!(
-                "input {}:{} is not available",
-                input.outpoint.txid, input.outpoint.vout
-            )));
-        }
-    }
     let user_info = UserInfo {
         depositor_evm_address: pegin_data.depositor_address,
         txn_fees: pegin_data.txn_fees,

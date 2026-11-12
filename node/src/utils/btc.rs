@@ -569,6 +569,36 @@ pub async fn check_bridge_in_uxto_available_or_self_spent(
     Ok(true)
 }
 
+/// Whether a committee member can answer a peg-in request with these inputs.
+/// Only a confirmed spend by another transaction rules the request out (an
+/// [`SpecialError::InvalidPeginRequest`]). An outpoint the backend does not know
+/// yet, or a spend still in the mempool, may change: `Some(reason)` asks the
+/// caller to look again later.
+pub async fn pegin_inputs_answerable(
+    btc_client: &BTCClient,
+    inputs: &[goat::transactions::base::Input],
+) -> Result<Option<String>> {
+    for input in inputs {
+        let (txid, vout) = (input.outpoint.txid, input.outpoint.vout);
+        match btc_client.get_output_status(&txid, u64::from(vout)).await? {
+            Some(status) if !status.spent => {}
+            Some(status) if status.status.as_ref().is_some_and(|tx_status| tx_status.confirmed) => {
+                anyhow::bail!(crate::error::SpecialError::InvalidPeginRequest(format!(
+                    "input {txid}:{vout} is spent by confirmed transaction {:?}",
+                    status.txid
+                )));
+            }
+            Some(_) => return Ok(Some(format!("input {txid}:{vout} is spent in the mempool"))),
+            None => {
+                return Ok(Some(format!(
+                    "input {txid}:{vout} is not known to the Bitcoin backend"
+                )));
+            }
+        }
+    }
+    Ok(None)
+}
+
 #[cfg(test)]
 mod input_availability_tests {
     use super::*;
@@ -607,5 +637,27 @@ mod input_availability_tests {
         assert!(check().await.unwrap(), "a mempool conflict can still be replaced");
         mock.set_output_status(funding, 0, spend(other, true));
         assert!(!check().await.unwrap(), "a confirmed conflict discards the request");
+    }
+
+    #[tokio::test]
+    async fn committee_answers_wait_for_unknown_or_mempool_spent_inputs() {
+        use goat::transactions::base::Input;
+        let (btc, mock) = BTCClient::new_mock_client();
+        let funding = Txid::from_byte_array([4; 32]);
+        let other = Txid::from_byte_array([5; 32]);
+        let inputs = [Input {
+            outpoint: bitcoin::OutPoint { txid: funding, vout: 0 },
+            amount: bitcoin::Amount::from_sat(1),
+        }];
+
+        assert!(pegin_inputs_answerable(&btc, &inputs).await.unwrap().is_some(), "unknown");
+        mock.set_output_status(funding, 0, spend(other, false));
+        assert!(pegin_inputs_answerable(&btc, &inputs).await.unwrap().is_some(), "mempool spend");
+        mock.set_output_status(funding, 0, spend(other, true));
+        let error = pegin_inputs_answerable(&btc, &inputs).await.unwrap_err();
+        assert!(matches!(
+            crate::error::classify_failure(&error),
+            crate::error::FailureClass::Permanent(_)
+        ));
     }
 }
