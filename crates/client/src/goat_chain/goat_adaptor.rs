@@ -345,7 +345,7 @@ sol!(
     }
 );
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct GoatInitConfig {
     pub rpc_url: Url,
     pub private_key: Option<String>,
@@ -357,6 +357,23 @@ pub struct GoatInitConfig {
     pub multi_sig_verifier_address: Option<Address>,
     pub btc_spv_address: Option<Address>,
     pub peg_btc_address: Option<Address>,
+}
+
+impl std::fmt::Debug for GoatInitConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GoatInitConfig")
+            .field("rpc_url", &self.rpc_url)
+            .field("private_key", &self.private_key.as_ref().map(|_| "<redacted>"))
+            .field("chain_id", &self.chain_id)
+            .field("gateway_address", &self.gateway_address)
+            .field("sequencer_set_publisher_address", &self.sequencer_set_publisher_address)
+            .field("committee_management_address", &self.committee_management_address)
+            .field("stake_management_address", &self.stake_management_address)
+            .field("multi_sig_verifier_address", &self.multi_sig_verifier_address)
+            .field("btc_spv_address", &self.btc_spv_address)
+            .field("peg_btc_address", &self.peg_btc_address)
+            .finish()
+    }
 }
 
 impl GoatInitConfig {
@@ -1723,6 +1740,30 @@ impl GoatAdaptor {
             btc_spv: config.btc_spv_address.map(|addr| IBitcoinSPV::new(addr, provider.clone())),
             peg_btc: config.peg_btc_address.map(|addr| IPegBtc::new(addr, provider.clone())),
         }
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    #[test]
+    fn debug_output_hides_the_private_key() {
+        let config = GoatInitConfig {
+            rpc_url: Url::parse("http://127.0.0.1:8545").unwrap(),
+            private_key: Some("deadbeefcafe".to_string()),
+            chain_id: 1,
+            gateway_address: None,
+            sequencer_set_publisher_address: None,
+            committee_management_address: None,
+            stake_management_address: None,
+            multi_sig_verifier_address: None,
+            btc_spv_address: None,
+            peg_btc_address: None,
+        };
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("deadbeefcafe"));
+        assert!(debug.contains("<redacted>"));
     }
 }
 

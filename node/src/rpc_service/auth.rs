@@ -38,7 +38,7 @@ pub async fn require_request_auth(
 ) -> Response {
     let (parts, body) = request.into_parts();
     let now = current_time_secs();
-    let parsed_auth = match parse_auth_headers(&parts.headers, now) {
+    let parsed_auth = match parse_auth_headers(&parts.headers, now, app_state.rpc_auth_not_before) {
         Ok(auth) => auth,
         Err(error) => return error.into_response(),
     };
@@ -116,9 +116,12 @@ pub fn sign_request_auth(
     (timestamp, nonce, signature)
 }
 
+/// `not_before` is the node start: the nonce cache is in memory, so a request
+/// stamped before it may already have been accepted by the previous process.
 fn parse_auth_headers(
     headers: &HeaderMap,
     now: i64,
+    not_before: i64,
 ) -> Result<ParsedAuth, (StatusCode, Json<ErrorResponse>)> {
     let timestamp_str = header_value(headers, AUTH_TIMESTAMP_HEADER)?.to_string();
     let timestamp = timestamp_str
@@ -126,6 +129,13 @@ fn parse_auth_headers(
         .map_err(|_| auth_error(StatusCode::UNAUTHORIZED, "AUTH_ERROR", "invalid timestamp"))?;
     if now.abs_diff(timestamp) > AUTH_WINDOW_SECS as u64 {
         return Err(auth_error(StatusCode::UNAUTHORIZED, "AUTH_ERROR", "timestamp expired"));
+    }
+    if timestamp < not_before {
+        return Err(auth_error(
+            StatusCode::UNAUTHORIZED,
+            "AUTH_ERROR",
+            "timestamp predates the node start; sign the request again",
+        ));
     }
 
     let nonce = header_value(headers, AUTH_NONCE_HEADER)?.to_string();
@@ -257,7 +267,7 @@ mod tests {
         body: &[u8],
         now: i64,
     ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-        let auth = parse_auth_headers(headers, now)?;
+        let auth = parse_auth_headers(headers, now, 0)?;
         let (x_only_pubkey, _) = test_keypair().x_only_public_key();
         verify_auth_signature(&auth, method, target, body, &x_only_pubkey)
     }
@@ -277,6 +287,18 @@ mod tests {
 
         assert!(verify(&headers, &Method::POST, TARGET, BODY, 2_000_000_000).is_ok());
         assert!(verify(&non_v4_headers, &Method::POST, TARGET, BODY, 2_000_000_000).is_ok());
+    }
+
+    #[test]
+    fn requests_signed_before_the_node_started_are_rejected() {
+        let keypair = test_keypair();
+        let headers = signed_headers(&keypair, TIMESTAMP, NONCE, &Method::POST, TARGET, BODY);
+        let now = 2_000_000_060;
+
+        assert!(parse_auth_headers(&headers, now, 2_000_000_000).is_ok());
+        let (status, body) = parse_auth_headers(&headers, now, 2_000_000_001).err().unwrap();
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(body.message.contains("predates the node start"));
     }
 
     #[test]

@@ -25,7 +25,7 @@ use bitvm_noded::{
     run_watch_event_task,
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use bitvm_noded::metrics_service::{MetricsState, set_node_metrics_state};
 use bitvm_noded::middleware::swarm::{BitvmNetworkManager, BitvmSwarmConfig};
 use bitvm_noded::p2p_admission::load_persisted_peer_bindings;
@@ -152,6 +152,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         )
         .into());
     }
+    // A malformed CORS setting stops startup here instead of failing the RPC task later.
+    let _ = rpc_service::cors_config::CorsConfig::from_env()
+        .create_cors_layer()
+        .context("invalid CORS configuration")?;
     // Bind the metrics listener before any background task starts, so an invalid path
     // or an unavailable metrics port aborts startup with an explicit error.
     let metrics_listener = match opt.metrics_addr.as_deref() {

@@ -162,7 +162,8 @@ struct BackendHealth {
     failed_calls: u64,
     unavailable_since: Option<i64>,
     last_failure_at: Option<i64>,
-    last_error: Option<String>,
+    /// The operation that failed last; the error text itself only goes to the log.
+    last_failed_operation: Option<&'static str>,
 }
 
 /// One backend's availability as served by `/v1/health`.
@@ -172,6 +173,8 @@ pub struct BackendHealthSnapshot {
     pub up: bool,
     pub unavailable_since: Option<i64>,
     pub consecutive_failures: u32,
+    /// Which operation failed last, e.g. `"get_block_height failed"`. Never the raw
+    /// error, which can carry backend URLs and API keys.
     pub last_error: Option<String>,
 }
 
@@ -589,16 +592,22 @@ impl MetricsState {
     }
 
     /// Records one call to a backend and logs only the transitions: one WARN
-    /// when it becomes unavailable, one INFO when it answers again.
-    pub fn record_backend_call(&self, backend: &'static str, success: bool, error: Option<&str>) {
-        self.record_backend_call_at(backend, success, error, current_time_secs());
+    /// when it becomes unavailable, one INFO when it answers again. A failure may
+    /// name the failed operation and its error.
+    pub fn record_backend_call(
+        &self,
+        backend: &'static str,
+        success: bool,
+        failure: Option<(&'static str, &str)>,
+    ) {
+        self.record_backend_call_at(backend, success, failure, current_time_secs());
     }
 
     fn record_backend_call_at(
         &self,
         backend: &'static str,
         success: bool,
-        error: Option<&str>,
+        failure: Option<(&'static str, &str)>,
         now: i64,
     ) {
         let labels = BackendLabels { backend: backend.to_owned() };
@@ -621,13 +630,13 @@ impl MetricsState {
                 self.backend_up.get_or_create(&labels).set(1);
                 self.backend_unavailable_since_seconds.get_or_create(&labels).set(0);
                 entry.failed_calls = 0;
-                entry.last_error = None;
+                entry.last_failed_operation = None;
             }
         } else {
             entry.consecutive_failures += 1;
             entry.failed_calls += 1;
             entry.last_failure_at = Some(now);
-            entry.last_error = error.map(str::to_owned);
+            entry.last_failed_operation = failure.map(|(operation, _)| operation);
             if entry.unavailable_since.is_none()
                 && entry.consecutive_failures >= BACKEND_UNAVAILABLE_AFTER_FAILURES
             {
@@ -637,7 +646,7 @@ impl MetricsState {
                     backend,
                     outcome = "unavailable",
                     consecutive_failures = entry.consecutive_failures,
-                    error = error.unwrap_or("unknown"),
+                    error = failure.map_or("unknown", |(_, error)| error),
                     "backend unavailable; further failures are logged at debug until it recovers"
                 );
                 self.backend_up.get_or_create(&labels).set(0);
@@ -682,7 +691,7 @@ impl MetricsState {
             _ => 0,
         };
         let message = error.to_string();
-        self.record_backend_call(backend, false, Some(&message));
+        self.record_backend_call(backend, false, Some((operation, &message)));
         if known_down {
             tracing::debug!(event = "metrics_backend_probe", backend, operation, error = %message, "backend probe failed (backend already unavailable)");
         } else {
@@ -701,7 +710,9 @@ impl MetricsState {
                     up: entry.is_none_or(|h| h.unavailable_since.is_none()),
                     unavailable_since: entry.and_then(|h| h.unavailable_since),
                     consecutive_failures: entry.map_or(0, |h| h.consecutive_failures),
-                    last_error: entry.and_then(|h| h.last_error.clone()),
+                    last_error: entry
+                        .and_then(|h| h.last_failed_operation)
+                        .map(|operation| format!("{operation} failed")),
                 }
             })
             .collect()
@@ -1230,19 +1241,19 @@ mod tests {
     #[test]
     fn backend_availability_transitions_after_consecutive_failures() {
         let state = MetricsState::new(Arc::new(Mutex::new(Registry::default())));
-        state.record_backend_call_at("goat", false, Some("timeout"), 1_000);
+        state.record_backend_call_at("goat", false, Some(("get_height", "timeout")), 1_000);
         assert!(!state.backend_unavailable("goat"), "one failure is not an outage");
-        state.record_backend_call_at("goat", false, Some("timeout"), 1_005);
+        state.record_backend_call_at("goat", false, Some(("get_height", "timeout")), 1_005);
         assert!(state.backend_unavailable("goat"));
         let snapshot = state.backend_health_snapshot();
         let goat = snapshot.iter().find(|b| b.backend == "goat").unwrap();
         assert!(!goat.up);
         assert_eq!(goat.unavailable_since, Some(1_005));
-        assert_eq!(goat.last_error.as_deref(), Some("timeout"));
+        assert_eq!(goat.last_error.as_deref(), Some("get_height failed"));
         // a success right after a failure is a flap, not a recovery
         state.record_backend_call_at("goat", true, None, 1_010);
         assert!(state.backend_unavailable("goat"));
-        state.record_backend_call_at("goat", false, Some("502"), 1_015);
+        state.record_backend_call_at("goat", false, Some(("get_height", "502")), 1_015);
         // recovered once no call failed for the quiet window
         state.record_backend_call_at("goat", true, None, 1_015 + BACKEND_RECOVERY_QUIET_SECS);
         assert!(!state.backend_unavailable("goat"));
@@ -1256,6 +1267,16 @@ mod tests {
     }
 
     #[test]
+    fn health_snapshot_names_the_operation_but_not_the_error() {
+        let state = MetricsState::new(Arc::new(Mutex::new(Registry::default())));
+        let error = "error sending request for url (https://rpc.example/v1/SECRET_API_KEY)";
+        state.backend_probe_failed("btc", "get_block_height", &error);
+        let btc = state.backend_health_snapshot().into_iter().find(|b| b.backend == "btc").unwrap();
+        assert_eq!(btc.last_error.as_deref(), Some("get_block_height failed"));
+        assert!(!serde_json::to_string(&btc).unwrap().contains("SECRET_API_KEY"));
+    }
+
+    #[test]
     fn readiness_follows_backend_availability() {
         let state = MetricsState::new(Arc::new(Mutex::new(Registry::default())));
         state.mark_startup_ready();
@@ -1263,14 +1284,14 @@ mod tests {
         state.mark_backend_ready(true);
         state.set_event_watch_state(EventWatchState::Healthy);
         assert!(state.readiness_snapshot().ready);
-        state.record_backend_call_at("graph", false, Some("down"), 100);
-        state.record_backend_call_at("graph", false, Some("down"), 105);
+        state.record_backend_call_at("graph", false, Some(("get_height", "down")), 100);
+        state.record_backend_call_at("graph", false, Some(("get_height", "down")), 105);
         assert!(!state.readiness_snapshot().ready, "an unavailable subgraph is not ready");
         assert!(encoded(&state).contains("bitvm_node_ready 0"));
         // the proof builder is informational only
         state.record_backend_call_at("graph", true, None, 200);
-        state.record_backend_call_at("proof", false, Some("down"), 200);
-        state.record_backend_call_at("proof", false, Some("down"), 205);
+        state.record_backend_call_at("proof", false, Some(("get_height", "down")), 200);
+        state.record_backend_call_at("proof", false, Some(("get_height", "down")), 205);
         assert!(state.readiness_snapshot().ready);
     }
 }
