@@ -29,7 +29,9 @@ use alloy::{
 };
 use anyhow::{bail, format_err};
 use async_trait::async_trait;
+use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 use tokio::time;
 use uuid::Uuid;
@@ -486,6 +488,23 @@ type StakeManagementInstance = IStakeManagementInstance<
     >,
 >;
 
+/// How long a send waits for its receipt before reporting failure.
+const RECEIPT_WAIT_SECS: u64 = 30;
+
+/// One lock per sender address, shared by every adaptor in the process. It is held
+/// from reading the nonce until the receipt arrives or the wait times out, so two
+/// clients with the same key never sign with the same nonce. The nonce comes from
+/// the latest block on purpose: with sends serialized it equals the pending nonce,
+/// except after a timeout, where reusing it replaces the stuck transaction instead
+/// of queueing a duplicate behind it.
+static SENDER_LOCKS: LazyLock<Mutex<HashMap<Address, Arc<tokio::sync::Mutex<()>>>>> =
+    LazyLock::new(Default::default);
+
+fn sender_lock(sender: Address) -> Arc<tokio::sync::Mutex<()>> {
+    let mut locks = SENDER_LOCKS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    locks.entry(sender).or_default().clone()
+}
+
 pub struct GoatAdaptor {
     chain_id: ChainId,
     signer: EthereumWallet,
@@ -559,7 +578,8 @@ impl GoatAdaptor {
         &self,
         tx_request: TransactionRequest,
     ) -> anyhow::Result<TxHash> {
-        let (tx_hash, _) = self.handle_transaction_request_with_wait(tx_request, 10).await?;
+        let (tx_hash, _) =
+            self.handle_transaction_request_with_wait(tx_request, RECEIPT_WAIT_SECS).await?;
         Ok(tx_hash)
     }
 
@@ -567,8 +587,9 @@ impl GoatAdaptor {
         &self,
         tx_request: TransactionRequest,
     ) -> anyhow::Result<TxHash> {
-        let (tx_hash, _) =
-            self.handle_transaction_request_with_wait_eip1559(tx_request, 10).await?;
+        let (tx_hash, _) = self
+            .handle_transaction_request_with_wait_eip1559(tx_request, RECEIPT_WAIT_SECS)
+            .await?;
         Ok(tx_hash)
     }
 
@@ -600,11 +621,13 @@ impl GoatAdaptor {
         mut tx_request: TransactionRequest,
         max_wait_secs: u64,
     ) -> anyhow::Result<(TxHash, TransactionReceipt)> {
+        let sender = tx_request.from.ok_or_else(|| format_err!("transaction has no sender"))?;
+        let sender_lock = sender_lock(sender);
+        let _sending = sender_lock.lock().await;
         // update  gas price nonce gas_limit
         tx_request.gas_price = Some(self.provider.clone().get_gas_price().await?);
         tracing::info!("gas price: {}", tx_request.gas_price.unwrap());
-        tx_request.nonce =
-            Some(self.provider.clone().get_transaction_count(tx_request.from.unwrap()).await?);
+        tx_request.nonce = Some(self.provider.clone().get_transaction_count(sender).await?);
         tracing::info!("tx: {:?}", tx_request);
         tx_request.gas = Some(self.provider.clone().estimate_gas(tx_request.clone()).await?);
         tracing::info!("estimated gas: {:?}", tx_request.gas);
@@ -656,7 +679,10 @@ impl GoatAdaptor {
                 }
             };
         }
-        bail!("tx_hash:{tx_hash} receipt not found within {max_wait_secs} seconds")
+        bail!(
+            "tx_hash:{tx_hash} receipt not found within {max_wait_secs} seconds; it may still be \
+             pending, and the next transaction from this sender reuses its nonce and replaces it"
+        )
     }
 
     async fn handle_transaction_request_with_wait_eip1559(
@@ -664,6 +690,9 @@ impl GoatAdaptor {
         mut tx_request: TransactionRequest,
         max_wait_secs: u64,
     ) -> anyhow::Result<(TxHash, TransactionReceipt)> {
+        let sender = tx_request.from.ok_or_else(|| format_err!("transaction has no sender"))?;
+        let sender_lock = sender_lock(sender);
+        let _sending = sender_lock.lock().await;
         let (max_fee_per_gas, max_priority_fee_per_gas) = self.get_eip1559_fee_params().await?;
         tx_request.gas_price = None;
         tx_request.max_fee_per_gas = Some(max_fee_per_gas);
@@ -673,8 +702,7 @@ impl GoatAdaptor {
             max_fee_per_gas,
             max_priority_fee_per_gas
         );
-        tx_request.nonce =
-            Some(self.provider.clone().get_transaction_count(tx_request.from.unwrap()).await?);
+        tx_request.nonce = Some(self.provider.clone().get_transaction_count(sender).await?);
         tracing::info!("tx(type2): {:?}", tx_request);
         tx_request.gas = Some(self.provider.clone().estimate_gas(tx_request.clone()).await?);
         tracing::info!("estimated gas(type2): {:?}", tx_request.gas);
@@ -723,7 +751,10 @@ impl GoatAdaptor {
                 }
             };
         }
-        bail!("tx_hash:{tx_hash} receipt not found within {max_wait_secs} seconds")
+        bail!(
+            "tx_hash:{tx_hash} receipt not found within {max_wait_secs} seconds; it may still be \
+             pending, and the next transaction from this sender reuses its nonce and replaces it"
+        )
     }
 }
 
@@ -1768,6 +1799,22 @@ mod config_tests {
         let debug = format!("{config:?}");
         assert!(!debug.contains("deadbeefcafe"));
         assert!(debug.contains("<redacted>"));
+    }
+}
+
+#[cfg(test)]
+mod sender_lock_tests {
+    use super::*;
+
+    #[test]
+    fn adaptors_share_one_lock_per_sender() {
+        let alice = Address::repeat_byte(0xa1);
+        let bob = Address::repeat_byte(0xb0);
+        let first = sender_lock(alice);
+        let _sending = first.try_lock().unwrap();
+        // another adaptor with the same key waits; another key does not
+        assert!(sender_lock(alice).try_lock().is_err());
+        assert!(sender_lock(bob).try_lock().is_ok());
     }
 }
 
