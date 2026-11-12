@@ -8,8 +8,15 @@ use std::future::Future;
 use std::time::Duration;
 use tracing::warn;
 
-const TEST_URL: &str = "https://mempool.space/testnet/api";
 const MAIN_URL: &str = "https://mempool.space/api";
+const TESTNET4_URL: &str = "https://mempool.space/testnet4/api";
+const SIGNET_URL: &str = "https://mempool.space/signet/api";
+const TESTNET3_URL: &str = "https://mempool.space/testnet/api";
+
+/// Retries esplora-client makes for 429 and 5xx answers. Its backoff starts at 256 ms
+/// and doubles, so three retries wait about 1.8 s in all and fit in the request
+/// timeout; its default of six waits about 16 s, longer than the default timeout.
+const ESPLORA_MAX_RETRIES: usize = 3;
 
 #[derive(Debug)]
 pub struct BtcRpcTimeoutError {
@@ -32,7 +39,10 @@ impl std::error::Error for BtcRpcTimeoutError {}
 pub fn get_esplora_url(network: Network) -> &'static str {
     match network {
         Network::Bitcoin => MAIN_URL,
-        _ => TEST_URL,
+        Network::Testnet4 => TESTNET4_URL,
+        Network::Signet => SIGNET_URL,
+        // testnet3; regtest has no public explorer and needs an explicit URL
+        _ => TESTNET3_URL,
     }
 }
 
@@ -47,6 +57,8 @@ impl EsploraBitcoinAdaptor {
         let timeout_secs = get_btc_request_timeout_secs();
         EsploraBitcoinAdaptor {
             esplora: Builder::new(esplora_url.unwrap_or(get_esplora_url(network)))
+                .timeout(timeout_secs)
+                .max_retries(ESPLORA_MAX_RETRIES)
                 .build_async()
                 .expect("Could not build esplora client"),
             network,
@@ -140,5 +152,18 @@ impl BitcoinAdaptor for EsploraBitcoinAdaptor {
 
     async fn get_header_by_hash(&self, block_hash: &bitcoin::BlockHash) -> anyhow::Result<Header> {
         self.with_timeout("get_header_by_hash", self.esplora.get_header_by_hash(block_hash)).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_explorer_matches_the_network() {
+        assert_eq!(get_esplora_url(Network::Bitcoin), MAIN_URL);
+        assert_eq!(get_esplora_url(Network::Testnet4), TESTNET4_URL);
+        assert_eq!(get_esplora_url(Network::Signet), SIGNET_URL);
+        assert_eq!(get_esplora_url(Network::Testnet), TESTNET3_URL);
     }
 }

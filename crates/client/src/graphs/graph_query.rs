@@ -277,6 +277,14 @@ pub fn get_meta_data_query() -> String {
     builder.build()
 }
 
+/// A subgraph returns numbers as strings; a malformed one is an error for the
+/// caller to report, not a panic that takes the node down on every restart.
+fn parse_subgraph_number(field: &str, value: &str) -> anyhow::Result<i64> {
+    value
+        .parse::<i64>()
+        .map_err(|_| anyhow::anyhow!("subgraph returned a non-numeric {field}: {value:?}"))
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub enum UserGraphWithdrawEvent {
     InitWithdraw(InitWithdrawEvent),
@@ -284,13 +292,13 @@ pub enum UserGraphWithdrawEvent {
 }
 
 impl UserGraphWithdrawEvent {
-    pub fn get_block_number(&self) -> i64 {
+    pub fn get_block_number(&self) -> anyhow::Result<i64> {
         match self {
             UserGraphWithdrawEvent::InitWithdraw(v) => {
-                v.block_number.parse::<i64>().expect("fail to decode block number")
+                parse_subgraph_number("blockNumber", &v.block_number)
             }
             UserGraphWithdrawEvent::CancelWithdraw(v) => {
-                v.block_number.parse::<i64>().expect("fail to decode block number")
+                parse_subgraph_number("blockNumber", &v.block_number)
             }
         }
     }
@@ -378,23 +386,23 @@ pub enum WithdrawPathsEvent {
 }
 
 impl WithdrawPathsEvent {
-    pub fn get_block_number(&self) -> i64 {
+    pub fn get_block_number(&self) -> anyhow::Result<i64> {
         match self {
             WithdrawPathsEvent::WithdrawHappyEvent(v) => {
-                v.block_number.parse::<i64>().expect("fail to decode block number")
+                parse_subgraph_number("blockNumber", &v.block_number)
             }
             WithdrawPathsEvent::WithdrawUnhappyEvent(v) => {
-                v.block_number.parse::<i64>().expect("fail to decode block number")
+                parse_subgraph_number("blockNumber", &v.block_number)
             }
         }
     }
-    pub fn reward_amount_sats(&self) -> i64 {
+    pub fn reward_amount_sats(&self) -> anyhow::Result<i64> {
         match self {
             WithdrawPathsEvent::WithdrawHappyEvent(v) => {
-                v.reward_amount_sats.parse::<i64>().expect("fail to decode reward amount sats")
+                parse_subgraph_number("rewardAmountSats", &v.reward_amount_sats)
             }
             WithdrawPathsEvent::WithdrawUnhappyEvent(v) => {
-                v.reward_amount_sats.parse::<i64>().expect("fail to decode reward amount sats")
+                parse_subgraph_number("rewardAmountSats", &v.reward_amount_sats)
             }
         }
     }
@@ -736,4 +744,24 @@ pub fn get_bridge_out_events_query(
         query_builder = entity.add_single_query(query_builder, block_range.clone());
     }
     query_builder.build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn malformed_block_number_is_an_error_not_a_panic() {
+        let event = |block_number: &str| {
+            UserGraphWithdrawEvent::InitWithdraw(InitWithdrawEvent {
+                id: "id".to_string(),
+                transaction_hash: "0x01".to_string(),
+                block_number: block_number.to_string(),
+                instance_id: "0x02".to_string(),
+                graph_id: "0x03".to_string(),
+            })
+        };
+        assert_eq!(event("42").get_block_number().unwrap(), 42);
+        assert!(event("not-a-number").get_block_number().is_err());
+    }
 }

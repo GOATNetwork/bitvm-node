@@ -172,8 +172,12 @@ async fn handle_user_withdraw_events<'a>(
         cancel_withdraw_events.into_iter().map(UserGraphWithdrawEvent::CancelWithdraw).collect();
     user_withdraw_events
         .extend(init_withdraw_events.into_iter().map(UserGraphWithdrawEvent::InitWithdraw));
-    user_withdraw_events.sort_by_key(|v| v.get_block_number());
-    for event in user_withdraw_events {
+    let mut user_withdraw_events = user_withdraw_events
+        .into_iter()
+        .map(|event| Ok((event.get_block_number()?, event)))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    user_withdraw_events.sort_by_key(|(block_number, _)| *block_number);
+    for (_, event) in user_withdraw_events {
         match event {
             UserGraphWithdrawEvent::InitWithdraw(init_event) => {
                 let instance_id = Uuid::from_str(&strip_hex_prefix_owned(&init_event.instance_id))?;
@@ -403,7 +407,7 @@ async fn handle_withdraw_paths_events<'a>(
                 graph_id,
                 tx_type: tx_type.clone(),
                 tx_hash: event.tx_hash(),
-                height: event.get_block_number(),
+                height: event.get_block_number()?,
                 is_local: false,
                 processing_status: GoatTxProcessingStatus::Pending.to_string(),
                 extra: None,
