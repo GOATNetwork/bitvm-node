@@ -157,6 +157,9 @@ pub async fn detect_heart_beat(swarm: &mut Swarm<AllBehaviours>) -> Result<()> {
 
 /// Retrieve the server's public IP via NAT protocol and combine it with
 /// the configured RPC monitoring port`rpc_addr` to generate the external RPC service address.
+/// Discovers this operator's public RPC address with STUN when neither the proof server URL nor
+/// `EXTERNAL_SOCKET_ADDR` is configured. The result is kept for [`get_local_node_info`]; the
+/// environment is not modified, since other threads are already running.
 pub async fn set_node_external_socket_addr_env(rpc_addr: &str) -> Result<()> {
     if get_proof_server_url().is_some() || std::env::var(ENV_EXTERNAL_SOCKET_ADDR).is_ok() {
         // not provide proof server
@@ -178,12 +181,7 @@ pub async fn set_node_external_socket_addr_env(rpc_addr: &str) -> Result<()> {
         return Ok(());
     }
     if let Some(socket_addr) = Attribute::get_xor_mapped_address(&message) {
-        unsafe {
-            std::env::set_var(
-                ENV_EXTERNAL_SOCKET_ADDR,
-                SocketAddr::new(socket_addr.ip(), addr.port()).to_string(),
-            );
-        }
+        set_discovered_external_socket_addr(SocketAddr::new(socket_addr.ip(), addr.port()));
     }
     Ok(())
 }
