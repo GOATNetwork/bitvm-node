@@ -501,6 +501,8 @@ pub async fn get_graph(
 /// # Returns
 ///
 /// - `200 OK`: Successfully returns graph list with status and waiting time
+/// - `400 Bad Request`: `from_addr` is not a Goat address, or `graph_field` is neither a
+///   pegin txid nor a graph id (an empty value means no filter)
 /// - `500 Internal Server Error`: Server internal error or database operation failed
 /// - Response includes total count and paginated graph data
 ///
@@ -565,7 +567,7 @@ pub async fn get_graphs(
     let mut resp = GraphListResponse::default();
     let mut storage_process = app_state.local_db.acquire().await.api_error("GET_GRAPHS_ERROR")?;
 
-    let filter_params: GraphQuery = params.into();
+    let filter_params = GraphQuery::try_from(params)?;
     let (graphs, total) =
         storage_process.find_graphs(filter_params).await.api_error("GET_GRAPHS_ERROR")?;
 
@@ -1115,16 +1117,27 @@ pub async fn get_graph_neighbor_ids(
         .find_graph_neighbor_ids(current_id, 1)
         .await
         .api_error("GET_GRAPH_NEIGHBOR_ERROR")?;
+    ok_response(graph_neighbors(current_id, &id_with_kickoff_indexes))
+}
+
+/// Previous and next graph of `current_id` among rows in no particular order.
+pub(crate) fn graph_neighbors(
+    current_id: uuid::Uuid,
+    rows: &[(i64, uuid::Uuid)],
+) -> GraphNeighborIdsResponse {
     let mut res = GraphNeighborIdsResponse { current_id, previous_id: None, next_id: None };
-    for (i, (_kickoff_index, graph_id)) in id_with_kickoff_indexes.iter().enumerate() {
-        if i == 0 && *graph_id != current_id {
-            res.previous_id = Some(*graph_id);
-        }
-        if i > 0 && *graph_id != current_id {
-            res.next_id = Some(*graph_id);
+    let Some(&(current_index, _)) = rows.iter().find(|(_, graph_id)| *graph_id == current_id)
+    else {
+        return res;
+    };
+    for &(kickoff_index, graph_id) in rows {
+        if kickoff_index < current_index {
+            res.previous_id = Some(graph_id);
+        } else if kickoff_index > current_index {
+            res.next_id = Some(graph_id);
         }
     }
-    ok_response(res)
+    res
 }
 
 /// Get unsigned pegin transactions
@@ -1372,7 +1385,9 @@ fn sats_to_token_amount(amount_sats: u64, token_decimals: u8) -> U256 {
 ///
 /// - `graph_id`: Optional preferred UUID of the graph to pegout. If it has
 ///   already been claimed by another graph, the next eligible graph is used.
-/// - `dry_run`: If true, validate but skip the actual initWithdraw call (default: false)
+/// - `dry_run`: If true, validate but skip the actual initWithdraw call (default: false).
+///   Candidate selection still marks a graph Obsoleted when the Gateway shows its
+///   instance claimed by another graph, as the graph scan would.
 /// - `skip_locked`: If true, skip a candidate whose instance is locked by another
 ///   withdrawal, including a stale locked predecessor (default: false).
 ///

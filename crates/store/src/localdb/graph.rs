@@ -18,7 +18,7 @@ pub struct GraphQuery {
     pub operator_pubkey: Option<String>,
     pub kickoff_index: Option<i64>,
     pub from_addr: Option<String>,
-    pub graph_id: Option<String>,
+    pub graph_id: Option<Uuid>,
     pub pegin_txid: Option<SerializableTxid>,
     pub raw_conditions: Vec<String>,
     pub order: Option<String>,
@@ -97,11 +97,8 @@ impl GraphQuery {
                 .and_where("pegin_txid = ?", Some(QueryParam::BTCTxid(pegin_txid.clone())));
         }
 
-        if let Some(graph_id) = &self.graph_id {
-            query_builder.and_where(
-                "hex(graph_id) = ? COLLATE NOCASE",
-                Some(QueryParam::Text(graph_id.clone())),
-            );
+        if let Some(graph_id) = self.graph_id {
+            query_builder.and_where("graph_id = ?", Some(QueryParam::Uuid(graph_id)));
         }
         for raw_condition in &self.raw_conditions {
             query_builder.add_raw_condition(raw_condition);
@@ -204,14 +201,8 @@ impl GraphRuntimeUpdate {
         query_builder.set_field("updated_at", QueryParam::Int(current_time));
 
         // Add WHERE clause
-        query_builder.and_where(
-            "hex(graph_id) = ? COLLATE NOCASE",
-            Some(QueryParam::Text(hex::encode(self.graph_id))),
-        );
-        query_builder.and_where(
-            "hex(instance_id) = ? COLLATE NOCASE",
-            Some(QueryParam::Text(hex::encode(self.instance_id))),
-        );
+        query_builder.and_where("graph_id = ?", Some(QueryParam::Uuid(self.graph_id)));
+        query_builder.and_where("instance_id = ?", Some(QueryParam::Uuid(self.instance_id)));
 
         query_builder
     }
@@ -477,14 +468,8 @@ impl StorageProcessor<'_> {
         }
         query_builder.set_field("status_updated_at", QueryParam::Int(current_time));
         query_builder.set_field("updated_at", QueryParam::Int(current_time));
-        query_builder.and_where(
-            "hex(graph_id) = ? COLLATE NOCASE",
-            Some(QueryParam::Text(hex::encode(graph_id))),
-        );
-        query_builder.and_where(
-            "hex(instance_id) = ? COLLATE NOCASE",
-            Some(QueryParam::Text(hex::encode(instance_id))),
-        );
+        query_builder.and_where("graph_id = ?", Some(QueryParam::Uuid(graph_id)));
+        query_builder.and_where("instance_id = ?", Some(QueryParam::Uuid(instance_id)));
         query_builder.and_where_in("status", &allowed_from, false);
 
         let update_sql = query_builder.get_sql();

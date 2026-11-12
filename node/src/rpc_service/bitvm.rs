@@ -2,9 +2,12 @@ use super::utils::{deserialize_u256, serialize_u256};
 use crate::aggregates::graph_scan::{ChallengeSubStatus, VerifierChallengeStatus};
 use crate::aggregates::instance::PeginDeadlines;
 use crate::clock::current_time_secs;
-use crate::utils::{check_bridge_in_uxto_available_or_self_spent, reflect_goat_address};
-use alloy::hex::ToHexExt;
+use crate::rpc_service::response::ErrorResponse;
+use crate::rpc_service::validation::InputValidator;
+use crate::utils::check_bridge_in_uxto_available_or_self_spent;
 use alloy::primitives::U256;
+use axum::Json;
+use axum::http::StatusCode;
 use bitcoin::Txid;
 use client::Utxo;
 use client::btc_chain::BTCClient;
@@ -37,7 +40,7 @@ const GRAPH_OPERATOR_KICKOFFING_STATUS_DURATION_SECS: i64 = 1800;
 const GRAPH_OPERATOR_KICKOFF_STATUS_DURATION_SECS: i64 = 3600 * 3;
 const GRAPH_OPERATOR_CHALLENGE_STATUS_DURATION_SECS: i64 = 3600 * 9;
 
-#[derive(Clone, Copy, Display, EnumString)]
+#[derive(Clone, Copy, PartialEq, Eq, Display, EnumString)]
 enum GraphDisplayStatus {
     Created,
     Presigned,
@@ -464,26 +467,40 @@ fn default_is_peg_out() -> bool {
     false
 }
 
-impl From<GraphQueryParams> for GraphQuery {
-    fn from(value: GraphQueryParams) -> Self {
+impl TryFrom<GraphQueryParams> for GraphQuery {
+    type Error = (StatusCode, Json<ErrorResponse>);
+
+    /// An empty filter means no filter; a malformed one is rejected rather
+    /// than dropped, which would return the unfiltered list.
+    fn try_from(value: GraphQueryParams) -> Result<Self, Self::Error> {
         let mut pegin_txid_op: Option<SerializableTxid> = None;
-        let mut graph_id_op: Option<String> = None;
-        if let Some(filed) = value.graph_field {
-            if let Ok(pegin_txid) = Txid::from_str(&filed) {
+        let mut graph_id_op: Option<Uuid> = None;
+        if let Some(field) = value.graph_field.filter(|field| !field.is_empty()) {
+            if let Ok(pegin_txid) = Txid::from_str(&field) {
                 pegin_txid_op = Some(pegin_txid.into());
-            }
-            if let Ok(uuid) = Uuid::from_str(&filed) {
-                graph_id_op = Some(uuid.encode_hex());
+            } else if let Ok(uuid) = Uuid::from_str(&field) {
+                graph_id_op = Some(uuid);
+            } else {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: "INVALID_GRAPH_FIELD".to_string(),
+                        message: "graph_field is neither a pegin txid nor a graph id".to_string(),
+                    }),
+                ));
             }
         }
-        let (_, from_addr) = reflect_goat_address(value.from_addr.clone());
+        let from_addr = value
+            .from_addr
+            .filter(|addr| !addr.is_empty())
+            .map(|addr| InputValidator::validate_goat_address(&addr, "from_addr"))
+            .transpose()?;
 
-        let mut is_init_withdraw_not_null = value
-            .status
-            .as_ref()
-            .map(|status| status == &GraphDisplayStatus::OperatorKickOffing.to_string())
-            .unwrap_or(false);
-        is_init_withdraw_not_null = is_init_withdraw_not_null || value.is_pegout_started;
+        let display_status =
+            value.status.as_deref().and_then(|status| GraphDisplayStatus::from_str(status).ok());
+        let is_init_withdraw_not_null = display_status
+            == Some(GraphDisplayStatus::OperatorKickOffing)
+            || value.is_pegout_started;
         let mut statuses = vec![];
         if let Some(status) = value.status {
             statuses = Graph::parse_display_status(&status)
@@ -499,7 +516,12 @@ impl From<GraphQueryParams> for GraphQuery {
         if is_init_withdraw_not_null {
             raw_conditions.push("init_withdraw_tx_hash IS NOT NULL".to_string());
         }
-        GraphQuery {
+        // L2Recorded and OperatorKickOffing are both OperatorDataPushed; only
+        // a started withdrawal tells them apart.
+        if display_status == Some(GraphDisplayStatus::L2Recorded) {
+            raw_conditions.push("init_withdraw_tx_hash IS NULL".to_string());
+        }
+        Ok(GraphQuery {
             statuses,
             operator_pubkey: value.operator,
             kickoff_index: None,
@@ -517,7 +539,7 @@ impl From<GraphQueryParams> for GraphQuery {
             ),
             offset: value.offset,
             limit: value.limit,
-        }
+        })
     }
 }
 
@@ -568,29 +590,8 @@ impl GraphExtended {
         {
             graph.proceed_withdraw_height = 0;
         }
+        let challenge_sub_status = simple_challenge_sub_status(&graph);
         graph.status = graph.convert_to_display_status();
-        let challenge_sub_status =
-            match serde_json::from_str::<ChallengeSubStatus>(&graph.sub_status) {
-                Ok(v) => {
-                    if v.verifier_challenge_status
-                        .iter()
-                        .any(|status| *status != VerifierChallengeStatus::None)
-                    {
-                        SimpleChallengeSubStatus::Assert
-                    } else if v.watchtower_challenge_status.iter().any(|status| *status) {
-                        SimpleChallengeSubStatus::WatchtowerChallenge
-                    } else {
-                        SimpleChallengeSubStatus::None
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        "fail to covert graph {} sub_status:{}, error:{e}",
-                        graph.graph_id, graph.sub_status
-                    );
-                    SimpleChallengeSubStatus::None
-                }
-            };
         // todo update proof status
         Ok(GraphExtended {
             current_status_waiting_time_in_secs,
@@ -599,6 +600,35 @@ impl GraphExtended {
             proof_status: ProofState::New,
             graph: Some(graph),
         })
+    }
+}
+
+/// The sub-status is kept after a challenge settles, but only describes a
+/// challenge still in progress.
+pub(crate) fn simple_challenge_sub_status(graph: &Graph) -> SimpleChallengeSubStatus {
+    if graph.status != GraphStatus::Challenge.to_string() || graph.sub_status.is_empty() {
+        return SimpleChallengeSubStatus::None;
+    }
+    match serde_json::from_str::<ChallengeSubStatus>(&graph.sub_status) {
+        Ok(v) => {
+            if v.verifier_challenge_status
+                .iter()
+                .any(|status| *status != VerifierChallengeStatus::None)
+            {
+                SimpleChallengeSubStatus::Assert
+            } else if v.watchtower_challenge_status.iter().any(|status| *status) {
+                SimpleChallengeSubStatus::WatchtowerChallenge
+            } else {
+                SimpleChallengeSubStatus::None
+            }
+        }
+        Err(e) => {
+            warn!(
+                "fail to covert graph {} sub_status:{}, error:{e}",
+                graph.graph_id, graph.sub_status
+            );
+            SimpleChallengeSubStatus::None
+        }
     }
 }
 
