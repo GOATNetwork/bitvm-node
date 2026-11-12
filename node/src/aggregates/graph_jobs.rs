@@ -202,7 +202,7 @@ async fn run_step(
         JOB_POST_GRAPH_DATA => post_graph_data(deps, graph_id, params).await,
         JOB_FETCH_GRAPH => fetch_graph(deps, graph_id, params, attempts).await,
         pegout if PEGOUT_JOBS.contains(&pegout) => {
-            run_pegout_step(deps, pegout, graph_id, params, attempts).await
+            run_pegout_step(deps, pegout, graph_id, params).await
         }
         other => bail!("unknown graph job {other}"),
     }
@@ -568,9 +568,12 @@ async fn ingest_soldering_proof(deps: &JobDeps, graph_id: Uuid, params: &[u8]) -
     let Some(frozen) = operator_state.candidate_verifier_pubkeys.clone() else {
         return Step::retry("operator verifier membership is not frozen", 30);
     };
-    let verifier_pubkey = *frozen.get(candidate_index).ok_or_else(|| {
-        anyhow!("SolderingProofReady candidate index {candidate_index} out of range")
-    })?;
+    // The membership is frozen, so an index outside it can never become valid.
+    let Some(&verifier_pubkey) = frozen.get(candidate_index) else {
+        return invalid(format!(
+            "SolderingProofReady candidate index {candidate_index} out of range"
+        ));
+    };
     let candidate = operator_state
         .candidates
         .iter()
@@ -1491,6 +1494,16 @@ async fn verifier_validate_graph(deps: &JobDeps, graph_id: Uuid, params: &[u8]) 
     else {
         return Step::ignore("local verifier is not in this graph");
     };
+    // Only a graph this verifier ran the setup for is worth the RPC checks and the
+    // graph rebuild below.
+    let Some(verifier_state) = load_babe_setup_state(&deps.local_db, instance_id, graph_id)?
+        .and_then(|state| state.verifier)
+    else {
+        return Step::ignore("missing local BABE verifier state");
+    };
+    if verifier_state.verifier_pubkey != local_verifier_pubkey {
+        return Step::ignore("local BABE verifier pubkey mismatch");
+    }
     crate::utils::validate_graph_instance_parameters(
         &deps.btc_client,
         &deps.goat_client,
@@ -1503,14 +1516,6 @@ async fn verifier_validate_graph(deps: &JobDeps, graph_id: Uuid, params: &[u8]) 
     verify_graph_operator_pre_signatures(&full_graph).map_err(|error| {
         SpecialError::InvalidGraph(format!("invalid operator pre-signatures: {error}"))
     })?;
-    let Some(verifier_state) = load_babe_setup_state(&deps.local_db, instance_id, graph_id)?
-        .and_then(|state| state.verifier)
-    else {
-        return Step::ignore("missing local BABE verifier state");
-    };
-    if verifier_state.verifier_pubkey != local_verifier_pubkey {
-        return Step::ignore("local BABE verifier pubkey mismatch");
-    }
     let Some(soldering_proof_ready) = verifier_state.soldering_proof_ready.clone() else {
         return Step::ignore("local verifier has no soldering proof");
     };
@@ -1603,6 +1608,11 @@ async fn committee_ingest_graph(deps: &JobDeps, graph_id: Uuid, params: &[u8]) -
     }
     if local_member(deps, instance_id).await?.is_none() {
         return Step::ignore("not in this instance's committee");
+    }
+    // Checked first: validation retries a lagging Bitcoin backend without limit,
+    // and the gate ends those retries at T0 or when the instance fails.
+    if let Some(reason) = gate_closed(deps, instance_id).await? {
+        return Step::ignore(format!("signing gate closed: {reason}"));
     }
     // Structure, policy, prekickoff continuity, instance parameters against
     // both chains, watchtower set and operator stake; verifier endorsements
@@ -1716,6 +1726,11 @@ async fn committee_nonces(deps: &JobDeps, graph_id: Uuid, _params: &[u8]) -> Res
             graph.parameters.gc_data.len()
         ));
     }
+    // Checked first: validation retries a lagging Bitcoin backend without limit,
+    // and the gate ends those retries at T0 or when the instance fails.
+    if let Some(reason) = gate_closed(deps, instance_id).await? {
+        return Step::ignore(format!("signing gate closed: {reason}"));
+    }
     let validation = validate_init_graph(
         &deps.local_db,
         &deps.btc_client,
@@ -1726,9 +1741,6 @@ async fn committee_nonces(deps: &JobDeps, graph_id: Uuid, _params: &[u8]) -> Res
     .await;
     deps.metrics_state.record_graph_validation(validation.is_ok());
     validation?;
-    if let Some(reason) = gate_closed(deps, instance_id).await? {
-        return Step::ignore(format!("signing gate closed: {reason}"));
-    }
     let Some(instance_keypair) = local_member(deps, instance_id).await? else {
         return Step::ignore("not in this instance's committee");
     };
@@ -2285,11 +2297,22 @@ const FETCH_GRAPH_FAST_ATTEMPTS: i64 = 5;
 const FETCH_GRAPH_SLOW_RETRY_SECS: i64 = 600;
 const FETCH_GRAPH_MAX_ATTEMPTS: i64 = FETCH_GRAPH_FAST_ATTEMPTS
     + super::common::PARKED_MESSAGE_TTL_SECS / FETCH_GRAPH_SLOW_RETRY_SECS;
+/// Slow retries between two alerts for a posted graph nobody serves (about a day).
+const FETCH_GRAPH_POSTED_ALERT_EVERY: i64 = 24 * 60 * 60 / FETCH_GRAPH_SLOW_RETRY_SECS;
 
 async fn fetch_graph(deps: &JobDeps, graph_id: Uuid, params: &[u8], attempts: i64) -> Result<Step> {
     let lookup: GraphLookup = bincode::deserialize(params).context("decode graph lookup")?;
+    // A graph posted on Goat exists, and only the event watcher asks for it, once:
+    // that pull never gives up. It keeps retrying slowly and alerts about once a day.
+    let posted_on_chain = matches!(lookup, GraphLookup::Id { finalized: true, .. });
     let give_up = |reason: String| {
-        if attempts + 1 >= FETCH_GRAPH_MAX_ATTEMPTS {
+        if posted_on_chain && attempts + 1 >= FETCH_GRAPH_FAST_ATTEMPTS {
+            if (attempts + 1 - FETCH_GRAPH_FAST_ATTEMPTS) % FETCH_GRAPH_POSTED_ALERT_EVERY == 0 {
+                warn!(event = "graph_fetch", graph_id = %graph_id, ?lookup, attempts, reason, "posted graph still not served by any peer");
+                deps.metrics_state.record_instance_alert("posted_graph_unavailable");
+            }
+            Step::retry(reason, FETCH_GRAPH_SLOW_RETRY_SECS)
+        } else if attempts + 1 >= FETCH_GRAPH_MAX_ATTEMPTS {
             warn!(event = "graph_fetch", graph_id = %graph_id, ?lookup, attempts, reason, "giving up on the pull");
             Step::ignore(format!("gave up pulling {lookup:?}: {reason}"))
         } else if attempts + 1 >= FETCH_GRAPH_FAST_ATTEMPTS {
