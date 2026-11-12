@@ -182,7 +182,39 @@ pub async fn read_pegin_request(
         user_refund_address,
         user_xonly_pubkey,
     };
-    Ok((user_info, Amount::from_sat(pegin_data.pegin_amount_sats), pegin_data.committee_addresses))
+    let pegin_amount = Amount::from_sat(pegin_data.pegin_amount_sats);
+    check_pegin_buildable(network, instance_id, &user_info, pegin_amount)?;
+    Ok((user_info, pegin_amount, pegin_data.committee_addresses))
+}
+
+/// The secp256k1 generator, standing in for the committee key that is not known
+/// before the answers.
+const PLACEHOLDER_COMMITTEE_KEY: &str =
+    "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+
+/// Reject a request whose own fields (inputs, amount, fees) cannot make the
+/// peg-in transactions. The committee key does not change what can be built,
+/// so a placeholder stands in for it; without this check the request would be
+/// answered and only fail once the answers are in.
+fn check_pegin_buildable(
+    network: bitcoin::Network,
+    instance_id: Uuid,
+    user_info: &UserInfo,
+    pegin_amount: Amount,
+) -> Result<()> {
+    let committee_key = PublicKey::from_str(PLACEHOLDER_COMMITTEE_KEY)?;
+    let parameters = BitvmGcInstanceParameters {
+        network,
+        instance_id,
+        user_info: user_info.clone(),
+        pegin_amount,
+        committee_pubkeys: vec![committee_key],
+        committee_agg_pubkey: bitvm_lib::types::checked_committee_key(&[committee_key])?,
+    };
+    parameters.build_pegin_tx().map_err(|e| {
+        SpecialError::InvalidPeginRequest(format!("peg-in transactions cannot be built: {e}"))
+    })?;
+    Ok(())
 }
 
 pub async fn read_instance_info_from_goat(
@@ -263,4 +295,60 @@ pub async fn get_graph_status(
         GraphStatus::from_str(&graph.status)
             .map_err(|_| anyhow!("unknown graph status: {}", graph.status))?,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::secp256k1::{Keypair, SECP256K1, SecretKey};
+
+    fn request(inputs_sats: &[u64], fees: [u64; 3]) -> UserInfo {
+        let key = Keypair::from_secret_key(SECP256K1, &SecretKey::from_slice(&[0x51; 32]).unwrap());
+        let address = Address::from_str(&crate::utils::get_rand_btc_address_p2wpkh(
+            bitcoin::Network::Regtest,
+        ))
+        .unwrap()
+        .require_network(bitcoin::Network::Regtest)
+        .unwrap();
+        UserInfo {
+            depositor_evm_address: [0x11; 20],
+            txn_fees: fees,
+            inputs: inputs_sats
+                .iter()
+                .enumerate()
+                .map(|(vout, sats)| Input {
+                    outpoint: OutPoint { txid: Txid::from_byte_array([9; 32]), vout: vout as u32 },
+                    amount: Amount::from_sat(*sats),
+                })
+                .collect(),
+            user_change_address: address.clone(),
+            user_refund_address: address,
+            user_xonly_pubkey: key.x_only_public_key().0,
+        }
+    }
+
+    fn check(user_info: &UserInfo, amount: u64) -> Result<()> {
+        check_pegin_buildable(
+            bitcoin::Network::Regtest,
+            Uuid::nil(),
+            user_info,
+            Amount::from_sat(amount),
+        )
+    }
+
+    fn rejected(result: Result<()>) -> bool {
+        matches!(
+            result.unwrap_err().downcast_ref::<SpecialError>(),
+            Some(SpecialError::InvalidPeginRequest(_))
+        )
+    }
+
+    #[test]
+    fn a_request_that_cannot_build_its_peg_in_is_not_answered() {
+        check(&request(&[50_000], [100; 3]), 10_000).unwrap();
+        assert!(rejected(check(&request(&[], [100; 3]), 10_000)), "no inputs");
+        assert!(rejected(check(&request(&[5_000], [100; 3]), 10_000)), "inputs short");
+        assert!(rejected(check(&request(&[50_000], [u64::MAX, 100, 100]), 10_000)), "fee overflow");
+        assert!(rejected(check(&request(&[50_000], [100, 100, u64::MAX]), 10_000)), "refund fee");
+    }
 }
