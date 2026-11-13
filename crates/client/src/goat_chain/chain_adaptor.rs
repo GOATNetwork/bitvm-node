@@ -374,7 +374,7 @@ pub struct GraphData {
     pub take2_txid: [u8; 32],
     pub watchtower_challenge_init_txid: [u8; 32],
     pub prover_assert_txid: [u8; 32],
-    pub disprove_txids: Vec<[u8; 32]>,
+    pub verifier_assert_txids: Vec<[u8; 32]>,
     pub watchtower_challenge_timeout_txids: Vec<[u8; 32]>,
     pub operator_challenge_nack_txids: Vec<[u8; 32]>,
     pub operator_commit_timeout_txid: [u8; 32],

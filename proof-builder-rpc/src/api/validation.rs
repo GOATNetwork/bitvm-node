@@ -197,7 +197,7 @@ mod tests {
             take2_txid: [0; 32],
             watchtower_challenge_init_txid: [0x22; 32],
             prover_assert_txid: [0; 32],
-            disprove_txids: vec![],
+            verifier_assert_txids: vec![],
             watchtower_challenge_timeout_txids: vec![[0; 32]],
             operator_challenge_nack_txids: vec![],
             operator_commit_timeout_txid: [0; 32],
