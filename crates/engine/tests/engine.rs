@@ -26,6 +26,8 @@ const WAIT: Duration = Duration::from_secs(10);
 struct Probe {
     concurrent: AtomicUsize,
     max_concurrent: AtomicUsize,
+    /// Event ids of `serial_probe` events, in the order they were applied.
+    applied: std::sync::Mutex<Vec<String>>,
 }
 
 struct TestHandler {
@@ -193,6 +195,7 @@ impl AggregateHandler for TestHandler {
                 let now = self.probe.concurrent.fetch_add(1, Ordering::SeqCst) + 1;
                 self.probe.max_concurrent.fetch_max(now, Ordering::SeqCst);
                 tokio::time::sleep(Duration::from_millis(20)).await;
+                self.probe.applied.lock().unwrap().push(event.event_id.clone());
                 self.probe.concurrent.fetch_sub(1, Ordering::SeqCst);
                 Ok(ApplyOutcome::Applied)
             }
@@ -1045,14 +1048,11 @@ async fn events_of_one_aggregate_apply_strictly_in_order() {
         t.wait_inbox_state(&format!("s{index}"), EngineInboxState::Applied).await;
     }
     assert_eq!(t.probe.max_concurrent.load(Ordering::SeqCst), 1);
-    // Applied in arrival order.
-    let mut s = t.db.acquire().await.unwrap();
-    let rows = s.list_engine_inbox_events_for_aggregate(KIND, "serial", 20).await.unwrap();
-    let applied: Vec<i64> = rows.iter().map(|row| row.applied_at.unwrap()).collect();
-    let mut sorted = applied.clone();
-    sorted.sort_unstable_by(|a, b| b.cmp(a));
-    assert_eq!(applied, sorted);
-    drop(s);
+    // Applied in arrival order. The test clock does not advance, so the
+    // order is taken from the handler rather than from `applied_at`.
+    let applied = t.probe.applied.lock().unwrap().clone();
+    let submitted: Vec<String> = (0..12).map(|index| format!("s{index}")).collect();
+    assert_eq!(applied, submitted);
     t.stop().await;
 }
 

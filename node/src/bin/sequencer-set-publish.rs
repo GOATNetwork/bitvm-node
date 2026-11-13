@@ -698,7 +698,9 @@ async fn push_fee_tx(
     )?;
     println!("Fee txid: {:#?}", fee_tx.compute_txid());
     broadcast_tx(btc_client, fee_tx).await?;
-    wait_tx_confirmation(btc_client, &fee_tx.compute_txid(), 3, 10000).await?;
+    if !wait_tx_confirmation(btc_client, &fee_tx.compute_txid(), 3, 10000).await? {
+        return Err(format!("fee tx {} not confirmed in time", fee_tx.compute_txid()).into());
+    }
     println!("Fee tx confirmed");
     Ok(fee_tx.compute_txid())
 }
@@ -758,7 +760,14 @@ async fn push_sequencer_set_publish_tx(
         hex::encode(bitcoin::consensus::encode::serialize(sequencer_set_publish_tx))
     );
     broadcast_tx(btc_client, sequencer_set_publish_tx).await?;
-    wait_tx_confirmation(btc_client, &sequencer_set_publish_tx.compute_txid(), 3, 10000).await?;
+    if !wait_tx_confirmation(btc_client, &sequencer_set_publish_tx.compute_txid(), 3, 10000).await?
+    {
+        return Err(format!(
+            "sequencer set publish tx {} not confirmed in time",
+            sequencer_set_publish_tx.compute_txid()
+        )
+        .into());
+    }
     println!("Sequencer set publish tx confirmed");
     Ok(sequencer_set_publish_tx.compute_txid())
 }
@@ -920,8 +929,8 @@ async fn action_push_sequencer_set_update(
     let total = btc_public_keys.len();
     let threshold = (2 * total).div_ceil(3);
 
-    let total = next_btc_public_keys.len();
-    let next_threshold = (2 * total).div_ceil(3);
+    let next_total = next_btc_public_keys.len();
+    let next_threshold = (2 * next_total).div_ceil(3);
 
     let redeem_script = create_sequencer_update_script(&btc_public_keys, threshold);
     let next_redeem_script = create_sequencer_update_script(&next_btc_public_keys, next_threshold);
