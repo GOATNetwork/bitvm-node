@@ -1,0 +1,12 @@
+pub mod assert_connectors;
+pub mod base;
+pub mod connector_0;
+pub mod connector_a;
+pub mod connector_b;
+pub mod connector_c;
+pub mod connector_d;
+pub mod connector_e;
+pub mod connector_f;
+pub mod connector_z;
+pub mod kickoff_connectors;
+pub mod watchtower_connectors;

@@ -2922,38 +2922,7 @@ dependencies = [
 [[package]]
 name = "bitvm"
 version = "0.1.0"
-source = "git+https://github.com/GOATNetwork/BitVM.git?branch=GA#26b0bd61b61b24b50b2d2443a7fda8e58412edfa"
-dependencies = [
- "ark-bn254",
- "ark-crypto-primitives",
- "ark-ec",
- "ark-ff 0.5.0",
- "ark-groth16",
- "ark-relations",
- "ark-serialize 0.5.0",
- "ark-std 0.5.0",
- "bitcoin",
- "bitcoin-script",
- "bitcoin-script-stack",
- "bitcoin-scriptexec",
- "blake3",
- "colored",
- "itertools 0.13.0",
- "num-bigint 0.4.6",
- "num-traits",
- "paste",
- "rand 0.8.8",
- "rand_chacha 0.3.1",
- "regex",
- "serde",
- "sha2 0.10.9",
- "tqdm",
-]
-
-[[package]]
-name = "bitvm"
-version = "0.1.0"
-source = "git+https://github.com/GOATNetwork/BitVM.git?branch=committee-force-skip#c24f6cc2fb99d61f38b082202c899cf368abdae6"
+source = "git+https://github.com/BitVM/BitVM.git?rev=c620dbfaacebdf778e765a6681985350389973b1#c620dbfaacebdf778e765a6681985350389973b1"
 dependencies = [
  "ark-bn254",
  "ark-crypto-primitives",
@@ -2995,7 +2964,7 @@ dependencies = [
  "bincode",
  "bitcoin",
  "bitcoin-script",
- "bitvm 0.1.0 (git+https://github.com/GOATNetwork/BitVM.git?branch=committee-force-skip)",
+ "bitvm",
  "chacha20poly1305",
  "clap",
  "esplora-client",
@@ -3041,7 +3010,7 @@ dependencies = [
  "bitcoin",
  "bitcoin-light-client-circuit",
  "bitcoin-script",
- "bitvm 0.1.0 (git+https://github.com/GOATNetwork/BitVM.git?branch=committee-force-skip)",
+ "bitvm",
  "bitvm-gc",
  "blake3",
  "borsh",
@@ -3537,6 +3506,7 @@ dependencies = [
  "esplora-client",
  "hex",
  "rand 0.8.8",
+ "reqwest 0.11.27",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -5184,7 +5154,7 @@ checksum = "42012b0f064e01aa58b545fe3727f90f7dd4020f4a3ea735b50344965f5a57e9"
 [[package]]
 name = "garbled-snark-verifier"
 version = "0.1.0"
-source = "git+https://github.com/GOATNetwork/bitvm-gc#a4dab03c56515ad4882dd73fd78c76edbe9dcc56"
+source = "git+https://github.com/GOATNetwork/bitvm-gc?rev=8e9a7aceb9d3b016d31eccb64c1fcf51fc139704#8e9a7aceb9d3b016d31eccb64c1fcf51fc139704"
 dependencies = [
  "aes",
  "ark-bn254",
@@ -5341,42 +5311,20 @@ dependencies = [
 [[package]]
 name = "goat"
 version = "0.1.0"
-source = "git+https://github.com/GOATNetwork/BitVM.git?branch=committee-force-skip#c24f6cc2fb99d61f38b082202c899cf368abdae6"
 dependencies = [
- "ark-bn254",
- "ark-crypto-primitives",
- "ark-ec",
- "ark-ff 0.5.0",
- "ark-groth16",
- "ark-relations",
- "ark-serialize 0.5.0",
- "ark-std 0.5.0",
- "bincode",
  "bitcode",
  "bitcoin",
  "bitcoin-script",
- "bitcoin-scriptexec",
- "bitvm 0.1.0 (git+https://github.com/GOATNetwork/BitVM.git?branch=committee-force-skip)",
+ "bitvm",
  "blake3",
- "clap",
- "colored",
  "hex",
  "itertools 0.13.0",
  "musig2",
- "num-traits",
  "rand 0.8.8",
- "regex",
- "reqwest 0.11.27",
  "secp256k1 0.29.1",
  "serde",
  "serde-big-array",
- "serde_json",
- "serial_test",
- "sha2 0.10.9",
  "strum 0.27.2",
- "strum_macros 0.27.2",
- "tokio",
- "toml 0.5.11",
  "zstd",
 ]
 
@@ -9197,7 +9145,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
- "toml 0.8.23",
+ "toml",
  "tower-http",
  "tracing",
  "tracing-subscriber 0.3.23",
@@ -11565,14 +11513,14 @@ dependencies = [
 [[package]]
 name = "soldering-host"
 version = "1.1.0"
-source = "git+https://github.com/GOATNetwork/bitvm-gc#a4dab03c56515ad4882dd73fd78c76edbe9dcc56"
+source = "git+https://github.com/GOATNetwork/bitvm-gc?rev=8e9a7aceb9d3b016d31eccb64c1fcf51fc139704#8e9a7aceb9d3b016d31eccb64c1fcf51fc139704"
 dependencies = [
  "ark-bn254",
  "ark-crypto-primitives",
  "ark-ff 0.5.0",
  "ark-groth16",
  "ark-relations",
- "bitvm 0.1.0 (git+https://github.com/GOATNetwork/BitVM.git?branch=GA)",
+ "bitvm",
  "garbled-snark-verifier",
  "rand 0.8.8",
  "rand_chacha 0.3.1",
@@ -12248,7 +12196,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tendermint",
- "toml 0.8.23",
+ "toml",
  "url",
 ]
 
@@ -12570,15 +12518,6 @@ dependencies = [
  "futures-util",
  "pin-project-lite",
  "tokio",
-]
-
-[[package]]
-name = "toml"
-version = "0.5.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f4f7f0dd8d50a853a531c426359045b1998f04219d88799810762cd4ad314234"
-dependencies = [
- "serde",
 ]
 
 [[package]]
@@ -13148,7 +13087,7 @@ dependencies = [
 [[package]]
 name = "verifiable-circuit-babe"
 version = "0.0.1"
-source = "git+https://github.com/GOATNetwork/bitvm-gc#a4dab03c56515ad4882dd73fd78c76edbe9dcc56"
+source = "git+https://github.com/GOATNetwork/bitvm-gc?rev=8e9a7aceb9d3b016d31eccb64c1fcf51fc139704#8e9a7aceb9d3b016d31eccb64c1fcf51fc139704"
 dependencies = [
  "aes",
  "ark-bn254",
@@ -13160,7 +13099,7 @@ dependencies = [
  "ark-serialize 0.5.0",
  "bincode",
  "bitcoin",
- "bitvm 0.1.0 (git+https://github.com/GOATNetwork/BitVM.git?branch=GA)",
+ "bitvm",
  "blake3",
  "cfg-if",
  "garbled-snark-verifier",
