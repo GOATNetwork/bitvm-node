@@ -10,12 +10,12 @@ use crate::rpc_service::response::{
     ApiErrorExt, ApiResult, ErrorResponse, error_response, ok_response,
 };
 use crate::rpc_service::validation::InputValidator;
-#[cfg(feature = "rpc-debug-endpoints")]
-use crate::utils::send_challenge_tx;
 use crate::utils::{
-    gen_instance_parameters_local, get_bridge_out_global_stats, load_validated_graph_definition,
-    obsolete_graph,
+    gen_instance_parameters_local, get_bridge_out_global_stats, obsolete_graph,
+    read_graph_definition,
 };
+#[cfg(feature = "rpc-debug-endpoints")]
+use crate::utils::{load_validated_graph_definition, send_challenge_tx};
 use alloy::primitives::U256;
 use axum::Json;
 use axum::extract::{Path, Query, State};
@@ -28,9 +28,45 @@ use std::collections::HashSet;
 use std::default::Default;
 use std::str::FromStr;
 use std::sync::Arc;
-use store::localdb::{GraphQuery, InstanceQuery, StorageProcessor};
+use store::localdb::{GraphQuery, InstanceQuery, LocalDB, StorageProcessor};
 use store::{Graph, GraphStatus, InstanceBridgeInStatus};
+use tokio::sync::{Semaphore, SemaphorePermit};
 use tracing::{info, warn};
+use uuid::Uuid;
+
+/// Public requests rebuilding a graph at a time; each rebuild and its
+/// signature checks take a blocking thread.
+static GRAPH_BUILDS: Semaphore = Semaphore::const_new(2);
+
+/// Run `work` on the blocking pool while holding `permit`. The permit moves
+/// into the task: a caller that stops waiting (the client went away) does not
+/// free it while the work is still running.
+async fn run_holding<T: Send + 'static>(
+    permit: SemaphorePermit<'static>,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, tokio::task::JoinError> {
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    })
+    .await
+}
+
+/// The validated graph of a public request. The connection is released
+/// before the rebuild, which runs on the blocking pool.
+async fn load_public_graph(
+    local_db: &LocalDB,
+    instance_id: Uuid,
+    graph_id: Uuid,
+) -> anyhow::Result<Option<BitvmGcGraph>> {
+    let permit = GRAPH_BUILDS.acquire().await?;
+    let stored =
+        read_graph_definition(&mut local_db.acquire().await?, instance_id, graph_id).await?;
+    let Some(stored) = stored else {
+        return Ok(None);
+    };
+    Ok(Some(run_holding(permit, move || stored.build()).await??))
+}
 
 fn graph_tx_index_error(
     tx_name: GraphBtcTxName,
@@ -177,6 +213,8 @@ pub async fn get_instances(
 
     let (instances, total) =
         storage_process.find_instances(query).await.api_error("GET_INSTANCE_ERROR")?;
+    // Released before the Goat and Bitcoin calls.
+    drop(storage_process);
 
     if instances.is_empty() {
         warn!("get_instances instance is empty: total {}", total);
@@ -285,11 +323,16 @@ pub async fn get_instance(
     // Validate instance_id format
     let instance_id_uuid = InputValidator::validate_uuid(&instance_id, "instance_id")?;
 
-    let mut storage_process = app_state.local_db.acquire().await.api_error("GET_INSTANCE_ERROR")?;
+    let instance = app_state
+        .local_db
+        .acquire()
+        .await
+        .api_error("GET_INSTANCE_ERROR")?
+        .find_instance(&instance_id_uuid)
+        .await
+        .api_error("GET_INSTANCE_ERROR")?;
 
-    if let Some(instance) =
-        storage_process.find_instance(&instance_id_uuid).await.api_error("GET_INSTANCE_ERROR")?
-    {
+    if let Some(instance) = instance {
         let response_window_blocks = app_state
             .goat_client
             .gateway_get_response_window_blocks()
@@ -470,11 +513,16 @@ pub async fn get_graph(
     // Validate graph_id format
     let graph_id_uuid = InputValidator::validate_uuid(&graph_id, "graph_id")?;
 
-    let mut storage_process = app_state.local_db.acquire().await.api_error("GET_GRAPH_ERROR")?;
+    let graph = app_state
+        .local_db
+        .acquire()
+        .await
+        .api_error("GET_GRAPH_ERROR")?
+        .find_graph(&graph_id_uuid)
+        .await
+        .api_error("GET_GRAPH_ERROR")?;
 
-    if let Some(graph) =
-        storage_process.find_graph(&graph_id_uuid).await.api_error("GET_GRAPH_ERROR")?
-    {
+    if let Some(graph) = graph {
         let graph_extended = GraphExtended::convert_from_graph(&app_state.btc_client, graph)
             .await
             .api_error("GET_GRAPH_ERROR")?;
@@ -568,6 +616,8 @@ pub async fn get_graphs(
     let filter_params: GraphQuery = params.into();
     let (graphs, total) =
         storage_process.find_graphs(filter_params).await.api_error("GET_GRAPHS_ERROR")?;
+    // Released before the Bitcoin calls.
+    drop(storage_process);
 
     resp.total = total;
     if graphs.is_empty() {
@@ -813,23 +863,20 @@ pub async fn get_graph_tx(
             get_graph_btc_tx_process_data(&mut storage_process, tx_name, &graph)
                 .await
                 .api_error("GET_GRAPH_TX_ERROR")?;
+        drop(storage_process);
 
-        let simplified_bitvm_graph =
-            load_validated_graph_definition(&mut storage_process, graph.instance_id, graph_id_uuid)
-                .await
-                .api_error("GET_GRAPH_TXN_ERROR")?
-                .ok_or_else(|| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(ErrorResponse {
-                            error: "GET_GRAPH_TXN_ERROR".to_string(),
-                            message: format!("graph:{graph_id} raw data is not record in db"),
-                        }),
-                    )
-                })?;
-
-        let bitvm_graph: BitvmGcGraph = BitvmGcGraph::from_simplified(&simplified_bitvm_graph)
-            .api_error("GET_GRAPH_TX_ERROR")?;
+        let bitvm_graph = load_public_graph(&app_state.local_db, graph.instance_id, graph_id_uuid)
+            .await
+            .api_error("GET_GRAPH_TXN_ERROR")?
+            .ok_or_else(|| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: "GET_GRAPH_TXN_ERROR".to_string(),
+                        message: format!("graph:{graph_id} raw data is not record in db"),
+                    }),
+                )
+            })?;
         let tx_index = params.index.unwrap_or(0);
 
         let raw_data = match tx_name {
@@ -977,28 +1024,6 @@ pub async fn get_graph_txn(
             graph
         };
 
-        let simplified_bitvm_graph = load_validated_graph_definition(
-            &mut storage_processor,
-            graph.instance_id,
-            graph.graph_id,
-        )
-        .await
-        .api_error("GET_GRAPH_TXN_ERROR")?
-        .ok_or_else(|| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: "GET_GRAPH_TXN_ERROR".to_string(),
-                    message: format!(
-                        "graph:{graph_id} with cursor:{} raw data is not record in db",
-                        params.cursor
-                    ),
-                }),
-            )
-        })?;
-        let bitvm_graph: BitvmGcGraph = BitvmGcGraph::from_simplified(&simplified_bitvm_graph)
-            .api_error("GET_GRAPH_TXN_ERROR")?;
-
         let (wt_progresses, wt_fail_reason) = get_graph_btc_tx_process_data(
             &mut storage_processor,
             GraphBtcTxName::WatchtowerChallengeInit,
@@ -1014,6 +1039,23 @@ pub async fn get_graph_txn(
         )
         .await
         .api_error("GET_GRAPH_TXN_ERROR")?;
+        drop(storage_processor);
+
+        let bitvm_graph = load_public_graph(&app_state.local_db, graph.instance_id, graph.graph_id)
+            .await
+            .api_error("GET_GRAPH_TXN_ERROR")?
+            .ok_or_else(|| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: "GET_GRAPH_TXN_ERROR".to_string(),
+                        message: format!(
+                            "graph:{graph_id} with cursor:{} raw data is not record in db",
+                            params.cursor
+                        ),
+                    }),
+                )
+            })?;
 
         let mut resp = GraphTxnGetResponse {
             cur_prekickoff: BtcTxData::new(serialize_hex(bitvm_graph.cur_prekickoff.tx())),
@@ -1741,3 +1783,49 @@ pub async fn pegout(
 //         Some(AddressType::P2wpkh) | Some(AddressType::P2wsh) | Some(AddressType::P2tr)
 //     ))
 // }
+
+#[cfg(test)]
+mod build_limit_tests {
+    use super::run_holding;
+    use std::sync::mpsc;
+    use std::time::Duration;
+    use tokio::sync::Semaphore;
+
+    /// A client that disconnects drops the request future; the build it
+    /// started must keep its permit until it finishes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dropped_request_keeps_its_permit_while_the_build_runs() {
+        static LIMIT: Semaphore = Semaphore::const_new(2);
+        let (started_tx, started_rx) = mpsc::channel();
+        let mut releases = Vec::new();
+        let mut requests = Vec::new();
+        for _ in 0..2 {
+            let (release_tx, release_rx) = mpsc::channel::<()>();
+            releases.push(release_tx);
+            let started = started_tx.clone();
+            requests.push(tokio::spawn(async move {
+                let permit = LIMIT.acquire().await.unwrap();
+                run_holding(permit, move || {
+                    started.send(()).unwrap();
+                    release_rx.recv().ok();
+                })
+                .await
+            }));
+        }
+        for _ in 0..2 {
+            started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        }
+        for request in &requests {
+            request.abort();
+        }
+        for request in requests {
+            assert!(request.await.unwrap_err().is_cancelled());
+        }
+        // Both builds still run, so a third request must wait.
+        assert_eq!(LIMIT.available_permits(), 0);
+        assert!(LIMIT.try_acquire().is_err());
+        drop(releases);
+        let third = tokio::time::timeout(Duration::from_secs(10), LIMIT.acquire_many(2)).await;
+        assert!(third.is_ok(), "permits return once the builds finish");
+    }
+}
