@@ -172,6 +172,35 @@ fn instance_row(status: InstanceBridgeInStatus, prepare_height: i64) -> Instance
     }
 }
 
+/// A row whose committee answers yield the three peg-in txids, and those answers.
+fn answerable_row(
+    status: InstanceBridgeInStatus,
+    members: usize,
+) -> (Instance, IndexMap<String, Vec<u8>>) {
+    use bitcoin::secp256k1::{Keypair, SECP256K1, SecretKey};
+    let key = |byte: u8| {
+        Keypair::from_secret_key(SECP256K1, &SecretKey::from_slice(&[byte; 32]).unwrap())
+    };
+    let mut row = instance_row(status, 0);
+    let address = crate::utils::get_rand_btc_address_p2wpkh(bitcoin::Network::Regtest);
+    row.to_addr = format!("0x{}", "11".repeat(20));
+    row.amount = 10_000;
+    row.fees = store::UInt64Array3([100; 3]);
+    row.input_utxos =
+        serde_json::to_string(&[client::Utxo { txid: [9; 32], vout: 0, amount_sats: 50_000 }])
+            .unwrap();
+    row.user_xonly_pubkey = store::ByteArray32(key(0x51).x_only_public_key().0.serialize());
+    row.user_change_addr = address.clone();
+    row.user_refund_addr = address;
+    let answers = (0..members)
+        .map(|index| {
+            let pubkey = bitcoin::PublicKey::new(key(0x61 + index as u8).public_key());
+            (format!("0x{index:040x}"), pubkey.to_bytes())
+        })
+        .collect();
+    (row, answers)
+}
+
 impl Harness {
     async fn stop(self) {
         self.cancel.cancel();
@@ -522,17 +551,29 @@ async fn no_enough_committees_answered_when_the_window_closes_below_quorum() {
 async fn committees_answered_at_quorum_keeps_the_key() {
     use InstanceBridgeInStatus::*;
     let t = start(Actor::Committee, false, true).await;
-    let id = t.insert(&instance_row(UserInited, 0)).await;
-    let mut answers = IndexMap::new();
-    answers.insert("0xa".to_string(), vec![1u8; 33]);
-    answers.insert("0xb".to_string(), vec![2u8; 33]);
+    let (row, answers) = answerable_row(UserInited, 2);
+    let id = t.insert(&row).await;
     let window = AnswerWindow { goat_height: 200, window_blocks: 50, quorum: 2, answers };
     t.submit(window.event(id).unwrap()).await;
     let instance = t.wait_status(id, CommitteesAnswered).await;
     assert_eq!(instance.committees_answers.len(), 2);
+    assert!(instance.btc_txid.is_some(), "the answers fix the Prepare txid");
     assert!(!instance.key_deleted);
     assert!(t.job_actions(id).await.is_empty());
     assert_eq!(t.engine_status(id).await.1, PHASE_AWAIT_PREPARE);
+    t.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn answers_that_yield_no_peg_in_txids_fail_the_instance() {
+    use InstanceBridgeInStatus::*;
+    let t = start(Actor::Committee, false, false).await;
+    let id = t.insert(&instance_row(UserInited, 0)).await;
+    let mut answers = IndexMap::new();
+    answers.insert("0xa".to_string(), vec![1u8; 33]); // not a public key
+    let window = AnswerWindow { goat_height: 200, window_blocks: 50, quorum: 1, answers };
+    t.submit(window.event(id).unwrap()).await;
+    t.wait_status(id, NoEnoughCommitteesAnswered).await;
     t.stop().await;
 }
 
@@ -740,14 +781,13 @@ async fn a_pegin_request_is_answered_by_committee_nodes_until_the_window_closes(
     t.stop().await;
 
     let t = start(Actor::Committee, false, false).await;
-    let id = t.insert(&instance_row(UserInited, 0)).await;
+    let (row, answers) = answerable_row(UserInited, 1);
+    let id = t.insert(&row).await;
     t.submit(pegin_request_event(id, &request).unwrap()).await;
     let job = t.wait_job(id, JOB_ANSWER_PEGIN_REQUEST, "Done").await;
     assert_eq!(job.phase, PHASE_ANSWER);
     assert_eq!(t.calls().len(), 1);
     // A request seen again after the Answer phase changes nothing.
-    let mut answers = IndexMap::new();
-    answers.insert("0xa".to_string(), vec![1u8; 33]);
     let window = AnswerWindow { goat_height: 200, window_blocks: 50, quorum: 1, answers };
     t.submit(window.event(id).unwrap()).await;
     t.wait_status(id, CommitteesAnswered).await;
@@ -800,10 +840,34 @@ async fn a_round_message_becomes_an_ingest_job_whose_plan_is_sent_until_the_conf
         1
     );
 
-    // Peg-In-Confirm confirmed: the Confirm phase's deliveries close.
+    // This member's partial signature, still owed to a relayer that missed it.
+    let partial_sig_outbox = format!("instance:{id}:PeginConfirmPartialSig");
+    t.db.acquire()
+        .await
+        .unwrap()
+        .insert_engine_outbox_message(
+            &NewEngineOutboxMessage {
+                outbox_id: partial_sig_outbox.clone(),
+                aggregate_kind: INSTANCE_KIND.to_string(),
+                aggregate_id: id.to_string(),
+                phase_ref: PHASE_CONFIRM.to_string(),
+                kind: "PeginConfirmPartialSig".to_string(),
+                topic: "topic".to_string(),
+                payload: b"partial".to_vec(),
+                ack_set: None,
+                first_at: 1,
+            },
+            1,
+        )
+        .await
+        .unwrap();
+
+    // Peg-In-Confirm confirmed: the nonce rounds' deliveries close, the
+    // partial signature keeps going out until Goat mints.
     t.snapshot(id, presign_snapshot(1_050, TxFact::confirmed_at(1_049), TxFact::UNKNOWN)).await;
     t.wait_status(id, RelayerL1Broadcasted).await;
     t.wait_outbox(&outbox_id, "Closed").await;
+    assert_eq!(t.outbox_state(&partial_sig_outbox).await, "Open");
     // A late partial signature is still ingested (it carries the endorsement
     // the relayer's post needs); a late nonce is not.
     t.submit(t.round_message("PeginConfirmPartialSig", OTHER_PEER, id)).await;

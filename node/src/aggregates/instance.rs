@@ -399,6 +399,9 @@ pub enum InstanceAlert {
     /// Goat refused the data of a confirmed peg-in for good: no instance
     /// parameters stored, no graph started by this operator.
     ConfirmInstanceRejected,
+    /// The committee answers do not yield the peg-in transactions; the instance
+    /// is failed instead of waiting forever for a Prepare nobody can build.
+    PeginTxidsUnderivable,
 }
 
 impl InstanceAlert {
@@ -411,6 +414,7 @@ impl InstanceAlert {
             InstanceAlert::PeginConfirmRoundFailed => "pegin_confirm_round_failed",
             InstanceAlert::AnswerPeginRequestFailed => "answer_pegin_request_failed",
             InstanceAlert::ConfirmInstanceRejected => "confirm_instance_rejected",
+            InstanceAlert::PeginTxidsUnderivable => "pegin_txids_underivable",
         }
     }
 }
@@ -636,11 +640,21 @@ pub async fn signing_gate(
     if status.is_failed() {
         return Ok(SigningGate::Closed(format!("instance is {status}")));
     }
-    if instance.btc_height <= 0 {
-        return Ok(SigningGate::Open);
+    let mut prepare_height = instance.btc_height;
+    if prepare_height <= 0 {
+        // The scan has not stored the Prepare height yet; ask Bitcoin rather than
+        // signing blind, since T0 may already have passed on a lagging node.
+        let Some(prepare_txid) = instance.btc_txid.clone() else {
+            anyhow::bail!("instance {instance_id} has no Peg-In-Prepare txid yet");
+        };
+        match btc_client.get_tx_info(&prepare_txid.0).await?.and_then(|tx| tx.status.block_height) {
+            Some(height) => prepare_height = i64::from(height),
+            // T0 counts from the Prepare confirmation, which has not happened.
+            None => return Ok(SigningGate::Open),
+        }
     }
     let height = i64::from(btc_client.get_height().await?);
-    Ok(signing_gate_for(status, instance.btc_height, height, &PeginDeadlines::from_env()))
+    Ok(signing_gate_for(status, prepare_height, height, &PeginDeadlines::from_env()))
 }
 
 // -------------------------------------------------------------------- handler
@@ -702,10 +716,32 @@ impl InstanceAggregate {
         ctx: &mut ApplyContext<'_>,
         instance: &Instance,
         status: InstanceBridgeInStatus,
-        transition: Transition,
+        mut transition: Transition,
     ) -> anyhow::Result<()> {
         let instance_id = instance.instance_id;
         let mut final_status = status;
+        // The answers fix the three peg-in txids. Answers they cannot be derived
+        // from never will be: fail the instance and say so.
+        let mut pegin_txids_derived = None;
+        if transition.next == Some(InstanceBridgeInStatus::CommitteesAnswered)
+            && let Some(answers) = transition.committees_answers.clone()
+        {
+            let mut seeded = instance.clone();
+            seeded.committees_answers = answers;
+            match pegin_txids(&seeded) {
+                Ok(txids) => pegin_txids_derived = Some(txids),
+                Err(error) => {
+                    warn!(
+                        event = "instance_transition",
+                        instance_id = %instance_id,
+                        error = %error,
+                        "could not derive the peg-in txids from the committee answers; failing the instance"
+                    );
+                    transition.next = Some(InstanceBridgeInStatus::NoEnoughCommitteesAnswered);
+                    transition.alerts.push(InstanceAlert::PeginTxidsUnderivable);
+                }
+            }
+        }
         if let Some(next) = transition.next.filter(|next| *next != status) {
             let mut update = InstanceUpdate::new_with_instance_id(instance_id)
                 .with_status(next.to_string())
@@ -714,25 +750,13 @@ impl InstanceAggregate {
                 update = update.with_btc_height(height);
             }
             if let Some(answers) = transition.committees_answers.clone() {
-                update = update.with_committees_answers(answers.clone());
-                if next == InstanceBridgeInStatus::CommitteesAnswered {
-                    let mut seeded = instance.clone();
-                    seeded.committees_answers = answers;
-                    match pegin_txids(&seeded) {
-                        Ok((deposit, confirm, cancel)) => {
-                            update = update
-                                .with_btc_txid(deposit)
-                                .with_pegin_confirm_txid(confirm)
-                                .with_pegin_cancel_txid(cancel);
-                        }
-                        Err(error) => warn!(
-                            event = "instance_transition",
-                            instance_id = %instance_id,
-                            error = %error,
-                            "could not derive the peg-in txids from the committee answers"
-                        ),
-                    }
-                }
+                update = update.with_committees_answers(answers);
+            }
+            if let Some((deposit, confirm, cancel)) = pegin_txids_derived {
+                update = update
+                    .with_btc_txid(deposit)
+                    .with_pegin_confirm_txid(confirm)
+                    .with_pegin_cancel_txid(cancel);
             }
             if let Some(tx_hash) = transition.post_pegin_txhash.clone() {
                 update = update.with_post_pegin(tx_hash);
@@ -794,7 +818,18 @@ impl InstanceAggregate {
                 }
             }
             RelayerL1Broadcasted => {
-                self.close_confirm_round(ctx, instance.instance_id, "Peg-In-Confirm confirmed");
+                // The nonce rounds are over, but the relayer still needs every
+                // member's PeginConfirmPartialSig (it carries the endorsement for
+                // postPeginData): that row keeps being resent until L2Minted.
+                for kind in ["PeginConfirmNonce", "PeginConfirmNonceConsensus"] {
+                    ctx.effects.close_outbox(
+                        EngineOutboxCloseTarget::Row(format!(
+                            "instance:{}:{kind}",
+                            instance.instance_id
+                        )),
+                        "Peg-In-Confirm confirmed",
+                    );
+                }
                 if self.relayer {
                     self.job(ctx, JOB_POST_PEGIN_DATA, Vec::new());
                 }
@@ -1569,6 +1604,58 @@ mod tests {
         for failed in InstanceBridgeInStatus::FAILED {
             assert!(!signing_gate_for(failed, PREPARE, 10, &DEADLINES).is_open());
         }
+    }
+
+    #[tokio::test]
+    async fn signing_gate_without_a_stored_prepare_height_asks_bitcoin() {
+        use bitcoin::hashes::Hash;
+        let db = store::create_local_db("sqlite::memory:").await;
+        let (btc, mock) = BTCClient::new_mock_client();
+        let prepare = bitcoin::Txid::from_byte_array([7; 32]);
+        let mut row = Instance {
+            instance_id: Uuid::new_v4(),
+            network: "regtest".to_string(),
+            input_utxos: "[]".to_string(),
+            status: Presigned.to_string(),
+            created_at: 1,
+            updated_at: 1,
+            ..Default::default()
+        };
+        db.acquire().await.unwrap().insert_instance_if_absent(&row).await.unwrap();
+        assert!(
+            signing_gate(&db, &btc, row.instance_id).await.is_err(),
+            "no Prepare txid: undecided, retried"
+        );
+
+        row.instance_id = Uuid::new_v4();
+        row.btc_txid = Some(prepare.into());
+        db.acquire().await.unwrap().insert_instance_if_absent(&row).await.unwrap();
+        assert!(signing_gate(&db, &btc, row.instance_id).await.unwrap().is_open(), "unconfirmed");
+
+        mock.set_tx(
+            prepare,
+            esplora_client::Tx {
+                txid: prepare,
+                version: 2,
+                locktime: 0,
+                vin: Vec::new(),
+                vout: Vec::new(),
+                size: 0,
+                weight: 0,
+                status: esplora_client::TxStatus {
+                    confirmed: true,
+                    block_height: Some(100),
+                    block_hash: None,
+                    block_time: None,
+                },
+                fee: 0,
+            },
+        );
+        mock.set_height(100 + 1_000_000);
+        assert!(
+            !signing_gate(&db, &btc, row.instance_id).await.unwrap().is_open(),
+            "T0 counted from the confirmed Prepare"
+        );
     }
 
     #[test]

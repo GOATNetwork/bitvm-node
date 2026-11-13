@@ -34,7 +34,7 @@ use crate::utils::{
     get_committee_pub_nonce_for_instance, get_committee_pub_nonces_for_instance,
     get_graph_by_instance_id_and_operator_pubkey, get_instance_parameters,
     has_required_presigned_graphs, is_io_not_found_error, order_committee_values,
-    read_instance_info_from_goat, read_pegin_request,
+    pegin_inputs_answerable, read_instance_info_from_goat, read_pegin_request,
     store_committee_agg_nonce_consensus_for_instance, store_committee_endorse_sig_for_pegin,
     store_committee_partial_sig_for_instance, store_committee_pub_nonce_for_instance,
     store_instance_parameters, tx_visible, verify_pegin_endorsement,
@@ -250,13 +250,16 @@ async fn answer_pegin_request(deps: &JobDeps, instance_id: Uuid) -> Result<Step>
         Some(InstanceBridgeInStatus::UserInited) => {}
         other => return Step::ignore(format!("instance is {other:?}; answer window closed")),
     }
-    let (_, _, answered_by) =
-        read_pegin_request(&deps.btc_client, &deps.goat_client, instance_id).await?;
+    let (user_info, _, answered_by) = read_pegin_request(&deps.goat_client, instance_id).await?;
     // Gateway.answerPeginRequest accepts a repeat answer (it overwrites the
     // stored pubkey and emits CommitteeResponse again), so every re-run must
     // check what the contract already holds for this signer.
     if answered_by.contains(&deps.goat_client.get_default_signer_address()) {
         return Step::ignore("this committee already answered");
+    }
+    // Retried until the inputs settle; leaving UserInited cancels this job.
+    if let Some(reason) = pegin_inputs_answerable(&deps.btc_client, &user_info.inputs).await? {
+        return Step::retry(reason, 30);
     }
     let committee_master_key = CommitteeMasterKey::new(get_bitvm_key()?);
     let instance_keypair = load_or_create_committee_instance_keypair(
