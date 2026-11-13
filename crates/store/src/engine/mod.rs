@@ -501,10 +501,13 @@ impl<'a> StorageProcessor<'a> {
             .rows_affected()
                 > 0;
         }
+        // ACK means stored for good: applied, parked on a dependency, or
+        // poisoned (terminal, so a resend changes nothing). A failed row is
+        // re-armed above and ACKed once it is applied or rejected again.
         let ack_again = match state {
-            EngineInboxState::Applied => true,
+            EngineInboxState::Applied | EngineInboxState::Poisoned => true,
             EngineInboxState::Pending => waiting_ref.is_some(),
-            EngineInboxState::Failed | EngineInboxState::Poisoned => false,
+            EngineInboxState::Failed => false,
         };
         Ok(EngineInboxInsert::Duplicate { state, ack_again, rearmed })
     }
@@ -1427,6 +1430,19 @@ impl<'a> StorageProcessor<'a> {
     /// Running jobs that were asked to cancel and whose lease lapsed (a crash
     /// or restart took their holder away) finish as `Cancelled` instead of being
     /// run again; the rows are returned so their results can be reported.
+    /// Whether [`Self::finish_lapsed_cancelled_engine_jobs`] has anything to do;
+    /// a plain read, so the idle executor poll takes no write lock.
+    pub async fn has_lapsed_cancelled_engine_jobs(&mut self, now: i64) -> anyhow::Result<bool> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS (SELECT 1 FROM engine_job \
+             WHERE state = 'Running' AND lease_until <= ? AND cancel_requested = 1)",
+        )
+        .bind(now)
+        .fetch_one(self.conn())
+        .await?
+            != 0)
+    }
+
     pub async fn finish_lapsed_cancelled_engine_jobs(
         &mut self,
         now: i64,

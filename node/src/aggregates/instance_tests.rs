@@ -3,6 +3,7 @@
 
 use super::common::{InboundMessage, MembershipProbe, PlannedMessage, content_event_id};
 use super::instance::*;
+use super::jobs::Plan;
 use crate::utils::{mark_graph_as_endorsed, store_committee_partial_sig_for_instance};
 use async_trait::async_trait;
 use bitvm_lib::actors::Actor;
@@ -1104,5 +1105,40 @@ async fn a_failed_instance_releases_its_pending_setup_session() {
         (woken.as_deref() != Some(slot.as_str())).then_some(())
     })
     .await;
+    t.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stale_job_result_is_dropped_and_the_current_one_applied() {
+    use InstanceBridgeInStatus::*;
+    let t = start(Actor::Committee, false, false).await;
+    let id = t.insert(&instance_row(Presigned, PREPARE)).await;
+    let outbox_id = format!("instance:{id}:PeginConfirmNonce");
+    let mut plan = InstancePlan::noted("nonce");
+    plan.send(PlannedMessage {
+        outbox_id: outbox_id.clone(),
+        phase_ref: PHASE_CONFIRM.into(),
+        kind: "PeginConfirmNonce".into(),
+        actor: Actor::Committee.to_string(),
+        payload: vec![1, 2, 3],
+        ack_set: None,
+    });
+    let result = |generation: i64, stale: bool| {
+        engine::JobResultEvent {
+            job_id: "job-confirm-nonce".into(),
+            phase: PHASE_CONFIRM.into(),
+            action: JOB_START_PEGIN_CONFIRM.into(),
+            generation,
+            stale,
+            outcome: engine::JobResultOutcome::Done(plan.encode().unwrap()),
+        }
+        .into_new_event(instance_ref(id))
+        .unwrap()
+    };
+    let event_id = t.submit_id(result(1, true)).await;
+    t.wait_applied(&event_id).await;
+    assert!(t.outbox(&outbox_id).await.is_none(), "a stale plan sends nothing");
+    t.submit(result(2, false)).await;
+    t.wait_outbox(&outbox_id, "Open").await;
     t.stop().await;
 }

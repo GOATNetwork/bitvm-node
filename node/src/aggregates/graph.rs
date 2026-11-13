@@ -797,6 +797,12 @@ impl GraphAggregate {
         status: Option<GraphStatus>,
         result: JobResultEvent,
     ) -> anyhow::Result<ApplyOutcome> {
+        if result.stale && !matches!(result.outcome, JobResultOutcome::Done(_)) {
+            // A newer run of the job holds it and reports its own result.
+            info!(event = "graph_job", graph_id = %graph_id, action = %result.action, generation = result.generation, "stale job result dropped; the newer run reports");
+            ctx.storage.clear_engine_job_result(&result.job_id, ctx.now).await?;
+            return Ok(ApplyOutcome::Applied);
+        }
         match &result.outcome {
             JobResultOutcome::Done(bytes) => {
                 let mut plan = match GraphPlan::decode(bytes) {
@@ -809,7 +815,13 @@ impl GraphAggregate {
                     }
                 };
                 if let Some(note) = &plan.note {
-                    info!(event = "graph_job", graph_id = %graph_id, action = %result.action, stale = result.stale, note = %note, "job note");
+                    info!(event = "graph_job", graph_id = %graph_id, action = %result.action, note = %note, "job note");
+                }
+                // A newer run holds the job and reports its own result; jobs
+                // re-run to the same effect, so only this run's wakes are kept.
+                if result.stale {
+                    info!(event = "graph_job", graph_id = %graph_id, action = %result.action, generation = result.generation, "stale job result dropped; the newer run reports");
+                    plan = GraphPlan { wake_refs: plan.wake_refs, ..Default::default() };
                 }
                 // Drop late setup/post actions for retired graphs, but preserve dependency wakes.
                 // Peg-out results may still be needed for settlement.
