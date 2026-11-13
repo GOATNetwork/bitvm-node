@@ -113,6 +113,7 @@ enum KeyCommands {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     dotenv::dotenv().ok();
+    env::validate_network_env()?;
     let actor = env::get_actor();
     let opt = Opts::parse();
     if let Some(Commands::Key(key_arg)) = opt.cmd {
@@ -197,6 +198,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         version = env!("CARGO_PKG_VERSION"),
     );
     let _node_span_guard = node_span.enter();
+    // Fixed before any job can read or write a committee instance key.
+    env::init_committee_instance_keys_dir(&opt.db_path, &actor)?;
     let local_db =
         store::create_local_db_with_busy_timeout(&opt.db_path, engine_bridge::db_busy_timeout())
             .await;
@@ -292,7 +295,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         set_node_external_socket_addr_env(&opt.rpc_addr).await?;
     }
     // validate node info
-    check_node_info().await;
+    check_node_info().await?;
     save_local_info(&local_db).await;
     metrics_state.mark_startup_ready();
 

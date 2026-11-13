@@ -22,6 +22,10 @@ cargo build -r -p bitvm-noded --bin bitvm-noded
    Bitcoin and GOAT accounts.
 3. Choose the proof service and peer network shared by the participants.
 4. Give each node isolated persistent state and distinct listening addresses.
+   A Committee node keeps its instance keys in `cache/committee-instance-keys`
+   next to its database file, or in `COMMITTEE_INSTANCE_KEYS_DIR`. Keep that
+   directory on the same persistent storage as the database, and never restore
+   either from an older snapshot.
 5. Start the nodes and confirm they are ready before initiating bridge activity.
 
 All participants must agree on the graph parameters, Verifier slot count, and

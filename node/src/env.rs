@@ -3,6 +3,7 @@ use alloy::primitives::Address as EvmAddress;
 use alloy::primitives::Address;
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
+use anyhow::{Context, Result, bail};
 use base64::Engine;
 use bitcoin::{Network, PublicKey, key::Keypair};
 use bitvm_lib::actors::Actor;
@@ -18,8 +19,9 @@ use client::timeout_config::get_goat_rpc_timeout_secs;
 use libp2p::PeerId;
 use reqwest::Url;
 use sha2::{Digest, Sha256};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::OnceLock;
 use std::time::SystemTime;
 use strum::{Display, EnumString};
 use tracing::{info, warn};
@@ -67,7 +69,10 @@ pub const ENV_VERIFIER_CANDIDATE_BACKUP_COUNT: &str = "VERIFIER_CANDIDATE_BACKUP
 pub const ENV_VERIFIER_CANDIDATE_COLLECTION_WINDOW_SECS: &str =
     "VERIFIER_CANDIDATE_COLLECTION_WINDOW_SECS";
 pub const ENV_EXTERNAL_SOCKET_ADDR: &str = "EXTERNAL_SOCKET_ADDR";
-pub const COMMITTEE_INSTANCE_KEYS_DIR: &str = "cache/committee-instance-keys/";
+/// Directory of the committee instance key envelopes. Defaults to
+/// `<database directory>/cache/committee-instance-keys`.
+pub const ENV_COMMITTEE_INSTANCE_KEYS_DIR: &str = "COMMITTEE_INSTANCE_KEYS_DIR";
+const COMMITTEE_INSTANCE_KEYS_SUBDIR: &str = "cache/committee-instance-keys";
 pub const DUST_AMOUNT: u64 = goat::transactions::base::DUST_AMOUNT;
 pub const MAX_CUSTOM_INPUTS: usize = 100;
 
@@ -160,20 +165,104 @@ pub const ENV_COMMITTEE_INSTANCE_KEY_DELETE_TIMELOCK_BLOCKS: &str =
     "COMMITTEE_INSTANCE_KEY_DELETE_TIMELOCK_BLOCKS";
 pub const DEFAULT_COMMITTEE_INSTANCE_KEY_DELETE_TIMELOCK_BLOCKS: i64 = 32;
 
+static COMMITTEE_INSTANCE_KEYS_PATH: OnceLock<PathBuf> = OnceLock::new();
+static DISCOVERED_EXTERNAL_SOCKET_ADDR: OnceLock<std::net::SocketAddr> = OnceLock::new();
+
+/// Records the public RPC address found at startup; `EXTERNAL_SOCKET_ADDR` still wins.
+pub fn set_discovered_external_socket_addr(addr: std::net::SocketAddr) {
+    let _ = DISCOVERED_EXTERNAL_SOCKET_ADDR.set(addr);
+}
+
+/// The directory holding the file of a sqlite database URL or path, as an absolute path.
+/// `None` for an in-memory database.
+fn sqlite_database_dir(db_path: &str) -> Option<PathBuf> {
+    let path = db_path
+        .strip_prefix("sqlite://")
+        .or_else(|| db_path.strip_prefix("sqlite:"))
+        .unwrap_or(db_path);
+    let path = path.split('?').next().unwrap_or_default();
+    if path.is_empty() || path == ":memory:" {
+        return None;
+    }
+    let file = std::path::absolute(path).ok()?;
+    file.parent().map(Path::to_path_buf)
+}
+
+fn resolve_committee_instance_keys_dir(
+    configured: Option<String>,
+    db_path: Option<&str>,
+) -> Result<PathBuf> {
+    if let Some(dir) = configured
+        && !dir.trim().is_empty()
+    {
+        return std::path::absolute(dir.trim())
+            .with_context(|| format!("invalid {ENV_COMMITTEE_INSTANCE_KEYS_DIR} {dir}"));
+    }
+    let base = match db_path {
+        Some(db_path) => sqlite_database_dir(db_path).with_context(|| {
+            format!(
+                "the database {db_path} has no directory; set {ENV_COMMITTEE_INSTANCE_KEYS_DIR}"
+            )
+        })?,
+        None => std::env::current_dir().context("read the current directory")?,
+    };
+    Ok(base.join(COMMITTEE_INSTANCE_KEYS_SUBDIR))
+}
+
+/// Fixes the committee instance key directory for this process: `COMMITTEE_INSTANCE_KEYS_DIR`,
+/// or next to the database. A committee node also checks that it can write there, since it
+/// answers a peg-in only after its key is on disk.
+pub fn init_committee_instance_keys_dir(db_path: &str, actor: &Actor) -> Result<PathBuf> {
+    let dir = resolve_committee_instance_keys_dir(
+        std::env::var(ENV_COMMITTEE_INSTANCE_KEYS_DIR).ok(),
+        Some(db_path),
+    )?;
+    if *actor == Actor::Committee {
+        check_writable_dir(&dir)?;
+    }
+    let dir = COMMITTEE_INSTANCE_KEYS_PATH.get_or_init(|| dir).clone();
+    info!(path = %dir.display(), "committee instance key directory");
+    Ok(dir)
+}
+
+fn check_writable_dir(dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("create key directory {}", dir.display()))?;
+    let probe = dir.join(".write-check");
+    std::fs::write(&probe, b"")
+        .and_then(|()| std::fs::remove_file(&probe))
+        .with_context(|| format!("key directory {} is not writable", dir.display()))
+}
+
+/// The committee instance key directory fixed at startup. Tools that never call
+/// [`init_committee_instance_keys_dir`] get the environment value or the current directory.
+pub fn committee_instance_keys_dir() -> &'static Path {
+    COMMITTEE_INSTANCE_KEYS_PATH.get_or_init(|| {
+        resolve_committee_instance_keys_dir(
+            std::env::var(ENV_COMMITTEE_INSTANCE_KEYS_DIR).ok(),
+            None,
+        )
+        .expect("resolve the committee instance key directory")
+    })
+}
+
+/// Parses a Bitcoin network name accepted by the node.
+pub fn parse_bitcoin_network(network: &str) -> Result<Network> {
+    match network {
+        "bitcoin" => Ok(Network::Bitcoin),
+        "testnet4" => Ok(Network::Testnet4),
+        "signet" => Ok(Network::Signet),
+        "regtest" => Ok(Network::Regtest),
+        _ => bail!(
+            "unknown Bitcoin network {network:?}: expected bitcoin, testnet4, signet or regtest"
+        ),
+    }
+}
+
+/// The configured Bitcoin network. An unknown name is a configuration error, not testnet4.
 pub fn get_network() -> Network {
     let network = std::env::var(ENV_BITCOIN_NETWORK).unwrap_or("testnet4".to_string());
-    match network.as_str() {
-        "bitcoin" => Network::Bitcoin,
-        "testnet4" => Network::Testnet4,
-        "signet" => Network::Signet,
-        "regtest" => Network::Regtest,
-        _ => {
-            warn!(
-                "Unknown BTC network: {network}, expect bitcoin, testnet4, signet or regtest, return testnet by default"
-            );
-            Network::Testnet4
-        }
-    }
+    parse_bitcoin_network(&network).unwrap_or_else(|error| panic!("{ENV_BITCOIN_NETWORK}: {error}"))
 }
 
 pub const ENV_PEGIN_ABANDON_BUFFER_BLOCKS: &str = "PEGIN_ABANDON_BUFFER_BLOCKS";
@@ -199,16 +288,30 @@ pub fn get_operator_graph_start_cutoff_blocks() -> i64 {
         .unwrap_or_else(|| i64::from(default_connector_z_timelock_blocks(get_network())) * 2 / 3)
 }
 
+/// The configured GOAT network. An unknown name is a configuration error, not test.
 pub fn get_goat_network() -> GoatNetwork {
     let network = std::env::var(ENV_GOAT_NETWORK).unwrap_or("test".to_string());
     match network.as_str() {
         "main" => GoatNetwork::Main,
         "test" => GoatNetwork::Test,
-        _ => {
-            warn!("Unknown GOAT network: {network}, expect main, or test, return test by default");
-            GoatNetwork::Test
-        }
+        _ => panic!("{ENV_GOAT_NETWORK}: unknown GOAT network {network:?}: expected main or test"),
     }
+}
+
+/// Reads both network settings once, so a bad name stops the node before it starts.
+pub fn validate_network_env() -> Result<()> {
+    validate_network_names(
+        &std::env::var(ENV_BITCOIN_NETWORK).unwrap_or("testnet4".to_string()),
+        &std::env::var(ENV_GOAT_NETWORK).unwrap_or("test".to_string()),
+    )
+}
+
+fn validate_network_names(bitcoin: &str, goat: &str) -> Result<()> {
+    parse_bitcoin_network(bitcoin).with_context(|| ENV_BITCOIN_NETWORK)?;
+    if !matches!(goat, "main" | "test") {
+        bail!("{ENV_GOAT_NETWORK}: unknown GOAT network {goat:?}: expected main or test");
+    }
+    Ok(())
 }
 
 /// Get the entropy of WOTS keys for current node
@@ -302,52 +405,44 @@ pub fn get_node_goat_address() -> Option<EvmAddress> {
     }
 }
 
-pub async fn check_node_info() {
-    if [Actor::Committee.to_string()].contains(&get_actor().to_string())
-        && std::env::var(ENV_GOAT_PRIVATE_KEY).is_err()
-    {
-        panic!("Relayer and Committee must set goat secret key");
+/// Checks the node's identity settings and, for a committee member, its registration on Goat.
+/// Goat reads are bounded and retried like the other boot reads.
+pub async fn check_node_info() -> Result<()> {
+    if get_actor() == Actor::Committee && std::env::var(ENV_GOAT_PRIVATE_KEY).is_err() {
+        bail!("Relayer and Committee must set goat secret key");
     }
     let node_info = get_local_node_info();
     if [Actor::Operator.to_string(), Actor::Verifier.to_string()].contains(&node_info.actor)
         && node_info.goat_addr.is_empty()
     {
-        panic!("Operator and Verifier must set goat address or goat secret key");
+        bail!("Operator and Verifier must set goat address or goat secret key");
     }
-    if Actor::Committee.to_string() == node_info.actor
-        || Actor::Operator.to_string() == node_info.actor
-    {
-        let rpc_url = get_goat_url_from_env();
-        let gateway_address = get_goat_gateway_contract_from_env();
-        let provider = ProviderBuilder::new().connect_http(rpc_url);
-        let committee_management_address =
+    if node_info.actor != Actor::Committee.to_string() {
+        return Ok(());
+    }
+    let rpc_url = get_goat_url_from_env();
+    let gateway_address = get_goat_gateway_contract_from_env();
+    let provider = ProviderBuilder::new().connect_http(rpc_url.clone());
+    let committee_management_address =
+        retry_at_boot("committee management address", &rpc_url, || {
             get_committee_management_contract(&provider, gateway_address)
-                .await
-                .expect("fail to get committee manager address");
-        let peer_id = PeerId::from_str(&node_info.peer_id).expect("fail to decode");
-
-        if node_info.actor == Actor::Committee.to_string() {
-            match is_validate_committee(
-                &provider,
-                committee_management_address,
-                &peer_id.to_bytes(),
-            )
-            .await
-            {
-                Ok(is_legal) => {
-                    if is_legal {
-                        info!("Committee is legal!");
-                    } else {
-                        panic!("Committee is illegal as not finish register! ")
-                    }
-                }
-                Err(err) => {
-                    panic!("Committee validate failed, err:{err:?}")
-                }
-            }
-        }
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("get committee management address: {error}"))?;
+    let peer_id =
+        PeerId::from_str(&node_info.peer_id).context("decode the node's peer id")?.to_bytes();
+    let registered = retry_at_boot("committee registration", &rpc_url, || {
+        is_validate_committee(&provider, committee_management_address, &peer_id)
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("check committee registration: {error}"))?;
+    if !registered {
+        bail!("Committee is not registered on Goat");
     }
+    info!("Committee is registered on Goat");
+    Ok(())
 }
+
 pub fn get_local_node_info() -> NodeInfo {
     let actor = get_actor();
     let peer_key = get_peer_id();
@@ -366,7 +461,10 @@ pub fn get_local_node_info() -> NodeInfo {
 
         addr_op
     };
-    let socket_addr = std::env::var(ENV_EXTERNAL_SOCKET_ADDR).unwrap_or("".to_string());
+    let socket_addr = std::env::var(ENV_EXTERNAL_SOCKET_ADDR)
+        .ok()
+        .or_else(|| DISCOVERED_EXTERNAL_SOCKET_ADDR.get().map(ToString::to_string))
+        .unwrap_or_default();
     // Sign this node's peer ID binding with its master key.
     let issued_at = SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -984,5 +1082,52 @@ mod tests {
         assert!(validate_soldering_proof_payload_store_config(&Actor::Verifier).is_err());
 
         unsafe { std::env::remove_var(ENV_SOLDERING_PROOF_PAYLOAD_STORE_PATH) };
+    }
+
+    #[test]
+    fn key_directory_follows_the_database_or_the_environment() {
+        let cwd = std::env::current_dir().unwrap();
+        for (db_path, base) in [
+            ("sqlite:/var/data/bitvm-node.db", PathBuf::from("/var/data")),
+            ("sqlite:///var/data/bitvm-node.db?mode=rwc", PathBuf::from("/var/data")),
+            ("/var/data/bitvm-node-0.db", PathBuf::from("/var/data")),
+            ("sqlite:bitvm-node.db", cwd.clone()),
+            ("sqlite:nodes/a/bitvm-node.db", cwd.join("nodes/a")),
+        ] {
+            assert_eq!(
+                resolve_committee_instance_keys_dir(None, Some(db_path)).unwrap(),
+                base.join(COMMITTEE_INSTANCE_KEYS_SUBDIR),
+                "{db_path}"
+            );
+        }
+        // An in-memory database has no directory to put keys next to.
+        assert!(resolve_committee_instance_keys_dir(None, Some("sqlite::memory:")).is_err());
+        // The environment wins, made absolute; a blank value is ignored.
+        assert_eq!(
+            resolve_committee_instance_keys_dir(Some("keys".into()), Some("sqlite::memory:"))
+                .unwrap(),
+            cwd.join("keys")
+        );
+        assert_eq!(
+            resolve_committee_instance_keys_dir(Some(" ".into()), Some("sqlite:/d/x.db")).unwrap(),
+            PathBuf::from("/d").join(COMMITTEE_INSTANCE_KEYS_SUBDIR)
+        );
+
+        let dir = std::env::temp_dir().join(format!("bitvm-key-dir-{}", std::process::id()));
+        check_writable_dir(&dir.join("nested")).unwrap();
+        assert!(dir.join("nested").is_dir());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn unknown_network_names_are_rejected() {
+        assert_eq!(parse_bitcoin_network("testnet4").unwrap(), Network::Testnet4);
+        assert_eq!(parse_bitcoin_network("regtest").unwrap(), Network::Regtest);
+        for name in ["testnet", "Testnet4", "mainnet", ""] {
+            assert!(parse_bitcoin_network(name).is_err(), "{name}");
+        }
+        assert!(validate_network_names("regtest", "main").is_ok());
+        assert!(validate_network_names("regtest", "mainnet").is_err());
+        assert!(validate_network_names("testnet", "test").is_err());
     }
 }
