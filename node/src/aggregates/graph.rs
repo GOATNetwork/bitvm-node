@@ -246,7 +246,7 @@ pub struct GraphState {
     /// The graph's Pre-Kickoff can never confirm (reported once).
     #[serde(default)]
     pub dead: bool,
-    /// The operator gave up its unfinished setup at the abandon height.
+    /// The setup was given up at the abandon height.
     #[serde(default)]
     pub abandoned: bool,
     /// Verifier: the authenticated InitGraph identity admitted to setup.
@@ -263,7 +263,7 @@ pub struct SetupAdmission {
 }
 
 impl GraphState {
-    fn load(raw: Option<&str>) -> Self {
+    pub(super) fn load(raw: Option<&str>) -> Self {
         raw.and_then(|raw| serde_json::from_str(raw).ok()).unwrap_or_default()
     }
 
@@ -944,7 +944,10 @@ impl GraphAggregate {
         row: Option<&store::Graph>,
         abandoned: &SetupAbandoned,
     ) -> anyhow::Result<ApplyOutcome> {
-        if self.actor != Actor::Operator || instance_failed(ctx, abandoned.instance_id).await? {
+        if self.actor != Actor::Operator {
+            return self.abandon_watched_setup(ctx, graph_id, state, row, abandoned).await;
+        }
+        if instance_failed(ctx, abandoned.instance_id).await? {
             return Ok(ApplyOutcome::Applied);
         }
         match row {
@@ -988,6 +991,61 @@ impl GraphAggregate {
             height = abandoned.height,
             abandon_height = abandoned.abandon_height,
             "setup unfinished at the abandon height; given up"
+        );
+        Ok(ApplyOutcome::Applied)
+    }
+
+    /// Other roles: a graph still without committee pre-signatures at the
+    /// abandon height turns Obsoleted (`finish` closes its deliveries and
+    /// jobs), and a verifier setup whose graph never arrived closes them here.
+    /// An Obsoleted graph is still probed for its Pre-Kickoff, which brings
+    /// it back.
+    async fn abandon_watched_setup(
+        &self,
+        ctx: &mut ApplyContext<'_>,
+        graph_id: Uuid,
+        state: &mut GraphState,
+        row: Option<&store::Graph>,
+        abandoned: &SetupAbandoned,
+    ) -> anyhow::Result<ApplyOutcome> {
+        match row {
+            Some(row) => {
+                if row.status != GraphStatus::OperatorPresigned.to_string() {
+                    return Ok(ApplyOutcome::Applied);
+                }
+                ctx.storage
+                    .transition_graph_status(
+                        row.instance_id,
+                        graph_id,
+                        GraphStatus::Obsoleted,
+                        GraphStatusSource::ChainReconcile,
+                        None,
+                    )
+                    .await?;
+            }
+            None => {
+                if state.abandoned || state.setup_admission.is_none() {
+                    return Ok(ApplyOutcome::Applied);
+                }
+                ctx.effects.close_outbox(
+                    EngineOutboxCloseTarget::Aggregate {
+                        aggregate_kind: GRAPH_KIND.to_string(),
+                        aggregate_id: graph_id.to_string(),
+                    },
+                    "setup abandoned",
+                );
+                ctx.effects.cancel_phase_jobs(JOB_PHASE);
+            }
+        }
+        state.abandoned = true;
+        warn!(
+            event = "graph_abandoned",
+            graph_id = %graph_id,
+            instance_id = %abandoned.instance_id,
+            built = row.is_some(),
+            height = abandoned.height,
+            abandon_height = abandoned.abandon_height,
+            "graph without committee pre-signatures at the abandon height; deliveries closed"
         );
         Ok(ApplyOutcome::Applied)
     }

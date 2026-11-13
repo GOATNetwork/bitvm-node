@@ -155,3 +155,35 @@ async fn verifier_binds_the_admission_to_the_authenticated_init_graph() {
     assert_eq!(t.called(JOB_VERIFIER_SETUP).len(), 1);
     t.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn verifier_closes_a_setup_whose_graph_never_arrives_at_the_abandon_height() {
+    let t = start(Actor::Verifier, false).await;
+    let (operator, peer) = (operator_key(7), PeerId::random());
+    let instance_id = t.insert_instance(InstanceBridgeInStatus::UserBroadcastPeginPrepare).await;
+    let graph_id = Uuid::new_v4();
+
+    // The setup package goes out, then the operator goes offline before its
+    // graph: the package would be resent forever.
+    t.script(
+        JOB_VERIFIER_SETUP,
+        GraphPlan {
+            messages: vec![planned(graph_id, "GenCircuits", PHASE_SETUP, Some(&peer.to_string()))],
+            ..Default::default()
+        },
+    );
+    let event = t.submit(t.init_graph(&operator, peer, instance_id, graph_id, false).await).await;
+    t.wait_inbox(&event, EngineInboxState::Applied).await;
+    let sent = outbox_id(graph_id, "GenCircuits", None);
+    t.wait_outbox(&sent, EngineOutboxState::Open).await;
+    assert_eq!(t.watched().await, BTreeMap::from([(graph_id, instance_id)]));
+
+    let abandoned = SetupAbandoned { instance_id, abandon_height: 166, height: 167 };
+    let event_id = t.submit(setup_abandoned_event(graph_id, &abandoned).unwrap()).await;
+    t.wait_inbox(&event_id, EngineInboxState::Applied).await;
+    let closed = t.wait_outbox(&sent, EngineOutboxState::Closed).await;
+    assert_eq!(closed.close_reason.as_deref(), Some("setup abandoned"));
+    assert!(t.graph_state(graph_id).await.abandoned);
+    assert!(t.watched().await.is_empty(), "reported once");
+    t.stop().await;
+}
