@@ -15,7 +15,6 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  ZKM_TOOLCHAIN_VERSION: '20260917'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -68,17 +67,7 @@ jobs:
           override: true
           components: clippy
       - name: Install Ziren toolchain
-        run: |
-          set -euo pipefail
-          installer="$RUNNER_TEMP/zkmup"
-          curl --proto '=https' --tlsv1.2 -fsSL --retry 3 \
-            https://raw.githubusercontent.com/ProjectZKM/toolchain/582f7927cac0668883a86cbd02fbc18b500b1b6f/zkmup \
-            -o "$installer"
-          sh "$installer" install -v "$ZKM_TOOLCHAIN_VERSION"
-          SHELL=/bin/true sh "$installer" setup -v "$ZKM_TOOLCHAIN_VERSION"
-          source "$HOME/.zkm-toolchain/env"
-          rustc --version
-          cargo --version
+        uses: ./.github/actions/install-ziren
       - name: Install Dependencies
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libclang-18-dev
       - run: |
@@ -92,17 +81,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: Install Ziren toolchain
-        run: |
-          set -euo pipefail
-          installer="$RUNNER_TEMP/zkmup"
-          curl --proto '=https' --tlsv1.2 -fsSL --retry 3 \
-            https://raw.githubusercontent.com/ProjectZKM/toolchain/582f7927cac0668883a86cbd02fbc18b500b1b6f/zkmup \
-            -o "$installer"
-          sh "$installer" install -v "$ZKM_TOOLCHAIN_VERSION"
-          SHELL=/bin/true sh "$installer" setup -v "$ZKM_TOOLCHAIN_VERSION"
-          source "$HOME/.zkm-toolchain/env"
-          rustc --version
-          cargo --version
+        uses: ./.github/actions/install-ziren
       - name: Install Dependencies
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libclang-18-dev
       - name: Launch the Regtest
