@@ -23,29 +23,49 @@ use client::graphs::graph_query::{
     UserGraphWithdrawEvent, WithdrawDisprovedEvent, WithdrawHappyEvent, WithdrawPathsEvent,
     WithdrawUnhappyEvent,
 };
+use std::collections::HashMap;
 use std::ops::AddAssign;
 use std::str::FromStr;
-use std::sync::Arc;
-use store::localdb::{GraphRuntimeUpdate, NodeQuery, StorageProcessor};
+use store::localdb::{GraphRuntimeUpdate, LocalDB, NodeQuery, StorageProcessor};
 use store::{
     GoatTxProcessingStatus, GoatTxRecord, GoatTxType, GraphStatus, GraphStatusSource,
-    GraphStatusTransitionOutcome, InstanceBridgeInStatus,
+    GraphStatusTransitionOutcome, Instance, InstanceBridgeInStatus,
 };
 use tracing::{info, warn};
 use uuid::Uuid;
 
 #[allow(clippy::too_many_arguments)]
-pub async fn fetch_and_handle_gateway_events<'a>(
-    actor: Actor,
-    btc_client: Arc<BTCClient>,
-    goat_client: Arc<GOATClient>,
+/// The gateway events of a block range, with the instances its BridgeIns need
+/// already built (that reads Goat and Bitcoin), so applying it only writes.
+#[derive(Default)]
+pub struct GatewayRange {
+    init_withdraw_events: Vec<InitWithdrawEvent>,
+    cancel_withdraw_events: Vec<CancelWithdrawEvent>,
+    proceed_withdraw_events: Vec<ProceedWithdrawEvent>,
+    withdraw_paths_events: Vec<WithdrawPathsEvent>,
+    withdraw_disproved_events: Vec<WithdrawDisprovedEvent>,
+    bridge_in_request_events: Vec<BridgeInRequestEvent>,
+    committee_response_events: Vec<CommitteeResponseEvent>,
+    bridge_in_events: Vec<BridgeInEvent>,
+    post_graph_data_events: Vec<PostGraphDataEvent>,
+    /// By instance id: the instance built from its request, or `None` when
+    /// building failed.
+    rebuilt_instances: HashMap<Uuid, Option<Instance>>,
+}
+
+/// Query and parse the range, and build the instances its BridgeIns need;
+/// the database is only read, outside any transaction.
+#[allow(clippy::too_many_arguments)]
+pub async fn fetch_gateway_events(
+    btc_client: &BTCClient,
+    goat_client: &GOATClient,
     client: &GraphQueryClient,
-    storage_processor: &mut StorageProcessor<'a>,
+    local_db: &LocalDB,
     graph_url: &str,
     event_entities: &[GatewayEventEntity],
     from_height: i64,
     to_height: i64,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<GatewayRange> {
     let query_res = client.get_events(graph_url, event_entities, from_height, to_height).await?;
 
     let mut init_withdraw_events: Vec<InitWithdrawEvent> = vec![];
@@ -141,22 +161,126 @@ pub async fn fetch_and_handle_gateway_events<'a>(
     } else {
         tracing::debug!("{summary}");
     }
-    handle_user_withdraw_events(storage_processor, init_withdraw_events, cancel_withdraw_events)
-        .await?;
-    handle_proceed_withdraw_events(storage_processor, proceed_withdraw_events).await?;
-    handle_withdraw_paths_events(storage_processor, withdraw_paths_events).await?;
-    handle_withdraw_disproved_events(storage_processor, withdraw_disproved_events).await?;
-    handle_bridge_in_request_events(storage_processor, bridge_in_request_events).await?;
-    handle_committee_response_events(storage_processor, committee_response_events).await?;
-    handle_bridge_in_events(
-        storage_processor,
-        btc_client.clone(),
-        goat_client.clone(),
-        bridge_in_events,
+    let rebuilt_instances = rebuild_missing_instances(
+        btc_client,
+        goat_client,
+        local_db,
+        &bridge_in_events,
+        &bridge_in_request_events,
     )
     .await?;
-    handle_post_graph_data_events(&actor, storage_processor, post_graph_data_events).await?;
+    Ok(GatewayRange {
+        init_withdraw_events,
+        cancel_withdraw_events,
+        proceed_withdraw_events,
+        withdraw_paths_events,
+        withdraw_disproved_events,
+        bridge_in_request_events,
+        committee_response_events,
+        bridge_in_events,
+        post_graph_data_events,
+        rebuilt_instances,
+    })
+}
+
+/// Write a fetched range.
+pub async fn apply_gateway_events<'a>(
+    actor: &Actor,
+    storage_processor: &mut StorageProcessor<'a>,
+    range: GatewayRange,
+) -> anyhow::Result<()> {
+    handle_user_withdraw_events(
+        storage_processor,
+        range.init_withdraw_events,
+        range.cancel_withdraw_events,
+    )
+    .await?;
+    handle_proceed_withdraw_events(storage_processor, range.proceed_withdraw_events).await?;
+    handle_withdraw_paths_events(storage_processor, range.withdraw_paths_events).await?;
+    handle_withdraw_disproved_events(storage_processor, range.withdraw_disproved_events).await?;
+    handle_bridge_in_request_events(storage_processor, range.bridge_in_request_events).await?;
+    handle_committee_response_events(storage_processor, range.committee_response_events).await?;
+    handle_bridge_in_events(storage_processor, &range.rebuilt_instances, range.bridge_in_events)
+        .await?;
+    handle_post_graph_data_events(actor, storage_processor, range.post_graph_data_events).await?;
     Ok(())
+}
+
+/// The request of a BridgeIn whose instance this node never built: from the
+/// same range, or from the record of an earlier one.
+async fn missing_instance_request(
+    storage_processor: &mut StorageProcessor<'_>,
+    instance_id: Uuid,
+    range_requests: &[BridgeInRequestEvent],
+) -> anyhow::Result<Option<BridgeInRequestEvent>> {
+    if storage_processor.find_instance(&instance_id).await?.is_some() {
+        return Ok(None);
+    }
+    if let Some(request) = range_requests.iter().find(|request| {
+        Uuid::from_str(&strip_hex_prefix_owned(&request.instance_id)).ok() == Some(instance_id)
+    }) {
+        return Ok(Some(request.clone()));
+    }
+    let record = storage_processor
+        .find_graph_goat_tx_record(
+            &instance_id,
+            &Uuid::nil(),
+            &GoatTxType::BridgeInRequest.to_string(),
+        )
+        .await?;
+    Ok(record
+        .and_then(|record| record.extra)
+        .and_then(|extra| serde_json::from_str::<BridgeInRequestEvent>(&extra).ok()))
+}
+
+/// Build the instances `handle_bridge_in_events` will insert. The pool
+/// connection is released before Goat and Bitcoin are read.
+async fn rebuild_missing_instances(
+    btc_client: &BTCClient,
+    goat_client: &GOATClient,
+    local_db: &LocalDB,
+    bridge_in_events: &[BridgeInEvent],
+    range_requests: &[BridgeInRequestEvent],
+) -> anyhow::Result<HashMap<Uuid, Option<Instance>>> {
+    let mut requests = Vec::new();
+    if !bridge_in_events.is_empty() {
+        let mut storage_processor = local_db.acquire().await?;
+        for event in bridge_in_events {
+            let Ok(instance_id) = Uuid::from_str(&strip_hex_prefix_owned(&event.instance_id))
+            else {
+                continue;
+            };
+            if requests.iter().any(|(id, _)| *id == instance_id) {
+                continue;
+            }
+            if let Some(request) =
+                missing_instance_request(&mut storage_processor, instance_id, range_requests)
+                    .await?
+            {
+                requests.push((instance_id, request));
+            }
+        }
+    }
+    let mut rebuilt = HashMap::new();
+    for (instance_id, request) in requests {
+        let instance =
+            match generate_instance_from_bridge_in_request_event(btc_client, goat_client, &request)
+                .await
+            {
+                Ok(instance) => Some(instance),
+                Err(error) => {
+                    warn!(
+                        event = "event_watch",
+                        instance_id = %instance_id,
+                        error = %error,
+                        "could not build the instance of a BridgeIn; mint event skipped"
+                    );
+                    None
+                }
+            };
+        rebuilt.insert(instance_id, instance);
+    }
+    Ok(rebuilt)
 }
 
 async fn handle_user_withdraw_events<'a>(
@@ -559,8 +683,7 @@ async fn handle_committee_response_events<'a>(
 
 async fn handle_bridge_in_events<'a>(
     storage_processor: &mut StorageProcessor<'a>,
-    btc_client: Arc<BTCClient>,
-    goat_client: Arc<GOATClient>,
+    rebuilt_instances: &HashMap<Uuid, Option<Instance>>,
     bridge_in_events: Vec<BridgeInEvent>,
 ) -> anyhow::Result<()> {
     for event in bridge_in_events {
@@ -583,19 +706,14 @@ async fn handle_bridge_in_events<'a>(
             // it in its final state.
             warn!("Instance {instance_id} is finished but not find in db. we will create it");
             if let Some(extra) = tx_record.extra.as_ref()
-                && let Ok(bridge_event) = serde_json::from_str::<BridgeInRequestEvent>(extra)
+                && serde_json::from_str::<BridgeInRequestEvent>(extra).is_ok()
             {
-                match generate_instance_from_bridge_in_request_event(
-                    btc_client.as_ref(),
-                    goat_client.as_ref(),
-                    &bridge_event,
-                )
-                .await
-                {
-                    Ok(mut instance) => {
+                match rebuilt_instances.get(&instance_id) {
+                    Some(Some(instance)) => {
                         info!(
                             "Instance {instance_id} is created and set status to RelayerL2Minted"
                         );
+                        let mut instance = instance.clone();
                         instance.status = InstanceBridgeInStatus::RelayerL2Minted.to_string();
                         instance.post_pegin_txhash = Some(post_pegin_txhash.clone());
                         if !storage_processor.insert_instance_if_absent(&instance).await? {
@@ -605,11 +723,11 @@ async fn handle_bridge_in_events<'a>(
                         }
                         row_exists = true;
                     }
-                    Err(error) => warn!(
-                        event = "event_watch",
-                        instance_id = %instance_id,
-                        error = %error,
-                        "could not build the instance of a BridgeIn; mint event skipped"
+                    // Building it failed while fetching; that was logged.
+                    Some(None) => {}
+                    // The request record appeared after the fetch: the range runs again.
+                    None => anyhow::bail!(
+                        "BridgeIn of instance {instance_id} needs an instance the fetch did not build; retrying the range"
                     ),
                 }
             }
@@ -762,5 +880,71 @@ mod tests {
                 "{actor}"
             );
         }
+    }
+
+    fn bridge_in_request(instance_id: Uuid) -> BridgeInRequestEvent {
+        serde_json::from_value(serde_json::json!({
+            "id": "1",
+            "transactionHash": "0xbb",
+            "blockNumber": "1",
+            "blockTimestamp": "1",
+            "instanceId": format!("0x{}", instance_id.simple()),
+            "depositorAddress": "0x00",
+            "peginAmountSats": "1",
+            "txnFees": ["0", "0", "0"],
+            "userXonlyPubkey": "",
+            "userChangeAddress": "",
+            "userRefundAddress": "",
+        }))
+        .unwrap()
+    }
+
+    fn bridge_in(instance_id: Uuid) -> BridgeInEvent {
+        serde_json::from_value(serde_json::json!({
+            "id": "1",
+            "transactionHash": "0xcc",
+            "blockNumber": "2",
+            "instanceId": format!("0x{}", instance_id.simple()),
+            "depositorAddress": "0x00",
+            "peginAmountSats": "1",
+            "feeAmountSats": "0",
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_missing_instance_is_built_from_the_request_of_the_range_or_of_its_record() {
+        let (db, _dir) = db().await;
+        let (in_range, recorded, unknown) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let mut storage = db.acquire().await.unwrap();
+        handle_bridge_in_request_events(&mut storage, vec![bridge_in_request(recorded)])
+            .await
+            .unwrap();
+        let range_requests = vec![bridge_in_request(in_range)];
+        for (instance_id, wanted) in [(in_range, true), (recorded, true), (unknown, false)] {
+            let request =
+                missing_instance_request(&mut storage, instance_id, &range_requests).await.unwrap();
+            assert_eq!(request.is_some(), wanted, "{instance_id}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bridge_in_whose_instance_the_fetch_did_not_build_retries_the_range() {
+        let (db, _dir) = db().await;
+        let instance_id = Uuid::new_v4();
+        let mut tx = db.start_immediate_transaction().await.unwrap();
+        handle_bridge_in_request_events(&mut tx, vec![bridge_in_request(instance_id)])
+            .await
+            .unwrap();
+        // The request record appeared after the fetch: refuse rather than
+        // skip the mint for good.
+        let error = handle_bridge_in_events(&mut tx, &HashMap::new(), vec![bridge_in(instance_id)])
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("retrying the range"), "{error:#}");
+        // Building failed while fetching: skipped, as before.
+        let failed = HashMap::from([(instance_id, None)]);
+        handle_bridge_in_events(&mut tx, &failed, vec![bridge_in(instance_id)]).await.unwrap();
+        assert!(tx.find_instance(&instance_id).await.unwrap().is_none());
     }
 }

@@ -83,6 +83,9 @@ pub enum DropReason {
     /// room, by rows or by bytes. Distinct from `ImmediateRateLimited`: that one
     /// is a sender exceeding its rate, this one is the node falling behind.
     ControlQueueFull,
+    /// The bounded queue in front of the inbox writer had no room, by rows or
+    /// by bytes: the database is behind. The sender's outbox sends again.
+    InboxQueueFull,
     SenderQuota,
     GlobalQuota,
     /// Not a message drop: a `NodeInfo` from a sender that is not registered was
@@ -114,6 +117,7 @@ impl DropReason {
             Self::UnexpectedBinaryKind => "unexpected_binary_kind",
             Self::ImmediateRateLimited => "immediate_rate_limited",
             Self::ControlQueueFull => "control_queue_full",
+            Self::InboxQueueFull => "inbox_queue_full",
             Self::SenderQuota => "sender_quota",
             Self::GlobalQuota => "global_quota",
             Self::NodeTableFull => "node_table_full",
@@ -137,6 +141,7 @@ impl DropReason {
                 | Self::ForwardRate
                 | Self::ImmediateRateLimited
                 | Self::ControlQueueFull
+                | Self::InboxQueueFull
                 | Self::SenderQuota
                 | Self::GlobalQuota
         )
