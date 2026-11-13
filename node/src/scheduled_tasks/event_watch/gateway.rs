@@ -15,7 +15,7 @@ use crate::utils::{
 use alloy::primitives::U256;
 use bitvm_lib::actors::Actor;
 use client::btc_chain::BTCClient;
-use client::goat_chain::GOATClient;
+use client::goat_chain::{GOATClient, WithdrawStatus};
 use client::graphs::GraphQueryClient;
 use client::graphs::graph_query::{
     BridgeInEvent, BridgeInRequestEvent, CancelWithdrawEvent, CommitteeResponseEvent,
@@ -141,6 +141,20 @@ pub async fn fetch_and_handle_gateway_events<'a>(
     } else {
         tracing::debug!("{summary}");
     }
+    let withdraw_paths_events = retain_withdraw_outcomes_on_gateway(
+        &goat_client,
+        withdraw_paths_events,
+        |event| event.graph_id(),
+        WithdrawStatus::Complete,
+    )
+    .await?;
+    let withdraw_disproved_events = retain_withdraw_outcomes_on_gateway(
+        &goat_client,
+        withdraw_disproved_events,
+        |event| &event.graph_id,
+        WithdrawStatus::Disproved,
+    )
+    .await?;
     handle_user_withdraw_events(storage_processor, init_withdraw_events, cancel_withdraw_events)
         .await?;
     handle_proceed_withdraw_events(storage_processor, proceed_withdraw_events).await?;
@@ -338,6 +352,35 @@ async fn graph_belongs_to_instance<'a>(
             Ok(false)
         }
     }
+}
+
+/// Keeps only the withdraw outcomes the Gateway contract itself holds.
+///
+/// A terminal graph status stops `graph_scan` from following the graph on
+/// Bitcoin and obsoletes the instance's other graphs, so it must not rest on
+/// the subgraph alone: a wrong or compromised subgraph would make the node stop
+/// challenging a graph that is still open, letting Take-2 through. An outcome
+/// the contract does not hold is dropped; the graph stays followed on Bitcoin,
+/// where its real outcome is still observed.
+async fn retain_withdraw_outcomes_on_gateway<E>(
+    goat_client: &GOATClient,
+    events: Vec<E>,
+    graph_id: impl Fn(&E) -> &str,
+    expected: WithdrawStatus,
+) -> anyhow::Result<Vec<E>> {
+    let mut retained = Vec::with_capacity(events.len());
+    for event in events {
+        let id = Uuid::from_str(&strip_hex_prefix_owned(graph_id(&event)))?;
+        let status = goat_client.gateway_get_withdraw_data(&id).await?.status;
+        if status == expected {
+            retained.push(event);
+        } else {
+            warn!(
+                "ignore subgraph withdraw outcome for graph {id}: the Gateway holds {status}, not {expected}"
+            );
+        }
+    }
+    Ok(retained)
 }
 
 async fn handle_withdraw_paths_events<'a>(
@@ -747,6 +790,61 @@ mod tests {
         let nodes = storage.find_nodes(&NodeQuery::default()).await.unwrap().0;
         // Adding the increment in SQL as well would give 0 + 5, then 5 + 10.
         assert_eq!(nodes[0].reward, "10");
+    }
+
+    #[tokio::test]
+    async fn only_withdraw_outcomes_the_gateway_holds_are_kept() {
+        use client::goat_chain::WithdrawData;
+        let (goat_client, mock) = GOATClient::new_mock_client();
+        let withdraw = |status| {
+            Ok(WithdrawData {
+                pegin_txid: [0; 32],
+                operator_address: [0; 20],
+                status,
+                instance_id: [0; 16],
+                lock_amount: U256::ZERO,
+                btc_block_height_withdraw: U256::ZERO,
+            })
+        };
+        let (settled, open, disproved) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        mock.set_withdraw_data(*settled.as_bytes(), withdraw(WithdrawStatus::Complete));
+        mock.set_withdraw_data(*open.as_bytes(), withdraw(WithdrawStatus::Processing));
+        mock.set_withdraw_data(*disproved.as_bytes(), withdraw(WithdrawStatus::Disproved));
+        let ids = [settled, open, disproved].map(|id| format!("0x{}", id.simple()));
+
+        let kept = retain_withdraw_outcomes_on_gateway(
+            &goat_client,
+            ids.to_vec(),
+            |id| id,
+            WithdrawStatus::Complete,
+        )
+        .await
+        .unwrap();
+        // A subgraph Take outcome for a withdraw still in its challenge
+        // period, or one the Gateway disproved, is not written.
+        assert_eq!(kept, [ids[0].clone()]);
+        let kept = retain_withdraw_outcomes_on_gateway(
+            &goat_client,
+            ids.to_vec(),
+            |id| id,
+            WithdrawStatus::Disproved,
+        )
+        .await
+        .unwrap();
+        assert_eq!(kept, [ids[2].clone()]);
+
+        // A failed lookup fails the range, so it is fetched again.
+        let unknown = format!("0x{}", Uuid::new_v4().simple());
+        assert!(
+            retain_withdraw_outcomes_on_gateway(
+                &goat_client,
+                vec![unknown],
+                |id| id,
+                WithdrawStatus::Complete,
+            )
+            .await
+            .is_err()
+        );
     }
 
     #[tokio::test]
