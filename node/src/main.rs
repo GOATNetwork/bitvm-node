@@ -51,8 +51,8 @@ struct Opts {
     #[arg(long, default_value = "sqlite:/tmp/bitvm-node.db")]
     pub db_path: String,
 
-    /// Peer nodes as the bootnodes
-    #[arg(long)]
+    /// Peer nodes as the bootnodes. Also read from `BOOTNODES`, comma-separated.
+    #[arg(long, env = "BOOTNODES", value_delimiter = ',')]
     bootnodes: Vec<String>,
 
     /// Dedicated Prometheus metrics listener address, e.g. `10.0.0.7:9108`.
@@ -108,6 +108,13 @@ enum KeyCommands {
     Peer,
     /// Generate the funding address with the Hex-Encoded private key in .env
     FundingAddress,
+}
+
+impl Opts {
+    /// The configured bootnodes; an empty `BOOTNODES=` means none.
+    fn bootnodes(&self) -> Vec<String> {
+        self.bootnodes.iter().filter(|addr| !addr.trim().is_empty()).cloned().collect()
+    }
 }
 
 #[tokio::main]
@@ -173,7 +180,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         BitvmSwarmConfig {
             local_key: env::get_peer_key(),
             p2p_port: opt.p2p_port,
-            bootnodes: opt.bootnodes,
+            bootnodes: opt.bootnodes(),
             topic_names: vec![
                 Actor::Committee.to_string(),
                 Actor::Verifier.to_string(),
@@ -798,4 +805,25 @@ pub async fn start_handle_swarm_msg_task(
     cancellation_token: CancellationToken,
 ) -> anyhow::Result<String> {
     swarm.run(actor, handler, cancellation_token).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bootnodes_come_from_the_flag_or_a_comma_separated_env() {
+        let parse = |args: &[&str]| Opts::try_parse_from(args).unwrap().bootnodes();
+        unsafe { std::env::set_var("BOOTNODES", "/ip4/1.2.3.4/tcp/1,/ip4/5.6.7.8/tcp/2") };
+        assert_eq!(parse(&["bitvm-noded"]), ["/ip4/1.2.3.4/tcp/1", "/ip4/5.6.7.8/tcp/2"]);
+        // The flag takes precedence over the environment.
+        assert_eq!(
+            parse(&["bitvm-noded", "--bootnodes", "/ip4/9.9.9.9/tcp/3"]),
+            ["/ip4/9.9.9.9/tcp/3"]
+        );
+        // An empty value, as in `.env.template`, means no bootnodes.
+        unsafe { std::env::set_var("BOOTNODES", "") };
+        assert!(parse(&["bitvm-noded"]).is_empty());
+        unsafe { std::env::remove_var("BOOTNODES") };
+    }
 }

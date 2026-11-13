@@ -13,7 +13,7 @@ cd ..
 echo "start operator_0"
 sleep 1
 cd operator_0
-sh -x .run.sh
+sh -x ./run.sh
 cd ..
 
 sleep 1
