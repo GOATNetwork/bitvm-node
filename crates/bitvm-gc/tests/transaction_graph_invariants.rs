@@ -196,6 +196,66 @@ fn csv_inputs_and_scripts_match_network_parameters() {
     }
 }
 
+#[test]
+fn committee_signs_both_spends_of_the_force_skip_connector() {
+    use bitcoin::{
+        TapSighashType, XOnlyPublicKey,
+        key::Keypair,
+        secp256k1::{SECP256K1, SecretKey},
+    };
+    use bitvm_lib::{committee::*, connectors::base::TaprootConnector, operator::*};
+
+    let mut graph = generate_bitvm_graph(graph_parameters(Network::Regtest, 1, 1)).unwrap();
+    let mut seed = [0u8; 32];
+    seed[28..].copy_from_slice(&1u32.to_be_bytes());
+    let keypair = Keypair::from_secret_key(SECP256K1, &SecretKey::from_slice(&seed).unwrap());
+    let committee_pubkeys = graph.parameters.instance_parameters.committee_pubkeys.clone();
+
+    let force_skip = graph.parameters.force_skip_connector();
+    assert_eq!(force_skip.n_of_n_taproot_public_key, graph.parameters.n_of_n_taproot_public_key());
+    assert_eq!(
+        graph.next_prekickoff.tx().output[0].script_pubkey,
+        force_skip.generate_taproot_address().script_pubkey()
+    );
+
+    let witnesses = operator_pre_sign(keypair, &mut graph).unwrap();
+    assert_eq!(witnesses.len(), operator_presig_num());
+    verify_graph_operator_pre_signatures(&graph).unwrap();
+
+    let (pub_nonces, sec_nonces, _) = generate_nonce_from_seed("seed".into(), 0, keypair, 1, 1);
+    let agg_nonces = nonces_aggregation(std::slice::from_ref(&pub_nonces)).unwrap();
+    let partial = committee_pre_sign(keypair, sec_nonces, agg_nonces.clone(), &mut graph).unwrap();
+    verify_graph_committee_partial_sigs(
+        &graph,
+        &committee_pubkeys,
+        &committee_pubkeys[0],
+        &pub_nonces,
+        &agg_nonces,
+        &partial,
+    )
+    .unwrap();
+    let sigs = signature_aggregation(&vec![partial], &agg_nonces, &graph).unwrap();
+    push_committee_pre_signatures(&mut graph, &sigs).unwrap();
+    verify_graph_committee_pre_signatures(&graph).unwrap();
+
+    // The operator's key cannot spend the connector.
+    let operator = XOnlyPublicKey::from(graph.parameters.operator_pubkey);
+    for tx in [graph.quick_challenge.tx(), graph.force_skip_kickoff.tx()] {
+        assert_eq!(tx.input[1].witness.len(), 3);
+    }
+    assert!(
+        verify_taproot_pre_signed_input(&graph.quick_challenge, &operator, 1, TapSighashType::None)
+            .is_err()
+    );
+
+    let restored =
+        bitvm_lib::types::BitvmGcGraph::from_simplified(&graph.to_simplified().unwrap()).unwrap();
+    verify_graph_operator_pre_signatures(&restored).unwrap();
+    verify_graph_committee_pre_signatures(&restored).unwrap();
+    assert_eq!(restored.quick_challenge.tx(), graph.quick_challenge.tx());
+    assert_eq!(restored.force_skip_kickoff.tx(), graph.force_skip_kickoff.tx());
+}
+
 fn graph_parameters(
     network: bitcoin::Network,
     watchtowers: usize,

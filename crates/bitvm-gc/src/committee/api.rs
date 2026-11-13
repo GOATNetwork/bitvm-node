@@ -45,6 +45,12 @@ pub fn operator_challenge_nack_pre_sign_num(watchtower_num: usize) -> usize {
 pub fn operator_commit_timeout_pre_sign_num() -> usize {
     2
 }
+pub fn force_skip_kickoff_pre_sign_num() -> usize {
+    1
+}
+pub fn quick_challenge_pre_sign_num() -> usize {
+    1
+}
 pub fn disprove_pre_sign_num(verifier_num: usize) -> usize {
     verifier_num * 2
 }
@@ -138,6 +144,10 @@ pub struct CommitteeMusig2Data<T> {
     pub operator_challenge_nack: Vec<T>,
     pub operator_commit_timeout: Vec<T>,
     pub disprove: Vec<T>,
+    /// Input 1 (the force-skip connector) of Force-Skip-Kickoff.
+    pub force_skip_kickoff: Vec<T>,
+    /// Input 1 (the force-skip connector) of Quick-Challenge.
+    pub quick_challenge: Vec<T>,
 }
 
 pub type CommitteeSecNonces = CommitteeMusig2Data<SecNonce>;
@@ -170,6 +180,14 @@ impl<T> CommitteeMusig2Data<T> {
             self.disprove.len() == disprove_pre_sign_num(verifier_num),
             "invalid number of disprove"
         );
+        ensure!(
+            self.force_skip_kickoff.len() == force_skip_kickoff_pre_sign_num(),
+            "invalid number of force skip kickoff"
+        );
+        ensure!(
+            self.quick_challenge.len() == quick_challenge_pre_sign_num(),
+            "invalid number of quick challenge"
+        );
         Ok(())
     }
 
@@ -182,6 +200,8 @@ impl<T> CommitteeMusig2Data<T> {
             operator_challenge_nack: vec![],
             operator_commit_timeout: vec![],
             disprove: vec![],
+            force_skip_kickoff: vec![],
+            quick_challenge: vec![],
         }
     }
 }
@@ -287,6 +307,20 @@ pub fn committee_presign_sighash_digest(graph: &BitvmGcGraph) -> Result<[u8; 32]
             TapSighashType::None,
         )?;
     }
+    add_sighash(
+        &mut hasher,
+        b"force_skip_kickoff/1/none",
+        &graph.force_skip_kickoff,
+        1,
+        TapSighashType::None,
+    )?;
+    add_sighash(
+        &mut hasher,
+        b"quick_challenge/1/none",
+        &graph.quick_challenge,
+        1,
+        TapSighashType::None,
+    )?;
     Ok(hasher.finalize().into())
 }
 
@@ -438,6 +472,26 @@ pub fn committee_pre_sign(
         res.disprove = disprove_sigs;
     }
 
+    {
+        // force skip kickoff
+        let sec_nonces = committee_member_sec_nonce.force_skip_kickoff.try_into().unwrap();
+        let agg_nonces = committee_agg_nonce.force_skip_kickoff.try_into().unwrap();
+        match graph.force_skip_kickoff.pre_sign(&committee_context, &sec_nonces, &agg_nonces) {
+            Ok(v) => res.force_skip_kickoff = v.to_vec(),
+            Err(e) => bail!("fail to pre-sign {}: {e}", graph.force_skip_kickoff.name()),
+        };
+    }
+
+    {
+        // quick challenge
+        let sec_nonces = committee_member_sec_nonce.quick_challenge.try_into().unwrap();
+        let agg_nonces = committee_agg_nonce.quick_challenge.try_into().unwrap();
+        match graph.quick_challenge.pre_sign(&committee_context, &sec_nonces, &agg_nonces) {
+            Ok(v) => res.quick_challenge = v.to_vec(),
+            Err(e) => bail!("fail to pre-sign {}: {e}", graph.quick_challenge.name()),
+        };
+    }
+
     Ok(res)
 }
 
@@ -480,6 +534,8 @@ pub fn nonces_aggregation(pub_nonces_vec: &[CommitteePubNonces]) -> Result<Commi
         operator_challenge_nack: aggregate_field(pub_nonces_vec, |c| &c.operator_challenge_nack)?,
         operator_commit_timeout: aggregate_field(pub_nonces_vec, |c| &c.operator_commit_timeout)?,
         disprove: aggregate_field(pub_nonces_vec, |c| &c.disprove)?,
+        force_skip_kickoff: aggregate_field(pub_nonces_vec, |c| &c.force_skip_kickoff)?,
+        quick_challenge: aggregate_field(pub_nonces_vec, |c| &c.quick_challenge)?,
     })
 }
 
@@ -595,6 +651,32 @@ pub fn signature_aggregation(
         disprove_sigs.extend(sigs);
     }
     res.disprove = disprove_sigs;
+
+    // force skip kickoff
+    let force_skip_kickoff_agg_nonces = agg_nonces.force_skip_kickoff.clone().try_into().unwrap();
+    let force_skip_kickoff_partial_sigs =
+        [partial_sigs.iter().map(|r| r.force_skip_kickoff[0]).collect()];
+    match graph.force_skip_kickoff.aggregate_pre_sigs(
+        &context,
+        &force_skip_kickoff_partial_sigs,
+        &force_skip_kickoff_agg_nonces,
+    ) {
+        Ok(v) => res.force_skip_kickoff = v.to_vec(),
+        Err(e) => bail!("fail to aggregate pre-sigs {}: {e}", graph.force_skip_kickoff.name()),
+    };
+
+    // quick challenge
+    let quick_challenge_agg_nonces = agg_nonces.quick_challenge.clone().try_into().unwrap();
+    let quick_challenge_partial_sigs =
+        [partial_sigs.iter().map(|r| r.quick_challenge[0]).collect()];
+    match graph.quick_challenge.aggregate_pre_sigs(
+        &context,
+        &quick_challenge_partial_sigs,
+        &quick_challenge_agg_nonces,
+    ) {
+        Ok(v) => res.quick_challenge = v.to_vec(),
+        Err(e) => bail!("fail to aggregate pre-sigs {}: {e}", graph.quick_challenge.name()),
+    };
 
     Ok(res)
 }
@@ -905,6 +987,27 @@ pub fn verify_graph_committee_partial_sigs(
         )?;
     }
 
+    verify_pre_signed_input(
+        &graph.force_skip_kickoff,
+        committee_pubkeys,
+        committee_pubkey,
+        &pub_nonces.force_skip_kickoff[0],
+        partial_sigs.force_skip_kickoff[0],
+        &agg_nonces.force_skip_kickoff[0],
+        1,
+        TapSighashType::None,
+    )?;
+    verify_pre_signed_input(
+        &graph.quick_challenge,
+        committee_pubkeys,
+        committee_pubkey,
+        &pub_nonces.quick_challenge[0],
+        partial_sigs.quick_challenge[0],
+        &agg_nonces.quick_challenge[0],
+        1,
+        TapSighashType::None,
+    )?;
+
     Ok(())
 }
 
@@ -950,6 +1053,18 @@ pub fn verify_graph_committee_pre_signatures(graph: &BitvmGcGraph) -> Result<()>
         verify_taproot_pre_signed_input(tx, &committee_pubkey, 0, TapSighashType::None)?;
         verify_taproot_pre_signed_input(tx, &committee_pubkey, 1, TapSighashType::None)?;
     }
+    verify_taproot_pre_signed_input(
+        &graph.force_skip_kickoff,
+        &committee_pubkey,
+        1,
+        TapSighashType::None,
+    )?;
+    verify_taproot_pre_signed_input(
+        &graph.quick_challenge,
+        &committee_pubkey,
+        1,
+        TapSighashType::None,
+    )?;
     Ok(())
 }
 
@@ -1039,6 +1154,15 @@ pub fn push_committee_pre_signatures(
             sigs.disprove[i * 2..(i * 2 + 2)].try_into().unwrap(),
         );
     }
+
+    // force skip kickoff and quick challenge
+    let force_skip_connector = graph.parameters.force_skip_connector();
+    graph
+        .force_skip_kickoff
+        .push_pre_sigs(&force_skip_connector, sigs.force_skip_kickoff.clone().try_into().unwrap());
+    graph
+        .quick_challenge
+        .push_pre_sigs(&force_skip_connector, sigs.quick_challenge.clone().try_into().unwrap());
 
     graph.committee_pre_signed = true;
     Ok(())
@@ -1138,6 +1262,28 @@ pub fn generate_nonce_from_seed(
             index += 1;
         }
     }
+    {
+        // force skip kickoff
+        for _ in 0..force_skip_kickoff_pre_sign_num() {
+            let (sec_nonce, pub_nonce, nonce_sig) =
+                generate_nonce(signer_keypair, &graph_seed, index);
+            pub_nonces.force_skip_kickoff.push(pub_nonce);
+            sec_nonces.force_skip_kickoff.push(sec_nonce);
+            nonce_sigs.force_skip_kickoff.push(nonce_sig);
+            index += 1;
+        }
+    }
+    {
+        // quick challenge
+        for _ in 0..quick_challenge_pre_sign_num() {
+            let (sec_nonce, pub_nonce, nonce_sig) =
+                generate_nonce(signer_keypair, &graph_seed, index);
+            pub_nonces.quick_challenge.push(pub_nonce);
+            sec_nonces.quick_challenge.push(sec_nonce);
+            nonce_sigs.quick_challenge.push(nonce_sig);
+            index += 1;
+        }
+    }
     (pub_nonces, sec_nonces, nonce_sigs)
 }
 
@@ -1176,7 +1322,9 @@ pub fn verify_nonce_signatures(
             &pub_nonces.operator_commit_timeout,
             &nonce_sigs.operator_commit_timeout,
         )
-        && verify_vec(pubkey, &pub_nonces.disprove, &nonce_sigs.disprove))
+        && verify_vec(pubkey, &pub_nonces.disprove, &nonce_sigs.disprove)
+        && verify_vec(pubkey, &pub_nonces.force_skip_kickoff, &nonce_sigs.force_skip_kickoff)
+        && verify_vec(pubkey, &pub_nonces.quick_challenge, &nonce_sigs.quick_challenge))
 }
 
 pub(crate) fn generate_nonce(

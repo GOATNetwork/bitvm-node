@@ -65,7 +65,7 @@ pub fn generate_commit_pubin_wots_key(
 }
 
 pub fn operator_presig_num() -> usize {
-    6
+    4
 }
 
 pub fn generate_bitvm_graph(params: BitvmGcGraphParameters) -> Result<BitvmGcGraph> {
@@ -340,24 +340,15 @@ pub fn operator_pre_sign(
 
     // presign force_skip_kickoff
     let kickoff_connector = graph.parameters.kickoff_connector();
-    let next_force_skip_connector = graph.parameters.force_skip_connector();
-    graph.force_skip_kickoff.pre_sign_and_push(
-        &context,
-        &kickoff_connector,
-        &next_force_skip_connector,
-    );
+    // Input 1 of both penalties spends the force-skip connector and is signed by
+    // the committee.
+    graph.force_skip_kickoff.pre_sign_and_push(&context, &kickoff_connector);
     wits.push(graph.force_skip_kickoff.tx().input[0].witness.clone());
-    wits.push(graph.force_skip_kickoff.tx().input[1].witness.clone());
 
     // presign quick_challenge
     let guardian_connector = graph.guardian_connector();
-    graph.quick_challenge.pre_sign_and_push(
-        &context,
-        &guardian_connector,
-        &next_force_skip_connector,
-    );
+    graph.quick_challenge.pre_sign_and_push(&context, &guardian_connector);
     wits.push(graph.quick_challenge.tx().input[0].witness.clone());
-    wits.push(graph.quick_challenge.tx().input[1].witness.clone());
 
     // presign challenge_incomplete_kickoff
     let next_prekickoff_connector = graph.parameters.prekickoff_connector();
@@ -385,11 +376,9 @@ pub fn push_operator_pre_signature(
     };
 
     graph.force_skip_kickoff.tx_mut().input[0].witness = signed_witness[0].clone();
-    graph.force_skip_kickoff.tx_mut().input[1].witness = signed_witness[1].clone();
-    graph.quick_challenge.tx_mut().input[0].witness = signed_witness[2].clone();
-    graph.quick_challenge.tx_mut().input[1].witness = signed_witness[3].clone();
-    graph.challenge_incomplete_kickoff.tx_mut().input[0].witness = signed_witness[4].clone();
-    graph.challenge_incomplete_kickoff.tx_mut().input[1].witness = signed_witness[5].clone();
+    graph.quick_challenge.tx_mut().input[0].witness = signed_witness[1].clone();
+    graph.challenge_incomplete_kickoff.tx_mut().input[0].witness = signed_witness[2].clone();
+    graph.challenge_incomplete_kickoff.tx_mut().input[1].witness = signed_witness[3].clone();
 
     graph.operator_pre_signed = true;
     Ok(())
@@ -408,21 +397,9 @@ pub fn verify_graph_operator_pre_signatures(graph: &BitvmGcGraph) -> Result<()> 
         TapSighashType::None,
     )?;
     verify_taproot_pre_signed_input(
-        &graph.force_skip_kickoff,
-        &operator_pubkey,
-        1,
-        TapSighashType::None,
-    )?;
-    verify_taproot_pre_signed_input(
         &graph.quick_challenge,
         &operator_pubkey,
         0,
-        TapSighashType::None,
-    )?;
-    verify_taproot_pre_signed_input(
-        &graph.quick_challenge,
-        &operator_pubkey,
-        1,
         TapSighashType::None,
     )?;
     verify_taproot_pre_signed_input(

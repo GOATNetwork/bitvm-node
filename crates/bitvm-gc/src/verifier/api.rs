@@ -79,6 +79,10 @@ pub fn build_force_skip_kickoff_tx(
     if !graph.operator_pre_signed() {
         bail!("missing pre-signatures from operator")
     };
+    // Input 1 spends the force-skip connector, which only the committee signs.
+    if !graph.committee_pre_signed() {
+        bail!("missing pre-signatures from committee")
+    };
     let mut tx = graph.force_skip_kickoff.tx().clone();
     let total_input_amount = graph.force_skip_kickoff.prev_outs().iter().map(|o| o.value).sum();
     let anchor_added = add_change_or_anchor_output(
@@ -99,6 +103,10 @@ pub fn build_quick_challenge_tx(
 ) -> Result<(Transaction, bool)> {
     if !graph.operator_pre_signed() {
         bail!("missing pre-signatures from operator")
+    };
+    // Input 1 spends the force-skip connector, which only the committee signs.
+    if !graph.committee_pre_signed() {
+        bail!("missing pre-signatures from committee")
     };
     let mut tx = graph.quick_challenge.tx().clone();
     let total_input_amount = graph.quick_challenge.prev_outs().iter().map(|o| o.value).sum();

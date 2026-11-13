@@ -109,6 +109,8 @@ pub async fn build_genesis_prekickoff_tx(
     let node_keypair = operator_master_key.master_keypair();
     let operator_taproot_public_key = node_keypair.x_only_public_key().0;
     let cur_prekickoff_connector = PrekickoffConnector::new(network, &operator_taproot_public_key);
+    // No graph precedes the genesis Pre-Kickoff, so no committee guards its
+    // force-skip connector and nothing pre-signs a spend of it.
     let next_force_skip_connector = ForceSkipConnector::new(network, &operator_taproot_public_key);
     let next_kickoff_connector = KickoffConnector::new(network, &operator_taproot_public_key);
     let next_prekickoff_connector = PrekickoffConnector::new(network, &operator_taproot_public_key);
