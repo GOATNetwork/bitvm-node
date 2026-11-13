@@ -30,13 +30,27 @@ use std::str::FromStr;
 use std::sync::Arc;
 use store::localdb::{GraphQuery, InstanceQuery, LocalDB, StorageProcessor};
 use store::{Graph, GraphStatus, InstanceBridgeInStatus};
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, SemaphorePermit};
 use tracing::{info, warn};
 use uuid::Uuid;
 
 /// Public requests rebuilding a graph at a time; each rebuild and its
 /// signature checks take a blocking thread.
 static GRAPH_BUILDS: Semaphore = Semaphore::const_new(2);
+
+/// Run `work` on the blocking pool while holding `permit`. The permit moves
+/// into the task: a caller that stops waiting (the client went away) does not
+/// free it while the work is still running.
+async fn run_holding<T: Send + 'static>(
+    permit: SemaphorePermit<'static>,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, tokio::task::JoinError> {
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    })
+    .await
+}
 
 /// The validated graph of a public request. The connection is released
 /// before the rebuild, which runs on the blocking pool.
@@ -45,13 +59,13 @@ async fn load_public_graph(
     instance_id: Uuid,
     graph_id: Uuid,
 ) -> anyhow::Result<Option<BitvmGcGraph>> {
-    let _permit = GRAPH_BUILDS.acquire().await?;
+    let permit = GRAPH_BUILDS.acquire().await?;
     let stored =
         read_graph_definition(&mut local_db.acquire().await?, instance_id, graph_id).await?;
     let Some(stored) = stored else {
         return Ok(None);
     };
-    Ok(Some(tokio::task::spawn_blocking(move || stored.build()).await??))
+    Ok(Some(run_holding(permit, move || stored.build()).await??))
 }
 
 fn graph_tx_index_error(
@@ -1769,3 +1783,49 @@ pub async fn pegout(
 //         Some(AddressType::P2wpkh) | Some(AddressType::P2wsh) | Some(AddressType::P2tr)
 //     ))
 // }
+
+#[cfg(test)]
+mod build_limit_tests {
+    use super::run_holding;
+    use std::sync::mpsc;
+    use std::time::Duration;
+    use tokio::sync::Semaphore;
+
+    /// A client that disconnects drops the request future; the build it
+    /// started must keep its permit until it finishes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dropped_request_keeps_its_permit_while_the_build_runs() {
+        static LIMIT: Semaphore = Semaphore::const_new(2);
+        let (started_tx, started_rx) = mpsc::channel();
+        let mut releases = Vec::new();
+        let mut requests = Vec::new();
+        for _ in 0..2 {
+            let (release_tx, release_rx) = mpsc::channel::<()>();
+            releases.push(release_tx);
+            let started = started_tx.clone();
+            requests.push(tokio::spawn(async move {
+                let permit = LIMIT.acquire().await.unwrap();
+                run_holding(permit, move || {
+                    started.send(()).unwrap();
+                    release_rx.recv().ok();
+                })
+                .await
+            }));
+        }
+        for _ in 0..2 {
+            started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        }
+        for request in &requests {
+            request.abort();
+        }
+        for request in requests {
+            assert!(request.await.unwrap_err().is_cancelled());
+        }
+        // Both builds still run, so a third request must wait.
+        assert_eq!(LIMIT.available_permits(), 0);
+        assert!(LIMIT.try_acquire().is_err());
+        drop(releases);
+        let third = tokio::time::timeout(Duration::from_secs(10), LIMIT.acquire_many(2)).await;
+        assert!(third.is_ok(), "permits return once the builds finish");
+    }
+}
