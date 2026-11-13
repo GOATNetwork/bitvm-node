@@ -49,6 +49,9 @@ pub async fn endorse_pegin(
     Ok(sig)
 }
 
+/// Whether `signature` is the member's endorsement of the peg-in. A signature
+/// that does not parse or recover is not one (`Ok(false)`) and is found out
+/// before any Goat call; an error means Goat could not be asked.
 pub async fn verify_pegin_endorsement(
     goat_client: &GOATClient,
     instance_id: Uuid,
@@ -56,6 +59,9 @@ pub async fn verify_pegin_endorsement(
     pegin_txid: &Txid,
     signature: &[u8],
 ) -> Result<bool> {
+    let Ok(sig) = EvmSignature::try_from(signature) else {
+        return Ok(false);
+    };
     let pegin_data = goat_client.gateway_get_pegin_data(&instance_id).await?;
     let expected_evm_address = pegin_data
         .committee_pubkeys
@@ -69,10 +75,9 @@ pub async fn verify_pegin_endorsement(
         })
         .ok_or_else(|| anyhow!("committee pubkey {committee_pubkey} not found on-chain"))?;
     let pegin_digest = goat_client.gateway_get_post_pegin_digest(&instance_id, pegin_txid).await?;
-    let sig = EvmSignature::try_from(signature)?;
-    sig.recover_address_from_prehash(&pegin_digest.into())
-        .map(|addr| addr == expected_evm_address)
-        .map_err(|e| e.into())
+    Ok(sig
+        .recover_address_from_prehash(&pegin_digest.into())
+        .is_ok_and(|addr| addr == expected_evm_address))
 }
 
 pub async fn verify_graph_endorsement(
@@ -130,4 +135,30 @@ pub fn verify_verifier_graph_params_endorsement(
             &XOnlyPublicKey::from(*verifier_pubkey),
         )
         .is_ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The mock knows no instance, so reaching Goat is an error: a malformed
+    /// signature is judged invalid without asking it.
+    #[tokio::test]
+    async fn a_malformed_pegin_endorsement_is_invalid_without_asking_goat() {
+        let (goat, _) = GOATClient::new_mock_client();
+        let pubkey = PublicKey::from_str(
+            "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+        )
+        .unwrap();
+        let txid = Txid::from_str(&"11".repeat(32)).unwrap();
+        let verify = |signature: Vec<u8>| {
+            let goat = &goat;
+            async move { verify_pegin_endorsement(goat, Uuid::nil(), &pubkey, &txid, &signature).await }
+        };
+        assert!(!verify(vec![1, 2, 3]).await.unwrap());
+        assert!(!verify(Vec::new()).await.unwrap());
+        let mut well_formed = vec![1u8; 65];
+        well_formed[64] = 27;
+        assert!(verify(well_formed).await.is_err());
+    }
 }
