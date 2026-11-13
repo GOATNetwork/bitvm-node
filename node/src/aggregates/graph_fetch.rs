@@ -37,6 +37,14 @@ pub enum GraphLookup {
         operator_pubkey: String,
         graph_nonce: u64,
     },
+    /// By slot, accepting only a copy with committee pre-signatures. An
+    /// operator-only copy would claim the slot for a graph the committee never
+    /// signed, and the finalized one could no longer be stored. A separate
+    /// variant keeps the encoding of persisted `Slot` lookups.
+    FinalizedSlot {
+        operator_pubkey: String,
+        graph_nonce: u64,
+    },
 }
 
 impl GraphLookup {
@@ -46,9 +54,16 @@ impl GraphLookup {
                 GetGraphRequest::by_id(*instance_id, *graph_id, *finalized)
             }
             GraphLookup::Slot { operator_pubkey, graph_nonce } => {
-                GetGraphRequest::by_slot(operator_pubkey.clone(), *graph_nonce)
+                GetGraphRequest::by_slot(operator_pubkey.clone(), *graph_nonce, false)
+            }
+            GraphLookup::FinalizedSlot { operator_pubkey, graph_nonce } => {
+                GetGraphRequest::by_slot(operator_pubkey.clone(), *graph_nonce, true)
             }
         }
+    }
+
+    fn wants_finalized(&self) -> bool {
+        matches!(self, GraphLookup::Id { finalized: true, .. } | GraphLookup::FinalizedSlot { .. })
     }
 }
 
@@ -127,7 +142,8 @@ pub async fn fetch_and_store_graph(
         return Ok(Some(found));
     }
     let operator_pubkey = match lookup {
-        GraphLookup::Slot { operator_pubkey, .. } => Some(operator_pubkey.as_str()),
+        GraphLookup::Slot { operator_pubkey, .. }
+        | GraphLookup::FinalizedSlot { operator_pubkey, .. } => Some(operator_pubkey.as_str()),
         GraphLookup::Id { .. } => None,
     };
     let candidates = fetch_candidates(operator_pubkey);
@@ -184,7 +200,8 @@ async fn local_copy(
     let mut storage = local_db.acquire().await?;
     let row = match lookup {
         GraphLookup::Id { graph_id, .. } => storage.find_graph(graph_id).await?,
-        GraphLookup::Slot { operator_pubkey, graph_nonce } => {
+        GraphLookup::Slot { operator_pubkey, graph_nonce }
+        | GraphLookup::FinalizedSlot { operator_pubkey, graph_nonce } => {
             storage.find_graph_by_operator_slot(operator_pubkey, *graph_nonce as i64).await?
         }
     };
@@ -195,7 +212,7 @@ async fn local_copy(
         return Ok(None);
     };
     let finalized = graph.committee_pre_signed();
-    if matches!(lookup, GraphLookup::Id { finalized: true, .. }) && !finalized {
+    if lookup.wants_finalized() && !finalized {
         // The stored copy is the operator's version; the finalized one is fetched.
         return Ok(None);
     }
@@ -225,21 +242,22 @@ async fn validate_and_store(
         bail!("response identifiers do not match the definition");
     }
     match lookup {
-        GraphLookup::Id { instance_id: wanted_instance, graph_id: wanted_graph, finalized } => {
+        GraphLookup::Id { instance_id: wanted_instance, graph_id: wanted_graph, .. } => {
             if *wanted_instance != instance_id || *wanted_graph != graph_id {
                 bail!("response names another graph than requested");
             }
-            if *finalized && !graph.committee_pre_signed() {
-                bail!("response lacks the committee pre-signatures the lookup asks for");
-            }
         }
-        GraphLookup::Slot { operator_pubkey, graph_nonce } => {
+        GraphLookup::Slot { operator_pubkey, graph_nonce }
+        | GraphLookup::FinalizedSlot { operator_pubkey, graph_nonce } => {
             if graph.parameters.operator_pubkey.to_string() != *operator_pubkey
                 || graph.parameters.graph_nonce != *graph_nonce
             {
                 bail!("response names another slot than requested");
             }
         }
+    }
+    if lookup.wants_finalized() && !graph.committee_pre_signed() {
+        bail!("response lacks the committee pre-signatures the lookup asks for");
     }
     if !graph.operator_pre_signed() {
         bail!("definition lacks operator pre-signatures");
@@ -344,5 +362,44 @@ mod admission_tests {
             }
         }
         assert!(db.acquire().await.unwrap().find_graph(&graph_id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn finalized_slot_pull_rejects_an_operator_only_copy_before_storing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = LocalDB::new_with_busy_timeout(
+            &format!("sqlite:{}", dir.path().join("pull.db").display()),
+            false,
+            store::DEFAULT_BUSY_TIMEOUT,
+        )
+        .await;
+        db.migrate().await;
+        let (btc, _) = BTCClient::new_mock_client();
+        let (goat, _) = GOATClient::new_mock_client();
+        let parameters =
+            admission_parameters(crate::env::get_network(), crate::utils::min_required_verifier());
+        let graph_id = parameters.graph_id;
+        let instance_id = parameters.instance_parameters.instance_id;
+        let operator_pubkey = parameters.operator_pubkey.to_string();
+        let graph_nonce = parameters.graph_nonce;
+        let raw=serde_json::json!({"parameters":parameters,"operator_pre_signed":true,"committee_pre_signed":false,"operator_pre_sigs":null,"committee_pre_sigs":null}).to_string();
+        let finalized =
+            GraphLookup::FinalizedSlot { operator_pubkey: operator_pubkey.clone(), graph_nonce };
+        assert!(finalized.request().finalized);
+        let error =
+            validate_and_store(&db, &btc, &goat, &finalized, instance_id, graph_id, raw.clone())
+                .await
+                .err()
+                .unwrap();
+        assert!(format!("{error:#}").contains("committee pre-signatures"), "{error:#}");
+        assert!(db.acquire().await.unwrap().find_graph(&graph_id).await.unwrap().is_none());
+        // A plain slot pull goes on to the other checks with the same copy.
+        let slot = GraphLookup::Slot { operator_pubkey, graph_nonce };
+        assert!(!slot.request().finalized);
+        let error = validate_and_store(&db, &btc, &goat, &slot, instance_id, graph_id, raw)
+            .await
+            .err()
+            .unwrap();
+        assert!(!format!("{error:#}").contains("committee pre-signatures"), "{error:#}");
     }
 }

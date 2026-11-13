@@ -397,6 +397,9 @@ pub fn graph_pull_event(graph_id: Uuid, lookup: GraphLookup) -> anyhow::Result<N
         GraphLookup::Slot { operator_pubkey, graph_nonce } => {
             format!("slot:{operator_pubkey}:{graph_nonce}")
         }
+        GraphLookup::FinalizedSlot { operator_pubkey, graph_nonce } => {
+            format!("finalized-slot:{operator_pubkey}:{graph_nonce}")
+        }
     };
     Ok(NewEvent::new(
         format!("graph:{graph_id}:pull:{key}"),

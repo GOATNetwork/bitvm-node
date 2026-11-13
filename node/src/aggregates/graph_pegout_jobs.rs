@@ -539,7 +539,9 @@ async fn enforce_previous_slot(deps: &JobDeps, graph: &BitvmGcGraph) -> Result<S
     let (previous_row, previous) = match previous {
         Some(previous) => previous,
         None => {
-            let lookup = super::graph_fetch::GraphLookup::Slot {
+            // Only a committee-signed copy may define the slot; an operator
+            // could otherwise serve one that hides its real previous graph.
+            let lookup = super::graph_fetch::GraphLookup::FinalizedSlot {
                 operator_pubkey: operator_pubkey.clone(),
                 graph_nonce: previous_slot,
             };
