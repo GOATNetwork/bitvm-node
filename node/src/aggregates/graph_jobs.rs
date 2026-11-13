@@ -245,14 +245,37 @@ async fn planned(
     })
 }
 
-/// Committee peers from the registry, for the ack sets of the operator's
-/// heavy messages.
-fn committee_ack_peers() -> Vec<String> {
-    crate::p2p_admission::peer_registry()
+/// The committee part of the ack sets of the operator's heavy messages: every
+/// member who answered the instance, resolved on Goat to its registered peer
+/// ID, plus the committee peers the registry holds. The registry is a cache
+/// and may miss a member, which would then never be waited for; a member whose
+/// lookup fails is left to the registry.
+async fn committee_ack_peers(deps: &JobDeps, instance_id: Uuid) -> Result<Vec<String>> {
+    let mut peers: Vec<String> = crate::p2p_admission::peer_registry()
         .committee_peer_ids(std::time::Instant::now())
         .into_iter()
         .map(|peer| peer.to_string())
-        .collect()
+        .collect();
+    let members = deps.goat_client.gateway_get_pegin_data(&instance_id).await?.committee_addresses;
+    for member in members {
+        let peer = deps
+            .goat_client
+            .committee_mana_get_committee_peer_id(&member.into_array())
+            .await
+            .and_then(|bytes| Ok(PeerId::from_bytes(&bytes)?));
+        match peer {
+            Ok(peer) => {
+                let peer = peer.to_string();
+                if !peers.contains(&peer) {
+                    peers.push(peer);
+                }
+            }
+            Err(error) => {
+                warn!(event = "graph_ack_set", instance_id = %instance_id, member = %member, error = %error, "committee member's peer ID not resolved; left out of the ack set")
+            }
+        }
+    }
+    Ok(peers)
 }
 
 /// Counts of committee endorsements, parameter endorsements, nonces and partials.
@@ -858,7 +881,7 @@ async fn build_graph(deps: &JobDeps, graph_id: Uuid, _params: &[u8]) -> Result<S
     let mut plan = GraphPlan::default();
     if !already_finalized {
         let mut ack_peers = selected_verifier_peer_ids;
-        ack_peers.extend(committee_ack_peers());
+        ack_peers.extend(committee_ack_peers(deps, instance_id).await?);
         plan.send(
             planned(
                 graph_id,
@@ -1174,7 +1197,7 @@ async fn finalize_graph(deps: &JobDeps, graph_id: Uuid, _params: &[u8]) -> Resul
     let operator_pubkey = graph.parameters.operator_pubkey.to_string();
     try_refresh_graph(deps, instance_id, graph_id, &graph).await;
 
-    let mut ack_peers = committee_ack_peers();
+    let mut ack_peers = committee_ack_peers(deps, instance_id).await?;
     ack_peers.extend(selected_verifier_peers(deps, instance_id, graph_id).await?);
     let mut plan = GraphPlan::default();
     plan.send(

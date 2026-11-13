@@ -26,7 +26,7 @@ use client::graphs::graph_query::{
 use std::ops::AddAssign;
 use std::str::FromStr;
 use std::sync::Arc;
-use store::localdb::{GraphRuntimeUpdate, NodeQuery, StorageProcessor};
+use store::localdb::{GraphRuntimeUpdate, StorageProcessor};
 use store::{
     GoatTxProcessingStatus, GoatTxRecord, GoatTxType, GraphStatus, GraphStatusSource,
     GraphStatusTransitionOutcome, InstanceBridgeInStatus,
@@ -366,7 +366,7 @@ async fn handle_withdraw_paths_events<'a>(
         }
 
         let reward_add = U256::from_str(&event.reward_amount_str()).unwrap_or_default();
-        let (flag, goat_addr) = reflect_goat_address(Some(event.operator_addr()));
+        let (flag, _) = reflect_goat_address(Some(event.operator_addr()));
         if !flag {
             warn!(
                 "handle_withdraw_paths_events failed as cast operator address failed, detail: {}, {}",
@@ -411,7 +411,7 @@ async fn handle_withdraw_paths_events<'a>(
             })
             .await?;
         if is_new_event {
-            add_node_reward(storage_processor, &goat_addr.unwrap(), reward_add).await?;
+            add_operator_reward(storage_processor, graph_id, reward_add).await?;
         }
         // The aggregate mirrors the settlement and releases the next slot.
         record_event_in(storage_processor, goat_status_event(graph_id, status, &event.tx_hash())?)
@@ -482,18 +482,17 @@ async fn handle_withdraw_disproved_events<'a>(
             if let Some(metrics_state) = crate::metrics_service::node_metrics_state() {
                 metrics_state.record_pegout_disprove();
             }
-            add_node_reward(
-                storage_processor,
-                &verifier_addr.unwrap(),
-                U256::from_str(&event.challenger_amount_sats).unwrap_or_default(),
-            )
-            .await?;
-            add_node_reward(
-                storage_processor,
-                &disprover_addr.unwrap(),
-                U256::from_str(&event.disprover_amount_sats).unwrap_or_default(),
-            )
-            .await?;
+            // Paid in the stake token, not in sats: not added to the node
+            // rewards, which count peg-out rewards in sats.
+            info!(
+                event = "withdraw_disproved",
+                graph_id = %graph_id,
+                challenger = %verifier_addr.unwrap_or_default(),
+                challenger_reward = %event.challenger_amount_sats,
+                disprover = %disprover_addr.unwrap_or_default(),
+                disprover_reward = %event.disprover_amount_sats,
+                "disprove rewards paid in the stake token"
+            );
         }
         record_event_in(
             storage_processor,
@@ -687,20 +686,27 @@ async fn handle_post_graph_data_events<'a>(
     Ok(())
 }
 
-async fn add_node_reward(
+/// Credit a peg-out reward (sats) to the node row of the graph's operator: the
+/// peer that proved it holds the operator key. Rows naming the operator's Goat
+/// address are self-reported and could belong to anyone.
+async fn add_operator_reward(
     storage_processor: &mut StorageProcessor<'_>,
-    goat_addr: &str,
+    graph_id: Uuid,
     add_value: U256,
 ) -> anyhow::Result<()> {
-    let (nodes, _) = storage_processor
-        .find_nodes(&NodeQuery::default().with_goat_addr(goat_addr.to_string()))
-        .await?;
-    for node in nodes {
-        let mut reward = U256::from_str(&node.reward).unwrap_or_default();
-        reward.add_assign(&add_value);
-        storage_processor.update_node_reward_by_peer_id(&node.peer_id, &reward.to_string()).await?
-    }
-    Ok(())
+    let Some(graph) = storage_processor.find_graph(&graph_id).await? else {
+        return Ok(());
+    };
+    let Some(peer) = crate::utils::operator_peer_id(&graph.operator_pubkey) else {
+        info!(graph_id = %graph_id, reward = %add_value, "graph operator has no verified peer; peg-out reward not recorded");
+        return Ok(());
+    };
+    let Some(node) = storage_processor.node_by_id(&peer).await? else {
+        return Ok(());
+    };
+    let mut reward = U256::from_str(&node.reward).unwrap_or_default();
+    reward.add_assign(&add_value);
+    storage_processor.update_node_reward_by_peer_id(&node.peer_id, &reward.to_string()).await
 }
 
 #[cfg(test)]
@@ -732,21 +738,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn node_reward_is_added_once() {
+    async fn a_peg_out_reward_goes_to_the_peer_that_proved_the_operator_key() {
+        use bitcoin::secp256k1::{Keypair, SECP256K1, SecretKey};
         let (db, _dir) = db().await;
+        let key = Keypair::from_secret_key(SECP256K1, &SecretKey::from_slice(&[0x7d; 32]).unwrap());
+        let operator_pubkey = bitcoin::PublicKey::new(key.public_key()).to_string();
+        let (verified, claimant) = (libp2p::PeerId::random(), libp2p::PeerId::random());
+        crate::p2p_admission::peer_registry().observe_operator_binding(
+            &verified,
+            &crate::p2p_admission::operator_key(&key.x_only_public_key().0),
+            1,
+        );
+        let graph_id = Uuid::new_v4();
         let mut storage = db.acquire().await.unwrap();
-        let node = store::Node {
-            peer_id: "operator".into(),
-            goat_addr: "0xabc".into(),
-            ..Default::default()
-        };
-        storage.upsert_node(&node).await.unwrap();
-        for _ in 0..2 {
-            add_node_reward(&mut storage, "0xabc", U256::from(5)).await.unwrap();
+        storage
+            .upsert_graph_definition(&store::Graph {
+                graph_id,
+                instance_id: Uuid::new_v4(),
+                operator_pubkey: operator_pubkey.clone(),
+                definition_hash: "hash".into(),
+                status: GraphStatus::OperatorPresigned.to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        // Both rows name the operator key; only one peer proved it.
+        for peer in [verified, claimant] {
+            storage
+                .upsert_node(&store::Node {
+                    peer_id: peer.to_string(),
+                    btc_pub_key: operator_pubkey.clone(),
+                    reward: "0".into(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
         }
-        let nodes = storage.find_nodes(&NodeQuery::default()).await.unwrap().0;
-        // Adding the increment in SQL as well would give 0 + 5, then 5 + 10.
-        assert_eq!(nodes[0].reward, "10");
+        for _ in 0..2 {
+            add_operator_reward(&mut storage, graph_id, U256::from(100u64)).await.unwrap();
+        }
+        let reward = |row: Option<store::Node>| row.map(|row| row.reward);
+        assert_eq!(
+            reward(storage.node_by_id(&verified.to_string()).await.unwrap()).as_deref(),
+            Some("200")
+        );
+        assert_eq!(
+            reward(storage.node_by_id(&claimant.to_string()).await.unwrap()).as_deref(),
+            Some("0")
+        );
     }
 
     #[tokio::test]

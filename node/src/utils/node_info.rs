@@ -188,6 +188,21 @@ pub async fn set_node_external_socket_addr_env(rpc_addr: &str) -> Result<()> {
     Ok(())
 }
 
+/// The peer that proved it holds `operator_pubkey`: this node for its own key,
+/// otherwise the peer whose signed NodeInfo binding names the key. The node
+/// table's `btc_pub_key` is self-reported, so a row naming the key proves nothing.
+pub fn operator_peer_id(operator_pubkey: &str) -> Option<String> {
+    let xonly = PublicKey::from_str(operator_pubkey).ok()?.inner.x_only_public_key().0;
+    if get_actor() == Actor::Operator
+        && get_node_pubkey().is_ok_and(|own| own.inner.x_only_public_key().0 == xonly)
+    {
+        return Some(get_peer_id());
+    }
+    crate::p2p_admission::peer_registry()
+        .operator_peer_for(&crate::p2p_admission::operator_key(&xonly))
+        .map(|peer| peer.to_string())
+}
+
 pub fn reflect_goat_address(addr_op: Option<String>) -> (bool, Option<String>) {
     if let Some(addr) = addr_op
         && let Ok(addr) = EvmAddress::from_str(&addr)
