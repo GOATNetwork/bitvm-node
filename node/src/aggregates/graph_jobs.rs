@@ -1473,6 +1473,25 @@ async fn verifier_solder(deps: &JobDeps, graph_id: Uuid, params: &[u8]) -> Resul
     Step::done(plan)
 }
 
+/// A verifier endorses a graph only for the operator that ran its BABE setup:
+/// the graph must name that operator's key and come from that operator's peer.
+/// Another staked operator could otherwise assemble the verifier's slot from
+/// gossip and obtain its endorsement for a squatted graph.
+fn check_graph_setup_operator(
+    setup_operator_pubkey: &PublicKey,
+    setup_operator_peer_id: &[u8],
+    graph_operator_pubkey: &PublicKey,
+    author: &PeerId,
+) -> std::result::Result<(), &'static str> {
+    if setup_operator_pubkey != graph_operator_pubkey {
+        return Err("graph operator is not the operator that initiated this verifier setup");
+    }
+    if setup_operator_peer_id != author.to_bytes() {
+        return Err("CreateGraph sender is not the operator that initiated this verifier setup");
+    }
+    Ok(())
+}
+
 async fn verifier_validate_graph(deps: &JobDeps, graph_id: Uuid, params: &[u8]) -> Result<Step> {
     let (inbound, message) = decode_inbound(params).await?;
     let GOATMessageContent::CreateGraph(CreateGraph {
@@ -1506,6 +1525,22 @@ async fn verifier_validate_graph(deps: &JobDeps, graph_id: Uuid, params: &[u8]) 
     else {
         return Step::ignore("local verifier is not in this graph");
     };
+    let Some(verifier_state) = load_babe_setup_state(&deps.local_db, instance_id, graph_id)?
+        .and_then(|state| state.verifier)
+    else {
+        return Step::ignore("missing local BABE verifier state");
+    };
+    if verifier_state.verifier_pubkey != local_verifier_pubkey {
+        return Step::ignore("local BABE verifier pubkey mismatch");
+    }
+    if let Err(reason) = check_graph_setup_operator(
+        &verifier_state.operator_pubkey,
+        &verifier_state.operator_peer_id,
+        &graph.parameters.operator_pubkey,
+        &author_peer(&inbound)?,
+    ) {
+        return Step::ignore(reason);
+    }
     crate::utils::validate_graph_instance_parameters(
         &deps.btc_client,
         &deps.goat_client,
@@ -1518,14 +1553,6 @@ async fn verifier_validate_graph(deps: &JobDeps, graph_id: Uuid, params: &[u8]) 
     verify_graph_operator_pre_signatures(&full_graph).map_err(|error| {
         SpecialError::InvalidGraph(format!("invalid operator pre-signatures: {error}"))
     })?;
-    let Some(verifier_state) = load_babe_setup_state(&deps.local_db, instance_id, graph_id)?
-        .and_then(|state| state.verifier)
-    else {
-        return Step::ignore("missing local BABE verifier state");
-    };
-    if verifier_state.verifier_pubkey != local_verifier_pubkey {
-        return Step::ignore("local BABE verifier pubkey mismatch");
-    }
     let Some(soldering_proof_ready) = verifier_state.soldering_proof_ready.clone() else {
         return Step::ignore("local verifier has no soldering proof");
     };
@@ -2342,5 +2369,30 @@ async fn fetch_graph(deps: &JobDeps, graph_id: Uuid, params: &[u8], attempts: i6
         }
         Ok(None) => give_up(format!("no peer served {lookup:?}")),
         Err(error) => give_up(format!("{error:#}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::secp256k1::{Keypair, SECP256K1};
+
+    fn pubkey(seed: u8) -> PublicKey {
+        Keypair::from_seckey_slice(SECP256K1, &[seed; 32]).unwrap().public_key().into()
+    }
+
+    #[test]
+    fn a_verifier_endorses_only_the_operator_that_ran_its_setup() {
+        let (operator, operator_peer) = (pubkey(1), PeerId::random());
+        let setup_peer = operator_peer.to_bytes();
+        let check = |graph_operator: &PublicKey, author: &PeerId| {
+            check_graph_setup_operator(&operator, &setup_peer, graph_operator, author)
+        };
+        assert!(check(&operator, &operator_peer).is_ok());
+        // Another operator's graph for this verifier slot, even sent from
+        // the setup operator's peer.
+        assert!(check(&pubkey(2), &operator_peer).is_err());
+        // The setup operator's graph relayed by another peer.
+        assert!(check(&operator, &PeerId::random()).is_err());
     }
 }
