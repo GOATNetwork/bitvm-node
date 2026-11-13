@@ -559,9 +559,12 @@ pub async fn get_graph(
 /// ```
 #[axum::debug_handler]
 pub async fn get_graphs(
-    Query(params): Query<GraphQueryParams>,
+    Query(mut params): Query<GraphQueryParams>,
     State(app_state): State<Arc<AppState>>,
 ) -> ApiResult<GraphListResponse> {
+    let (offset, limit) = InputValidator::validate_pagination(params.offset, params.limit)?;
+    params.offset = Some(offset);
+    params.limit = Some(limit);
     let mut resp = GraphListResponse::default();
     let mut storage_process = app_state.local_db.acquire().await.api_error("GET_GRAPHS_ERROR")?;
 

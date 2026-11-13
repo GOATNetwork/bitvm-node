@@ -64,20 +64,16 @@ async fn handle_proof_desc_forwarding(
             let Some(env_url) =
                 Url::parse(&host).ok().filter(|u| u.scheme() == "http" || u.scheme() == "https")
             else {
-                tracing::warn!(
-                    "GOAT_PROOF_BUILD_URL is invalid (must be valid http/https URL): {host}"
-                );
+                tracing::warn!("GOAT_PROOF_BUILD_URL is invalid (must be valid http/https URL)");
                 return ok_response(ProofDescResponse {
                     proof_desc: None,
-                    error: Some(format!("Invalid GOAT_PROOF_BUILD_URL configuration: {host}")),
+                    error: Some("proof builder URL is misconfigured".to_string()),
                 });
             };
 
             let request_host = headers.get("host").and_then(|h| h.to_str().ok());
             if is_loop_detected(&env_url, request_host) {
-                tracing::warn!(
-                    "GOAT_PROOF_BUILD_URL points to self ({host}), returning mock data to avoid loop"
-                );
+                tracing::warn!("GOAT_PROOF_BUILD_URL points to this node; not forwarding");
                 return ok_response(ProofDescResponse {
                     proof_desc: None,
                     error: Some("Request host matches self, loop detected".to_string()),
@@ -90,10 +86,10 @@ async fn handle_proof_desc_forwarding(
             let resp =
                 app_state.http_client.get_response_json::<ProofDescResponse>(&url).await.map_err(
                     |e| {
-                        to_api_error(
-                            error_code,
-                            format!("fail to get proof from url: {host}, error: {e}"),
-                        )
+                        // The URL and the upstream error stay in the log: the URL can
+                        // carry credentials and this endpoint is public.
+                        tracing::warn!(error = %e, "proof builder request failed");
+                        to_api_error(error_code, "proof builder unavailable".to_string())
                     },
                 )?;
             ok_response(resp)

@@ -15,7 +15,7 @@ use store::localdb::NodeQuery;
 /// Get node list
 ///
 /// Returns a paginated list of BitVM network nodes based on query parameters. Supports filtering by
-/// GOAT address, actor type, and online status. Automatically updates the current node's timestamp.
+/// GOAT address, actor type, and online status.
 ///
 /// # Query Parameters
 ///
@@ -84,10 +84,6 @@ pub async fn get_nodes(
 
     let mut storage_process = app_state.local_db.acquire().await.api_error("GET_NODES_ERROR")?;
 
-    storage_process
-        .update_node_timestamp(&app_state.peer_id, current_time_secs())
-        .await
-        .api_error("GET_NODES_ERROR")?;
     let time_threshold = current_time_secs() - ALIVE_TIME_JUDGE_THRESHOLD;
     let (_, goat_addr) = reflect_goat_address(query_params.goat_addr);
     let (nodes, total) = storage_process
@@ -97,7 +93,7 @@ pub async fn get_nodes(
             time_threshold: query_params.status.clone().map(|_| time_threshold),
             is_in_time_threshold: query_params
                 .status
-                .map(|status| status != NODE_STATUS_OFFLINE)
+                .map(|status| !status.eq_ignore_ascii_case(NODE_STATUS_OFFLINE))
                 .unwrap_or(true),
             order: None,
             offset: Some(offset),
@@ -115,7 +111,7 @@ pub async fn get_nodes(
 /// Get nodes overview statistics
 ///
 /// Returns statistical overview of all nodes in the BitVM network, including counts by actor type
-/// and online/offline status. Automatically updates the current node's timestamp.
+/// and online/offline status.
 ///
 /// # Returns
 ///
@@ -157,11 +153,6 @@ pub async fn get_nodes_overview(
     let mut storage_process =
         app_state.local_db.acquire().await.api_error("NODES_OVERVIEW_ERROR")?;
 
-    storage_process
-        .update_node_timestamp(&app_state.peer_id, current_time_secs())
-        .await
-        .api_error("NODES_OVERVIEW_ERROR")?;
-
     let time_threshold = current_time_secs() - ALIVE_TIME_JUDGE_THRESHOLD;
     let nodes_overview =
         storage_process.node_overview(time_threshold).await.api_error("NODES_OVERVIEW_ERROR")?;
@@ -171,8 +162,7 @@ pub async fn get_nodes_overview(
 
 /// Get node by peer ID
 ///
-/// Returns detailed information for a specific node based on its peer_id. If the requested
-/// node is the current node, automatically updates its timestamp.
+/// Returns detailed information for a specific node based on its peer_id.
 ///
 /// # Path Parameters
 ///
@@ -220,13 +210,6 @@ pub async fn get_node(
     InputValidator::validate_peer_id(&peer_id, "peer_id")?;
 
     let mut storage_process = app_state.local_db.acquire().await.api_error("GET_NODE_ERROR")?;
-
-    if peer_id == app_state.peer_id {
-        storage_process
-            .update_node_timestamp(&app_state.peer_id, current_time_secs())
-            .await
-            .api_error("GET_NODE_ERROR")?;
-    }
 
     let res =
         storage_process.node_by_id(peer_id.as_str()).await.api_error("GET_NODE_ERROR")?.map(|v| {
