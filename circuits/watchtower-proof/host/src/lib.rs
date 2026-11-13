@@ -1,9 +1,8 @@
 #![feature(trim_prefix_suffix)]
 //! Generate watchtower proof
 use anyhow::Context;
-use borsh::BorshDeserialize;
 use commit_chain::{CommitChainCircuitInput, CommitChainPrevProofType};
-use header_chain::{CircuitBlockHeader, HeaderChainCircuitInput, HeaderChainPrevProofType};
+use header_chain::{HeaderChainCircuitInput, HeaderChainPrevProofType};
 use zkm_sdk::{
     HashableKey, ProverClient, ZKMProofKind, ZKMProofWithPublicValues, ZKMStdin, include_elf,
 };
@@ -284,13 +283,9 @@ impl ProofBuilder for WatchtowerProofBuilder {
         };
         // --- spv --- //
         let genesis_sequencer_commit_txid = Txid::from_str(genesis_sequencer_commit_txid)?;
-        let bitcoin_block_headers = {
-            let headers: Vec<u8> = std::fs::read(format!("{header_chain_input_proof}.blocks"))?;
-            headers
-                .chunks(80)
-                .map(|header| CircuitBlockHeader::try_from_slice(header).unwrap())
-                .collect::<Vec<CircuitBlockHeader>>()
-        };
+        let bitcoin_block_headers =
+            proof_builder::headers::proven_headers(&header_chain_input_proof)
+                .context("read the headers of the header-chain proof")?;
         tracing::info!("block headers: {:?}", bitcoin_block_headers.len());
         let found = bitcoin_block_headers
             .iter()

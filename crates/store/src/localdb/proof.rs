@@ -674,6 +674,25 @@ impl StorageProcessor<'_> {
         Ok(state)
     }
 
+    /// Deletes the unproven tasks of one proof chain starting at or after `from_block` and
+    /// returns their starts.
+    pub async fn delete_unproven_long_running_task_proofs(
+        &mut self,
+        chain_name: &str,
+        from_block: i64,
+    ) -> anyhow::Result<Vec<i64>> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "DELETE FROM long_running_task_proof
+             WHERE chain_name = ? AND block_start >= ? AND proof_state != ?
+             RETURNING block_start",
+        )
+        .bind(chain_name)
+        .bind(from_block)
+        .bind(crate::ProofState::Proven.to_i64())
+        .fetch_all(self.conn())
+        .await?)
+    }
+
     /// Counts unfinished (`New` or `Proving`) tasks of one proof chain starting at or after
     /// `from_block`.
     pub async fn count_pending_long_running_task_proofs(

@@ -11,7 +11,8 @@ use std::time::Duration;
 use store::localdb::LocalDB;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{info, warn};
+use zkm_sdk::HashableKey;
 
 use crate::api::metrics_service::{ApiMetricsState, COMMIT_CHAIN_PROOF};
 
@@ -35,36 +36,50 @@ pub(crate) fn spawn_commit_chain_proof_task(
         }
 
         let builder = runtime.builder(CommitChainProofBuilder::with_client).await?;
+        let vk_hash = builder.vk().bytes32();
+        let configured = args.clone();
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(interval)) => {
-                    let init_input = args.init_input;
-                    if !init_input {
-                        let next_task = fetch_latest_long_running_task(&local_db, CommitChainProofBuilder::name()).await?;
-                        if let Some(next_task) = next_task {
-                            info!("Commit chain's next task: {next_task:?}");
-                            args.start = fetch_next_commit_task_index(&local_db).await?;
-                            args.input_proof = next_task.path_to_proof.unwrap();
-                            args.commit_info = format!(
-                                "{}/commit_info.json.{}",
-                                std::path::Path::new(&args.output_proof).parent().unwrap().to_str().unwrap(),
-                                args.start,
-                            );
-                            args.output_proof = format!(
-                                "{}/{}-{}.bin",
-                                std::path::Path::new(&args.output_proof).parent().unwrap().to_str().unwrap(),
-                                args.start,
-                                args.batch_size
-                            );
-                            args.commits = format!(
-                                "{}/{}-{}.bin.commits",
-                                std::path::Path::new(&args.output_proof).parent().unwrap().to_str().unwrap(),
-                                args.start,
-                                args.batch_size
-                            );
-                            args.init_input = false;
+                    // Stored progress wins over `init_input`, as for the header chain: a
+                    // restart must not prove from Genesis again and replace the chain.
+                    // After a commit-chain upgrade the stored proofs come from another
+                    // program, which this one cannot verify: the chain then starts
+                    // over from the configured input.
+                    let next_task = fetch_latest_long_running_task(&local_db, CommitChainProofBuilder::name()).await?;
+                    let next_task = match next_task {
+                        Some(task) if stored_proof_is_current(task.path_to_proof.as_deref(), &vk_hash)? => Some(task),
+                        Some(task) => {
+                            warn!("Commit chain's stored proof {:?} is not from the current program; starting over from the configured input", task.path_to_proof);
+                            args = configured.clone();
+                            None
                         }
+                        None => None,
+                    };
+                    if let Some(next_task) = next_task {
+                        info!("Commit chain's next task: {next_task:?}");
+                        args.start = fetch_next_commit_task_index(&local_db).await?;
+                        args.input_proof = next_task.path_to_proof.unwrap();
+                        args.commit_info = format!(
+                            "{}/commit_info.json.{}",
+                            std::path::Path::new(&args.output_proof).parent().unwrap().to_str().unwrap(),
+                            args.start,
+                        );
+                        args.output_proof = format!(
+                            "{}/{}-{}.bin",
+                            std::path::Path::new(&args.output_proof).parent().unwrap().to_str().unwrap(),
+                            args.start,
+                            args.batch_size
+                        );
+                        args.commits = format!(
+                            "{}/{}-{}.bin.commits",
+                            std::path::Path::new(&args.output_proof).parent().unwrap().to_str().unwrap(),
+                            args.start,
+                            args.batch_size
+                        );
+                        args.init_input = false;
                     }
+                    let init_input = args.init_input;
                     info!("Commit chain proof generate task: generate proof, args: {args:?}");
 
                     let commits = match fetch_commit_chain(&args.esplora_url, &args.commit_info, &args.commits, args.bitcoin_network).await {
@@ -135,4 +150,35 @@ pub(crate) fn spawn_commit_chain_proof_task(
             }
         }
     })
+}
+
+/// Whether the proof at `path` was made by the program whose verifying key
+/// hashes to `vk_hash`, going by the `.vk_hash.bin` written next to it. A proof
+/// without that file cannot be continued either.
+fn stored_proof_is_current(path: Option<&str>, vk_hash: &str) -> std::io::Result<bool> {
+    let Some(path) = path else { return Ok(false) };
+    match std::fs::read(format!("{path}.vk_hash.bin")) {
+        Ok(stored) => Ok(stored == vk_hash.as_bytes()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stored_proof_is_current;
+
+    #[test]
+    fn only_a_proof_of_the_current_program_is_resumed() {
+        let dir = tempfile::tempdir().unwrap();
+        let proof = dir.path().join("0-10.bin");
+        let proof = proof.to_str().unwrap();
+        // No sidecar, or no stored path: nothing to continue from.
+        assert!(!stored_proof_is_current(Some(proof), "0xaa").unwrap());
+        assert!(!stored_proof_is_current(None, "0xaa").unwrap());
+        std::fs::write(format!("{proof}.vk_hash.bin"), "0xaa").unwrap();
+        assert!(stored_proof_is_current(Some(proof), "0xaa").unwrap());
+        // After an upgrade the program, and so its key hash, differs.
+        assert!(!stored_proof_is_current(Some(proof), "0xbb").unwrap());
+    }
 }
