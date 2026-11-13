@@ -210,12 +210,23 @@ impl Harness {
     /// A PeginConfirm round message event as `inbound_event` builds it; the
     /// apply only reads the envelope.
     fn round_message(&self, kind: &str, author: &str, instance_id: Uuid) -> NewEvent {
+        self.round_message_with(kind, author, instance_id, "")
+    }
+
+    /// The same member's message with other content when `body` differs.
+    fn round_message_with(
+        &self,
+        kind: &str,
+        author: &str,
+        instance_id: Uuid,
+        body: &str,
+    ) -> NewEvent {
         let inbound = InboundMessage {
             author: author.to_string(),
             instance_id,
             graph_nonce: None,
             operator_pubkey: None,
-            message: format!("{kind}:{instance_id}:{author}").into_bytes(),
+            message: format!("{kind}:{instance_id}:{author}{body}").into_bytes(),
         };
         NewEvent::new(
             content_event_id(author, kind, &instance_id.to_string(), &inbound.message),
@@ -394,6 +405,40 @@ impl Harness {
 
     async fn wait_key_deleted(&self, instance_id: Uuid) {
         wait_for(|| async { self.instance(instance_id).await.key_deleted.then_some(()) }).await;
+    }
+
+    /// A network round message for an instance this node has no row of,
+    /// recorded `age` seconds ago.
+    async fn insert_unknown_instance_message(&self, age: i64) -> String {
+        let instance_id = Uuid::new_v4();
+        let event = self.round_message("PeginConfirmNonce", OTHER_PEER, instance_id);
+        let mut storage = self.db.acquire().await.unwrap();
+        storage
+            .insert_engine_inbox_event(
+                &NewEngineInboxEvent {
+                    event_id: event.event_id.clone(),
+                    aggregate_kind: INSTANCE_KIND.to_string(),
+                    aggregate_id: instance_id.to_string(),
+                    kind: "PeginConfirmNonce".to_string(),
+                    source: EventSource::Network.as_str().to_string(),
+                    author: OTHER_PEER.to_string(),
+                    admission_class: String::new(),
+                    payload: event.payload.clone(),
+                    ack: None,
+                },
+                crate::clock::current_time_secs() - age,
+            )
+            .await
+            .unwrap();
+        event.event_id
+    }
+
+    async fn wait_inbox(&self, event_id: &str, found: impl Fn(&store::EngineInboxEvent) -> bool) {
+        wait_for(|| async {
+            let mut storage = self.db.acquire().await.unwrap();
+            storage.find_engine_inbox_event(event_id).await.unwrap().filter(&found).map(|_| ())
+        })
+        .await;
     }
 
     async fn wait_applied(&self, event_id: &str) {
@@ -812,6 +857,48 @@ async fn a_round_message_becomes_an_ingest_job_whose_plan_is_sent_until_the_conf
     let late_id = t.submit_id(late).await;
     t.wait_applied(&late_id).await;
     assert!(!t.job_actions(id).await.contains(&JOB_INGEST_PEGIN_CONFIRM_VOTE.to_string()));
+    t.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_member_gets_one_ingest_job_per_message_type() {
+    use InstanceBridgeInStatus::*;
+    let t = start(Actor::Committee, false, false).await;
+    let id = t.insert(&instance_row(Presigned, PREPARE)).await;
+    t.submit(t.round_message("PeginConfirmNonce", OTHER_PEER, id)).await;
+    t.wait_job(id, JOB_INGEST_PEGIN_CONFIRM_NONCE, "Done").await;
+    // Other content from the same member: applied, but no second job.
+    let other = t.submit_id(t.round_message_with("PeginConfirmNonce", OTHER_PEER, id, ":2")).await;
+    t.wait_applied(&other).await;
+    settle().await;
+    let ingests = |jobs: &[store::EngineJob]| {
+        jobs.iter().filter(|job| job.action == JOB_INGEST_PEGIN_CONFIRM_NONCE).count()
+    };
+    assert_eq!(ingests(&t.jobs_of(id).await), 1);
+    // Another member and another message type still get their own.
+    t.submit(t.round_message("PeginConfirmNonce", "12D3KooWThirdPeer", id)).await;
+    t.submit(t.round_message("PeginConfirmNonceConsensus", OTHER_PEER, id)).await;
+    t.wait_job(id, JOB_INGEST_PEGIN_CONFIRM_VOTE, "Done").await;
+    wait_for(|| async { (ingests(&t.jobs_of(id).await) == 2).then_some(()) }).await;
+    t.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_message_for_an_unknown_instance_is_rejected_after_the_parked_ttl() {
+    let t = start(Actor::Committee, false, false).await;
+    let ttl = crate::aggregates::common::PARKED_MESSAGE_TTL_SECS;
+    let fresh = t.insert_unknown_instance_message(ttl - 3_600).await;
+    let stale = t.insert_unknown_instance_message(ttl + 60).await;
+    t.wait_inbox(&stale, |row| {
+        row.state == EngineInboxState::Failed.to_string()
+            && row.last_error.as_deref().is_some_and(|error| error.contains("giving up"))
+    })
+    .await;
+    t.wait_inbox(&fresh, |row| {
+        row.state == EngineInboxState::Pending.to_string()
+            && row.waiting_detail.as_deref() == Some("instance row not found")
+    })
+    .await;
     t.stop().await;
 }
 

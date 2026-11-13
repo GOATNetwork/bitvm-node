@@ -31,7 +31,7 @@ use client::btc_chain::BTCClient;
 use engine::{
     AggregateHandler, AggregateRef, ApplyContext, ApplyError, ApplyOutcome, EngineInboxEvent,
     EngineOutboxCloseTarget, EventSource, JOB_RESULT_KIND, JobPool, JobResultEvent,
-    JobResultOutcome, JobSpec, NewEvent, OutboxMessage, WaitingFor,
+    JobResultOutcome, JobSpec, NewEvent, OutboxMessage, WaitingFor, stable_job_id,
 };
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
@@ -997,10 +997,15 @@ impl InstanceAggregate {
             debug!(event = "instance_apply", instance_id = %instance_id, kind, status = %status, "PeginConfirm round is over; message ignored");
             return ApplyOutcome::Applied;
         }
-        ctx.effects.enqueue_job(
+        // One ingest job per member and message type: a member's round message
+        // is the same on every resend, so a second, different one is not taken
+        // and cannot add jobs that wait and retry beside the first.
+        let mut job =
             JobSpec::new(&ctx.aggregate, PHASE_CONFIRM, action, JobPool::Network, payload.to_vec())
-                .with_deadline(ctx.now + PARKED_MESSAGE_TTL_SECS),
-        );
+                .with_deadline(ctx.now + PARKED_MESSAGE_TTL_SECS);
+        job.job_id =
+            stable_job_id(&ctx.aggregate, PHASE_CONFIRM, action, inbound.author.as_bytes());
+        ctx.effects.enqueue_job(job);
         ApplyOutcome::Applied
     }
 
@@ -1204,6 +1209,15 @@ impl InstanceAggregate {
     }
 }
 
+/// How long a network message has waited for an instance this node does not
+/// know, once that exceeds the parked-message TTL. Such a message holds a slot
+/// of its sender's inbox quota; events this node made itself keep waiting.
+fn unknown_instance_wait_expired(event: &EngineInboxEvent, now: i64) -> Option<i64> {
+    let waited = now - event.created_at;
+    (event.source == EventSource::Network.as_str() && waited > PARKED_MESSAGE_TTL_SECS)
+        .then_some(waited)
+}
+
 fn decode<T: for<'de> Deserialize<'de>>(kind: &str, payload: &[u8]) -> Result<T, ApplyOutcome> {
     serde_json::from_slice(payload)
         .map_err(|error| ApplyOutcome::Rejected(format!("malformed {kind} payload: {error}")))
@@ -1220,6 +1234,11 @@ impl AggregateHandler for InstanceAggregate {
             ApplyError::invariant(anyhow!("instance aggregate id {}: {error}", ctx.aggregate.id))
         })?;
         let Some(instance) = ctx.storage.find_instance(&instance_id).await? else {
+            if let Some(waited) = unknown_instance_wait_expired(event, ctx.now) {
+                return Ok(ApplyOutcome::Rejected(format!(
+                    "waited {waited}s for instance {instance_id} to appear; giving up"
+                )));
+            }
             return Ok(ApplyOutcome::Waiting(WaitingFor::on(
                 &ctx.aggregate,
                 "instance row not found",
