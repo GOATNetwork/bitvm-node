@@ -74,7 +74,6 @@ jobs:
           BINS=(
             "target/release/bitvm-noded"
             "target/release/sequencer-set-publish"
-            "target/release/challenge"
             "target/release/send-rbf"
             "target/release/pegin-request"
             "target/release/pegout"
@@ -94,13 +93,17 @@ jobs:
           STAGING_DIR="release-staging"
           mkdir -p "$STAGING_DIR"
 
+          # `challenge` needs the rpc-debug-endpoints feature, which release
+          # builds leave out, so it is not listed. A listed binary must exist.
           for bin in "${BINS[@]}"; do
-            if [ -f "$bin" ]; then
-              BASENAME=$(basename "$bin")
-              cp "$bin" "$STAGING_DIR/"
-              chmod +x "$STAGING_DIR/$BASENAME"
-              echo "✓ $BASENAME"
+            if [ ! -f "$bin" ]; then
+              echo "missing release binary: $bin" >&2
+              exit 1
             fi
+            BASENAME=$(basename "$bin")
+            cp "$bin" "$STAGING_DIR/"
+            chmod +x "$STAGING_DIR/$BASENAME"
+            echo "✓ $BASENAME"
           done
 
           ARCHIVE_NAME="bitvm-node-${VERSION}-${PLATFORM}.tar.gz"
