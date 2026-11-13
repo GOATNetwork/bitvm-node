@@ -732,6 +732,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn node_reward_is_added_once() {
+        let (db, _dir) = db().await;
+        let mut storage = db.acquire().await.unwrap();
+        let node = store::Node {
+            peer_id: "operator".into(),
+            goat_addr: "0xabc".into(),
+            ..Default::default()
+        };
+        storage.upsert_node(&node).await.unwrap();
+        for _ in 0..2 {
+            add_node_reward(&mut storage, "0xabc", U256::from(5)).await.unwrap();
+        }
+        let nodes = storage.find_nodes(&NodeQuery::default()).await.unwrap().0;
+        // Adding the increment in SQL as well would give 0 + 5, then 5 + 10.
+        assert_eq!(nodes[0].reward, "10");
+    }
+
+    #[tokio::test]
     async fn a_posted_graph_unknown_locally_is_pulled_by_the_watching_roles() {
         let (db, _dir) = db().await;
         for (actor, pulled) in [
