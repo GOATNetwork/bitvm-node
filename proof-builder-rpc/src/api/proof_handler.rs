@@ -5,7 +5,8 @@ use crate::api::response::{ApiErrorExt, ApiResult, ok_response};
 use crate::api::routes;
 use crate::api::validation::InputValidator;
 use crate::task::{
-    add_operator_task, add_watchtower_task, find_operator_task, find_watchtower_task,
+    OperatorTaskInput, add_operator_task, add_watchtower_task, find_operator_task,
+    find_watchtower_task, restart_failed_operator_task, restart_failed_watchtower_task,
     update_operator_task_state, update_watchtower_task_state, watchtower_task_key,
 };
 use axum::Json;
@@ -15,12 +16,39 @@ use proof_builder::api_auth::ProofBuilderAuthRole;
 use proof_builder::{
     ChainProofDescRequest, OperatorProofDescRequest, OperatorProofRequest, OperatorProofResponse,
     OperatorProofTimeoutUpdateRequest, OperatorProofTimeoutUpdateResponse, ProofData, ProofDesc,
-    ProofDescResponse, ProofType, WatchtowerProofRequest, WatchtowerProofResponse,
+    ProofDescResponse, ProofTaskState, ProofType, WatchtowerProofRequest, WatchtowerProofResponse,
     WatchtowerProofTimeoutUpdateRequest, WatchtowerProofTimeoutUpdateResponse,
 };
 use std::sync::Arc;
 use store::ProofState;
 use tracing::info;
+
+/// The API result label of a task in `proof_state`.
+fn state_result(proof_state: i64) -> &'static str {
+    match ProofState::from_i64(proof_state) {
+        Some(ProofState::Proven) => "ready",
+        Some(ProofState::Failed) => "failed",
+        Some(ProofState::Cancelled) => "cancelled",
+        _ => "pending",
+    }
+}
+
+/// The submission state of an unfinished task in `proof_state`.
+fn task_state(proof_state: i64) -> ProofTaskState {
+    match ProofState::from_i64(proof_state) {
+        Some(ProofState::Failed) => ProofTaskState::Failed,
+        Some(ProofState::Cancelled) => ProofTaskState::Cancelled,
+        _ => ProofTaskState::Pending,
+    }
+}
+
+/// Why a failed task is not restarted.
+fn failure_reason(invalid_reason: Option<String>, reset_count: i64) -> String {
+    match invalid_reason {
+        Some(reason) => format!("the task inputs can never be proven: {reason}"),
+        None => format!("the proof failed again after {reset_count} restarts"),
+    }
+}
 
 /// Marks validation failures as invalid API results while preserving the original result.
 fn record_invalid<T, E>(api_result: &mut ApiResultGuard, result: Result<T, E>) -> Result<T, E> {
@@ -83,13 +111,7 @@ pub(super) async fn get_chain_proof_task_desc(
                 .api_error("GET_CHAIN_PROOF_ERROR")?
                 .map(|v| v.block_start);
 
-            api_result.set(if proof.proof_state == ProofState::Proven.to_i64() {
-                "ready"
-            } else if proof.proof_state == ProofState::Failed.to_i64() {
-                "failed"
-            } else {
-                "pending"
-            });
+            api_result.set(state_result(proof.proof_state));
             ok_response(ProofDescResponse {
                 proof_desc: Some(ProofDesc {
                     block_start: proof.block_start,
@@ -142,13 +164,7 @@ pub(super) async fn get_operator_proof_task_desc(
         .api_error("POST_OPERATOR_PROOF_TASK_ERROR")?;
     match operator_proof {
         Some(operator_proof) => {
-            api_result.set(if operator_proof.proof_state == ProofState::Proven.to_i64() {
-                "ready"
-            } else if operator_proof.proof_state == ProofState::Failed.to_i64() {
-                "failed"
-            } else {
-                "pending"
-            });
+            api_result.set(state_result(operator_proof.proof_state));
             info!("Get Operator Proof:{operator_proof:?}");
             ok_response(ProofDescResponse {
                 proof_desc: Some(ProofDesc {
@@ -230,6 +246,7 @@ pub(super) async fn post_operator_proof_task(
         {
             api_result.set("ready");
             ok_response(OperatorProofResponse {
+                state: ProofTaskState::Proven,
                 proof_data: Some(ProofData::load_proof_data(
                     &operator_proof.path_to_proof.unwrap(),
                     ProofType::Operator,
@@ -237,13 +254,41 @@ pub(super) async fn post_operator_proof_task(
                 error: None,
             })
         }
-        Some(operator_proof) => {
-            api_result.set(if operator_proof.proof_state == ProofState::Failed.to_i64() {
-                "failed"
-            } else {
-                "pending"
-            });
+        Some(operator_proof) if operator_proof.proof_state == ProofState::Failed.to_i64() => {
+            record_invalid(
+                &mut api_result,
+                InputValidator::validate_operator_task(&payload, &graph_data),
+            )?;
+            let restarted = restart_failed_operator_task(
+                &api_state.local_db,
+                &operator_proof,
+                &OperatorTaskInput::from_request(&payload),
+            )
+            .await
+            .api_error("POST_OPERATOR_PROOF_TASK_ERROR")?;
+            if restarted {
+                info!(%instance_id, %graph_id, "restarting the failed operator task");
+                api_result.set("restarted");
+                return ok_response(OperatorProofResponse {
+                    state: ProofTaskState::Pending,
+                    proof_data: None,
+                    error: Some("The failed task was restarted".to_string()),
+                });
+            }
+            api_result.set("failed");
             ok_response(OperatorProofResponse {
+                state: ProofTaskState::Failed,
+                proof_data: None,
+                error: Some(failure_reason(
+                    operator_proof.invalid_reason,
+                    operator_proof.reset_count,
+                )),
+            })
+        }
+        Some(operator_proof) => {
+            api_result.set(state_result(operator_proof.proof_state));
+            ok_response(OperatorProofResponse {
+                state: task_state(operator_proof.proof_state),
                 proof_data: None,
                 error: Some(format!(
                     "The proof is not ready, state {}, path:{:?}",
@@ -261,17 +306,13 @@ pub(super) async fn post_operator_proof_task(
                 &api_state.local_db,
                 instance_id,
                 graph_id,
-                payload.operator_committed_blockhash,
-                payload.execution_layer_block_number,
-                payload.watchtower_challenge_txids.clone(),
-                payload.included_watchtowers.clone(),
-                payload.watchtower_challenge_init_txid.clone(),
-                payload.watchtower_challenge_pubkeys.clone(),
+                &OperatorTaskInput::from_request(&payload),
             )
             .await
             .api_error("POST_OPERATOR_PROOF_TASK_ERROR")?;
             api_result.set("created");
             ok_response(OperatorProofResponse {
+                state: ProofTaskState::Pending,
                 proof_data: None,
                 error: Some("No proof found".to_string()),
             })
@@ -322,7 +363,7 @@ pub(super) async fn update_operator_proof_task_timeout(
         instance_id,
         graph_id,
         ProofState::New,
-        ProofState::Failed,
+        ProofState::Cancelled,
     )
     .await
     {
@@ -404,6 +445,7 @@ pub(super) async fn post_watchtower_proof_task(
         {
             api_result.set("ready");
             ok_response(WatchtowerProofResponse {
+                state: ProofTaskState::Proven,
                 proof_data: Some(ProofData::load_proof_data(
                     &watchtower_proof.path_to_proof.unwrap(),
                     ProofType::Watchtower,
@@ -411,16 +453,41 @@ pub(super) async fn post_watchtower_proof_task(
                 error: None,
             })
         }
-        Some(watchtower_proof) => {
-            api_result.set(if watchtower_proof.proof_state == ProofState::Failed.to_i64() {
-                "failed"
-            } else {
-                "pending"
-            });
+        Some(watchtower_proof) if watchtower_proof.proof_state == ProofState::Failed.to_i64() => {
+            let restarted = restart_failed_watchtower_task(
+                &api_state.local_db,
+                &watchtower_proof,
+                &challenge_init_txid,
+                payload.execution_layer_block_number,
+            )
+            .await
+            .api_error("POST_WATCHTOWER_PROOF_TASK_ERROR")?;
+            if restarted {
+                info!(%instance_id, %graph_id, "restarting the failed watchtower task");
+                api_result.set("restarted");
+                return ok_response(WatchtowerProofResponse {
+                    state: ProofTaskState::Pending,
+                    proof_data: None,
+                    error: Some("The failed task was restarted".to_string()),
+                });
+            }
+            api_result.set("failed");
             ok_response(WatchtowerProofResponse {
+                state: ProofTaskState::Failed,
+                proof_data: None,
+                error: Some(failure_reason(
+                    watchtower_proof.invalid_reason,
+                    watchtower_proof.reset_count,
+                )),
+            })
+        }
+        Some(watchtower_proof) => {
+            api_result.set(state_result(watchtower_proof.proof_state));
+            ok_response(WatchtowerProofResponse {
+                state: task_state(watchtower_proof.proof_state),
                 proof_data: None,
                 error: Some(format!(
-                    "No proof is not ready, state {}, path:{:?}",
+                    "The proof is not ready, state {}, path:{:?}",
                     watchtower_proof.proof_state, watchtower_proof.path_to_proof
                 )),
             })
@@ -443,6 +510,7 @@ pub(super) async fn post_watchtower_proof_task(
             }
             api_result.set("created");
             ok_response(WatchtowerProofResponse {
+                state: ProofTaskState::Pending,
                 proof_data: None,
                 error: Some("No proof found".to_string()),
             })
@@ -494,7 +562,7 @@ pub(super) async fn update_watchtower_proof_task_timeout(
         graph_id,
         &watchtower_task_key(&request.signer),
         ProofState::New,
-        ProofState::Failed,
+        ProofState::Cancelled,
     )
     .await
     {

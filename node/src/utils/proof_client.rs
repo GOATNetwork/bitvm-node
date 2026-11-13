@@ -32,7 +32,7 @@ use bitcoin_light_client_circuit::hash_operator_constant;
 use client::http_client::async_client::HttpAsyncClient;
 use proof_builder::api_auth::{ProofBuilderAuthRole, sign_proof_builder_request};
 use proof_builder::{
-    OperatorProofRequest, OperatorProofResponse, ProofData, WatchtowerProofRequest,
+    OperatorProofRequest, OperatorProofResponse, ProofData, ProofTaskState, WatchtowerProofRequest,
     WatchtowerProofResponse, WatchtowerProofTimeoutUpdateRequest,
     WatchtowerProofTimeoutUpdateResponse,
 };
@@ -73,6 +73,40 @@ pub struct OperatorStatement {
     pub constant: [u8; 32],
 }
 
+/// What the proof builder said about a requested proof.
+pub enum ProofPoll<T> {
+    Ready(T),
+    /// Not ready yet; ask again after this many seconds.
+    NotReady(usize),
+    /// The proof builder will not produce the proof: the task failed for good or the
+    /// request was refused as invalid. Submitting again does not help.
+    Failed(String),
+    /// The task is no longer wanted on the proof builder.
+    Cancelled,
+}
+
+/// The reason of a request the proof builder refused as invalid (HTTP 400); the same
+/// request is refused again, so it is not retried.
+fn refused_request(error: &anyhow::Error) -> Option<String> {
+    match error.downcast_ref::<esplora_client::Error>() {
+        Some(esplora_client::Error::HttpResponse { status: 400, message }) => {
+            Some(format!("the proof builder refused the request: {message}"))
+        }
+        _ => None,
+    }
+}
+
+/// The poll result of a task that has no proof yet.
+fn unfinished<T>(state: ProofTaskState, error: Option<String>, wait_secs: usize) -> ProofPoll<T> {
+    match state {
+        ProofTaskState::Failed => {
+            ProofPoll::Failed(error.unwrap_or_else(|| "the proof task failed".to_string()))
+        }
+        ProofTaskState::Cancelled => ProofPoll::Cancelled,
+        ProofTaskState::Pending | ProofTaskState::Proven => ProofPoll::NotReady(wait_secs),
+    }
+}
+
 fn gen_watchtower_commitment(graph_id: Uuid, proof_data: ProofData) -> Result<Vec<u8>> {
     let graph_id = graph_id.as_bytes();
     let proof =
@@ -111,16 +145,15 @@ fn proof_builder_auth_headers<B: Serialize>(
     Ok(sign_proof_builder_request(keypair, role, "POST", path, body)?.to_header_pairs())
 }
 
-/// Returns:
-/// - `Ok(Some(WatchtowerCommitment), _)` if watchtower proof is available
-/// - `Ok(None, wait_secs)` if watchtower proof is not yet available, with suggested wait time
+/// Requests this watchtower's proof for the graph and returns its commitment once the
+/// proof is available.
 pub async fn get_watchtower_commitment(
     local_db: &LocalDB,
     btc_client: &BTCClient,
     http_client: &HttpAsyncClient,
     instance_id: Uuid,
     graph_id: Uuid,
-) -> Result<(Option<Vec<u8>>, usize)> {
+) -> Result<ProofPoll<Vec<u8>>> {
     let mut storage_processor = local_db.acquire().await?;
     if let Some(graph) = storage_processor.find_graph(&graph_id).await?
         && let Some(challenge_init_txid) = graph.watchtower_challenge_init_txid
@@ -129,7 +162,7 @@ pub async fn get_watchtower_commitment(
         let tx_status = btc_client.get_tx_status(&challenge_init_txid.0).await?;
         if !tx_status.confirmed {
             warn!("graph {graph_id} challenge tx is not confirmed");
-            return Ok((None, get_watchtower_proof_wait_secs()));
+            return Ok(ProofPoll::NotReady(get_watchtower_proof_wait_secs()));
         }
 
         let base_url = Url::parse(
@@ -147,7 +180,7 @@ pub async fn get_watchtower_commitment(
             execution_layer_block_number: graph.proceed_withdraw_height, // NOTE: this number may be zero
         };
         let auth_keypair = get_bitvm_key()?;
-        let response = http_client
+        let response = match http_client
             .post_response_json_with_dynamic_headers::<WatchtowerProofResponse, _, _>(
                 url.as_str(),
                 &payload,
@@ -164,13 +197,17 @@ pub async fn get_watchtower_commitment(
             .inspect(|_| crate::metrics_service::record_backend_ok("proof"))
             .inspect_err(|error| {
                 crate::metrics_service::record_backend_failure("proof", "watchtower_proofs", error)
-            })?;
+            }) {
+            Ok(response) => response,
+            Err(error) => return refused_request(&error).map(ProofPoll::Failed).ok_or(error),
+        };
         match response.proof_data {
             Some(proof_data) => {
-                let watchtower_commitment = gen_watchtower_commitment(graph_id, proof_data)?;
-                Ok((Some(watchtower_commitment), 0))
+                Ok(ProofPoll::Ready(gen_watchtower_commitment(graph_id, proof_data)?))
             }
-            None => Ok((None, get_watchtower_proof_wait_secs())),
+            None => {
+                Ok(unfinished(response.state, response.error, get_watchtower_proof_wait_secs()))
+            }
         }
     } else {
         warn!("graph:{graph_id} not found or related txn is none",);
@@ -404,9 +441,8 @@ pub fn derive_operator_statement(
     Ok(OperatorStatement { static_input, vk_hash, zkm_version, constant })
 }
 
-/// Returns:
-/// - `Ok(Some(OperatorProof), _)` if operator proof is available and valid
-/// - `Ok(None, wait_secs)` if operator proof is not yet available
+/// Requests the operator proof for the graph and returns it once it is available and
+/// checked against the graph.
 pub async fn get_operator_proof(
     local_db: &LocalDB,
     http_client: &HttpAsyncClient,
@@ -414,7 +450,7 @@ pub async fn get_operator_proof(
     btc_client: &BTCClient,
     instance_id: Uuid,
     graph_id: Uuid,
-) -> Result<(Option<ValidatedOperatorProof>, usize)> {
+) -> Result<ProofPoll<ValidatedOperatorProof>> {
     let mut storage_processor = local_db.acquire().await?;
     let Some(graph) = storage_processor.find_graph(&graph_id).await? else {
         warn!("graph:{graph_id} not found");
@@ -424,7 +460,7 @@ pub async fn get_operator_proof(
 
     if graph.proceed_withdraw_height <= 0 {
         warn!("graph {graph_id} proceed_withdraw_height <= 0, waiting to been updated");
-        return Ok((None, get_operator_proof_wait_secs()));
+        return Ok(ProofPoll::NotReady(get_operator_proof_wait_secs()));
     }
 
     let watchtower_challenge_init_txid = graph
@@ -448,7 +484,7 @@ pub async fn get_operator_proof(
         Ok(info) => info,
         Err(e) => {
             warn!("Failed to get watchtower challenge info: {e}");
-            return Ok((None, get_operator_proof_wait_secs()));
+            return Ok(ProofPoll::NotReady(get_operator_proof_wait_secs()));
         }
     };
     let Some(operator_committed_blockhash) = get_operator_committed_blockhash(
@@ -459,7 +495,7 @@ pub async fn get_operator_proof(
     )
     .await?
     else {
-        return Ok((None, get_operator_proof_wait_secs()));
+        return Ok(ProofPoll::NotReady(get_operator_proof_wait_secs()));
     };
 
     let base_url = Url::parse(
@@ -484,7 +520,7 @@ pub async fn get_operator_proof(
             .collect(),
     };
     let auth_keypair = get_bitvm_key()?;
-    let operator_response = http_client
+    let operator_response = match http_client
         .post_response_json_with_dynamic_headers::<OperatorProofResponse, _, _>(
             operator_url.as_str(),
             &payload,
@@ -501,13 +537,20 @@ pub async fn get_operator_proof(
         .inspect(|_| crate::metrics_service::record_backend_ok("proof"))
         .inspect_err(|error| {
             crate::metrics_service::record_backend_failure("proof", "operator_proofs", error)
-        })?;
+        }) {
+        Ok(response) => response,
+        Err(error) => return refused_request(&error).map(ProofPoll::Failed).ok_or(error),
+    };
 
     let Some(proof_data) = operator_response.proof_data else {
-        if let Some(error) = operator_response.error {
+        if let Some(error) = &operator_response.error {
             info!("operator proof is not ready for graph_id:{graph_id}: {error}");
         }
-        return Ok((None, get_operator_proof_wait_secs()));
+        return Ok(unfinished(
+            operator_response.state,
+            operator_response.error,
+            get_operator_proof_wait_secs(),
+        ));
     };
 
     let statement = derive_operator_statement(
@@ -543,17 +586,14 @@ pub async fn get_operator_proof(
         bail!("operator proof static public inputs do not match graph setup statement");
     }
 
-    Ok((
-        Some(ValidatedOperatorProof {
-            proof: ark_proof.proof,
-            public_inputs: ark_proof.public_inputs.into(),
-            verifying_key: ark_proof.groth16_vk.into(),
-            public_values: proof.public_values.to_vec(),
-            vk_hash: proof_data.vk,
-            zkm_version: proof.zkm_version,
-        }),
-        0,
-    ))
+    Ok(ProofPoll::Ready(ValidatedOperatorProof {
+        proof: ark_proof.proof,
+        public_inputs: ark_proof.public_inputs.into(),
+        verifying_key: ark_proof.groth16_vk.into(),
+        public_values: proof.public_values.to_vec(),
+        vk_hash: proof_data.vk,
+        zkm_version: proof.zkm_version,
+    }))
 }
 
 /// Tell the proof builder that this watchtower's proof for the graph is no
@@ -822,5 +862,31 @@ mod commit_pubin_tests {
         // bits 0 and 2 set → byte 0 = 0b0000_0101
         assert_eq!(bitmap[0], 0b0000_0101u8);
         assert_eq!(&bitmap[1..], &[0u8; 31]);
+    }
+}
+
+#[cfg(test)]
+mod poll_tests {
+    use super::*;
+
+    #[test]
+    fn only_a_bad_request_and_a_failed_task_are_final() {
+        let refused = |status| {
+            refused_request(
+                &esplora_client::Error::HttpResponse { status, message: "bad".to_string() }.into(),
+            )
+        };
+        assert!(refused(400).is_some());
+        for status in [401, 403, 429, 500, 503] {
+            assert!(refused(status).is_none(), "{status} is retried");
+        }
+        assert!(refused_request(&anyhow!("connection reset")).is_none());
+
+        let poll = |state| unfinished::<()>(state, Some("why".to_string()), 7);
+        assert!(matches!(poll(ProofTaskState::Pending), ProofPoll::NotReady(7)));
+        assert!(
+            matches!(poll(ProofTaskState::Failed), ProofPoll::Failed(reason) if reason == "why")
+        );
+        assert!(matches!(poll(ProofTaskState::Cancelled), ProofPoll::Cancelled));
     }
 }

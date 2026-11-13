@@ -50,7 +50,7 @@ use goat::wots::{Wots, Wots96};
 use std::str::FromStr;
 use store::localdb::{GraphQuery, LocalDB};
 use store::{Graph, GraphStatus, InstanceBridgeInStatus, SerializableTxid};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 pub(super) async fn run_pegout_step(
@@ -1285,12 +1285,31 @@ async fn prover_assert(deps: &JobDeps, mut graph: BitvmGcGraph) -> Result<Step> 
     ) {
         return step;
     }
-    let (proof, wait_secs) =
-        get_operator_proof(&deps.local_db, &deps.http_client, &graph, btc, instance_id, graph_id)
-            .await?;
-    let Some(proof) = proof else {
-        // Not ready yet, never "never": the assert must follow once the proof exists.
-        return Step::retry("operator proof is not ready", (wait_secs as i64).max(1));
+    let proof = match get_operator_proof(
+        &deps.local_db,
+        &deps.http_client,
+        &graph,
+        btc,
+        instance_id,
+        graph_id,
+    )
+    .await?
+    {
+        ProofPoll::Ready(proof) => proof,
+        ProofPoll::NotReady(wait_secs) => {
+            // Not ready yet, never "never": the assert must follow once the proof exists.
+            return Step::retry("operator proof is not ready", (wait_secs as i64).max(1));
+        }
+        ProofPoll::Failed(reason) => {
+            error!(event = "graph_challenge", graph_id = %graph_id, %reason, "the proof builder cannot produce the operator proof; no assert");
+            alert("operator_proof_failed");
+            return Step::ignore(format!("operator proof failed: {reason}"));
+        }
+        ProofPoll::Cancelled => {
+            error!(event = "graph_challenge", graph_id = %graph_id, "the operator proof task was cancelled; no assert");
+            alert("operator_proof_failed");
+            return Step::ignore("operator proof task cancelled");
+        }
     };
     let (master, _) = local_operator()?;
     let assert_secret = master.assert_wots_keypair_for_graph(graph_id).0;
@@ -1647,13 +1666,20 @@ async fn watchtower_challenge(deps: &JobDeps, row: &Graph, graph: &BitvmGcGraph)
     )
     .await?
     {
-        (Some(proof), _) => proof,
-        (None, wait_secs) => {
+        ProofPoll::Ready(proof) => proof,
+        ProofPoll::NotReady(wait_secs) => {
             return Step::retry(
                 "watchtower proof commitment is not ready",
                 (wait_secs as i64).max(1),
             );
         }
+        ProofPoll::Failed(reason) => {
+            error!(event = "graph_challenge", graph_id = %row.graph_id, watchtower_index = index, %reason, "the proof builder cannot produce the watchtower proof; no challenge");
+            alert("watchtower_proof_failed");
+            return Step::ignore(format!("watchtower proof failed: {reason}"));
+        }
+        // This node's own timeout: the operator asserted, so the challenge is moot.
+        ProofPoll::Cancelled => return Step::ignore("watchtower proof task cancelled"),
     };
     match send_watchtower_challenge_tx(btc, graph, index, proof).await {
         Ok(txid) => {

@@ -25,12 +25,14 @@ use std::sync::Arc;
 use std::time::{Instant, UNIX_EPOCH};
 use uuid::Uuid;
 
+use bitcoin::hashes::{Hash, sha256};
 use futures::future::Either;
-use proof_builder::{OnDemandTask, ProofBuilder, ProofRequest};
+use proof_builder::{OnDemandTask, OperatorProofRequest, ProofBuilder, ProofRequest};
+use serde::Serialize;
 use store::localdb::LocalDB;
 use store::{
     LongRunningTaskProof, OnDemandProofCompletion, OnDemandProofTable, OperatorProof, ProofState,
-    WatchtowerProof,
+    SerializableTxid, WatchtowerProof,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -360,13 +362,7 @@ pub(crate) async fn fail_invalid_on_demand_task(
     reason: &str,
 ) -> anyhow::Result<()> {
     warn!(task_index, "{} task cannot be proven; marking it failed: {reason}", table.table_name());
-    let completion =
-        OnDemandProofCompletion { proof_state: ProofState::Failed.to_i64(), ..Default::default() };
-    local_db
-        .acquire()
-        .await?
-        .complete_on_demand_proof_if_new(table, task_index, &completion)
-        .await?;
+    local_db.acquire().await?.fail_invalid_on_demand_proof(table, task_index, reason).await?;
     Ok(())
 }
 
@@ -1020,7 +1016,7 @@ pub(crate) fn watchtower_task_key(public_key: &XOnlyPublicKey) -> String {
 
 /// table schema: (index, instance_id, graph_id, public_key, challenge_txid, challenge_init_txid, path_to_proof, cycles, state, update_time)
 /// * index: incremental id
-/// * state: 0-new, 1-doing, 2-done, 3-failed
+/// * state: 0-new, 1-doing, 2-done, 3-failed, 4-cancelled
 ///
 /// Invoked by API.
 ///
@@ -1063,6 +1059,43 @@ pub(crate) async fn add_watchtower_task(
     Ok(true)
 }
 
+/// Invoked by API.
+///
+/// Restarts a failed Watchtower task that its Watchtower submitted again, like
+/// [`restart_failed_operator_task`]. Returns whether the task was restarted.
+pub(crate) async fn restart_failed_watchtower_task(
+    local_db: &LocalDB,
+    task: &WatchtowerProof,
+    challenge_init_txid: &str,
+    execution_layer_block_number: i64,
+) -> anyhow::Result<bool> {
+    let challenge_init_txid: SerializableTxid = Txid::from_str(challenge_init_txid)?.into();
+    let same_inputs = task.challenge_init_txid.0 == challenge_init_txid.0
+        && task.execution_layer_block_number == execution_layer_block_number;
+    let mut storage_processor = local_db.start_transaction().await?;
+    let restarted = storage_processor
+        .reset_failed_on_demand_proof(
+            OnDemandProofTable::Watchtower,
+            task.id,
+            same_inputs.then_some(MAX_TASK_RESETS),
+        )
+        .await?;
+    if restarted == 0 {
+        return Ok(false);
+    }
+    if !same_inputs {
+        storage_processor
+            .update_watchtower_proof_inputs(
+                task.id,
+                &challenge_init_txid,
+                execution_layer_block_number,
+            )
+            .await?;
+    }
+    storage_processor.commit().await?;
+    Ok(true)
+}
+
 pub(crate) async fn find_watchtower_task(
     local_db: &LocalDB,
     instance_id: Uuid,
@@ -1095,30 +1128,151 @@ pub(crate) async fn update_watchtower_task_state(
         .await
 }
 
-/// table schema: (index, instance_id, graph_id, execution_layer_block_number, path_to_proof, cycles, state, update_time)
-/// * state: 0-new, 1-doing, 2-done, 3-failed
-/// * execution_layer_block_number: proceedWithdraw's block number
-/// * index: incremental id
-/// Invocated by API
+/// How often a task owner may restart a failed Operator or Watchtower task by submitting
+/// the same inputs again. New inputs start the count over.
+pub(crate) const MAX_TASK_RESETS: i64 = 2;
+
+/// The inputs of an Operator task, as the Operator submits them.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct OperatorTaskInput {
+    pub operator_committed_blockhash: String,
+    /// proceedWithdraw's block number.
+    pub execution_layer_block_number: i64,
+    pub watchtower_challenge_txids: Vec<Option<String>>,
+    pub included_watchtowers: Vec<bool>,
+    pub watchtower_challenge_init_txid: String,
+    pub watchtower_challenge_pubkeys: Vec<String>,
+}
+
+impl OperatorTaskInput {
+    pub(crate) fn from_request(request: &OperatorProofRequest) -> Self {
+        Self {
+            operator_committed_blockhash: request.operator_committed_blockhash.clone(),
+            execution_layer_block_number: request.execution_layer_block_number,
+            watchtower_challenge_txids: request.watchtower_challenge_txids.clone(),
+            included_watchtowers: request.included_watchtowers.clone(),
+            watchtower_challenge_init_txid: request.watchtower_challenge_init_txid.clone(),
+            watchtower_challenge_pubkeys: request.watchtower_challenge_pubkeys.clone(),
+        }
+    }
+
+    fn hash(&self) -> anyhow::Result<String> {
+        Ok(sha256::Hash::hash(&serde_json::to_vec(self)?).to_string())
+    }
+}
+
+/// Invoked by API.
+///
+/// Adds the Operator task of a graph and fixes the graph's Watchtower slots.
 #[tracing::instrument(level = "info", skip(local_db))]
 pub(crate) async fn add_operator_task(
     local_db: &LocalDB,
     instance_id: Uuid,
     graph_id: Uuid,
-    operator_committed_blockhash: String,
-    execution_layer_block_number: i64,
-    watchtower_challenge_txids: Vec<Option<String>>,
-    included_watchtowers: Vec<bool>,
-    watchtower_challenge_init_txid: String,
-    watchtower_challenge_pubkeys: Vec<String>,
+    input: &OperatorTaskInput,
 ) -> anyhow::Result<u64> {
     let graph_watchtower_xonly_keys = validate_indexed_watchtower_challenges(
-        &watchtower_challenge_txids,
-        &included_watchtowers,
-        &watchtower_challenge_pubkeys,
+        &input.watchtower_challenge_txids,
+        &input.included_watchtowers,
+        &input.watchtower_challenge_pubkeys,
     )?;
+    let input_hash = input.hash()?;
     let mut storage_processor = local_db.start_transaction().await?;
+    sync_watchtower_slots(
+        &mut storage_processor,
+        instance_id,
+        graph_id,
+        &graph_watchtower_xonly_keys,
+        input,
+    )
+    .await?;
+    let affected_rows = storage_processor
+        .create_operator_proof(&OperatorProof {
+            id: 1,
+            instance_id,
+            graph_id,
+            execution_layer_block_number: input.execution_layer_block_number,
+            proof_state: ProofState::New.to_i64(),
+            created_at: current_time_secs(),
+            updated_at: current_time_secs(),
+            cycles: 0,
+            operator_committed_blockhash: input.operator_committed_blockhash.clone(),
+            ..Default::default()
+        })
+        .await?;
+    storage_processor
+        .update_operator_proof_inputs(
+            &instance_id,
+            &graph_id,
+            &input.operator_committed_blockhash,
+            input.execution_layer_block_number,
+            &input_hash,
+        )
+        .await?;
+    storage_processor.commit().await?;
+    Ok(affected_rows)
+}
 
+/// Invoked by API.
+///
+/// Restarts a failed Operator task that the Operator submitted again. New inputs replace
+/// the stored ones. The same inputs restart it at most [`MAX_TASK_RESETS`] times, and
+/// never when they can never be proven. Returns whether the task was restarted.
+pub(crate) async fn restart_failed_operator_task(
+    local_db: &LocalDB,
+    task: &OperatorProof,
+    input: &OperatorTaskInput,
+) -> anyhow::Result<bool> {
+    let graph_watchtower_xonly_keys = validate_indexed_watchtower_challenges(
+        &input.watchtower_challenge_txids,
+        &input.included_watchtowers,
+        &input.watchtower_challenge_pubkeys,
+    )?;
+    let input_hash = input.hash()?;
+    let same_inputs = task.input_hash.as_deref() == Some(input_hash.as_str());
+    let mut storage_processor = local_db.start_transaction().await?;
+    let restarted = storage_processor
+        .reset_failed_on_demand_proof(
+            OnDemandProofTable::Operator,
+            task.id,
+            same_inputs.then_some(MAX_TASK_RESETS),
+        )
+        .await?;
+    if restarted == 0 {
+        return Ok(false);
+    }
+    if !same_inputs {
+        sync_watchtower_slots(
+            &mut storage_processor,
+            task.instance_id,
+            task.graph_id,
+            &graph_watchtower_xonly_keys,
+            input,
+        )
+        .await?;
+        storage_processor
+            .update_operator_proof_inputs(
+                &task.instance_id,
+                &task.graph_id,
+                &input.operator_committed_blockhash,
+                input.execution_layer_block_number,
+                &input_hash,
+            )
+            .await?;
+    }
+    storage_processor.commit().await?;
+    Ok(true)
+}
+
+/// Gives each of the graph's Watchtowers one task row at its slot. A Watchtower that has
+/// not asked for a proof gets a `Cancelled` row: its challenge window is over.
+async fn sync_watchtower_slots(
+    storage_processor: &mut store::localdb::StorageProcessor<'_>,
+    instance_id: Uuid,
+    graph_id: Uuid,
+    graph_watchtower_xonly_keys: &[[u8; 32]],
+    input: &OperatorTaskInput,
+) -> anyhow::Result<()> {
     let existing_watchtower_proof_task = storage_processor
         .find_watchtower_proof_by_instance_and_graph(&instance_id, &graph_id)
         .await?;
@@ -1154,69 +1308,52 @@ pub(crate) async fn add_operator_task(
         .filter(|node_index| !existing_watchtower_indices.contains(node_index))
         .collect();
     tracing::info!("missing_watchtower_indices: {:?}", missing_watchtower_indices);
-    // insert timeout watchtower proof task with failed state.
+    let init_txid = &input.watchtower_challenge_init_txid;
     for node_index in missing_watchtower_indices {
-        let stored_txid = watchtower_challenge_txids[node_index]
-            .as_deref()
-            .unwrap_or(&watchtower_challenge_init_txid);
+        let stored_txid =
+            input.watchtower_challenge_txids[node_index].as_deref().unwrap_or(init_txid);
         let task = WatchtowerProof {
             id: 1,
             instance_id,
             graph_id,
-            challenge_init_txid: Txid::from_str(&watchtower_challenge_init_txid)?.into(),
+            challenge_init_txid: Txid::from_str(init_txid)?.into(),
             challenge_txid: Txid::from_str(stored_txid)?.into(),
-            proof_state: ProofState::Failed.to_i64(),
+            proof_state: ProofState::Cancelled.to_i64(),
             created_at: current_time_secs(),
             updated_at: current_time_secs(),
-            execution_layer_block_number,
+            execution_layer_block_number: input.execution_layer_block_number,
             // The Graph key identifies the missing Watchtower slot.
             public_key: watchtower_task_key(&XOnlyPublicKey::from_slice(
                 &graph_watchtower_xonly_keys[node_index],
             )?),
             node_index: node_index as i32,
-            included: included_watchtowers[node_index],
+            included: input.included_watchtowers[node_index],
             ..Default::default()
         };
         let affected = storage_processor.create_watchtower_proof(&task).await?;
         tracing::info!(
-            "mark timeout watchtower proof as failed, node_index: {node_index}, affected rows: {affected}",
+            "cancelled the watchtower slot that asked for no proof, node_index: {node_index}, affected rows: {affected}",
         );
     }
 
     // update watchtower's challenge txid.
-    for (i, txid) in watchtower_challenge_txids.iter().enumerate() {
-        let stored_txid = txid.as_deref().unwrap_or(&watchtower_challenge_init_txid);
+    for (i, txid) in input.watchtower_challenge_txids.iter().enumerate() {
+        let stored_txid = txid.as_deref().unwrap_or(init_txid);
         let affected = storage_processor
             .update_watchtower_proof_challenge_txid(
                 &instance_id,
                 &graph_id,
                 i as i32,
                 stored_txid,
-                included_watchtowers[i],
+                input.included_watchtowers[i],
             )
             .await?;
         tracing::info!("update watchtower proof, node_index: {i} affected rows: {affected}",);
     }
-
-    let affected_rows = storage_processor
-        .create_operator_proof(&OperatorProof {
-            id: 1,
-            instance_id,
-            graph_id,
-            execution_layer_block_number,
-            proof_state: ProofState::New.to_i64(),
-            created_at: current_time_secs(),
-            updated_at: current_time_secs(),
-            cycles: 0,
-            operator_committed_blockhash,
-            ..Default::default()
-        })
-        .await?;
-    storage_processor.commit().await?;
-    Ok(affected_rows)
+    Ok(())
 }
 
-fn validate_indexed_watchtower_challenges(
+pub(crate) fn validate_indexed_watchtower_challenges(
     challenge_txids: &[Option<String>],
     included_watchtowers: &[bool],
     challenge_pubkeys: &[String],
@@ -1424,19 +1561,15 @@ mod tests {
         ];
 
         let included_watchtowers = vec![true, false];
-        add_operator_task(
-            &local_db,
-            instance_id,
-            graph_id,
+        let input = OperatorTaskInput {
             operator_committed_blockhash,
-            number,
+            execution_layer_block_number: number,
             watchtower_challenge_txids,
             included_watchtowers,
             watchtower_challenge_init_txid,
             watchtower_challenge_pubkeys,
-        )
-        .await
-        .unwrap();
+        };
+        add_operator_task(&local_db, instance_id, graph_id, &input).await.unwrap();
 
         //use crate::task::read_watchtower_challenge_details;
         //let is_watchtower = false;
@@ -1565,19 +1698,15 @@ mod watchtower_slot_tests {
 
         // The Operator lists the member as compressed with odd parity.
         let member_odd = format!("03{member}");
-        add_operator_task(
-            &local_db,
-            Uuid::nil(),
-            graph_id,
-            "11".repeat(32),
-            1,
-            vec![None],
-            vec![false],
-            "22".repeat(32),
-            vec![member_odd],
-        )
-        .await
-        .unwrap();
+        let input = OperatorTaskInput {
+            operator_committed_blockhash: "11".repeat(32),
+            execution_layer_block_number: 1,
+            watchtower_challenge_txids: vec![None],
+            included_watchtowers: vec![false],
+            watchtower_challenge_init_txid: "22".repeat(32),
+            watchtower_challenge_pubkeys: vec![member_odd],
+        };
+        add_operator_task(&local_db, Uuid::nil(), graph_id, &input).await.unwrap();
 
         let rows = local_db
             .acquire()
@@ -1591,5 +1720,166 @@ mod watchtower_slot_tests {
         assert_eq!(rows[0].node_index, 0);
         // The list is fixed now; a key outside it cannot add a task.
         assert!(!add(&local_db, graph_id, &outsider).await.unwrap());
+    }
+}
+
+#[cfg(test)]
+mod restart_tests {
+    use super::*;
+    use secp256k1::{Keypair, SECP256K1};
+    use store::create_local_db;
+
+    fn input(committed_blockhash: &str) -> OperatorTaskInput {
+        let key = Keypair::from_seckey_slice(SECP256K1, &[1; 32]).unwrap().x_only_public_key().0;
+        OperatorTaskInput {
+            operator_committed_blockhash: committed_blockhash.to_string(),
+            execution_layer_block_number: 1,
+            watchtower_challenge_txids: vec![None],
+            included_watchtowers: vec![false],
+            watchtower_challenge_init_txid: "22".repeat(32),
+            watchtower_challenge_pubkeys: vec![watchtower_task_key(&key)],
+        }
+    }
+
+    async fn task(local_db: &LocalDB, graph_id: Uuid) -> OperatorProof {
+        find_operator_task(local_db, Uuid::nil(), graph_id).await.unwrap().unwrap()
+    }
+
+    async fn fail(local_db: &LocalDB, id: i64) {
+        let completion = OnDemandProofCompletion {
+            proof_state: ProofState::Failed.to_i64(),
+            ..Default::default()
+        };
+        let mut storage = local_db.acquire().await.unwrap();
+        assert_eq!(
+            storage
+                .complete_on_demand_proof_if_new(OnDemandProofTable::Operator, id, &completion)
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_operator_task_restarts_twice_on_the_same_inputs_and_again_on_new_ones() {
+        let local_db = create_local_db("sqlite::memory:").await;
+        let graph_id = Uuid::new_v4();
+        let first = input(&"11".repeat(32));
+        add_operator_task(&local_db, Uuid::nil(), graph_id, &first).await.unwrap();
+        // The Watchtower never asked for a proof: its slot is cancelled, not failed.
+        let slots = local_db
+            .acquire()
+            .await
+            .unwrap()
+            .find_watchtower_proof_by_instance_and_graph(&Uuid::nil(), &graph_id)
+            .await
+            .unwrap();
+        assert_eq!(slots.len(), 1);
+        assert_eq!(slots[0].proof_state, ProofState::Cancelled.to_i64());
+        // One task per graph.
+        assert!(add_operator_task(&local_db, Uuid::nil(), graph_id, &first).await.is_err());
+
+        // A task that is not failed is not restarted.
+        let id = task(&local_db, graph_id).await.id;
+        assert!(
+            !restart_failed_operator_task(&local_db, &task(&local_db, graph_id).await, &first)
+                .await
+                .unwrap()
+        );
+
+        for restarts in 1..=MAX_TASK_RESETS {
+            fail(&local_db, id).await;
+            let failed = task(&local_db, graph_id).await;
+            assert!(restart_failed_operator_task(&local_db, &failed, &first).await.unwrap());
+            let restarted = task(&local_db, graph_id).await;
+            assert_eq!(restarted.proof_state, ProofState::New.to_i64());
+            assert_eq!(restarted.reset_count, restarts);
+        }
+        fail(&local_db, id).await;
+        let failed = task(&local_db, graph_id).await;
+        assert!(!restart_failed_operator_task(&local_db, &failed, &first).await.unwrap());
+        assert_eq!(task(&local_db, graph_id).await.proof_state, ProofState::Failed.to_i64());
+
+        // New inputs replace the old ones and start the count over.
+        let second = input(&"33".repeat(32));
+        assert!(restart_failed_operator_task(&local_db, &failed, &second).await.unwrap());
+        let replaced = task(&local_db, graph_id).await;
+        assert_eq!(replaced.id, id);
+        assert_eq!(replaced.proof_state, ProofState::New.to_i64());
+        assert_eq!(replaced.reset_count, 0);
+        assert_eq!(replaced.operator_committed_blockhash, "33".repeat(32));
+    }
+
+    #[tokio::test]
+    async fn a_task_with_inputs_that_can_never_be_proven_is_not_restarted() {
+        let local_db = create_local_db("sqlite::memory:").await;
+        let graph_id = Uuid::new_v4();
+        let first = input(&"11".repeat(32));
+        add_operator_task(&local_db, Uuid::nil(), graph_id, &first).await.unwrap();
+        let id = task(&local_db, graph_id).await.id;
+        fail_invalid_on_demand_task(&local_db, OnDemandProofTable::Operator, id, "bad block")
+            .await
+            .unwrap();
+        let failed = task(&local_db, graph_id).await;
+        assert_eq!(failed.invalid_reason.as_deref(), Some("bad block"));
+        assert!(!restart_failed_operator_task(&local_db, &failed, &first).await.unwrap());
+        // New inputs may be provable.
+        assert!(
+            restart_failed_operator_task(&local_db, &failed, &input(&"33".repeat(32)))
+                .await
+                .unwrap()
+        );
+        assert_eq!(task(&local_db, graph_id).await.invalid_reason, None);
+    }
+
+    #[tokio::test]
+    async fn a_failed_watchtower_task_restarts_like_an_operator_task() {
+        let local_db = create_local_db("sqlite::memory:").await;
+        let graph_id = Uuid::new_v4();
+        let key = watchtower_task_key(
+            &Keypair::from_seckey_slice(SECP256K1, &[1; 32]).unwrap().x_only_public_key().0,
+        );
+        let init_txid = "22".repeat(32);
+        add_watchtower_task(&local_db, Uuid::nil(), graph_id, key.clone(), init_txid.clone(), 5)
+            .await
+            .unwrap();
+        let load = || async {
+            find_watchtower_task(&local_db, Uuid::nil(), graph_id, &key).await.unwrap().unwrap()
+        };
+        let id = load().await.id;
+        let completion = OnDemandProofCompletion {
+            proof_state: ProofState::Failed.to_i64(),
+            ..Default::default()
+        };
+        for _ in 0..MAX_TASK_RESETS {
+            local_db
+                .acquire()
+                .await
+                .unwrap()
+                .complete_on_demand_proof_if_new(OnDemandProofTable::Watchtower, id, &completion)
+                .await
+                .unwrap();
+            assert!(
+                restart_failed_watchtower_task(&local_db, &load().await, &init_txid, 5)
+                    .await
+                    .unwrap()
+            );
+        }
+        local_db
+            .acquire()
+            .await
+            .unwrap()
+            .complete_on_demand_proof_if_new(OnDemandProofTable::Watchtower, id, &completion)
+            .await
+            .unwrap();
+        assert!(
+            !restart_failed_watchtower_task(&local_db, &load().await, &init_txid, 5).await.unwrap()
+        );
+        // A new execution-layer height is a new input.
+        assert!(
+            restart_failed_watchtower_task(&local_db, &load().await, &init_txid, 6).await.unwrap()
+        );
+        let restarted = load().await;
+        assert_eq!((restarted.reset_count, restarted.execution_layer_block_number), (0, 6));
     }
 }
