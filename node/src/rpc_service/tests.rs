@@ -1,3 +1,4 @@
+use crate::aggregates::graph_scan::{ChallengeSubStatus, VerifierChallengeStatus};
 use crate::clock::current_time_secs;
 use crate::env::{
     ENV_BITVM_SECRET, ENV_GOAT_CHAIN_URL, ENV_GOAT_GATEWAY_CONTRACT_ADDRESS, ENV_PROOF_SEVER_URL,
@@ -8,9 +9,11 @@ use crate::rpc_service::auth::{
     AUTH_NONCE_HEADER, AUTH_SIGNATURE_HEADER, AUTH_TIMESTAMP_HEADER, sign_request_auth,
 };
 use crate::rpc_service::bitvm::{
-    BRIDGE_IN_AMOUNTS, GraphGetResponse, GraphListResponse, InstanceGetResponse,
+    BRIDGE_IN_AMOUNTS, GraphGetResponse, GraphListResponse, GraphQueryParams, InstanceGetResponse,
     InstanceListResponse, InstanceOverviewResponse, InstanceSettingResponse,
+    SimpleChallengeSubStatus, simple_challenge_sub_status,
 };
+use crate::rpc_service::handler::bitvm_handler::graph_neighbors;
 use crate::rpc_service::node::{NodeListResponse, NodeOverViewResponse};
 use crate::rpc_service::{self, Actor, AppState, routes};
 use crate::utils::{
@@ -20,6 +23,7 @@ use crate::utils::{
 use alloy::primitives::U256;
 use client::Utxo;
 use http::Method;
+use http::StatusCode;
 use prometheus_client::registry::Registry;
 use reqwest::Client;
 use secp256k1::{Keypair, SECP256K1, Secp256k1};
@@ -27,7 +31,7 @@ use serde_json::Value;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use store::localdb::{GraphRuntimeUpdate, LocalDB, StorageProcessor};
+use store::localdb::{GraphQuery, GraphRuntimeUpdate, LocalDB, StorageProcessor};
 use store::{
     Graph, GraphStatus, GraphStatusSource, Instance, InstanceBridgeInStatus, Node, create_local_db,
 };
@@ -757,7 +761,7 @@ async fn test_bitvm_api() -> Result<(), Box<dyn std::error::Error>> {
         ApiTestItem {
             tag: format!("{} get graphs info", routes::v1::GRAPHS_BASE),
             url: format!(
-                "http://{addr}{}?status={}&from_addr={}&graph_id={}",
+                "http://{addr}{}?status={}&from_addr={}&graph_field={}",
                 routes::v1::GRAPHS_BASE,
                 graph_status,
                 graph_from,
@@ -770,6 +774,25 @@ async fn test_bitvm_api() -> Result<(), Box<dyn std::error::Error>> {
                 matches!(
                     serde_json::from_str::<GraphListResponse>(&text),
                     Ok(graph_list) if graph_list.total == 1
+                )
+            })),
+        },
+        ApiTestItem {
+            tag: format!("{} filtered by graph_field alone", routes::v1::GRAPHS_BASE),
+            url: format!(
+                "http://{addr}{}?graph_field={}",
+                routes::v1::GRAPHS_BASE,
+                finalized_graph_id
+            ),
+            json_payload: None,
+            method: Method::GET,
+            expe_res: true,
+            resp_validation: Some(Box::new(move |text| -> bool {
+                matches!(
+                    serde_json::from_str::<GraphListResponse>(&text),
+                    Ok(graph_list) if graph_list.total == 1
+                        && graph_list.graphs[0].graph.as_ref().map(|graph| graph.graph_id)
+                            == Some(finalized_graph_id)
                 )
             })),
         },
@@ -815,4 +838,101 @@ async fn test_proof_api() -> Result<(), Box<dyn std::error::Error>> {
     }];
     do_batch_tests("node apis", &client, &api_test_items).await?;
     Ok(())
+}
+
+fn graph_params(from_addr: &str, graph_field: &str, status: &str) -> GraphQueryParams {
+    GraphQueryParams {
+        status: Some(status.to_string()),
+        operator: None,
+        from_addr: Some(from_addr.to_string()),
+        is_pegout_started: false,
+        graph_field: Some(graph_field.to_string()),
+        offset: None,
+        limit: None,
+    }
+}
+
+#[test]
+fn a_malformed_graph_filter_is_rejected_and_an_empty_one_ignored() {
+    let rejected = |params| GraphQuery::try_from(params).err().map(|(status, _)| status);
+    assert_eq!(rejected(graph_params("not-an-address", "", "")), Some(StatusCode::BAD_REQUEST));
+    assert_eq!(rejected(graph_params("", "not-an-id", "")), Some(StatusCode::BAD_REQUEST));
+
+    let query = GraphQuery::try_from(graph_params("", "", "")).unwrap();
+    assert!(query.from_addr.is_none() && query.graph_id.is_none() && query.pegin_txid.is_none());
+    let graph_id = Uuid::new_v4();
+    let from_addr = get_rand_goat_address();
+    let query = GraphQuery::try_from(graph_params(&from_addr, &graph_id.to_string(), "")).unwrap();
+    assert_eq!(query.graph_id, Some(graph_id));
+    assert!(query.from_addr.is_some_and(|addr| addr.eq_ignore_ascii_case(&from_addr)));
+}
+
+#[tokio::test]
+async fn l2_recorded_and_operator_kickoffing_are_told_apart_by_a_started_withdrawal() {
+    let local_db = create_local_db(&temp_sqlite_db_path()).await;
+    let graph = |kickoff_index, init_withdraw: bool| Graph {
+        graph_id: Uuid::new_v4(),
+        instance_id: Uuid::new_v4(),
+        kickoff_index,
+        operator_pubkey: "operator".to_string(),
+        definition_hash: format!("fixture-{kickoff_index}"),
+        status: GraphStatus::OperatorDataPushed.to_string(),
+        init_withdraw_tx_hash: init_withdraw.then(|| "0x01".to_string()),
+        ..Default::default()
+    };
+    let recorded = graph(0, false);
+    let kicking_off = graph(1, true);
+    init_instance_graph_data(&local_db, &[], &[recorded.clone(), kicking_off.clone()])
+        .await
+        .unwrap();
+
+    let mut storage = local_db.acquire().await.unwrap();
+    for (status, expected) in
+        [("L2Recorded", recorded.graph_id), ("OperatorKickOffing", kicking_off.graph_id)]
+    {
+        let query = GraphQuery::try_from(graph_params("", "", status)).unwrap();
+        let (graphs, total) = storage.find_graphs(query).await.unwrap();
+        assert_eq!(total, 1, "{status}");
+        assert_eq!(graphs[0].graph_id, expected, "{status}");
+    }
+}
+
+#[test]
+fn graph_neighbors_follow_the_kickoff_index_not_the_row_order() {
+    let [previous, current, next] = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+    let neighbors = graph_neighbors(current, &[(6, next), (5, current), (4, previous)]);
+    assert_eq!(neighbors.previous_id, Some(previous));
+    assert_eq!(neighbors.next_id, Some(next));
+
+    let neighbors = graph_neighbors(current, &[(6, next), (5, current)]);
+    assert_eq!(neighbors.previous_id, None);
+    assert_eq!(neighbors.next_id, Some(next));
+}
+
+#[test]
+fn the_challenge_sub_status_is_reported_only_during_a_challenge() {
+    let sub_status = serde_json::to_string(&ChallengeSubStatus {
+        verifier_challenge_status: vec![VerifierChallengeStatus::VerifierAsserted],
+        ..Default::default()
+    })
+    .unwrap();
+    let graph = |status: GraphStatus, sub_status: &str| Graph {
+        status: status.to_string(),
+        sub_status: sub_status.to_string(),
+        ..Default::default()
+    };
+    assert!(matches!(
+        simple_challenge_sub_status(&graph(GraphStatus::Challenge, &sub_status)),
+        SimpleChallengeSubStatus::Assert
+    ));
+    for status in [GraphStatus::OperatorTake2, GraphStatus::Disprove] {
+        assert!(matches!(
+            simple_challenge_sub_status(&graph(status, &sub_status)),
+            SimpleChallengeSubStatus::None
+        ));
+    }
+    assert!(matches!(
+        simple_challenge_sub_status(&graph(GraphStatus::Challenge, "")),
+        SimpleChallengeSubStatus::None
+    ));
 }
