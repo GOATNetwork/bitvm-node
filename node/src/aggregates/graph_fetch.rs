@@ -7,8 +7,9 @@
 use crate::middleware::get_graph::{GetGraphRequest, GetGraphResponse};
 use crate::middleware::publisher::NetworkPublisher;
 use crate::utils::{
-    load_validated_graph_definition, parse_graph_raw_data, store_finalized_graph_if_needed,
-    store_operator_presigned_graph, validate_graph_instance_parameters,
+    load_validated_graph_definition, parse_graph_raw_data, raw_definition_committee_pre_signed,
+    store_finalized_graph_if_needed, store_operator_presigned_graph,
+    validate_graph_instance_parameters,
 };
 use anyhow::{Context, bail};
 use bitvm_lib::operator::verify_graph_operator_pre_signatures;
@@ -18,7 +19,6 @@ use client::goat_chain::GOATClient;
 use libp2p::PeerId;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
-use store::GraphStatus;
 use store::localdb::LocalDB;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -73,13 +73,15 @@ pub async fn serve_graph_request(
     {
         return Ok(GetGraphResponse::not_found());
     }
-    // Only the operator's copy is stored while the graph is OperatorPresigned.
-    if request.finalized && row.status == GraphStatus::OperatorPresigned.to_string() {
-        return Ok(GetGraphResponse::not_found());
-    }
     let Some(raw) = storage.find_graph_raw_data(&row.graph_id).await? else {
         return Ok(GetGraphResponse::not_found());
     };
+    // A finalized copy is one with committee pre-signatures. The status says
+    // nothing about it: a Goat event moves an operator-only copy past
+    // OperatorPresigned too.
+    if request.finalized && !raw_definition_committee_pre_signed(&raw.raw_data)? {
+        return Ok(GetGraphResponse::not_found());
+    }
     Ok(GetGraphResponse::found(row.instance_id, row.graph_id, raw.raw_data))
 }
 
@@ -344,5 +346,67 @@ mod admission_tests {
             }
         }
         assert!(db.acquire().await.unwrap().find_graph(&graph_id).await.unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod serve_tests {
+    use super::*;
+    use store::{Graph, GraphRawData, GraphStatus, GraphStatusSource};
+
+    #[tokio::test]
+    async fn a_finalized_request_is_served_only_a_copy_with_committee_pre_signatures() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = LocalDB::new_with_busy_timeout(
+            &format!("sqlite:{}", dir.path().join("serve.db").display()),
+            false,
+            store::DEFAULT_BUSY_TIMEOUT,
+        )
+        .await;
+        db.migrate().await;
+        for committee_pre_signed in [false, true] {
+            let (instance_id, graph_id) = (Uuid::new_v4(), Uuid::new_v4());
+            let mut storage = db.acquire().await.unwrap();
+            storage
+                .upsert_graph_definition(&Graph {
+                    graph_id,
+                    instance_id,
+                    status: GraphStatus::OperatorPresigned.to_string(),
+                    definition_hash: "definition".to_string(),
+                    kickoff_index: i64::from(committee_pre_signed),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            // Past OperatorPresigned either way: a Goat event moves the status
+            // of an operator-only copy too.
+            storage
+                .transition_graph_status(
+                    instance_id,
+                    graph_id,
+                    GraphStatus::OperatorDataPushed,
+                    GraphStatusSource::ChainReconcile,
+                    None,
+                )
+                .await
+                .unwrap();
+            let raw =
+                serde_json::json!({ "committee_pre_signed": committee_pre_signed }).to_string();
+            storage
+                .upsert_graph_raw_data(
+                    instance_id,
+                    GraphRawData { graph_id, raw_data: raw, created_at: 0, updated_at: 0 },
+                    "definition",
+                )
+                .await
+                .unwrap();
+            drop(storage);
+
+            let finalized = GetGraphRequest::by_id(instance_id, graph_id, true);
+            let served = serve_graph_request(&db, &finalized).await.unwrap();
+            assert_eq!(served.graph.is_some(), committee_pre_signed);
+            let any = GetGraphRequest::by_id(instance_id, graph_id, false);
+            assert!(serve_graph_request(&db, &any).await.unwrap().graph.is_some());
+        }
     }
 }

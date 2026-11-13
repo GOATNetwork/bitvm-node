@@ -427,6 +427,28 @@ async fn confirm_finalized_graph_definition(
     }
 }
 
+/// Whether a raw definition carries committee pre-signatures, read without
+/// parsing the graph. The store paths verify the signatures before they write
+/// a definition with the flag set, so the flag is what "finalized" means.
+pub fn raw_definition_committee_pre_signed(raw_data: &str) -> Result<bool> {
+    #[derive(serde::Deserialize)]
+    struct Flags {
+        committee_pre_signed: bool,
+    }
+    Ok(serde_json::from_str::<Flags>(raw_data)?.committee_pre_signed)
+}
+
+/// Whether the stored definition is finalized; `None` when none is stored.
+pub async fn stored_definition_committee_pre_signed(
+    storage_processor: &mut StorageProcessor<'_>,
+    graph_id: &Uuid,
+) -> Result<Option<bool>> {
+    let Some(raw) = storage_processor.find_graph_raw_data(graph_id).await? else {
+        return Ok(None);
+    };
+    raw_definition_committee_pre_signed(&raw.raw_data).map(Some)
+}
+
 /// Parse raw graph data JSON string to SimplifiedBitvmGcGraph using spawn_blocking
 /// to handle large data and potential stack overflow issues
 pub async fn parse_graph_raw_data(
