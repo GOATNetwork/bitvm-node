@@ -5,12 +5,62 @@ use alloy_primitives::{Address, B256, U256};
 use bincode::Options as BincodeOptions;
 use guest_executor::executor::EthClientExecutor;
 use guest_executor::io::EthClientExecutorInput;
+use header_chain::MMRGuest;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use tendermint_light_client_verifier::types::LightBlock;
 
 // Contract address, base slot and key, the expected value of the slot is hardcoded to 1.
-type WithdrawalSlot = (Address, [u8; 32], Vec<[u8; 16]>);
+pub type WithdrawalSlot = (Address, [u8; 32], Vec<[u8; 16]>);
+
+/// Base storage slot of `Gateway.withdrawDataMap`, the only slot a withdrawal may
+/// be read from. `forge inspect src/GatewayDebug.sol:GatewayDebug storage-layout`.
+pub const WITHDRAW_DATA_BASE_SLOT: [u8; 32] = {
+    let mut slot = [0u8; 32];
+    slot[31] = 16;
+    slot
+};
+
+/// Leaf of the withdrawal accumulator: the Gateway that processed the withdrawal
+/// and the graph it was processed for. The slot is fixed by [`WITHDRAW_DATA_BASE_SLOT`].
+pub fn withdrawal_leaf(gateway: &[u8; 20], graph_id: &[u8; 16]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"bitvm/withdrawal-leaf/v1");
+    hasher.update(gateway);
+    hasher.update(graph_id);
+    hasher.finalize().into()
+}
+
+/// One withdrawal in accumulator order, as the host replays it to build inclusion proofs.
+#[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Debug)]
+pub struct WithdrawalRecord {
+    pub block_number: u64,
+    pub gateway: [u8; 20],
+    pub graph_id: [u8; 16],
+}
+
+impl WithdrawalRecord {
+    pub fn leaf(&self) -> [u8; 32] {
+        withdrawal_leaf(&self.gateway, &self.graph_id)
+    }
+}
+
+/// The withdrawals of `block` in the order the circuit appends them.
+pub fn block_withdrawal_records(block: &CircuitStateBlock) -> Vec<WithdrawalRecord> {
+    let block_number = block.evm_block.current_block.number;
+    block
+        .withdrawals
+        .iter()
+        .flat_map(|(gateway, _, graph_ids)| {
+            graph_ids.iter().map(move |graph_id| WithdrawalRecord {
+                block_number,
+                gateway: gateway.into_array(),
+                graph_id: *graph_id,
+            })
+        })
+        .collect()
+}
 
 /// The input proof of the commit chain circuit.
 /// The proof can be either None (implying the beginning) or a Succinct proof.
@@ -37,7 +87,8 @@ pub struct StateChainState {
     pub genesis_evm_block_hash: [u8; 32],
     pub latest_evm_block_hash: [u8; 32],
     pub latest_cosmos_block: Vec<u8>,
-    pub withdrawals: Vec<WithdrawalSlot>,
+    /// Every withdrawal processed since genesis, one [`withdrawal_leaf`] each.
+    pub withdrawals: MMRGuest,
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Clone, Debug)]
@@ -94,7 +145,7 @@ impl StateChainState {
             latest_evm_block_hash: genesis_evm_block_hash,
             genesis_evm_block_hash,
             latest_cosmos_block,
-            withdrawals: vec![],
+            withdrawals: MMRGuest::new(),
         }
     }
 
@@ -135,7 +186,9 @@ impl StateChainState {
                     &block.cosmos_txns,
                     &data_hash,
                 );
-                self.withdrawals.extend_from_slice(&block.withdrawals);
+                for record in block_withdrawal_records(&block) {
+                    self.withdrawals.append(record.leaf());
+                }
             }
             self.evm_block_height += 1;
             self.latest_evm_block_hash = current_block_hash;
@@ -158,6 +211,7 @@ pub fn execute_el_block_and_check_withdraw_tx(
 
     let mut storage_info = vec![];
     withdrawals.iter().for_each(|withdrawal| {
+        assert_eq!(withdrawal.1, WITHDRAW_DATA_BASE_SLOT, "withdrawal is not in withdrawDataMap");
         for graph_id in &withdrawal.2 {
             let mut data = [0u8; 32 * 2];
             data[0..16].copy_from_slice(graph_id);
@@ -191,5 +245,79 @@ mod tests {
             serde_json::from_slice(include_bytes!("../../../data/state-chain/10346768-10.blocks"))
                 .unwrap();
         chain_state.apply_blocks(blocks2);
+    }
+
+    #[test]
+    fn withdrawals_accumulate_in_block_order_and_prove_their_gateway() {
+        let blocks: Vec<CircuitStateBlock> =
+            serde_json::from_slice(include_bytes!("../../../data/state-chain/10346758-10.blocks"))
+                .unwrap();
+        let block_hash: [u8; 32] = blocks[0].evm_block.current_block.hash_slow().into();
+        let block_height = blocks[0].evm_block.current_block.header.number;
+        let mut chain_state =
+            StateChainState::new(block_height, block_hash, blocks[0].cosmos_block.clone());
+        assert_eq!(chain_state.withdrawals.size, 0);
+
+        // The fixture has no withdrawals; a block-level unit check covers the leaf order.
+        let gateway = Address::repeat_byte(0x11);
+        let other_gateway = Address::repeat_byte(0x22);
+        let mut block = blocks[1].clone();
+        block.withdrawals = vec![
+            (gateway, WITHDRAW_DATA_BASE_SLOT, vec![[1; 16], [2; 16]]),
+            (other_gateway, WITHDRAW_DATA_BASE_SLOT, vec![[1; 16]]),
+        ];
+        let records = block_withdrawal_records(&block);
+        assert_eq!(
+            records,
+            vec![
+                WithdrawalRecord {
+                    block_number: block.evm_block.current_block.number,
+                    gateway: gateway.into_array(),
+                    graph_id: [1; 16]
+                },
+                WithdrawalRecord {
+                    block_number: block.evm_block.current_block.number,
+                    gateway: gateway.into_array(),
+                    graph_id: [2; 16]
+                },
+                WithdrawalRecord {
+                    block_number: block.evm_block.current_block.number,
+                    gateway: other_gateway.into_array(),
+                    graph_id: [1; 16]
+                },
+            ]
+        );
+        let mut host = header_chain::MMRHost::new();
+        for record in &records {
+            chain_state.withdrawals.append(record.leaf());
+            host.append(record.leaf());
+        }
+        assert_eq!(chain_state.withdrawals.size, 3);
+        let (leaf, proof) = host.generate_proof(1);
+        assert_eq!(leaf, withdrawal_leaf(&gateway.into_array(), &[2; 16]));
+        assert!(chain_state.withdrawals.verify_proof(leaf, &proof));
+        // The same graph id under another Gateway is a different leaf.
+        assert!(
+            !chain_state
+                .withdrawals
+                .verify_proof(withdrawal_leaf(&other_gateway.into_array(), &[2; 16]), &proof)
+        );
+        assert_ne!(
+            withdrawal_leaf(&gateway.into_array(), &[1; 16]),
+            withdrawal_leaf(&other_gateway.into_array(), &[1; 16])
+        );
+    }
+
+    #[test]
+    fn withdrawals_outside_withdraw_data_map_are_rejected() {
+        let blocks: Vec<CircuitStateBlock> =
+            serde_json::from_slice(include_bytes!("../../../data/state-chain/10346758-10.blocks"))
+                .unwrap();
+        let mut block = blocks[1].clone();
+        block.withdrawals = vec![(Address::repeat_byte(0x11), [0; 32], vec![[1; 16]])];
+        let result = std::panic::catch_unwind(|| {
+            execute_el_block_and_check_withdraw_tx(&block.withdrawals, block.evm_block.clone())
+        });
+        assert!(result.is_err());
     }
 }

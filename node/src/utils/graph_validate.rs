@@ -89,12 +89,14 @@ fn validate_watchtower_selection(
     registered: &[XOnlyPublicKey],
     graph_id: [u8; 16],
     genesis_txid: [u8; 32],
+    gateway: [u8; 20],
     challenge_init_txid: [u8; 32],
     constant: [u8; 32],
 ) -> Result<()> {
     validate_watchtower_registry_selection(selected, registered)?;
     let key_bytes = selected.iter().map(XOnlyPublicKey::serialize).collect::<Vec<_>>();
-    let expected = hash_operator_constant(graph_id, genesis_txid, challenge_init_txid, &key_bytes);
+    let expected =
+        hash_operator_constant(graph_id, genesis_txid, gateway, challenge_init_txid, &key_bytes);
     if constant != expected {
         bail!(SpecialError::InvalidGraph(
             "operator constant mismatch for graph watchtower list".to_string()
@@ -314,6 +316,7 @@ pub async fn validate_init_graph_base(
         &watchtowers_on_chain,
         *graph.parameters.graph_id.as_bytes(),
         get_genesis_sequencer_commit_id(),
+        get_goat_gateway_contract_from_env().into_array(),
         full_graph.watchtower_challenge_init.tx().compute_txid().to_byte_array(),
         graph.parameters.pubin_disprove_constant,
     )?;
@@ -495,6 +498,7 @@ pub async fn validate_finalized_graph(
         &watchtowers_on_chain,
         *graph.parameters.graph_id.as_bytes(),
         get_genesis_sequencer_commit_id(),
+        get_goat_gateway_contract_from_env().into_array(),
         full_graph.watchtower_challenge_init.tx().compute_txid().to_byte_array(),
         graph.parameters.pubin_disprove_constant,
     )?;

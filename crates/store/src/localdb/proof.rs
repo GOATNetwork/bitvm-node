@@ -4,7 +4,7 @@
 use super::{StorageProcessor, get_current_timestamp_secs};
 use crate::{
     LongRunningTaskProof, MetricsStateCount, OnDemandProofCompletion, OnDemandProofTable,
-    OperatorProof, WatchtowerProof,
+    OperatorProof, StateChainWithdrawal, WatchtowerProof,
 };
 use sqlx::types::Uuid;
 
@@ -269,30 +269,84 @@ impl StorageProcessor<'_> {
         &mut self,
         operator_proof: &OperatorProof,
     ) -> anyhow::Result<u64> {
-        let res = sqlx::query!(
+        let res = sqlx::query(
             "INSERT
              INTO operator_proof (instance_id, graph_id, execution_layer_block_number, path_to_proof, public_value_hex, proof_size, cycles, proof_state, total_time_to_proof, proving_time,
-                                 zkm_version, extra, updated_at, created_at, operator_committed_blockhash)
-             VALUES ( ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            operator_proof.instance_id,
-            operator_proof.graph_id,
-            operator_proof.execution_layer_block_number,
-            operator_proof.path_to_proof,
-            operator_proof.public_value_hex,
-            operator_proof.proof_size,
-            operator_proof.cycles,
-            operator_proof.proof_state,
-            operator_proof.total_time_to_proof,
-            operator_proof.proving_time,
-            operator_proof.zkm_version,
-            operator_proof.extra,
-            operator_proof.updated_at,
-            operator_proof.created_at,
-            operator_proof.operator_committed_blockhash,
+                                 zkm_version, extra, updated_at, created_at, operator_committed_blockhash, gateway_address)
+             VALUES ( ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
+        .bind(operator_proof.instance_id)
+        .bind(operator_proof.graph_id)
+        .bind(operator_proof.execution_layer_block_number)
+        .bind(&operator_proof.path_to_proof)
+        .bind(&operator_proof.public_value_hex)
+        .bind(operator_proof.proof_size)
+        .bind(operator_proof.cycles)
+        .bind(operator_proof.proof_state)
+        .bind(operator_proof.total_time_to_proof)
+        .bind(operator_proof.proving_time)
+        .bind(&operator_proof.zkm_version)
+        .bind(&operator_proof.extra)
+        .bind(operator_proof.updated_at)
+        .bind(operator_proof.created_at)
+        .bind(&operator_proof.operator_committed_blockhash)
+        .bind(&operator_proof.gateway_address)
+        .execute(self.conn())
+        .await?;
+        Ok(res.rows_affected())
+    }
+
+    /// Replaces the accumulated withdrawals from `from_block` on with `withdrawals`, in
+    /// order, continuing the leaf numbering of the rows that stay.
+    pub async fn replace_state_chain_withdrawals(
+        &mut self,
+        from_block: i64,
+        withdrawals: &[StateChainWithdrawal],
+    ) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM state_chain_withdrawal WHERE block_number >= ?")
+            .bind(from_block)
             .execute(self.conn())
             .await?;
-        Ok(res.rows_affected())
+        let next: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(leaf_index) + 1, 0) FROM state_chain_withdrawal",
+        )
+        .fetch_one(self.conn())
+        .await?;
+        for (offset, withdrawal) in withdrawals.iter().enumerate() {
+            anyhow::ensure!(
+                withdrawal.block_number >= from_block,
+                "withdrawal in block {} precedes batch start {from_block}",
+                withdrawal.block_number
+            );
+            sqlx::query(
+                "INSERT INTO state_chain_withdrawal (leaf_index, block_number, gateway_address, graph_id)
+                 VALUES (?, ?, ?, ?)",
+            )
+            .bind(next + offset as i64)
+            .bind(withdrawal.block_number)
+            .bind(&withdrawal.gateway_address)
+            .bind(withdrawal.graph_id)
+            .execute(self.conn())
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// The accumulated withdrawals of every block before `block_end`, in leaf order.
+    pub async fn list_state_chain_withdrawals_before(
+        &mut self,
+        block_end: i64,
+    ) -> anyhow::Result<Vec<StateChainWithdrawal>> {
+        let rows = sqlx::query_as::<_, StateChainWithdrawal>(
+            "SELECT leaf_index, block_number, gateway_address, graph_id
+             FROM state_chain_withdrawal
+             WHERE block_number < ?
+             ORDER BY leaf_index ASC",
+        )
+        .bind(block_end)
+        .fetch_all(self.conn())
+        .await?;
+        Ok(rows)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -726,16 +780,18 @@ impl StorageProcessor<'_> {
         &mut self,
         instance_id: &Uuid,
         graph_id: &Uuid,
+        gateway_address: &str,
         operator_committed_blockhash: &str,
         execution_layer_block_number: i64,
         input_hash: &str,
     ) -> anyhow::Result<u64> {
         let res = sqlx::query(
             "UPDATE operator_proof
-             SET operator_committed_blockhash = ?, execution_layer_block_number = ?,
-                 input_hash = ?, updated_at = ?
+             SET gateway_address = ?, operator_committed_blockhash = ?,
+                 execution_layer_block_number = ?, input_hash = ?, updated_at = ?
              WHERE instance_id = ? AND graph_id = ?",
         )
+        .bind(gateway_address)
         .bind(operator_committed_blockhash)
         .bind(execution_layer_block_number)
         .bind(input_hash)

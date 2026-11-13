@@ -15,14 +15,18 @@ use crate::task::{
 };
 use ::commit_chain_proof::CommitChainProofBuilder;
 use ::header_chain_proof::HeaderChainProofBuilder;
+use ::operator_proof::build_withdrawal_proof;
 use ::state_chain_proof::StateChainProofBuilder;
+use alloy_primitives::Address;
 use bitcoin::{BlockHash, Network, PublicKey, Txid};
 use client::btc_chain::BTCClient;
 use secp256k1::XOnlyPublicKey;
+use state_chain::WithdrawalRecord;
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Instant, UNIX_EPOCH};
+use util::hex_parse;
 use uuid::Uuid;
 
 use bitcoin::hashes::{Hash, sha256};
@@ -553,6 +557,7 @@ async fn read_watchtower_challenge_details<'a>(
     Vec<String>,
     Option<String>,
     Option<String>,
+    Option<String>,
 )> {
     let (
         task_index,
@@ -563,6 +568,7 @@ async fn read_watchtower_challenge_details<'a>(
         watchtower_public_keys,
         graph_id,
         operator_committed_blockhash,
+        gateway_address,
     ) = match row {
         OnDemandRow::Watchtower(task) => {
             tracing::info!("watchtower task: {task:?}");
@@ -578,6 +584,7 @@ async fn read_watchtower_challenge_details<'a>(
                 vec![true],
                 pubkeys,
                 Some(task.graph_id.as_simple().to_string()),
+                None,
                 None,
             )
         }
@@ -623,6 +630,7 @@ async fn read_watchtower_challenge_details<'a>(
                 challenge_public_keys,
                 Some(task.graph_id.as_simple().to_string()),
                 Some(task.operator_committed_blockhash),
+                Some(task.gateway_address),
             )
         }
     };
@@ -639,7 +647,43 @@ async fn read_watchtower_challenge_details<'a>(
         watchtower_public_keys,
         graph_id,
         operator_committed_blockhash,
+        gateway_address,
     ))
+}
+
+/// The inclusion proof of the graph's withdrawal from `gateway_address` in the
+/// accumulator of the state-chain proof ending at `block_end`.
+async fn build_operator_withdrawal_proof(
+    storage_processor: &mut store::localdb::StorageProcessor<'_>,
+    gateway_address: &str,
+    graph_id: &str,
+    block_end: i64,
+) -> anyhow::Result<header_chain::MMRInclusionProof> {
+    let gateway = Address::from_str(gateway_address)
+        .map_err(|error| invalid_task(format!("invalid gateway {gateway_address}: {error}")))?
+        .into_array();
+    let graph_id = hex_parse::<16>(graph_id)
+        .map_err(|error| invalid_task(format!("invalid graph id {graph_id}: {error}")))?;
+    let rows = storage_processor.list_state_chain_withdrawals_before(block_end).await?;
+    let records = rows
+        .iter()
+        .enumerate()
+        .map(|(position, row)| {
+            anyhow::ensure!(
+                row.leaf_index == position as i64,
+                "state chain withdrawal leaves are not contiguous at {}",
+                row.leaf_index
+            );
+            Ok(WithdrawalRecord {
+                block_number: row.block_number as u64,
+                gateway: Address::from_str(&row.gateway_address)?.into_array(),
+                graph_id: *row.graph_id.as_bytes(),
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    // The proven chain holds every withdrawal before `block_end`; a missing one never appears.
+    build_withdrawal_proof(&records, gateway, graph_id)
+        .map_err(|error| invalid_task(format!("{error:#}")))
 }
 
 /// Fetches and prepares the next watchtower or operator task after `after_id`.
@@ -695,6 +739,7 @@ async fn prepare_on_demand_task(
         watchtower_public_keys,
         graph_id,
         operator_committed_blockhash,
+        gateway_address,
     ) = read_watchtower_challenge_details(storage_processor, row).await?;
 
     if !is_watchtower && operator_committed_blockhash.is_none() {
@@ -820,6 +865,18 @@ async fn prepare_on_demand_task(
             return Ok(None);
         }
     };
+    let withdrawal_proof = match &gateway_address {
+        Some(gateway_address) => Some(
+            build_operator_withdrawal_proof(
+                storage_processor,
+                gateway_address,
+                graph_id.as_deref().unwrap_or_default(),
+                state_chain_input_proof.block_end,
+            )
+            .await?,
+        ),
+        None => None,
+    };
     let state_chain_input_proof = state_chain_input_proof.path_to_proof.unwrap();
 
     // commit chain
@@ -866,6 +923,10 @@ async fn prepare_on_demand_task(
         watchtower_public_keys,
         graph_id,
         operator_committed_blockhash,
+        gateway_address: gateway_address
+            .map(|address| Ok::<_, anyhow::Error>(Address::from_str(&address)?.into_array()))
+            .transpose()?,
+        withdrawal_proof,
     }))
 }
 
@@ -1135,6 +1196,8 @@ pub(crate) const MAX_TASK_RESETS: i64 = 2;
 /// The inputs of an Operator task, as the Operator submits them.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct OperatorTaskInput {
+    /// The Gateway the withdrawal is proven from; part of the graph constant.
+    pub gateway_address: String,
     pub operator_committed_blockhash: String,
     /// proceedWithdraw's block number.
     pub execution_layer_block_number: i64,
@@ -1145,8 +1208,9 @@ pub(crate) struct OperatorTaskInput {
 }
 
 impl OperatorTaskInput {
-    pub(crate) fn from_request(request: &OperatorProofRequest) -> Self {
+    pub(crate) fn from_request(request: &OperatorProofRequest, gateway_address: Address) -> Self {
         Self {
+            gateway_address: gateway_address.to_string(),
             operator_committed_blockhash: request.operator_committed_blockhash.clone(),
             execution_layer_block_number: request.execution_layer_block_number,
             watchtower_challenge_txids: request.watchtower_challenge_txids.clone(),
@@ -1191,6 +1255,7 @@ pub(crate) async fn add_operator_task(
             id: 1,
             instance_id,
             graph_id,
+            gateway_address: input.gateway_address.clone(),
             execution_layer_block_number: input.execution_layer_block_number,
             proof_state: ProofState::New.to_i64(),
             created_at: current_time_secs(),
@@ -1204,6 +1269,7 @@ pub(crate) async fn add_operator_task(
         .update_operator_proof_inputs(
             &instance_id,
             &graph_id,
+            &input.gateway_address,
             &input.operator_committed_blockhash,
             input.execution_layer_block_number,
             &input_hash,
@@ -1254,6 +1320,7 @@ pub(crate) async fn restart_failed_operator_task(
             .update_operator_proof_inputs(
                 &task.instance_id,
                 &task.graph_id,
+                &input.gateway_address,
                 &input.operator_committed_blockhash,
                 input.execution_layer_block_number,
                 &input_hash,
@@ -1562,6 +1629,7 @@ mod tests {
 
         let included_watchtowers = vec![true, false];
         let input = OperatorTaskInput {
+            gateway_address: Address::repeat_byte(0x11).to_string(),
             operator_committed_blockhash,
             execution_layer_block_number: number,
             watchtower_challenge_txids,
@@ -1699,6 +1767,7 @@ mod watchtower_slot_tests {
         // The Operator lists the member as compressed with odd parity.
         let member_odd = format!("03{member}");
         let input = OperatorTaskInput {
+            gateway_address: Address::repeat_byte(0x11).to_string(),
             operator_committed_blockhash: "11".repeat(32),
             execution_layer_block_number: 1,
             watchtower_challenge_txids: vec![None],
@@ -1732,6 +1801,7 @@ mod restart_tests {
     fn input(committed_blockhash: &str) -> OperatorTaskInput {
         let key = Keypair::from_seckey_slice(SECP256K1, &[1; 32]).unwrap().x_only_public_key().0;
         OperatorTaskInput {
+            gateway_address: Address::repeat_byte(0x11).to_string(),
             operator_committed_blockhash: committed_blockhash.to_string(),
             execution_layer_block_number: 1,
             watchtower_challenge_txids: vec![None],

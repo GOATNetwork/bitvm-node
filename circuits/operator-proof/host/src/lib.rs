@@ -7,9 +7,15 @@ use borsh::BorshDeserialize;
 use clap::Parser;
 use client::btc_chain::BTCClient;
 use commit_chain::{CommitChainCircuitInput, CommitChainPrevProofType};
-use header_chain::{CircuitBlockHeader, HeaderChainCircuitInput, HeaderChainPrevProofType};
+use header_chain::{
+    CircuitBlockHeader, HeaderChainCircuitInput, HeaderChainPrevProofType, MMRHost,
+    MMRInclusionProof,
+};
 use proof_builder::{LongRunning, ProofBuilder, ProofRequest};
-use state_chain::{StateChainCircuitInput, StateChainPrevProofType};
+use state_chain::{
+    StateChainCircuitInput, StateChainPrevProofType, WithdrawalRecord,
+    decode_state_chain_circuit_output, withdrawal_leaf,
+};
 use std::str::FromStr;
 use util::get_btc_block_confirms;
 use zkm_sdk::{
@@ -76,6 +82,29 @@ pub struct Args {
         default_value_if("print_program_id", "true", Some(""))
     )]
     pub genesis_sequencer_commit_txid: String,
+
+    /// The Gateway that processed the graph's withdrawal.
+    #[clap(
+        long,
+        env,
+        required = false,
+        required_unless_present = "print_program_id",
+        default_value_if("print_program_id", "true", Some(""))
+    )]
+    #[serde(default)]
+    pub gateway_address: String,
+
+    /// JSON file with the state chain's withdrawal records, in accumulator order, up to
+    /// the end of the state-chain proof.
+    #[clap(
+        long,
+        env,
+        required = false,
+        required_unless_present = "print_program_id",
+        default_value_if("print_program_id", "true", Some(""))
+    )]
+    #[serde(default)]
+    pub withdrawal_records: String,
 
     #[clap(
         long,
@@ -341,6 +370,33 @@ pub async fn fetch_target_block_and_watchtower_tx(
         watchtower_challenge_witnesses,
     ))
 }
+/// Proves that `records` holds a withdrawal of `graph_id` from `gateway`. The records
+/// must be every withdrawal the state-chain proof accumulated, in order.
+pub fn build_withdrawal_proof(
+    records: &[WithdrawalRecord],
+    gateway: [u8; 20],
+    graph_id: [u8; 16],
+) -> anyhow::Result<MMRInclusionProof> {
+    let leaf = withdrawal_leaf(&gateway, &graph_id);
+    let mut mmr = MMRHost::new();
+    let mut index = None;
+    for (position, record) in records.iter().enumerate() {
+        let record_leaf = record.leaf();
+        if index.is_none() && record_leaf == leaf {
+            index = Some(position as u32);
+        }
+        mmr.append(record_leaf);
+    }
+    let index = index.with_context(|| {
+        format!(
+            "graph {} has no withdrawal from Gateway 0x{} in the state chain",
+            hex::encode(graph_id),
+            hex::encode(gateway)
+        )
+    })?;
+    Ok(mmr.generate_proof(index).1)
+}
+
 pub struct OperatorProofBuilder {
     client: Arc<ProverClient>,
     proving_key: zkm_sdk::ZKMProvingKey,
@@ -390,6 +446,8 @@ impl ProofBuilder for OperatorProofBuilder {
             commit_chain_input_proof,
             state_chain_input_proof,
             genesis_sequencer_commit_txid,
+            gateway_address,
+            withdrawal_proof,
 
             target_block_ss_commit,
             block_pos_ss_commit,
@@ -485,6 +543,14 @@ impl ProofBuilder for OperatorProofBuilder {
                 })?;
             let self_program_id =
                 verifier::program_id(&zkm_vk_hash, &zkm_version).map_err(anyhow::Error::msg)?;
+            // Fail here rather than after a proving run.
+            anyhow::ensure!(
+                decode_state_chain_circuit_output(&zkm_public_values)
+                    .chain_state
+                    .withdrawals
+                    .verify_proof(withdrawal_leaf(gateway_address, graph_id), withdrawal_proof),
+                "withdrawal proof does not match the state-chain proof"
+            );
 
             StateChainCircuitInput {
                 prev_proof: StateChainPrevProofType::GenesisBlock, // unused
@@ -566,6 +632,8 @@ impl ProofBuilder for OperatorProofBuilder {
                 stdin.write(&graph_id);
 
                 stdin.write(&operator_genesis_sequencer_commit_txid.to_byte_array());
+                stdin.write(gateway_address);
+                stdin.write(withdrawal_proof);
 
                 stdin.write(&watchtower_challenge_init_txid.to_byte_array());
                 stdin.write(&watchtower_challenge_init_txn);
@@ -637,6 +705,29 @@ impl ProofBuilder for OperatorProofBuilder {
 mod tests {
     use super::*;
     use ark_bn254::Bn254;
+
+    #[test]
+    fn withdrawal_proof_names_the_gateway_and_verifies_against_the_accumulator() {
+        let records = (0..5u8)
+            .map(|i| WithdrawalRecord {
+                block_number: 100 + u64::from(i),
+                gateway: [i % 2; 20],
+                graph_id: [i; 16],
+            })
+            .collect::<Vec<_>>();
+        let mut accumulator = header_chain::MMRGuest::new();
+        for record in &records {
+            accumulator.append(record.leaf());
+        }
+        let proof = build_withdrawal_proof(&records, [1; 20], [3; 16]).unwrap();
+        assert_eq!(proof.leaf_index, 3);
+        assert!(accumulator.verify_proof(withdrawal_leaf(&[1; 20], &[3; 16]), &proof));
+        // Same graph id, other Gateway: not in the accumulator.
+        assert!(build_withdrawal_proof(&records, [0; 20], [3; 16]).is_err());
+        // A proof from a record list whose peak the accumulator has since merged fails.
+        let stale = build_withdrawal_proof(&records[..3], [0; 20], [2; 16]).unwrap();
+        assert!(!accumulator.verify_proof(withdrawal_leaf(&[0; 20], &[2; 16]), &stale));
+    }
 
     use ark_groth16::{Groth16, r1cs_to_qap::LibsnarkReduction};
 

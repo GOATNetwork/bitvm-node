@@ -175,9 +175,17 @@ fn build_operator_public_values(
         xonly_keys.push(xonly);
     }
 
+    let gateway = req
+        .gateway_address
+        .as_deref()
+        .ok_or_else(|| "gateway_address is required".to_string())?
+        .parse::<alloy::primitives::Address>()
+        .map_err(|e| format!("invalid gateway_address: {e}"))?
+        .into_array();
     let constant = bitcoin_light_client_circuit::hash_operator_constant(
         graph_id_bytes,
         genesis,
+        gateway,
         wci_internal,
         &xonly_keys,
     );
@@ -434,7 +442,7 @@ mod tests {
         OperatorProofRequest {
             instance_id: "11111111-1111-1111-1111-111111111111".to_string(),
             graph_id: "22222222-2222-2222-2222-222222222222".to_string(),
-            gateway_address: None,
+            gateway_address: Some(format!("0x{}", "33".repeat(20))),
             operator_committed_blockhash: "aa".repeat(32),
             execution_layer_block_number: 5,
             watchtower_challenge_txids: vec![Some("bb".repeat(32))],

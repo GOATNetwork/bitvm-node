@@ -259,10 +259,14 @@ pub(super) async fn post_operator_proof_task(
                 &mut api_result,
                 InputValidator::validate_operator_task(&payload, &graph_data),
             )?;
+            let gateway_address = record_auth_result(
+                &mut api_result,
+                api_state.auth.resolve_gateway(payload.gateway_address.as_deref()),
+            )?;
             let restarted = restart_failed_operator_task(
                 &api_state.local_db,
                 &operator_proof,
-                &OperatorTaskInput::from_request(&payload),
+                &OperatorTaskInput::from_request(&payload, gateway_address),
             )
             .await
             .api_error("POST_OPERATOR_PROOF_TASK_ERROR")?;
@@ -302,11 +306,15 @@ pub(super) async fn post_operator_proof_task(
                 &mut api_result,
                 InputValidator::validate_operator_task(&payload, &graph_data),
             )?;
+            let gateway_address = record_auth_result(
+                &mut api_result,
+                api_state.auth.resolve_gateway(payload.gateway_address.as_deref()),
+            )?;
             add_operator_task(
                 &api_state.local_db,
                 instance_id,
                 graph_id,
-                &OperatorTaskInput::from_request(&payload),
+                &OperatorTaskInput::from_request(&payload, gateway_address),
             )
             .await
             .api_error("POST_OPERATOR_PROOF_TASK_ERROR")?;

@@ -435,6 +435,7 @@ pub fn derive_operator_statement(
     let constant = hash_operator_constant(
         *graph_id.as_bytes(),
         get_genesis_sequencer_commit_id(),
+        get_goat_gateway_contract_from_env().into_array(),
         challenge_init_txid,
         &key_bytes,
     );
@@ -631,7 +632,8 @@ pub async fn notify_watchtower_proof_timeout(instance_id: Uuid, graph_id: Uuid) 
     Ok(response.data.is_some())
 }
 
-/// Computes the graph constant committed by the Operator guest and Connector D.
+/// Computes the graph constant committed by the Operator guest and Connector D. It names
+/// this node's Gateway, so the proof must show a withdrawal processed by that contract.
 pub fn get_guest_constant_value(
     graph_id: Uuid,
     challenge_init_txid: [u8; 32],
@@ -641,6 +643,7 @@ pub fn get_guest_constant_value(
     Ok(hash_operator_constant(
         graph_id.into_bytes(),
         get_genesis_sequencer_commit_id(),
+        get_goat_gateway_contract_from_env().into_array(),
         challenge_init_txid,
         &key_bytes,
     ))
