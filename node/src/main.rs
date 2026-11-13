@@ -140,6 +140,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .with_span_list(true)
         .with_env_filter(EnvFilter::from_default_env())
         .try_init();
+    // The mock accepts every operator proof by default; it must never run
+    // against a real Bitcoin network.
+    #[cfg(feature = "mock-gc")]
+    if get_network() != bitcoin::Network::Regtest {
+        return Err(anyhow::anyhow!(
+            "a mock-gc build runs only on regtest, but BITCOIN_NETWORK is {}",
+            get_network()
+        )
+        .into());
+    }
     let min_required_verifier = env::get_min_required_verifier()?;
     validate_soldering_proof_payload_store_config(&actor)?;
 

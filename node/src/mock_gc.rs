@@ -21,9 +21,7 @@
 //! Note: `Challenge` and `Eval` run inside the peg-out jobs (`verifier_assert`,
 //! `wrongly_challenged`), which compete with the honest Operator on 1-3 block regtest
 //! timelocks (WronglyChallenged / Disprove). A long delay there makes the Operator lose that
-//! race and, past the engine job lease, lets a second holder re-run the job and double-broadcast
-//! a dispute tx with a second, conflicting fee input. So `Challenge` and `Eval` are
-//! **hard-capped** at [`LATENCY_CRITICAL_MAX_DELAY`]; a larger env value is clamped with a
+//! race. So `Challenge` and `Eval` are **hard-capped** at [`LATENCY_CRITICAL_MAX_DELAY`]; a larger env value is clamped with a
 //! warning. The three heavy setup ops carry no such cap and may be set to minutes. In practice
 //! keep `Challenge`/`Eval` to a few seconds (below the block-mining cadence).
 
@@ -65,10 +63,10 @@ impl GcOp {
 
     /// The maximum artificial delay this op may impose, or `None` for an unbounded op.
     ///
-    /// `Challenge` and `Eval` run inline on the sequential P2P-inbox dispatch worker with no
-    /// lease renewal, so their delay is capped well under the inbox lease (see the module docs).
-    /// The heavy ops (`BuilderInit`/`Setup`/`Solder`/`Verify`) are spawned with lease renewal and
-    /// serialized by the heavy-task permit, so they may run for minutes and are left unbounded.
+    /// `Challenge` and `Eval` sit on the dispute path, where the Operator races 1-3 block
+    /// timelocks, so their delay is capped (see the module docs). The setup ops
+    /// (`BuilderInit`/`Setup`/`Solder`/`Verify`) have no deadline that close and are left
+    /// unbounded.
     const fn max_delay(self) -> Option<Duration> {
         match self {
             GcOp::Challenge | GcOp::Eval => Some(LATENCY_CRITICAL_MAX_DELAY),
@@ -79,9 +77,8 @@ impl GcOp {
 
 const DEFAULT_DELAY_VAR: &str = "MOCK_GC_DELAY_SECS";
 
-/// Hard cap for the `Challenge`/`Eval` delays of the dispute jobs: well under the engine's
-/// 5-minute job lease, so a misconfigured value can never let a second holder re-run the job
-/// and double-broadcast a dispute transaction.
+/// Hard cap for the `Challenge`/`Eval` delays of the dispute jobs, so a misconfigured value
+/// cannot make the Operator miss a dispute timelock.
 const LATENCY_CRITICAL_MAX_DELAY: Duration = Duration::from_secs(60);
 
 fn parse_secs(name: &str) -> Option<Duration> {
@@ -105,8 +102,8 @@ fn clamp_delay(op: GcOp, configured: Duration) -> Duration {
                 stage = "clamped",
                 configured_secs = configured.as_secs_f64(),
                 max_secs = max.as_secs_f64(),
-                "mock GC delay exceeds the safe maximum for an inline dispatch op; clamping so it \
-                 cannot stall the inbox worker past the lease or race the dispute timelock"
+                "mock GC delay exceeds the safe maximum for a dispute op; clamping so it cannot \
+                 race the dispute timelock"
             );
             max
         }
@@ -146,14 +143,14 @@ pub async fn simulate(op: GcOp) {
 mod tests {
     use super::*;
 
-    // The three heavy ops are spawned with lease renewal, so their delay is unbounded.
+    // The setup ops have no close deadline, so their delay is unbounded.
     const HEAVY_OPS: [GcOp; 4] = [GcOp::BuilderInit, GcOp::Setup, GcOp::Solder, GcOp::Verify];
-    // These two run inline on the dispatch worker with no lease renewal, so they are capped.
-    const INLINE_OPS: [GcOp; 2] = [GcOp::Challenge, GcOp::Eval];
+    // These two race dispute timelocks, so they are capped.
+    const DISPUTE_OPS: [GcOp; 2] = [GcOp::Challenge, GcOp::Eval];
 
     #[test]
-    fn inline_dispatch_ops_are_capped() {
-        for op in INLINE_OPS {
+    fn dispute_ops_are_capped() {
+        for op in DISPUTE_OPS {
             assert_eq!(op.max_delay(), Some(LATENCY_CRITICAL_MAX_DELAY));
         }
         for op in HEAVY_OPS {
@@ -162,10 +159,10 @@ mod tests {
     }
 
     #[test]
-    fn clamp_truncates_only_inline_ops_over_the_cap() {
+    fn clamp_truncates_only_dispute_ops_over_the_cap() {
         let over = LATENCY_CRITICAL_MAX_DELAY + Duration::from_secs(600);
-        // An oversized inline delay is clamped to the safe maximum (well under the inbox lease).
-        for op in INLINE_OPS {
+        // An oversized dispute-op delay is clamped to the safe maximum.
+        for op in DISPUTE_OPS {
             assert_eq!(clamp_delay(op, over), LATENCY_CRITICAL_MAX_DELAY);
         }
         // Heavy ops keep whatever was configured, even minutes.
@@ -177,20 +174,12 @@ mod tests {
     #[test]
     fn clamp_preserves_values_within_the_cap() {
         let within = Duration::from_secs(3);
-        for op in INLINE_OPS.into_iter().chain(HEAVY_OPS) {
+        for op in DISPUTE_OPS.into_iter().chain(HEAVY_OPS) {
             assert_eq!(clamp_delay(op, within), within);
         }
         // Exactly the cap is not truncated.
-        for op in INLINE_OPS {
+        for op in DISPUTE_OPS {
             assert_eq!(clamp_delay(op, LATENCY_CRITICAL_MAX_DELAY), LATENCY_CRITICAL_MAX_DELAY);
         }
-    }
-
-    #[test]
-    fn cap_is_well_under_the_p2p_inbox_lease() {
-        // P2P_INBOX_LEASE_SECS is 5 minutes (node/src/action.rs); the cap must leave ample margin
-        // so a clamped inline op cannot outlive the (never-renewed) lease and get re-dispatched.
-        assert!(LATENCY_CRITICAL_MAX_DELAY <= Duration::from_secs(60));
-        assert!(LATENCY_CRITICAL_MAX_DELAY * 4 < Duration::from_secs(5 * 60));
     }
 }

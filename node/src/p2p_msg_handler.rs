@@ -1036,8 +1036,13 @@ mod tests {
 
         let queue = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+        let (publisher_key, publisher_peer_id) = gen_local_key().unwrap();
+        let publisher_peer_id: PeerId = publisher_peer_id.parse().unwrap();
+        // The relay stores durable messages only from registered authors.
+        crate::p2p_admission::peer_registry()
+            .seed_verified_committee_peer(&publisher_peer_id, std::time::Instant::now());
         let mut publisher_manager = BitvmNetworkManager::new(
-            swarm_config(gen_local_key().unwrap().0, 0, vec![bootnode.clone()]),
+            swarm_config(publisher_key, 0, vec![bootnode.clone()]),
             &mut Registry::default(),
         )
         .unwrap();
@@ -1076,9 +1081,9 @@ mod tests {
                     }),
                 )
             };
-            let (first, sentinel) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
-            let first = protocol_message(first).serialize_message().await.unwrap();
-            let sentinel = protocol_message(sentinel).serialize_message().await.unwrap();
+            let (first_graph, sentinel_graph) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+            let first = protocol_message(first_graph).serialize_message().await.unwrap();
+            let sentinel = protocol_message(sentinel_graph).serialize_message().await.unwrap();
 
             // The recorder is not connected to the publisher: whatever it sees came
             // through the relay, after the relay admitted it.
@@ -1124,6 +1129,19 @@ mod tests {
                 bytes <= (first.len() + sentinel.len() + envelope_overhead) as i64,
                 "the relay persisted {bytes} bytes; junk must never reach the inbox"
             );
+            // The bounds above also hold for an empty inbox: both protocol
+            // messages of the registered author must have been kept.
+            for graph_id in [first_graph, sentinel_graph] {
+                let kept = storage
+                    .list_engine_inbox_events_for_aggregate(
+                        crate::aggregates::graph::GRAPH_KIND,
+                        &graph_id.to_string(),
+                        4,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(kept.len(), 1, "graph {graph_id} has {} inbox events", kept.len());
+            }
         };
         tokio::select! {
             result = relay_run => panic!("the relay stopped before the scenario finished: {result:?}"),

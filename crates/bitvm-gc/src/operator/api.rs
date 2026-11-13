@@ -28,9 +28,7 @@ use goat::wots::{Wots, Wots96};
 
 use crate::committee::verify_taproot_pre_signed_input;
 use crate::keys::hkdf_derive_bytes;
-use crate::timelocks::{
-    default_timelock_config, take1_timelock_blocks, take2_timelock_blocks, validate_timelock_config,
-};
+use crate::timelocks::{take1_timelock_blocks, take2_timelock_blocks, validate_timelock_config};
 use crate::types::{BitvmGcGraph, BitvmGcGraphParameters};
 
 const OPERATOR_ASSERT_WOTS_HKDF_SALT: &[u8] = b"bitvm-gc/operator-wots/v2";
@@ -640,16 +638,8 @@ pub fn operator_sign_wrongly_challenged(
         .map_err(|e| anyhow::anyhow!("failed to sign wrongly challenged: {e}"))
 }
 
-pub fn take1_timelock(network: Network) -> u32 {
-    take1_timelock_with_config(network, &default_timelock_config(network))
-}
-
 pub fn take1_timelock_with_config(network: Network, timelock_config: &TimelockConfig) -> u32 {
     take1_timelock_blocks(network, timelock_config)
-}
-
-pub fn take2_timelock(network: Network) -> u32 {
-    take2_timelock_with_config(network, &default_timelock_config(network))
 }
 
 pub fn take2_timelock_with_config(network: Network, timelock_config: &TimelockConfig) -> u32 {
