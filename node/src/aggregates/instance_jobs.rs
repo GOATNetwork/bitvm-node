@@ -241,7 +241,8 @@ async fn load_or_create_committee_instance_keypair(
 // ------------------------------------------------------------------- answer
 
 /// Answer a pending request with this committee node's instance key.
-/// Skip requests already answered, no longer pending, or with spent inputs.
+/// Skip requests already answered, no longer pending, with spent inputs or
+/// whose amount does not cover the Gateway fee.
 async fn answer_pegin_request(deps: &JobDeps, instance_id: Uuid) -> Result<Step> {
     if deps.actor != Actor::Committee {
         return Step::ignore("only committee nodes answer");

@@ -150,6 +150,17 @@ pub async fn read_pegin_request(
             pegin_data.status
         )));
     }
+    let fee_sats = pegin_fee_sats(
+        pegin_data.pegin_amount_sats,
+        goat_client.gateway_get_min_pegin_fee_sats().await?,
+        goat_client.gateway_get_pegin_fee_rate().await?,
+    );
+    if fee_sats >= u128::from(pegin_data.pegin_amount_sats) {
+        bail!(SpecialError::InvalidPeginRequest(format!(
+            "pegin amount {} sats does not cover the Gateway fee of {fee_sats} sats",
+            pegin_data.pegin_amount_sats
+        )));
+    }
     let network = get_network();
     let user_change_address = Address::from_str(&pegin_data.user_change_addr)
         .map_err(|e| SpecialError::InvalidPeginRequest(format!("invalid user_change_addr: {e}")))?
@@ -194,6 +205,13 @@ pub async fn read_pegin_request(
         user_xonly_pubkey,
     };
     Ok((user_info, Amount::from_sat(pegin_data.pegin_amount_sats), pegin_data.committee_addresses))
+}
+
+/// The fee `Gateway.postPeginData` deducts; it reverts when the fee is not
+/// below the amount.
+fn pegin_fee_sats(amount_sats: u64, min_fee_sats: u64, fee_rate: u64) -> u128 {
+    const RATE_MULTIPLIER: u128 = 10_000;
+    u128::from(min_fee_sats) + u128::from(amount_sats) * u128::from(fee_rate) / RATE_MULTIPLIER
 }
 
 pub async fn read_instance_info_from_goat(
@@ -274,4 +292,17 @@ pub async fn get_graph_status(
         GraphStatus::from_str(&graph.status)
             .map_err(|_| anyhow!("unknown graph status: {}", graph.status))?,
     ))
+}
+
+#[cfg(test)]
+mod fee_tests {
+    use super::pegin_fee_sats;
+
+    #[test]
+    fn the_pegin_fee_follows_the_gateway_formula() {
+        // Gateway defaults: 5000 sats plus 0.5%.
+        assert_eq!(pegin_fee_sats(1_000_000, 5_000, 50), 10_000);
+        assert_eq!(pegin_fee_sats(5_024, 5_000, 50), 5_025);
+        assert_eq!(pegin_fee_sats(u64::MAX, u64::MAX, 10_000), 2 * u128::from(u64::MAX));
+    }
 }
