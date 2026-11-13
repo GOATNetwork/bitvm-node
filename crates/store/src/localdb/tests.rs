@@ -731,3 +731,25 @@ async fn balance_update_does_not_overwrite_node_fields_or_a_rebound_key() {
     assert_eq!(nodes[0].goat_addr, "untrusted");
     assert_eq!(nodes[0].reward, "42");
 }
+
+#[tokio::test]
+async fn watch_contract_writes_report_database_errors() {
+    let local_db = setup_db().await;
+    let mut storage = local_db.acquire().await.unwrap();
+    let watch = crate::WatchContract {
+        contract_addr: "0xabc".to_string(),
+        the_graph_url: "http://graph".to_string(),
+        gap: 1,
+        from_height: 0,
+        status: "Normal".to_string(),
+        extra: None,
+        updated_at: 1,
+        created_at: 1,
+    };
+    storage.upsert_watch_contract(&watch).await.unwrap();
+    storage.update_watch_contract_status("0xabc", "Syncing", 2).await.unwrap();
+
+    sqlx::query("DROP TABLE watch_contract").execute(storage.conn()).await.unwrap();
+    assert!(storage.upsert_watch_contract(&watch).await.is_err());
+    assert!(storage.update_watch_contract_status("0xabc", "Normal", 3).await.is_err());
+}

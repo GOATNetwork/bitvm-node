@@ -10,7 +10,6 @@ pub mod bitcoin_adaptor;
 pub mod bitcoin_chain;
 mod esplora_bitcoin_adaptor;
 pub use esplora_bitcoin_adaptor::BtcRpcTimeoutError;
-pub mod mempool_v1_type;
 mod mock_bitcoin_adaptor;
 
 #[derive(Debug)]

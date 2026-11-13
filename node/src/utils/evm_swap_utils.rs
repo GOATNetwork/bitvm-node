@@ -254,6 +254,11 @@ fn find_claim_data(
     swap_contract_address: &EvmAddress,
     escrow_hash: &[u8; 32],
 ) -> anyhow::Result<Option<ClaimData>> {
+    // A reverted frame and everything under it had no effect on chain; a claim
+    // inside it could carry any witness.
+    if call.error.is_some() {
+        return Ok(None);
+    }
     if call.to == Some(*swap_contract_address)
         && let Ok(calldata) = IEscrowManagerCalls::abi_decode(&call.input)
         && let IEscrowManagerCalls::claim(args) = calldata
@@ -353,6 +358,66 @@ fn test_hash_claim_commitment() {
     assert_eq!(commitment_hash, expected_hash);
 }
 
+/// The claim witness of testnet3 Goat tx 0xc2b26508…e64a.
+#[cfg(test)]
+const TESTNET_CLAIM_WITNESS_HEX: &str = "8977831297fa2d7156898a8d26bb9e276a83cf907d739eb64ff98a0092e9250e000000023887b022\
+        17726bb36958dd595e57293fb63d508200600020bfe2760399ccb567289b120361316911b13e937aa0f2742bb7\
+        0b000000000000efaf19dc26fadb8b1cd69e76c6d1f51123f6d22407755f865b65b446cf863c3c5fbe3769f0ff\
+        0f1ad88a60f10000000000000000000000000000000000000000000017b6e253602b5f4cc25000494e876937b2\
+        636937bd246937bd2a6937bd2d6937bd306937bd6f6937bd8f6937bda66937bde76937bdf96937be07000000000\
+        00000000000000000000000000000000000000000000000000000000000008902000000018c3db50ef29dbdddf9\
+        628cd968667688cd37560ef5e64131efc3a1e4cf4e739c0100000000a1d60dfe022725000000000000225120a5d\
+        06cb76aaf6287b93a8ee73d9678e32b039354e6df4019bbd60087e347f5ccf61a010000000000225120eb3e0c2d\
+        d6b344c6efaa771306a29e864c65d536dfac8f89a87680285af7acad1afc4b5d000000060000000000000000000\
+        000000000000000000000000000000000000000000003f7cfe6eed4929eea954c8e1358704c6dec19e2826f7223\
+        ff7d0eff92c1addf20fd2b876e05846a100c38bd3c30619c66437abb97bc5fc21e2595fbb8a514f5341ebf1f8dd\
+        26752879de5c581667aaf183b18c1b5a111f4a24061d2c44aea2fd1";
+
+#[test]
+fn claims_inside_reverted_frames_are_ignored() {
+    use alloy::primitives::{Bytes, U256};
+    use alloy::sol_types::SolCall;
+
+    let swap = EvmAddress::repeat_byte(0x11);
+    let escrow = EscrowData {
+        offerer: EvmAddress::ZERO,
+        claimer: EvmAddress::ZERO,
+        amount: U256::from(1),
+        token: EvmAddress::ZERO,
+        flags: U256::ZERO,
+        claimHandler: EvmAddress::ZERO,
+        claimData: B256::ZERO,
+        refundHandler: EvmAddress::ZERO,
+        refundData: B256::ZERO,
+        securityDeposit: U256::ZERO,
+        claimerBounty: U256::ZERO,
+        depositToken: EvmAddress::ZERO,
+        successActionCommitment: B256::ZERO,
+    };
+    let escrow_hash = hash_escrow_data(&escrow).0;
+    let input = IEscrowManager::claimCall {
+        escrow,
+        witness: Bytes::from(hex::decode(TESTNET_CLAIM_WITNESS_HEX).unwrap()),
+    }
+    .abi_encode();
+    let claim_frame = |error: Option<&str>| CallFrame {
+        to: Some(swap),
+        input: input.clone().into(),
+        error: error.map(str::to_owned),
+        ..Default::default()
+    };
+    let root = |child: CallFrame| CallFrame {
+        to: Some(EvmAddress::repeat_byte(0x22)),
+        calls: vec![child],
+        ..Default::default()
+    };
+
+    let reverted = root(claim_frame(Some("execution reverted")));
+    assert!(find_claim_data("0x01", &reverted, &swap, &escrow_hash).unwrap().is_none());
+    let succeeded = root(claim_frame(None));
+    assert!(find_claim_data("0x01", &succeeded, &swap, &escrow_hash).unwrap().is_some());
+}
+
 #[tokio::test]
 async fn test_find_claim_data() {
     unsafe {
@@ -382,19 +447,7 @@ async fn test_find_claim_data() {
         confirmations: 2u32,
         btc_relay_contract: EvmAddress::from_str("0x3887B02217726bB36958Dd595e57293fB63D5082")
             .unwrap(),
-        witness: "8977831297fa2d7156898a8d26bb9e276a83cf907d739eb64ff98a0092e9250e000000023887b022\
-        17726bb36958dd595e57293fb63d508200600020bfe2760399ccb567289b120361316911b13e937aa0f2742bb7\
-        0b000000000000efaf19dc26fadb8b1cd69e76c6d1f51123f6d22407755f865b65b446cf863c3c5fbe3769f0ff\
-        0f1ad88a60f10000000000000000000000000000000000000000000017b6e253602b5f4cc25000494e876937b2\
-        636937bd246937bd2a6937bd2d6937bd306937bd6f6937bd8f6937bda66937bde76937bdf96937be07000000000\
-        00000000000000000000000000000000000000000000000000000000000008902000000018c3db50ef29dbdddf9\
-        628cd968667688cd37560ef5e64131efc3a1e4cf4e739c0100000000a1d60dfe022725000000000000225120a5d\
-        06cb76aaf6287b93a8ee73d9678e32b039354e6df4019bbd60087e347f5ccf61a010000000000225120eb3e0c2d\
-        d6b344c6efaa771306a29e864c65d536dfac8f89a87680285af7acad1afc4b5d000000060000000000000000000\
-        000000000000000000000000000000000000000000003f7cfe6eed4929eea954c8e1358704c6dec19e2826f7223\
-        ff7d0eff92c1addf20fd2b876e05846a100c38bd3c30619c66437abb97bc5fc21e2595fbb8a514f5341ebf1f8dd\
-        26752879de5c581667aaf183b18c1b5a111f4a24061d2c44aea2fd1"
-            .to_string(),
+        witness: TESTNET_CLAIM_WITNESS_HEX.to_string(),
     };
     let claim_data =
         extract_claim_data_from_tx(&goat_client, tx_hash, &swap_contract_address, &escrow_hash)
