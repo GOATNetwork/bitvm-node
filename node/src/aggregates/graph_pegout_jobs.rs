@@ -58,7 +58,6 @@ pub(super) async fn run_pegout_step(
     action: &str,
     graph_id: Uuid,
     params: &[u8],
-    attempts: i64,
 ) -> Result<Step> {
     match action {
         JOB_KICKOFF => kickoff(deps, graph_id, params).await,
@@ -68,7 +67,7 @@ pub(super) async fn run_pegout_step(
             let Some((row, graph)) = load_graph(&deps.local_db, graph_id).await? else {
                 return Step::ignore("graph not stored locally");
             };
-            settlement_step(deps, action, &row, graph, signal, attempts).await
+            settlement_step(deps, action, &row, graph, signal).await
         }
     }
 }
@@ -79,7 +78,6 @@ async fn settlement_step(
     row: &Graph,
     graph: BitvmGcGraph,
     signal: PegoutSignal,
-    attempts: i64,
 ) -> Result<Step> {
     use PegoutSignal::*;
     // A closed graph's branches are over; it may still owe the relayer's Goat
@@ -97,7 +95,7 @@ async fn settlement_step(
     }
     match (action, signal) {
         (JOB_ENFORCE_PREVIOUS_SLOT, _) => enforce_previous_slot(deps, &graph).await,
-        (JOB_PROCEED_WITHDRAW, _) => proceed_withdraw(deps, row, &graph, attempts).await,
+        (JOB_PROCEED_WITHDRAW, _) => proceed_withdraw(deps, row, &graph).await,
         (JOB_CHALLENGE_KICKOFF, _) => challenge_kickoff(deps, &graph).await,
         (JOB_WATCHTOWER_CHALLENGE_INIT, ChallengeSent { challenge_txid }) => {
             watchtower_challenge_init(deps, row, graph, challenge_txid).await
@@ -139,9 +137,9 @@ async fn settlement_step(
             .await
         }
         (JOB_TAKE1, _) => take1(deps, row, graph).await,
-        (JOB_FINISH_HAPPY, _) => finish_happy(deps, &graph, attempts).await,
+        (JOB_FINISH_HAPPY, _) => finish_happy(deps, &graph).await,
         (JOB_TAKE2, _) => take2(deps, row, graph).await,
-        (JOB_FINISH_UNHAPPY, _) => finish_unhappy(deps, &graph, attempts).await,
+        (JOB_FINISH_UNHAPPY, _) => finish_unhappy(deps, &graph).await,
         (action, signal) => bail!("{action} does not act on {signal:?}"),
     }
 }
@@ -372,7 +370,14 @@ async fn settle_predecessors(deps: &JobDeps, graph_id: Uuid, params: &[u8]) -> R
                 else {
                     bail!("slot {slot} definition disappeared");
                 };
-                operator_skip_graph(&deps.btc_client, &mut skipped).await?;
+                if !operator_skip_graph(&deps.btc_client, &mut skipped).await? {
+                    let reason = format!(
+                        "slot {slot}: Kickoff connector cannot pay the Skip-Kickoff fee at the current rate"
+                    );
+                    warn!(event = "graph_skip", graph_id = %graph_id, skipped_graph_id = %local.graph_id, slot, reason = %reason, "earlier slot cannot be skipped yet");
+                    alert("pegout_predecessor_stuck");
+                    return after_blocks(deps, reason, 10);
+                }
                 info!(
                     event = "graph_skip",
                     graph_id = %graph_id,
@@ -1676,23 +1681,40 @@ async fn watchtower_proof_timeout(row: &Graph, graph: &BitvmGcGraph) -> Result<S
 // ------------------------------------------------------------------ relayer
 
 /// Kickoff confirmed and covered by the SPV client: `proceedWithdraw`.
-/// Blocks a relayer job waits for a lagging Goat node to show the withdraw
-/// before it gives up on it.
-const WITHDRAW_LAG_RETRIES: i64 = 30;
-/// Runs (six blocks apart) a finish job waits for `proceedWithdraw` to land.
-const WITHDRAW_PROCEED_RETRIES: i64 = 60;
+/// Bitcoin blocks past the settling transaction a relayer job waits for a
+/// lagging Goat node to show the withdraw before it gives up on it.
+const WITHDRAW_LAG_BLOCKS: u64 = 30;
+/// Bitcoin blocks past the settling transaction a finish job waits for
+/// `proceedWithdraw` to land.
+const WITHDRAW_PROCEED_BLOCKS: u64 = 360;
+
+/// Confirmations of `txid`, or None while it is unconfirmed. The give-up
+/// windows below count chain depth, not job attempts: a Goat or Bitcoin RPC
+/// outage retries the job many times without the chain moving.
+async fn confirmations(deps: &JobDeps, txid: &Txid) -> Result<Option<u64>> {
+    let Some(height) = deps.btc_client.get_tx_status(txid).await?.block_height else {
+        return Ok(None);
+    };
+    let tip = deps.btc_client.get_height().await?;
+    Ok(Some(u64::from(tip.saturating_add(1).saturating_sub(height))))
+}
 
 /// For proceed/happy/unhappy jobs, wait for the withdraw to become visible.
 /// Disproved settlement must not use this gate: it also handles rogue kickoffs
 /// without initWithdraw. These jobs run once per graph, so an early
 /// `ignore` would leave the Goat side behind for good.
-fn withdraw_missing(deps: &JobDeps, graph_id: Uuid, call: &str, attempts: i64) -> Result<Step> {
-    if attempts < WITHDRAW_LAG_RETRIES {
+fn withdraw_missing(
+    deps: &JobDeps,
+    graph_id: Uuid,
+    call: &str,
+    depth: Option<u64>,
+) -> Result<Step> {
+    if depth.is_none_or(|depth| depth < WITHDRAW_LAG_BLOCKS) {
         return after_blocks(deps, format!("withdraw is not visible on Goat yet; {call} waits"), 1);
     }
-    warn!(event = "graph_withdraw", graph_id = %graph_id, call, attempts, "withdraw never appeared on Goat; giving up");
+    warn!(event = "graph_withdraw", graph_id = %graph_id, call, ?depth, "withdraw never appeared on Goat; giving up");
     alert("pegout_withdraw_missing");
-    Step::ignore(format!("withdraw not on Goat after {attempts} attempts; {call} skipped"))
+    Step::ignore(format!("withdraw not on Goat {depth:?} blocks after settlement; {call} skipped"))
 }
 
 /// `proceedWithdraw` has not landed: wait for it, but not forever.
@@ -1700,14 +1722,16 @@ fn withdraw_not_proceeded(
     deps: &JobDeps,
     graph_id: Uuid,
     call: &str,
-    attempts: i64,
+    depth: Option<u64>,
 ) -> Result<Step> {
-    if attempts < WITHDRAW_PROCEED_RETRIES {
+    if depth.is_none_or(|depth| depth < WITHDRAW_PROCEED_BLOCKS) {
         return after_blocks(deps, "withdraw is initialized but the kickoff is not posted", 6);
     }
-    warn!(event = "graph_withdraw", graph_id = %graph_id, call, attempts, "proceedWithdraw never landed; giving up");
+    warn!(event = "graph_withdraw", graph_id = %graph_id, call, ?depth, "proceedWithdraw never landed; giving up");
     alert("pegout_withdraw_stuck");
-    Step::ignore(format!("withdraw still Initialized after {attempts} attempts; {call} skipped"))
+    Step::ignore(format!(
+        "withdraw still Initialized {depth:?} blocks after settlement; {call} skipped"
+    ))
 }
 
 /// Goat shows a status the chain contradicts: report it, nothing to send.
@@ -1722,12 +1746,7 @@ fn withdraw_inconsistent(
     Step::ignore(format!("withdraw is {status:?} although {settled_by} confirmed; {call} skipped"))
 }
 
-async fn proceed_withdraw(
-    deps: &JobDeps,
-    row: &Graph,
-    graph: &BitvmGcGraph,
-    attempts: i64,
-) -> Result<Step> {
+async fn proceed_withdraw(deps: &JobDeps, row: &Graph, graph: &BitvmGcGraph) -> Result<Step> {
     if !deps.relayer {
         return Step::ignore("not a relayer");
     }
@@ -1740,7 +1759,8 @@ async fn proceed_withdraw(
             return Step::ignore("graph closed without a withdraw on Goat");
         }
         WithdrawStatus::None => {
-            return withdraw_missing(deps, graph_id, "proceedWithdraw", attempts);
+            let depth = confirmations(deps, &graph.kickoff.tx().compute_txid()).await?;
+            return withdraw_missing(deps, graph_id, "proceedWithdraw", depth);
         }
         WithdrawStatus::Canceled => {
             // Cancelling needs the committee; a cancelled withdraw is handled by hand.
@@ -1789,7 +1809,7 @@ async fn spv_covered(deps: &JobDeps, txid: &Txid, what: &str) -> Result<Option<S
 }
 
 /// Take-1 confirmed: `finishWithdrawHappyPath`.
-async fn finish_happy(deps: &JobDeps, graph: &BitvmGcGraph, attempts: i64) -> Result<Step> {
+async fn finish_happy(deps: &JobDeps, graph: &BitvmGcGraph) -> Result<Step> {
     if !deps.relayer {
         return Step::ignore("not a relayer");
     }
@@ -1802,10 +1822,12 @@ async fn finish_happy(deps: &JobDeps, graph: &BitvmGcGraph, attempts: i64) -> Re
     match withdraw_status {
         WithdrawStatus::Processing => {}
         WithdrawStatus::Initialized => {
-            return withdraw_not_proceeded(deps, graph_id, "finishWithdrawHappyPath", attempts);
+            let depth = confirmations(deps, &take1_txid).await?;
+            return withdraw_not_proceeded(deps, graph_id, "finishWithdrawHappyPath", depth);
         }
         WithdrawStatus::None => {
-            return withdraw_missing(deps, graph_id, "finishWithdrawHappyPath", attempts);
+            let depth = confirmations(deps, &take1_txid).await?;
+            return withdraw_missing(deps, graph_id, "finishWithdrawHappyPath", depth);
         }
         WithdrawStatus::Complete => return Step::ignore("withdraw already complete on Goat"),
         other => {
@@ -1823,7 +1845,7 @@ async fn finish_happy(deps: &JobDeps, graph: &BitvmGcGraph, attempts: i64) -> Re
 }
 
 /// Take-2 confirmed: `finishWithdrawUnhappyPath`.
-async fn finish_unhappy(deps: &JobDeps, graph: &BitvmGcGraph, attempts: i64) -> Result<Step> {
+async fn finish_unhappy(deps: &JobDeps, graph: &BitvmGcGraph) -> Result<Step> {
     if !deps.relayer {
         return Step::ignore("not a relayer");
     }
@@ -1836,10 +1858,12 @@ async fn finish_unhappy(deps: &JobDeps, graph: &BitvmGcGraph, attempts: i64) -> 
     match withdraw_status {
         WithdrawStatus::Processing => {}
         WithdrawStatus::Initialized => {
-            return withdraw_not_proceeded(deps, graph_id, "finishWithdrawUnhappyPath", attempts);
+            let depth = confirmations(deps, &take2_txid).await?;
+            return withdraw_not_proceeded(deps, graph_id, "finishWithdrawUnhappyPath", depth);
         }
         WithdrawStatus::None => {
-            return withdraw_missing(deps, graph_id, "finishWithdrawUnhappyPath", attempts);
+            let depth = confirmations(deps, &take2_txid).await?;
+            return withdraw_missing(deps, graph_id, "finishWithdrawUnhappyPath", depth);
         }
         WithdrawStatus::Complete => return Step::ignore("withdraw already complete on Goat"),
         other => {

@@ -29,8 +29,9 @@ use goat::constants::TimelockConfig;
 use goat::transactions::base::output_topology;
 use goat::transactions::pre_signed::PreSignedTransaction;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex};
 use store::localdb::{GraphQuery, LocalDB};
 use store::{Graph, GraphBtcTxVoutMonitor, GraphStatus, InstanceBridgeInStatus, SerializableTxid};
@@ -93,10 +94,18 @@ fn resume_index(slots: &[(String, i64)], cursor: Option<&(String, i64)>) -> usiz
 
 /// Lowest slot per operator whose Pre-Kickoff can never confirm. The later
 /// slots extend it, so their own scans report it too and keep them Obsoleted
-/// instead of following their own unspent outpoints. Graphs are scanned
-/// lowest slot first, which rebuilds the map after a restart.
+/// instead of following their own unspent outpoints. The map lives in memory:
+/// after a restart [`seed_dead_slots`] rebuilds it before any Obsoleted graph is
+/// scanned, since a later slot scanned first would otherwise look usable again.
 static DEAD_SLOTS: LazyLock<Mutex<HashMap<String, u64>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Operators whose Obsoleted slots were checked for a dead slot since the
+/// start, and whether every operator has been. Kept across ticks, so a seed
+/// cut short by the maintenance timeout resumes instead of starting over.
+static SEEDED_OPERATORS: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+static DEAD_SLOTS_SEEDED: AtomicBool = AtomicBool::new(false);
 
 fn dead_slot_below(operator_pubkey: &str, slot: u64) -> Option<u64> {
     let dead = DEAD_SLOTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -151,7 +160,80 @@ pub async fn scan_graphs_on_chain(
         graphs.into_iter().partition(|row| row.status == GraphStatus::Obsoleted.to_string());
     let scan = ScanPass { local_db, btc_client, goat_client, engine, height };
     scan.rows(&active, SCAN_BATCH, &SCAN_CURSOR, false).await?;
+    if !seed_dead_slots(local_db, btc_client, &obsoleted).await {
+        return Ok(());
+    }
     scan.rows(&obsoleted, OBSOLETED_SCAN_BATCH, &OBSOLETED_SCAN_CURSOR, true).await
+}
+
+/// Rebuild [`DEAD_SLOTS`] from the Obsoleted graphs (sorted by operator and
+/// slot): per operator, the lowest slot whose Pre-Kickoff input another
+/// confirmed transaction spent. Returns true once every operator is done; a
+/// failed lookup leaves its operator for the next tick.
+async fn seed_dead_slots(local_db: &LocalDB, btc_client: &BTCClient, obsoleted: &[Graph]) -> bool {
+    if DEAD_SLOTS_SEEDED.load(Ordering::Acquire) {
+        return true;
+    }
+    let mut complete = true;
+    let mut index = 0;
+    while index < obsoleted.len() {
+        let operator = obsoleted[index].operator_pubkey.clone();
+        let end = obsoleted[index..]
+            .iter()
+            .position(|row| row.operator_pubkey != operator)
+            .map_or(obsoleted.len(), |offset| index + offset);
+        let rows = &obsoleted[index..end];
+        index = end;
+        if SEEDED_OPERATORS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(&operator)
+        {
+            continue;
+        }
+        match lowest_dead_slot(local_db, btc_client, rows).await {
+            Ok(dead) => {
+                if let Some(slot) = dead {
+                    record_dead_slot(&operator, slot);
+                }
+                SEEDED_OPERATORS
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(operator);
+            }
+            Err(error) => {
+                complete = false;
+                warn!(event = "graph_scan", operator_pubkey = %operator, error = %error, "dead slot seed failed; Obsoleted graphs wait for the next tick");
+            }
+        }
+    }
+    if complete {
+        DEAD_SLOTS_SEEDED.store(true, Ordering::Release);
+    }
+    complete
+}
+
+/// The lowest of `rows` (one operator, ascending slots) whose Pre-Kickoff can
+/// never confirm.
+async fn lowest_dead_slot(
+    local_db: &LocalDB,
+    btc_client: &BTCClient,
+    rows: &[Graph],
+) -> anyhow::Result<Option<u64>> {
+    for row in rows {
+        let definition = {
+            let mut storage = local_db.acquire().await?;
+            load_validated_graph_definition(&mut storage, row.instance_id, row.graph_id).await?
+        };
+        let Some(definition) = definition else {
+            continue;
+        };
+        let graph = BitvmGcGraph::from_simplified(&definition)?;
+        if prekickoff_input_spent(btc_client, &graph).await?.is_some() {
+            return Ok(Some(row.kickoff_index as u64));
+        }
+    }
+    Ok(None)
 }
 
 struct ScanPass<'a> {

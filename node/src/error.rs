@@ -16,6 +16,11 @@ pub enum SpecialError {
 
     #[error("Insufficient Balance: {0}")]
     InsufficientBalance(String),
+
+    /// A backend has not caught up with a fact another source already proved
+    /// (a transaction Goat names that esplora does not know yet). Retried.
+    #[error("Backend Lag: {0}")]
+    BackendLag(String),
 }
 
 /// How a failed step is retried.
@@ -50,7 +55,7 @@ pub fn permanent_rejection(error: &anyhow::Error) -> Option<String> {
                 | SpecialError::InvalidPeginData(message)
                 | SpecialError::InvalidGraph(message)
                 | SpecialError::InvalidCommittee(message) => Some(message.clone()),
-                SpecialError::InsufficientBalance(_) => None,
+                SpecialError::InsufficientBalance(_) | SpecialError::BackendLag(_) => None,
             };
         }
         if let Some(message) = revert_message(cause) {
@@ -79,9 +84,10 @@ fn revert_message(cause: &(dyn std::error::Error + 'static)) -> Option<String> {
 fn is_transient(error: &anyhow::Error) -> bool {
     store::is_storage_error(error)
         || error.chain().any(|cause| {
-            cause.downcast_ref::<reqwest::Error>().is_some()
+            matches!(cause.downcast_ref::<SpecialError>(), Some(SpecialError::BackendLag(_)))
+            || cause.downcast_ref::<reqwest::Error>().is_some()
             || cause.downcast_ref::<esplora_client::Error>().is_some()
-            || cause.downcast_ref::<std::io::Error>().is_some()
+            || cause.downcast_ref::<std::io::Error>().is_some_and(is_transient_io)
             || cause.downcast_ref::<tokio::time::error::Elapsed>().is_some()
             || cause.downcast_ref::<alloy::transports::TransportError>().is_some_and(transport_down)
             || cause.downcast_ref::<alloy::contract::Error>().is_some_and(|contract| {
@@ -89,6 +95,24 @@ fn is_transient(error: &anyhow::Error) -> bool {
             })
             || transient_message(&cause.to_string())
         })
+}
+
+/// Network-shaped io errors pass; a missing file, a permission error or bad data
+/// stays wrong on retry and must reach the give-up cap and its alert.
+fn is_transient_io(error: &std::io::Error) -> bool {
+    use std::io::ErrorKind::*;
+    matches!(
+        error.kind(),
+        TimedOut
+            | ConnectionRefused
+            | ConnectionReset
+            | ConnectionAborted
+            | NotConnected
+            | BrokenPipe
+            | Interrupted
+            | WouldBlock
+            | UnexpectedEof
+    )
 }
 
 fn transport_down(error: &alloy::transports::TransportError) -> bool {
@@ -131,5 +155,28 @@ pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
         message
     } else {
         "non-string panic payload"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Error, ErrorKind};
+
+    #[test]
+    fn only_network_io_errors_are_transient() {
+        let wrapped = |kind| anyhow::Error::new(Error::from(kind)).context("read setup state");
+        assert!(is_transient(&wrapped(ErrorKind::ConnectionReset)));
+        assert!(is_transient(&wrapped(ErrorKind::TimedOut)));
+        assert!(!is_transient(&wrapped(ErrorKind::NotFound)));
+        assert!(!is_transient(&wrapped(ErrorKind::PermissionDenied)));
+        assert!(!is_transient(&wrapped(ErrorKind::InvalidData)));
+    }
+
+    #[test]
+    fn backend_lag_is_transient() {
+        let error = anyhow::Error::new(SpecialError::BackendLag("tx not seen".to_string()))
+            .context("validate graph");
+        assert_eq!(classify_failure(&error), FailureClass::Transient);
     }
 }

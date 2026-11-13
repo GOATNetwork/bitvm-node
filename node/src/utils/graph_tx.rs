@@ -260,7 +260,10 @@ pub async fn build_graph_params(
     })
 }
 
-pub async fn operator_skip_graph(btc_client: &BTCClient, graph: &mut BitvmGcGraph) -> Result<()> {
+/// Broadcasts the Pre-Kickoff and the Skip-Kickoff of a slot the operator gives up.
+/// Returns false when the Kickoff connector cannot pay the Skip-Kickoff fee at the
+/// current fee rate: then only the Pre-Kickoff goes out and the slot stays open.
+pub async fn operator_skip_graph(btc_client: &BTCClient, graph: &mut BitvmGcGraph) -> Result<bool> {
     let graph_nonce = graph.parameters.graph_nonce;
     let operator_master_key = OperatorMasterKey::new(get_bitvm_key()?);
     let operator_master_keypair = operator_master_key.master_keypair();
@@ -308,21 +311,24 @@ pub async fn operator_skip_graph(btc_client: &BTCClient, graph: &mut BitvmGcGrap
                     broadcast_tx(btc_client, &skip_kickoff_tx).await?;
                 }
             }
+            Ok(true)
         }
-        None => match child_tx {
-            Some(tx) => {
-                if !tx_visible(btc_client, &prekickoff_txid).await? {
-                    broadcast_package(btc_client, &[prekickoff_tx, tx], true).await?;
+        None => {
+            match child_tx {
+                Some(tx) => {
+                    if !tx_visible(btc_client, &prekickoff_txid).await? {
+                        broadcast_package(btc_client, &[prekickoff_tx, tx], true).await?;
+                    }
+                }
+                None => {
+                    if !tx_visible(btc_client, &prekickoff_txid).await? {
+                        broadcast_tx(btc_client, &prekickoff_tx).await?;
+                    }
                 }
             }
-            None => {
-                if !tx_visible(btc_client, &prekickoff_txid).await? {
-                    broadcast_tx(btc_client, &prekickoff_tx).await?;
-                }
-            }
-        },
-    };
-    Ok(())
+            Ok(false)
+        }
+    }
 }
 
 pub async fn operator_kickoff(btc_client: &BTCClient, graph: &mut BitvmGcGraph) -> Result<()> {

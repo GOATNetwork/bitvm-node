@@ -124,7 +124,10 @@ pub async fn validate_graph_instance_parameters(
         // The parameters already match GoatChain: a transaction the Bitcoin
         // backend does not know yet is the backend lagging, not a bad graph.
         let Some(funding_tx) = funding_tx else {
-            bail!("peg-in funding transaction {} not found on Bitcoin", input.outpoint.txid);
+            bail!(SpecialError::BackendLag(format!(
+                "peg-in funding transaction {} not found on Bitcoin",
+                input.outpoint.txid
+            )));
         };
         let funding_output =
             funding_tx.output.get(input.outpoint.vout as usize).ok_or_else(|| {
@@ -158,7 +161,9 @@ pub async fn validate_graph_instance_parameters(
         .with_context(|| format!("failed to load peg-in deposit transaction {pegin_deposit_txid}"))?
         .is_none()
     {
-        bail!("peg-in deposit transaction {pegin_deposit_txid} not found on Bitcoin");
+        bail!(SpecialError::BackendLag(format!(
+            "peg-in deposit transaction {pegin_deposit_txid} not found on Bitcoin"
+        )));
     }
 
     Ok(())
