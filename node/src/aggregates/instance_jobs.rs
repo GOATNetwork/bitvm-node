@@ -16,7 +16,8 @@ use super::instance::{
 };
 use super::jobs::{
     JobDeps, Plan, aggregate_uuid, committee_pubkeys, decode_inbound, ensure_committee_sender,
-    gate_closed, instance_status, local_member, local_operator, plan_outcome, signing_nonce_id,
+    gate_closed, instance_status, local_member, local_operator, plan_outcome,
+    retry_contract_revert, signing_nonce_id,
 };
 use crate::clock::current_time_secs;
 use crate::env::{
@@ -971,7 +972,8 @@ pub enum PostOutcome {
     Rejected(String),
 }
 
-/// The gateway reverts these for good; everything else is retried.
+/// The client's own checks before the call; these are final. A revert from
+/// the gateway is retried a few times first (`retry_contract_revert`).
 fn is_permanent_post_rejection(error: &anyhow::Error) -> bool {
     let message = format!("{error:#}");
     ["not a pending pegin request", "pegin amount mismatch", "only committee member can call"]
@@ -1067,6 +1069,15 @@ impl JobRunner for PostPeginDataRunner {
             },
             Ok(PostOutcome::Rejected(reason)) => JobOutcome::Failed(reason),
             Err(error) => {
+                if let Some(retry) = retry_contract_revert(&error, ctx.job.last_error.as_deref()) {
+                    warn!(event = "instance_post", instance_id = %instance_id, error = %format!("{error:#}"), "postPeginData reverted; re-reading the chain before giving up");
+                    return retry;
+                }
+                // A revert that persisted is the gateway's answer: fail the job,
+                // which raises PostPeginDataRejected.
+                if crate::error::is_contract_revert(&error) {
+                    return JobOutcome::Failed(format!("{error:#}"));
+                }
                 JobOutcome::Transient { error: format!("{error:#}"), retry_after_secs: None }
             }
         }

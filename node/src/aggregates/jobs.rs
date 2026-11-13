@@ -85,6 +85,36 @@ pub fn plan_outcome(plan: &impl Serialize) -> JobOutcome {
     }
 }
 
+/// Consecutive runs a contract revert gets before it counts as a rejection.
+/// A load-balanced or lagging Goat node can answer from an older state. Every
+/// Goat call reads the chain state first, so a call that another relayer made
+/// meanwhile ends the job on the next run.
+pub(super) const CONTRACT_REVERT_RUNS: u32 = 5;
+const CONTRACT_REVERT_RETRY_SECS: i64 = 60;
+const CONTRACT_REVERT_PREFIX: &str = "contract revert ";
+
+/// The retry for a contract revert that has runs left, `None` for any other
+/// error or once the runs are used up. The count lives in the job's last
+/// error, so any other failure in between starts it again.
+pub(super) fn retry_contract_revert(
+    error: &anyhow::Error,
+    last_error: Option<&str>,
+) -> Option<JobOutcome> {
+    if !crate::error::is_contract_revert(error) {
+        return None;
+    }
+    let previous = last_error
+        .and_then(|last| last.strip_prefix(CONTRACT_REVERT_PREFIX))
+        .and_then(|rest| rest.split_once(" of "))
+        .and_then(|(run, _)| run.parse::<u32>().ok())
+        .unwrap_or(0);
+    let run = previous + 1;
+    (run < CONTRACT_REVERT_RUNS).then(|| JobOutcome::Transient {
+        error: format!("{CONTRACT_REVERT_PREFIX}{run} of {CONTRACT_REVERT_RUNS}: {error:#}"),
+        retry_after_secs: Some(CONTRACT_REVERT_RETRY_SECS),
+    })
+}
+
 /// The aggregate id of a job as a UUID; `what` names the aggregate in the
 /// failure ("a graph", "an instance").
 pub(super) fn aggregate_uuid(ctx: &JobContext, what: &str) -> Result<Uuid, JobOutcome> {
@@ -170,4 +200,56 @@ pub(super) async fn ensure_committee_sender(
 ) -> Result<()> {
     let peer = author_peer(inbound)?;
     validate_committee(&deps.goat_client, &peer, inbound.instance_id, committee_pubkey).await
+}
+
+#[cfg(test)]
+mod contract_revert_tests {
+    use super::*;
+
+    fn revert() -> anyhow::Error {
+        // A Goat node's JSON-RPC answer to a reverting eth_call or estimateGas.
+        let payload = serde_json::from_value(serde_json::json!({
+            "code": 3,
+            "message": "execution reverted: PeginNotPending",
+        }))
+        .unwrap();
+        let error: alloy::transports::TransportError =
+            alloy::transports::RpcError::ErrorResp(payload);
+        anyhow::Error::new(error).context("postGraphData")
+    }
+
+    fn retried(outcome: Option<JobOutcome>) -> Option<String> {
+        match outcome {
+            Some(JobOutcome::Transient { error, retry_after_secs }) => {
+                assert_eq!(retry_after_secs, Some(CONTRACT_REVERT_RETRY_SECS));
+                Some(error)
+            }
+            None => None,
+            Some(other) => panic!("unexpected outcome {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_revert_is_retried_a_few_consecutive_runs_then_left_to_the_rejection_path() {
+        let mut last_error: Option<String> = None;
+        for run in 1..CONTRACT_REVERT_RUNS {
+            let error = retried(retry_contract_revert(&revert(), last_error.as_deref()))
+                .unwrap_or_else(|| panic!("run {run} is retried"));
+            assert!(error.starts_with(&format!("contract revert {run} of {CONTRACT_REVERT_RUNS}")));
+            assert!(error.contains("PeginNotPending"));
+            last_error = Some(error);
+        }
+        assert!(retry_contract_revert(&revert(), last_error.as_deref()).is_none());
+    }
+
+    #[test]
+    fn another_failure_in_between_starts_the_count_again() {
+        let error = retried(retry_contract_revert(&revert(), Some("Goat SPV at 10, block 12")));
+        assert!(error.unwrap().starts_with("contract revert 1 of"));
+    }
+
+    #[test]
+    fn other_errors_are_not_handled() {
+        assert!(retry_contract_revert(&anyhow::anyhow!("connection refused"), None).is_none());
+    }
 }
