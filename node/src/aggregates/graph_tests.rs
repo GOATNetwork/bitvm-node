@@ -527,6 +527,37 @@ async fn a_definition_waits_for_its_predecessor_and_pulls_it() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_finalized_pull_runs_while_only_the_operator_copy_is_stored() {
+    let t = start(Actor::Verifier, false).await;
+    for (nonce, committee_pre_signed) in [(0, false), (1, true)] {
+        let instance_id = Uuid::new_v4();
+        let graph_id = t.insert_graph(instance_id, nonce, GraphStatus::OperatorDataPushed).await;
+        let raw = serde_json::json!({ "committee_pre_signed": committee_pre_signed }).to_string();
+        let mut storage = t.db.acquire().await.unwrap();
+        storage
+            .upsert_graph_raw_data(
+                instance_id,
+                store::GraphRawData { graph_id, raw_data: raw, created_at: 0, updated_at: 0 },
+                "definition",
+            )
+            .await
+            .unwrap();
+        drop(storage);
+        let lookup = GraphLookup::Id { instance_id, graph_id, finalized: true };
+        let event = graph_pull_event(graph_id, lookup.clone()).unwrap();
+        let event_id = t.submit(event).await;
+        t.wait_inbox(&event_id, EngineInboxState::Applied).await;
+        if committee_pre_signed {
+            settle().await;
+            assert!(t.jobs_of(graph_id).await.iter().all(|job| job.action != JOB_FETCH_GRAPH));
+        } else {
+            t.wait_job(graph_id, JOB_FETCH_GRAPH, EngineJobState::Done).await;
+        }
+    }
+    t.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_value_from_an_unregistered_author_waits_without_a_pull() {
     let t = start_with(Actor::Committee, false, Arc::new(Unacquainted)).await;
     let (instance_id, graph_id) = (Uuid::new_v4(), Uuid::new_v4());

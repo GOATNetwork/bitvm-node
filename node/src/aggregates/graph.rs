@@ -19,6 +19,7 @@ use crate::engine_bridge::record_event_in;
 use crate::messages::{GOATMessage, GOATMessageContent, verify_init_graph_signature};
 use crate::metrics_service::node_metrics_state;
 use crate::middleware::get_topic_name;
+use crate::utils::stored_definition_committee_pre_signed;
 use anyhow::anyhow;
 use async_trait::async_trait;
 use bitvm_lib::actors::Actor;
@@ -1169,7 +1170,17 @@ impl AggregateHandler for GraphAggregate {
                         )));
                     }
                 };
-                if row.is_none() {
+                // A finalized lookup also runs when only the operator's copy is
+                // stored, whatever the status.
+                let wanted = match (&row, &pull.lookup) {
+                    (None, _) => true,
+                    (Some(_), GraphLookup::Id { finalized: true, .. }) => {
+                        stored_definition_committee_pre_signed(ctx.storage, &graph_id).await?
+                            != Some(true)
+                    }
+                    (Some(_), _) => false,
+                };
+                if wanted {
                     let params = bincode::serialize(&pull.lookup)
                         .map_err(|error| anyhow::anyhow!("encode graph lookup: {error}"))?;
                     self.enqueue_setup_job(ctx, JOB_FETCH_GRAPH, &params);
