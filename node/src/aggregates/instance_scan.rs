@@ -33,6 +33,9 @@ use uuid::Uuid;
 
 const TASK_KEY_ANSWER_WINDOW: &str = "instance_answer_window_scan";
 const TASK_KEY_BTC: &str = "instance_btc_scan";
+/// Instances parked in CommitteesAnswered or Timeout page separately: many
+/// never move again and must not use up the live instances' budget.
+const TASK_KEY_BTC_PARKED: &str = "instance_btc_scan_parked";
 const SCAN_MARKS_LIMIT: usize = 50_000;
 
 // ----------------------------------------------------------------- paging
@@ -177,41 +180,46 @@ fn mark_settled_timeout(instance_id: Uuid) {
     settled.insert(instance_id);
 }
 
-/// Statuses the Bitcoin scan follows. The key-deletion statuses are only
-/// followed on committee nodes with deletion enabled.
-fn scanned_statuses(actor: &Actor) -> (Vec<String>, bool) {
+/// Statuses the Bitcoin scan follows: the live ones and the parked ones,
+/// paged apart. The key-deletion statuses are only followed on committee
+/// nodes with deletion enabled.
+fn scanned_statuses(actor: &Actor) -> (Vec<String>, Vec<String>, bool) {
     use InstanceBridgeInStatus::*;
     let key_scan = *actor == Actor::Committee && is_enable_committee_instance_key_delete();
-    let mut statuses = vec![CommitteesAnswered, UserBroadcastPeginPrepare, Presigned, Timeout];
+    let mut live = vec![UserBroadcastPeginPrepare, Presigned];
     if key_scan {
-        statuses.extend([RelayerL1Broadcasted, RelayerL2Minted]);
+        live.extend([RelayerL1Broadcasted, RelayerL2Minted]);
     }
-    (statuses.iter().map(ToString::to_string).collect(), key_scan)
+    let parked = [CommitteesAnswered, Timeout];
+    (
+        live.iter().map(ToString::to_string).collect(),
+        parked.iter().map(ToString::to_string).collect(),
+        key_scan,
+    )
 }
 
-/// Record a Bitcoin snapshot for every live instance.
+/// Record a Bitcoin snapshot for every scanned instance: one page of the live
+/// instances and one page of the parked ones per tick.
 pub async fn scan_instances_on_bitcoin(
     local_db: &LocalDB,
     btc_client: &BTCClient,
     engine: &EngineHandle,
     actor: &Actor,
 ) -> anyhow::Result<()> {
-    let (statuses, key_scan) = scanned_statuses(actor);
-    let mut query = InstanceQuery::default().with_statuses(statuses);
+    let (live, parked, key_scan) = scanned_statuses(actor);
+    let mut live_query = InstanceQuery::default().with_statuses(live);
     if key_scan {
-        query = query.with_raw_condition(format!(
+        live_query = live_query.with_raw_condition(format!(
             "(status NOT IN ('{}', '{}') OR key_deleted = 0)",
             InstanceBridgeInStatus::RelayerL1Broadcasted,
             InstanceBridgeInStatus::RelayerL2Minted
         ));
     }
-    let instances = find_one_instance_page(
-        local_db,
-        TASK_KEY_BTC,
-        query,
-        get_instance_maintenance_batch_size(),
-    )
-    .await?;
+    let batch = get_instance_maintenance_batch_size();
+    let mut instances = find_one_instance_page(local_db, TASK_KEY_BTC, live_query, batch).await?;
+    let parked_query = InstanceQuery::default().with_statuses(parked);
+    instances
+        .extend(find_one_instance_page(local_db, TASK_KEY_BTC_PARKED, parked_query, batch).await?);
     if instances.is_empty() {
         return Ok(());
     }
@@ -582,6 +590,19 @@ mod tests {
     use bitcoin::{Address, hashes::Hash, key::Keypair, secp256k1::SECP256K1};
     use client::goat_chain::{PeginData, PeginStatus};
     use store::GoatTxType;
+
+    #[test]
+    fn parked_instances_do_not_share_the_live_page() {
+        use InstanceBridgeInStatus::*;
+        let (live, parked, _) = scanned_statuses(&Actor::Operator);
+        for status in [CommitteesAnswered, Timeout] {
+            assert!(parked.contains(&status.to_string()) && !live.contains(&status.to_string()));
+        }
+        for status in [UserBroadcastPeginPrepare, Presigned] {
+            assert!(live.contains(&status.to_string()) && !parked.contains(&status.to_string()));
+        }
+        assert_ne!(TASK_KEY_BTC, TASK_KEY_BTC_PARKED);
+    }
 
     async fn database() -> (LocalDB, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
