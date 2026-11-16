@@ -27,10 +27,55 @@ use rand::{RngCore, rngs::OsRng};
 use secp256k1::schnorr::Signature as SchnorrSignature;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{fs, io::Write, path::Path};
 use uuid::Uuid;
+
+/// Writes `contents` to `path` so that after a crash the file is either complete or absent.
+/// The bytes go to a 0600 temporary file in the same directory, which is synced, renamed
+/// over `path`, and the directory is synced so the rename itself survives power loss.
+/// The instance key is answered on chain right after this returns; it is the only copy.
+fn write_file_durably(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .with_context(|| format!("envelope path has no directory: {}", path.display()))?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("create envelope directory failed: {}", parent.display()))?;
+    let file_name = path
+        .file_name()
+        .with_context(|| format!("envelope path has no file name: {}", path.display()))?;
+    let mut temp_name = file_name.to_os_string();
+    temp_name.push(".tmp");
+    let temp_path = parent.join(temp_name);
+
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&temp_path)
+            .with_context(|| format!("create envelope file failed: {}", temp_path.display()))?;
+        // `mode` only applies to a new file; a leftover temporary file keeps its old mode.
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("set envelope permissions failed: {}", temp_path.display()))?;
+        file.write_all(contents)
+            .with_context(|| format!("write envelope failed: {}", temp_path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("sync envelope failed: {}", temp_path.display()))?;
+        fs::rename(&temp_path, path)
+            .with_context(|| format!("rename envelope failed: {}", path.display()))?;
+        fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .with_context(|| format!("sync envelope directory failed: {}", parent.display()))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
+}
 
 pub type OperatorAssertWotsSecretKey = OperatorAssertSecretKey;
 pub type OperatorAssertWotsPublicKey = OperatorAssertPublicKey;
@@ -248,18 +293,7 @@ impl CommitteeMasterKey {
 
         let serialized = serde_json::to_vec_pretty(&envelope)
             .context("serialize committee instance key envelope")?;
-        if let Some(parent) = envelope_path.parent() {
-            fs::create_dir_all(parent).with_context(|| {
-                format!("create envelope directory failed: {}", parent.display())
-            })?;
-        }
-        let mut file = fs::File::create(envelope_path)
-            .with_context(|| format!("create envelope file failed: {}", envelope_path.display()))?;
-        file.write_all(&serialized)
-            .with_context(|| format!("write envelope failed: {}", envelope_path.display()))?;
-        fs::set_permissions(envelope_path, fs::Permissions::from_mode(0o600)).with_context(
-            || format!("set envelope permissions failed: {}", envelope_path.display()),
-        )?;
+        write_file_durably(envelope_path, &serialized)?;
         Ok(committee_pubkey)
     }
 
@@ -372,6 +406,13 @@ impl CommitteeMasterKey {
         Ok(self.nonces_for_graph_context_with_keypair(context, signer_keypair))
     }
 
+    /// The nonces are derived from the key and the signed context, so the node needs no
+    /// nonce state of its own. That is safe only while the record of what it signed is never
+    /// rolled back: a MuSig2 partial signature also depends on the other signers' nonces, so
+    /// after a rollback a co-signer can answer the same context with a new nonce, and this node
+    /// would sign again with the same secret nonce. Two partial signatures under one nonce reveal
+    /// the key. Keep the database and the key envelopes on storage that is not restored from
+    /// older snapshots.
     fn nonces_for_graph_context_with_keypair(
         &self,
         context: CommitteeGraphNonceContext,
@@ -529,6 +570,29 @@ mod tests {
             .delete_instance_keypair_envelope(instance_id, &envelope_path)
             .expect("delete envelope should succeed");
         assert!(!envelope_path.exists(), "envelope file should be removed");
+    }
+
+    #[test]
+    fn committee_instance_key_envelope_is_written_whole_with_owner_only_access() {
+        let instance_id = Uuid::new_v4();
+        let master = CommitteeMasterKey::new(test_master_keypair("seed:test-committee-master"));
+        let directory = std::env::temp_dir().join(format!("bitvm-gc-envelope-dir-{instance_id}"));
+        let envelope_path = directory.join("nested").join(format!("{instance_id}.json"));
+        let temp_path = envelope_path.with_file_name(format!("{instance_id}.json.tmp"));
+        // A temporary file left by an interrupted write is replaced, not trusted.
+        fs::create_dir_all(temp_path.parent().unwrap()).unwrap();
+        fs::write(&temp_path, b"partial").unwrap();
+        fs::set_permissions(&temp_path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let created = master.create_instance_keypair_envelope(instance_id, &envelope_path).unwrap();
+        assert!(!temp_path.exists(), "the temporary file is renamed into place");
+        let mode = fs::metadata(&envelope_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let loaded: PublicKey =
+            master.load_instance_keypair(instance_id, &envelope_path).unwrap().public_key().into();
+        assert_eq!(created, loaded);
+
+        fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]

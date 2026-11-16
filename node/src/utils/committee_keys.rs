@@ -12,9 +12,7 @@ use uuid::Uuid;
 
 /// Path of the committee instance key envelope for `instance_id`.
 pub fn committee_instance_keys_envelope_path(instance_id: Uuid) -> PathBuf {
-    let mut envelope_path = PathBuf::from(COMMITTEE_INSTANCE_KEYS_DIR);
-    envelope_path.push(format!("{instance_id}.json"));
-    envelope_path
+    committee_instance_keys_dir().join(format!("{instance_id}.json"))
 }
 
 /// Whether this node signs for an instance: it holds the instance key

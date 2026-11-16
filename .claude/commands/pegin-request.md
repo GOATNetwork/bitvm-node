@@ -8,7 +8,7 @@ Send a pegin request to GoatChain via the `pegin-request` binary.
      - `prepare` - Build, sign and broadcast the pegin deposit tx on Bitcoin
      - `request-prepare` - Request then auto-prepare after waiting ~12 minutes
      - `cancel` - Build, sign and broadcast the pegin refund tx on Bitcoin
-   - **network**: Bitcoin network (`bitcoin`, `testnet`, `testnet4`, `signet`, `regtest`). Default: `testnet4`
+   - **network**: Bitcoin network (`bitcoin`, `testnet4`, `signet`, `regtest`). Default: `BITCOIN_NETWORK`, or `testnet4`. Must match `BITCOIN_NETWORK` when both are set
    - **esplora_url**: Esplora API URL. Default: `https://mempool.space/testnet4/api`
    - For `request` / `request-prepare`:
      - **pegin_amount_sats**: Amount in satoshis. Default: `1000000` (0.01 BTC)

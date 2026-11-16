@@ -21,7 +21,7 @@
 
 use alloy::primitives::Address as EvmAddress;
 use alloy::providers::{Provider, ProviderBuilder};
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use bitcoin::hashes::Hash;
 use bitcoin::sighash::EcdsaSighashType;
 use bitcoin::{Address, Amount, key::Keypair};
@@ -43,7 +43,7 @@ use tracing_subscriber::EnvFilter;
 
 use bitvm_noded::env::{
     ENV_BITCOIN_NETWORK, ENV_BITVM_SECRET, ENV_GOAT_ADDRESS, get_goat_network,
-    get_node_goat_address, goat_config_from_env,
+    get_node_goat_address, goat_config_from_env, parse_bitcoin_network,
 };
 use bitvm_noded::utils::{
     broadcast_tx, get_fee_rate, get_proper_utxo_set, node_p2wsh_address, node_sign,
@@ -148,20 +148,13 @@ async fn main() -> Result<()> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
     let args = Args::parse();
-    let network = args.network.as_str();
-    let network = match network {
-        "bitcoin" => Network::Bitcoin,
-        "testnet" => Network::Testnet,
-        "testnet4" => Network::Testnet4,
-        "signet" => Network::Signet,
-        "regtest" => Network::Regtest,
-        _ => {
-            tracing::warn!(
-                "Unknown BTC network: {network}, expect bitcoin, testnet, signet or regtest, return testnet by default"
-            );
-            Network::Testnet4
-        }
-    };
+    let network = parse_bitcoin_network(&args.network)?;
+    // Addresses are also checked by node code that reads BITCOIN_NETWORK; both must agree.
+    if let Ok(configured) = std::env::var(ENV_BITCOIN_NETWORK)
+        && parse_bitcoin_network(&configured)? != network
+    {
+        bail!("--network {} disagrees with {ENV_BITCOIN_NETWORK}={configured}", args.network);
+    }
     let btc_client = BTCClient::new(network, Some(&args.esplora_url));
 
     let goat_client = {
