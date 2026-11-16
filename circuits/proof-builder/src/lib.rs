@@ -13,6 +13,7 @@ use zkm_sdk::{Prover, ZKMProofKind, ZKMProvingKey, ZKMStdin, ZKMVerifyingKey};
 
 pub mod api_auth;
 pub mod artifacts;
+pub mod headers;
 
 // Every variant carries a batch of inputs; the request is built once per proof.
 #[allow(clippy::large_enum_variant)]

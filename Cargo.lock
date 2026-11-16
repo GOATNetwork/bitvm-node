@@ -9144,7 +9144,9 @@ name = "proof-builder"
 version = "0.4.0"
 dependencies = [
  "anyhow",
+ "bincode",
  "bitcoin",
+ "borsh",
  "commit-chain",
  "header-chain",
  "hex",
