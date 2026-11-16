@@ -287,10 +287,7 @@ impl InstanceUpdate {
         query_builder.set_field("updated_at", QueryParam::Int(current_time));
 
         // Add WHERE clause
-        query_builder.and_where(
-            "hex(instance_id) = ? COLLATE NOCASE ",
-            Some(QueryParam::Text(hex::encode(self.instance_id))),
-        );
+        query_builder.and_where("instance_id = ?", Some(QueryParam::Uuid(self.instance_id)));
 
         if let Some(ref statuses) = self.only_if_status_in {
             if statuses.is_empty() {
