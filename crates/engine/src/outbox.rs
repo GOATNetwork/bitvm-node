@@ -6,6 +6,7 @@ use crate::clock::Clock;
 use crate::config::EngineConfig;
 use crate::metrics::EngineMetrics;
 use async_trait::async_trait;
+use std::collections::HashMap;
 use std::sync::Arc;
 use store::localdb::LocalDB;
 use tokio::sync::Notify;
@@ -33,11 +34,12 @@ pub(crate) async fn run_publisher(
     notify: Arc<Notify>,
     cancel: CancellationToken,
 ) {
+    let mut failures = PublishFailures::default();
     loop {
         if cancel.is_cancelled() {
             return;
         }
-        if let Err(error) = drain_outbox(&deps).await {
+        if let Err(error) = drain_outbox(&deps, &mut failures).await {
             warn!(event = "engine_outbox", outcome = "drain_failed", error = %error, "outbox drain failed");
         }
         tokio::select! {
@@ -49,8 +51,36 @@ pub(crate) async fn run_publisher(
     }
 }
 
+/// Consecutive publish failures per outbox row, so a row the transport keeps
+/// refusing backs off instead of retrying at the first step forever. Kept in
+/// memory: a restart starts the backoff over.
+#[derive(Default)]
+pub(crate) struct PublishFailures(HashMap<String, i64>);
+
+/// Rows remembered at most; past it the counts start over, which only
+/// shortens some backoffs once.
+const PUBLISH_FAILURES_MAX_ROWS: usize = 4_096;
+
+impl PublishFailures {
+    fn record(&mut self, outbox_id: &str) -> i64 {
+        if self.0.len() >= PUBLISH_FAILURES_MAX_ROWS && !self.0.contains_key(outbox_id) {
+            self.0.clear();
+        }
+        let count = self.0.entry(outbox_id.to_string()).or_default();
+        *count += 1;
+        *count
+    }
+
+    fn clear(&mut self, outbox_id: &str) {
+        self.0.remove(outbox_id);
+    }
+}
+
 /// Publish every due row once. Returns the number of successful publishes.
-pub(crate) async fn drain_outbox(deps: &PublisherDeps) -> anyhow::Result<usize> {
+pub(crate) async fn drain_outbox(
+    deps: &PublisherDeps,
+    failures: &mut PublishFailures,
+) -> anyhow::Result<usize> {
     let mut published = 0;
     loop {
         let now = deps.clock.now();
@@ -74,6 +104,7 @@ pub(crate) async fn drain_outbox(deps: &PublisherDeps) -> anyhow::Result<usize> 
             let mut storage = deps.db.acquire().await?;
             match result {
                 Ok(()) => {
+                    failures.clear(&row.outbox_id);
                     let next_at = now + deps.config.outbox_backoff.delay(row.publish_count + 1);
                     storage.record_engine_outbox_publish(&row.outbox_id, next_at, now).await?;
                     deps.metrics.record_publish(true);
@@ -89,7 +120,8 @@ pub(crate) async fn drain_outbox(deps: &PublisherDeps) -> anyhow::Result<usize> 
                     );
                 }
                 Err(error) => {
-                    let next_at = now + deps.config.outbox_backoff.delay(1);
+                    let failed = failures.record(&row.outbox_id);
+                    let next_at = now + deps.config.outbox_backoff.delay(failed);
                     storage
                         .record_engine_outbox_publish_failure(
                             &row.outbox_id,
@@ -105,6 +137,7 @@ pub(crate) async fn drain_outbox(deps: &PublisherDeps) -> anyhow::Result<usize> 
                         outbox_id = %row.outbox_id,
                         kind = %row.kind,
                         error = %error,
+                        failures = failed,
                         next_at,
                         "outbox publish failed; will retry"
                     );
@@ -114,5 +147,22 @@ pub(crate) async fn drain_outbox(deps: &PublisherDeps) -> anyhow::Result<usize> 
         if claimed < deps.config.outbox_batch {
             return Ok(published);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Backoff;
+
+    #[test]
+    fn repeated_publish_failures_back_off_until_a_publish_succeeds() {
+        let backoff = Backoff::Doubling { base: 30, cap: 600 };
+        let mut failures = PublishFailures::default();
+        let delays: Vec<i64> = (0..6).map(|_| backoff.delay(failures.record("row"))).collect();
+        assert_eq!(delays, vec![30, 60, 120, 240, 480, 600]);
+        assert_eq!(failures.record("other"), 1, "rows count apart");
+        failures.clear("row");
+        assert_eq!(failures.record("row"), 1, "a publish starts the count over");
     }
 }

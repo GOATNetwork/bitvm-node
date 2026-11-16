@@ -1083,6 +1083,22 @@ impl InstanceAggregate {
         result: JobResultEvent,
     ) -> Result<ApplyOutcome, ApplyError> {
         let instance_id = instance.instance_id;
+        if result.stale {
+            // A newer run of the job holds it and reports its own result; jobs
+            // re-run to the same effect, so only this run's wakes are kept.
+            if let JobResultOutcome::Done(bytes) = &result.outcome
+                && INSTANCE_JOBS.contains(&result.action.as_str())
+                && let Ok(plan) = InstancePlan::decode(bytes)
+            {
+                for wake_ref in plan.wake_refs {
+                    ctx.effects.wake(wake_ref);
+                }
+            }
+            info!(event = "instance_job", instance_id = %instance_id, action = %result.action, generation = result.generation, "stale job result dropped; the newer run reports");
+            ctx.storage.clear_engine_job_result(&result.job_id, ctx.now).await?;
+            ctx.effects.set_status(status.to_string()).set_phase(phase_of(status).to_string());
+            return Ok(ApplyOutcome::Applied);
+        }
         match result.action.as_str() {
             JOB_DELETE_INSTANCE_KEY => match &result.outcome {
                 JobResultOutcome::Done(bytes) => {
@@ -1099,7 +1115,6 @@ impl InstanceAggregate {
                             event = "instance_key_delete",
                             instance_id = %instance_id,
                             outcome = "deleted",
-                            stale = result.stale,
                             detail = %outcome.detail,
                             "committee instance key envelope deleted"
                         );
@@ -1125,7 +1140,7 @@ impl InstanceAggregate {
             },
             JOB_POST_PEGIN_DATA => match &result.outcome {
                 JobResultOutcome::Done(_) => {
-                    info!(event = "instance_post", instance_id = %instance_id, outcome = "posted", stale = result.stale, "pegin data posted; waiting for the BridgeIn event");
+                    info!(event = "instance_post", instance_id = %instance_id, outcome = "posted", "pegin data posted; waiting for the BridgeIn event");
                 }
                 JobResultOutcome::Failed(error) => {
                     raise_alert(instance_id, InstanceAlert::PostPeginDataRejected, error);
@@ -1148,7 +1163,7 @@ impl InstanceAggregate {
                         }
                     };
                     if let Some(note) = &plan.note {
-                        info!(event = "instance_job", instance_id = %instance_id, action, stale = result.stale, note = %note, "job note");
+                        info!(event = "instance_job", instance_id = %instance_id, action, note = %note, "job note");
                     }
                     self.apply_plan(ctx, instance, status, plan).await?;
                 }

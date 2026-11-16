@@ -151,14 +151,14 @@ async fn inbox_dedup_rearms_failed_and_acks_applied_or_waiting() {
     assert!(applied.payload.is_none());
     assert_eq!(applied.applied_at, Some(16));
     assert_eq!(applied.ack_target().unwrap().peer, "peer-a");
-    // Poisoned rows are terminal and never re-armed.
+    // Poisoned rows are terminal and never re-armed; a resend is ACKed.
     s.insert_engine_inbox_event(&event("e2", "a"), 20).await.unwrap();
     assert!(s.mark_engine_inbox_poisoned("e2", "panic", 21).await.unwrap());
     assert_eq!(
         s.insert_engine_inbox_event(&event("e2", "a"), 22).await.unwrap(),
         EngineInboxInsert::Duplicate {
             state: EngineInboxState::Poisoned,
-            ack_again: false,
+            ack_again: true,
             rearmed: false
         }
     );
@@ -605,4 +605,18 @@ async fn ack_lookup_matches_exactly_and_skips_payloads() {
         plan.iter().any(|(.., detail)| detail.contains("COVERING INDEX idx_engine_outbox_ack")),
         "{plan:?}"
     );
+}
+
+#[tokio::test]
+async fn lapsed_cancelled_jobs_are_found_without_a_write() {
+    let db = setup_db().await;
+    let mut s = db.acquire().await.unwrap();
+    assert!(s.insert_engine_job(&job("j1", "broadcast"), 10).await.unwrap().is_inserted());
+    assert_eq!(s.claim_due_engine_jobs("cpu", 10, 100, 10).await.unwrap().len(), 1);
+    assert!(!s.has_lapsed_cancelled_engine_jobs(20).await.unwrap(), "not cancelled");
+    assert!(s.cancel_engine_job("j1", 20).await.unwrap());
+    assert!(!s.has_lapsed_cancelled_engine_jobs(50).await.unwrap(), "holder still leased");
+    assert!(s.has_lapsed_cancelled_engine_jobs(100).await.unwrap());
+    assert_eq!(s.finish_lapsed_cancelled_engine_jobs(100).await.unwrap().len(), 1);
+    assert!(!s.has_lapsed_cancelled_engine_jobs(100).await.unwrap());
 }

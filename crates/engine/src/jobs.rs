@@ -93,6 +93,10 @@ pub(crate) async fn run_executor(
 /// it finishes as `Cancelled` here and its result reaches the aggregate.
 async fn finish_lapsed_cancelled(deps: &ExecutorDeps) -> anyhow::Result<()> {
     let now = deps.clock.now();
+    // Every poll comes here; only take the write lock when there is work.
+    if !deps.db.acquire().await?.has_lapsed_cancelled_engine_jobs(now).await? {
+        return Ok(());
+    }
     let mut tx = deps.db.start_immediate_transaction().await?;
     let jobs = tx.finish_lapsed_cancelled_engine_jobs(now).await?;
     if jobs.is_empty() {
