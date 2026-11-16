@@ -134,8 +134,11 @@ impl QueryBuilder {
     }
 
     pub fn apply_pagination(&mut self, limit: Option<u32>, offset: Option<u32>) {
-        if let Some(limit) = limit {
-            self.sql.push_str(&format!(" LIMIT {limit}"));
+        // SQLite only accepts OFFSET after a LIMIT; -1 means no limit.
+        match (limit, offset) {
+            (Some(limit), _) => self.sql.push_str(&format!(" LIMIT {limit}")),
+            (None, Some(_)) => self.sql.push_str(" LIMIT -1"),
+            (None, None) => {}
         }
 
         if let Some(offset) = offset {
@@ -204,4 +207,20 @@ impl QueryBuilder {
 /// Creates a string of placeholders like "$1,$2,$3" for use in SQL IN clauses
 pub fn create_place_holders<T>(inputs: &[T]) -> String {
     vec!["?"; inputs.len()].join(",")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn offset_without_limit_still_produces_valid_sql() {
+        let mut builder = QueryBuilder::new("SELECT * FROM graph");
+        builder.apply_pagination(None, Some(20));
+        assert!(builder.sql.ends_with(" LIMIT -1 OFFSET 20"));
+
+        let mut builder = QueryBuilder::new("SELECT * FROM graph");
+        builder.apply_pagination(Some(10), Some(20));
+        assert!(builder.sql.ends_with(" LIMIT 10 OFFSET 20"));
+    }
 }

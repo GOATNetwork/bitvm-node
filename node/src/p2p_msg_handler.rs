@@ -210,12 +210,19 @@ impl P2pMessageHandler for BitvmNodeProcessor {
     async fn handle_tick_message(
         &self,
         swarm: &mut BitvmSwarmWrapper,
-        _peer_id: PeerId,
+        peer_id: PeerId,
         actor: Actor,
         msg_type: TickMessageType,
     ) -> anyhow::Result<()> {
         match msg_type {
             TickMessageType::HeartBeat => {
+                // Keep this node's own row fresh so it counts as online in the
+                // node list; the public RPC handlers no longer write it.
+                if let Err(error) =
+                    update_node_timestamp(&self.local_db, &peer_id.to_string()).await
+                {
+                    tracing::warn!("refresh local node timestamp: {error}");
+                }
                 match detect_heart_beat(swarm).await {
                     Ok(_) => {}
                     Err(e) => {

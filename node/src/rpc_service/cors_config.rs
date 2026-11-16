@@ -108,56 +108,54 @@ impl CorsConfig {
         }
     }
 
-    /// Create CORS layer
-    pub fn create_cors_layer(&self) -> CorsLayer {
+    /// Create the CORS layer. A malformed origin or header is an error rather than a
+    /// silent widening to `*`, and so is a combination tower-http would panic on.
+    pub fn create_cors_layer(&self) -> anyhow::Result<CorsLayer> {
+        // An empty list or a literal `*` means any value.
+        let any_origin =
+            self.allowed_origins.is_empty() || self.allowed_origins.iter().any(|o| o == "*");
+        let any_headers =
+            self.allowed_headers.is_empty() || self.allowed_headers.iter().any(|h| h == "*");
+        if self.allow_credentials && (any_origin || any_headers) {
+            anyhow::bail!(
+                "CORS_ALLOW_CREDENTIALS=true needs explicit CORS_ALLOWED_ORIGINS and \
+                 CORS_ALLOWED_HEADERS (no empty list, no `*`)"
+            );
+        }
+
         let mut cors_layer = CorsLayer::new();
-
-        // Set allowed origins
-        if self.allowed_origins.is_empty() {
-            cors_layer = cors_layer.allow_origin(Any);
+        cors_layer = if any_origin {
+            cors_layer.allow_origin(Any)
         } else {
-            let origins: Result<Vec<_>, _> =
-                self.allowed_origins.iter().map(|origin| HeaderValue::from_str(origin)).collect();
-
-            match origins {
-                Ok(header_values) => {
-                    cors_layer = cors_layer.allow_origin(header_values);
-                }
-                Err(_) => {
-                    tracing::warn!("Invalid CORS origins, falling back to Any");
-                    cors_layer = cors_layer.allow_origin(Any);
-                }
-            }
-        }
-
-        // Set allowed headers
-        if self.allowed_headers.is_empty() {
-            cors_layer = cors_layer.allow_headers(Any);
+            let origins = self
+                .allowed_origins
+                .iter()
+                .map(|origin| {
+                    HeaderValue::from_str(origin)
+                        .map_err(|_| anyhow::anyhow!("invalid CORS origin {origin:?}"))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            cors_layer.allow_origin(origins)
+        };
+        cors_layer = if any_headers {
+            cors_layer.allow_headers(Any)
         } else {
-            let headers: Result<Vec<_>, _> =
-                self.allowed_headers.iter().map(|header| HeaderName::from_str(header)).collect();
+            let headers = self
+                .allowed_headers
+                .iter()
+                .map(|header| {
+                    HeaderName::from_str(header)
+                        .map_err(|_| anyhow::anyhow!("invalid CORS header {header:?}"))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            cors_layer.allow_headers(headers)
+        };
 
-            match headers {
-                Ok(header_names) => {
-                    cors_layer = cors_layer.allow_headers(header_names);
-                }
-                Err(_) => {
-                    tracing::warn!("Invalid CORS headers, falling back to Any");
-                    cors_layer = cors_layer.allow_headers(Any);
-                }
-            }
-        }
-
-        // Set allowed HTTP methods;
-        // Set credentials allowance;
-        // Set preflight request cache time;
-        // Set private network allowance
-        cors_layer = cors_layer
+        Ok(cors_layer
             .allow_methods(self.allowed_methods.clone())
             .allow_credentials(self.allow_credentials)
             .max_age(std::time::Duration::from_secs(self.max_age))
-            .allow_private_network(self.allow_private_network);
-        cors_layer
+            .allow_private_network(self.allow_private_network))
     }
 
     /// Validate configuration security
@@ -309,6 +307,42 @@ mod tests {
         config.max_age = 1800; // 30 minutes
         let warnings = config.validate_security();
         assert!(!warnings.iter().any(|w| w.contains("long")));
+    }
+
+    #[test]
+    fn bad_cors_settings_are_errors_not_wildcards_or_panics() {
+        let invalid_origin = CorsConfig {
+            allowed_origins: vec!["https://ok.example".to_string(), "bad\norigin".to_string()],
+            ..Default::default()
+        };
+        assert!(invalid_origin.create_cors_layer().is_err());
+
+        let invalid_header =
+            CorsConfig { allowed_headers: vec!["bad header".to_string()], ..Default::default() };
+        assert!(invalid_header.create_cors_layer().is_err());
+
+        for (origins, headers) in [
+            (vec![], vec!["content-type".to_string()]),
+            (vec!["*".to_string()], vec!["content-type".to_string()]),
+            (vec!["https://ok.example".to_string()], vec![]),
+        ] {
+            let config = CorsConfig {
+                allowed_origins: origins,
+                allowed_headers: headers,
+                allow_credentials: true,
+                ..Default::default()
+            };
+            assert!(config.create_cors_layer().is_err());
+        }
+
+        let wildcard = CorsConfig { allowed_origins: vec!["*".to_string()], ..Default::default() };
+        assert!(wildcard.create_cors_layer().is_ok());
+        let credentials = CorsConfig {
+            allowed_origins: vec!["https://ok.example".to_string()],
+            allow_credentials: true,
+            ..Default::default()
+        };
+        assert!(credentials.create_cors_layer().is_ok());
     }
 
     #[test]

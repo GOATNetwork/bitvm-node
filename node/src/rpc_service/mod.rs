@@ -1,6 +1,6 @@
 pub mod auth;
 mod bitvm;
-mod cors_config;
+pub mod cors_config;
 pub mod handler;
 mod node;
 mod response;
@@ -11,6 +11,7 @@ mod tests;
 pub(super) mod utils;
 pub mod validation;
 
+use crate::clock::current_time_secs;
 use crate::env::{get_btc_url_from_env, get_goat_network, get_network, goat_config_from_env};
 use crate::metrics_service::{MetricsState, metrics_handler, metrics_middleware};
 use crate::rpc_service::auth::require_request_auth;
@@ -49,7 +50,7 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
 /// Create secure CORS layer
-pub fn create_secure_cors_layer() -> CorsLayer {
+pub fn create_secure_cors_layer() -> anyhow::Result<CorsLayer> {
     let cors_config = CorsConfig::from_env();
 
     // Validate configuration security
@@ -58,7 +59,7 @@ pub fn create_secure_cors_layer() -> CorsLayer {
         tracing::warn!("CORS security warning: {}", warning);
     }
 
-    cors_config.create_cors_layer()
+    cors_config.create_cors_layer().context("invalid CORS configuration")
 }
 
 pub struct AppState {
@@ -72,6 +73,10 @@ pub struct AppState {
     /// Present when the execution engine is enabled (debug and status endpoints).
     pub engine: Option<engine::EngineHandle>,
     rpc_auth_nonces: Mutex<HashMap<String, i64>>,
+    /// Signed requests stamped before this second are rejected. The nonce cache
+    /// starts empty after a restart, so a request captured earlier could
+    /// otherwise be replayed until its timestamp expires.
+    rpc_auth_not_before: i64,
 }
 
 impl AppState {
@@ -84,7 +89,9 @@ impl AppState {
     ) -> anyhow::Result<Arc<AppState>> {
         let btc_client = BTCClient::new(get_network(), get_btc_url_from_env().as_deref());
         let goat_client = GOATClient::new(goat_config_from_env().await, get_goat_network());
-        let http_client = HttpAsyncClient::new(None);
+        // The public proof-desc proxy is the only user: one attempt per request,
+        // so an unauthenticated caller cannot multiply load on the proof builder.
+        let http_client = HttpAsyncClient::new(Some(0));
         Ok(Arc::new(AppState {
             local_db,
             btc_client,
@@ -95,6 +102,7 @@ impl AppState {
             engine,
             http_client,
             rpc_auth_nonces: Mutex::new(HashMap::new()),
+            rpc_auth_not_before: current_time_secs(),
         }))
     }
 
@@ -119,8 +127,9 @@ impl AppState {
             actor,
             peer_id,
             engine: None,
-            http_client: HttpAsyncClient::new(None),
+            http_client: HttpAsyncClient::new(Some(0)),
             rpc_auth_nonces: Mutex::new(HashMap::new()),
+            rpc_auth_not_before: current_time_secs(),
         }))
     }
 }
@@ -145,7 +154,7 @@ async fn root() -> &'static str {
     "Hello, World!"
 }
 
-pub(crate) fn build_business_router(app_state: Arc<AppState>) -> Router {
+pub(crate) fn build_business_router(app_state: Arc<AppState>) -> anyhow::Result<Router> {
     let public_routes = Router::new()
         .route(routes::ROOT, get(root))
         .route(routes::v1::HEALTH, get(get_health))
@@ -184,7 +193,7 @@ pub(crate) fn build_business_router(app_state: Arc<AppState>) -> Router {
     let signed_routes = signed_routes
         .route_layer(middleware::from_fn_with_state(app_state.clone(), require_request_auth));
 
-    public_routes.merge(signed_routes).layer(create_secure_cors_layer()).with_state(app_state)
+    Ok(public_routes.merge(signed_routes).layer(create_secure_cors_layer()?).with_state(app_state))
 }
 
 pub async fn serve_with_app_state(
@@ -204,7 +213,7 @@ async fn serve_with_listener(
     cancellation_token: CancellationToken,
 ) -> anyhow::Result<String> {
     let node_span = tracing::Span::current();
-    let server = build_business_router(app_state.clone())
+    let server = build_business_router(app_state.clone())?
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(move |request: &Request<Body>| {

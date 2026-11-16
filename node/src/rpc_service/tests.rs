@@ -161,7 +161,7 @@ async fn spawn_business_listener(
     let app_state = mock_app_state().await?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?.to_string();
-    let server = rpc_service::build_business_router(app_state);
+    let server = rpc_service::build_business_router(app_state)?;
     let handle = tokio::spawn(async move {
         let _ = tokio::select! {
             result = axum::serve(listener, server) => result,
@@ -202,6 +202,23 @@ async fn signed_request_nonce_is_rejected_after_first_use() -> Result<(), Box<dy
     assert_eq!(replay.status().as_u16(), 409);
     let replay_body: Value = replay.json().await?;
     assert_eq!(replay_body["error"], "AUTH_REPLAY");
+
+    cancellation_token.cancel();
+    server.await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn graph_list_pagination_is_bounded() -> Result<(), Box<dyn std::error::Error>> {
+    let cancellation_token = CancellationToken::new();
+    let (addr, server) = spawn_business_listener(cancellation_token.clone()).await?;
+    let client = Client::new();
+    let base = format!("http://{addr}{}", routes::v1::GRAPHS_BASE);
+
+    let too_many = client.get(format!("{base}?limit=1000")).send().await?;
+    assert_eq!(too_many.status().as_u16(), 400);
+    let offset_only = client.get(format!("{base}?offset=5")).send().await?;
+    assert_eq!(offset_only.status().as_u16(), 200);
 
     cancellation_token.cancel();
     server.await?;
