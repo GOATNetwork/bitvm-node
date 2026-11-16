@@ -39,9 +39,7 @@ jobs:
           echo "CGO_ENABLED=1" >> $GITHUB_ENV        
 
       - name: Install Ziren toolchain
-        run: |
-          curl --proto '=https' --tlsv1.2 -sSf \
-            https://raw.githubusercontent.com/ProjectZKM/toolchain/refs/heads/main/setup.sh | sh
+        uses: ./.github/actions/install-ziren
 
       # Install Go for all platforms (required for zkm-recursion-gnark-ffi)
       - name: Install Go (Ubuntu, macOS)
@@ -107,7 +105,8 @@ jobs:
 
           ARCHIVE_NAME="bitvm-node-${VERSION}-${PLATFORM}.tar.gz"
           tar -czf "release-artifacts/${ARCHIVE_NAME}" -C "$STAGING_DIR" .
-          $CHECKSUM_CMD "release-artifacts/${ARCHIVE_NAME}" > "release-artifacts/${ARCHIVE_NAME}.sha256"
+          # Name only: the checksum is checked next to the downloaded archive.
+          (cd release-artifacts && $CHECKSUM_CMD "${ARCHIVE_NAME}" > "${ARCHIVE_NAME}.sha256")
 
           echo "Archive created:"
           ls -lh release-artifacts/
