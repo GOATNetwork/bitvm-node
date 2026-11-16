@@ -349,14 +349,12 @@ async fn run_bitcoin_scans(
         scan_instances_on_bitcoin(local_db, btc_client, engine, actor),
     )
     .await;
-    if *actor == Actor::Operator {
-        failed |= !run_maintenance_subtask(
-            metrics_state,
-            "graph_setup_abandon_scan",
-            abandon_unfinished_setups(local_db, btc_client, engine),
-        )
-        .await;
-    }
+    failed |= !run_maintenance_subtask(
+        metrics_state,
+        "graph_setup_abandon_scan",
+        abandon_unfinished_setups(local_db, btc_client, engine, actor),
+    )
+    .await;
 
     let outcome = if failed { "failed" } else { "success" };
     metrics_state.record_task_run("bitcoin_maintenance", outcome, started.elapsed());

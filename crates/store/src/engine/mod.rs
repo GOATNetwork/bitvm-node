@@ -828,6 +828,23 @@ impl<'a> StorageProcessor<'a> {
         Ok(query.fetch_all(self.conn()).await?)
     }
 
+    /// `aggregate_kind` aggregates whose mirrored status is `status`.
+    pub async fn list_engine_aggregates_by_status(
+        &mut self,
+        aggregate_kind: &str,
+        status: &str,
+    ) -> anyhow::Result<Vec<EngineAggregate>> {
+        let rows = sqlx::query(&format!(
+            "SELECT {ENGINE_AGGREGATE_COLUMNS} FROM engine_aggregate \
+             WHERE aggregate_kind = ? AND status = ?"
+        ))
+        .bind(aggregate_kind)
+        .bind(status)
+        .fetch_all(self.conn())
+        .await?;
+        Ok(rows.iter().map(engine_aggregate_from_row).collect::<Result<_, _>>()?)
+    }
+
     /// Create the row if needed and apply `update`; bumps `version`.
     pub async fn upsert_engine_aggregate(
         &mut self,

@@ -2,11 +2,11 @@
 //!
 //! Maintenance scans active graphs once per Bitcoin height and stored status;
 //! Obsoleted graphs only get a cheap probe until their Pre-Kickoff confirms.
-//! Each result becomes a `chain_scan` event. Operator nodes also report setups
+//! Each result becomes a `chain_scan` event. Every role also reports setups
 //! unfinished at their instance's abandon height.
 
 use super::common::ScanMarks;
-use super::graph::{SetupAbandoned, setup_abandoned_event};
+use super::graph::{GRAPH_KIND, GraphState, SetupAbandoned, setup_abandoned_event};
 use super::graph_pegout::{ChainScan, PegoutSignal, Unusable};
 use super::instance::PeginDeadlines;
 use crate::clock::current_time_secs;
@@ -16,6 +16,7 @@ use crate::utils::{
     scan_graph_chain_state,
 };
 use bitcoin::{OutPoint, Txid};
+use bitvm_lib::actors::Actor;
 use bitvm_lib::timelocks::{
     connector_f_timelock_blocks, disprove_timelock_blocks, operator_ack_timelock_blocks,
     operator_commit_timelock_blocks, take1_timelock_blocks, take2_timelock_blocks,
@@ -32,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
 use std::sync::{LazyLock, Mutex};
-use store::localdb::{GraphQuery, LocalDB};
+use store::localdb::{GraphQuery, LocalDB, StorageProcessor};
 use store::{Graph, GraphBtcTxVoutMonitor, GraphStatus, InstanceBridgeInStatus, SerializableTxid};
 use strum::{Display, EnumString};
 use tracing::{debug, trace, warn};
@@ -250,30 +251,39 @@ async fn prekickoff_confirmed(btc_client: &BTCClient, row: &Graph) -> anyhow::Re
     Ok(btc_client.get_tx_status(&Txid::from(txid)).await?.confirmed)
 }
 
-/// Report operator setups unfinished at the abandon height, including pending
-/// sessions and built graphs without committee pre-signatures. Failed instances
-/// are handled by their own cleanup.
+/// Report setups unfinished at the abandon height. An operator reports its
+/// pending sessions and built graphs without committee pre-signatures; failed
+/// instances are handled by their own cleanup. Other roles report every graph
+/// without committee pre-signatures and every admitted verifier setup whose
+/// graph never arrived, failed instance or not: nothing else ends their
+/// deliveries.
 pub async fn abandon_unfinished_setups(
     local_db: &LocalDB,
     btc_client: &BTCClient,
     engine: &EngineHandle,
+    actor: &Actor,
 ) -> anyhow::Result<()> {
-    let operator_pubkey = get_node_pubkey()?.to_string();
+    let operator = *actor == Actor::Operator;
     let setups: BTreeMap<Uuid, Uuid> = {
         let mut storage = local_db.acquire().await?;
-        let sessions = storage.list_pending_graph_inits_by_operator(&operator_pubkey).await?;
-        let graphs = storage
-            .get_operator_graphs(
-                GraphQuery::default()
-                    .with_operator_pubkey(operator_pubkey)
-                    .with_statuses(vec![GraphStatus::OperatorPresigned.to_string()]),
-            )
-            .await?;
-        sessions
-            .into_iter()
-            .map(|session| (session.graph_id, session.instance_id))
-            .chain(graphs.into_iter().map(|graph| (graph.graph_id, graph.instance_id)))
-            .collect()
+        if operator {
+            let operator_pubkey = get_node_pubkey()?.to_string();
+            let sessions = storage.list_pending_graph_inits_by_operator(&operator_pubkey).await?;
+            let graphs = storage
+                .get_operator_graphs(
+                    GraphQuery::default()
+                        .with_operator_pubkey(operator_pubkey)
+                        .with_statuses(vec![GraphStatus::OperatorPresigned.to_string()]),
+                )
+                .await?;
+            sessions
+                .into_iter()
+                .map(|session| (session.graph_id, session.instance_id))
+                .chain(graphs.into_iter().map(|graph| (graph.graph_id, graph.instance_id)))
+                .collect()
+        } else {
+            watched_setups(&mut storage).await?
+        }
     };
     if setups.is_empty() {
         return Ok(());
@@ -284,7 +294,9 @@ pub async fn abandon_unfinished_setups(
         let Some(instance) = local_db.acquire().await?.find_instance(&instance_id).await? else {
             continue;
         };
-        if InstanceBridgeInStatus::from_str(&instance.status).is_ok_and(|status| status.is_failed())
+        if operator
+            && InstanceBridgeInStatus::from_str(&instance.status)
+                .is_ok_and(|status| status.is_failed())
         {
             continue;
         }
@@ -296,6 +308,29 @@ pub async fn abandon_unfinished_setups(
         }
     }
     Ok(())
+}
+
+/// `(graph, instance)` of what a non-operator still delivers for: graphs
+/// without committee pre-signatures and admitted verifier setups whose graph
+/// never arrived.
+pub(super) async fn watched_setups(
+    storage: &mut StorageProcessor<'_>,
+) -> anyhow::Result<BTreeMap<Uuid, Uuid>> {
+    let graphs = storage
+        .get_operator_graphs(
+            GraphQuery::default().with_statuses(vec![GraphStatus::OperatorPresigned.to_string()]),
+        )
+        .await?;
+    let unbuilt = storage.list_engine_aggregates_by_status(GRAPH_KIND, "").await?;
+    Ok(graphs
+        .into_iter()
+        .map(|graph| (graph.graph_id, graph.instance_id))
+        .chain(unbuilt.into_iter().filter_map(|aggregate| {
+            let state = GraphState::load(aggregate.state.as_deref());
+            let admission = state.setup_admission.filter(|_| !state.abandoned)?;
+            Some((Uuid::parse_str(&aggregate.aggregate_id).ok()?, admission.instance_id))
+        }))
+        .collect())
 }
 
 /// The facts of one graph at `height`; `None` when its definition is not
