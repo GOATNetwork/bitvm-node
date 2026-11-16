@@ -100,13 +100,13 @@ impl GetGraphRequest {
         }
     }
 
-    pub fn by_slot(operator_pubkey: String, graph_nonce: u64) -> Self {
+    pub fn by_slot(operator_pubkey: String, graph_nonce: u64, finalized: bool) -> Self {
         Self {
             instance_id: None,
             graph_id: None,
             operator_pubkey: Some(operator_pubkey),
             graph_nonce: Some(graph_nonce),
-            finalized: false,
+            finalized,
         }
     }
 }
