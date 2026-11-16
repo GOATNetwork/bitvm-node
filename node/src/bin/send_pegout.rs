@@ -188,7 +188,20 @@ fn print_pegout_result(resp: &PegoutApiResponse) {
     }
 }
 
-const IN_PROGRESS_STATUSES: &[&str] = &["OperatorDataPushed", "OperatorKickOff", "Challenge"];
+/// Statuses the graph API reports while a started pegout is still running. The
+/// API shows `OperatorDataPushed` as `L2Recorded` or `OperatorKickOffing`.
+const IN_PROGRESS_STATUSES: &[&str] =
+    &["L2Recorded", "OperatorKickOffing", "PreKickoff", "OperatorKickOff", "Challenge"];
+
+fn pegout_in_progress(status: &str) -> bool {
+    IN_PROGRESS_STATUSES.contains(&status)
+}
+
+/// A preflight that finds no eligible graph ends the batch normally; any other
+/// error is a failure.
+fn batch_finished(error: &anyhow::Error) -> bool {
+    error.to_string().contains("no eligible graph found")
+}
 
 async fn wait_for_graph_ready(
     client: &reqwest::Client,
@@ -200,7 +213,7 @@ async fn wait_for_graph_ready(
     let mut waited = 0u64;
     loop {
         if let Some(status) = get_graph_status(client, base_url, graph_id).await? {
-            if !IN_PROGRESS_STATUSES.contains(&status.as_str()) {
+            if !pegout_in_progress(&status) {
                 eprintln!("graph {graph_id} ready, status: {status}");
                 return Ok(());
             }
@@ -292,9 +305,13 @@ async fn main() -> Result<()> {
                         )
                         .await?;
                     }
-                    Err(e) => {
+                    Err(e) if batch_finished(&e) => {
                         eprintln!("batch stop: {e}");
                         break;
+                    }
+                    Err(e) => {
+                        eprintln!("batch failed after {count} pegouts, {total_sent} total sats");
+                        return Err(e);
                     }
                 }
             }
@@ -304,4 +321,31 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_started_pegout_is_waited_for_under_its_display_status() {
+        for status in
+            ["L2Recorded", "OperatorKickOffing", "PreKickoff", "OperatorKickOff", "Challenge"]
+        {
+            assert!(pegout_in_progress(status), "{status}");
+        }
+        for status in ["OperatorTake1", "OperatorTake2", "Disprove", "Obsoleted", "Skipped"] {
+            assert!(!pegout_in_progress(status), "{status}");
+        }
+    }
+
+    #[test]
+    fn only_running_out_of_graphs_ends_a_batch_normally() {
+        assert!(batch_finished(&anyhow::anyhow!(
+            "API error (PEGOUT_ERROR): no eligible graph found for operator 02ab"
+        )));
+        assert!(!batch_finished(&anyhow::anyhow!(
+            "API error (PEGOUT_ERROR): graph x not ready: previous graph y is in active pegout status Challenge"
+        )));
+    }
 }

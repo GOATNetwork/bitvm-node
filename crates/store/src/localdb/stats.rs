@@ -57,9 +57,8 @@ impl StorageProcessor<'_> {
                     SELECT MIN(status_updated_at)
                     FROM instance
                     WHERE status NOT IN (
-                        'RelayerL2Minted', 'PresignedFailed', 'RelayerL2MintedFailed',
-                        'Timeout', 'UserCanceled', 'NoEnoughCommitteesAnswered', 'UserDiscarded',
-                        'Failed', 'Success', 'Canceled'
+                        'RelayerL2Minted', 'Timeout', 'UserCanceled',
+                        'NoEnoughCommitteesAnswered', 'UserDiscarded'
                     )
                 ) AS pegin_oldest_active_status_updated_at,
                 (
