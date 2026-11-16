@@ -18,6 +18,13 @@ pub(super) const REPLAY_MAX_FUTURE: Duration = Duration::from_secs(10 * 60);
 /// Below-floor rejections of one author per tick that are worth an operator's
 /// attention; see [`ReplayGuard::take_lockout_suspects`].
 pub(super) const REPLAY_LOCKOUT_SUSPECT_REJECTIONS: u32 = 8;
+/// An author none of whose messages was admitted for this long has its window
+/// reset by the next one below it: gossipsub numbers messages from the wall
+/// clock at start-up, so an author restarted with its clock set back would
+/// otherwise stay locked out until every peer restarts. While the author is
+/// live its own messages keep being admitted and no replay can trigger this;
+/// the reset re-opens the window as a local restart does.
+pub(super) const REPLAY_RESET_AFTER: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Debug, Default)]
 struct AuthorSequence {
@@ -26,6 +33,8 @@ struct AuthorSequence {
     recent: std::collections::BTreeSet<u64>,
     /// Rejection count since the last report; diagnostic only.
     rejected: u32,
+    /// Local wall time (nanos) of the last admitted message.
+    last_admitted: u64,
 }
 
 /// Per-registered-author sequence window, in memory only: accept unseen numbers
@@ -75,12 +84,20 @@ impl ReplayGuard {
             let floor = sequence_number.saturating_sub(REPLAY_WINDOW);
             state.recent = state.recent.split_off(&floor);
         } else if state.highest - sequence_number >= REPLAY_WINDOW
+            && unix_nanos.saturating_sub(state.last_admitted)
+                >= REPLAY_RESET_AFTER.as_nanos() as u64
+        {
+            // The author's numbering went back (see `REPLAY_RESET_AFTER`).
+            state.highest = sequence_number;
+            state.recent.clear();
+        } else if state.highest - sequence_number >= REPLAY_WINDOW
             || state.recent.contains(&sequence_number)
         {
             state.rejected = state.rejected.saturating_add(1);
             return Err(DropReason::ReplayedSequence);
         }
         state.recent.insert(sequence_number);
+        state.last_admitted = unix_nanos;
         Ok(())
     }
 

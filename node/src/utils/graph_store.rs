@@ -343,9 +343,13 @@ async fn ingest_graph_definition(
         definition_hash.clone(),
     );
 
-    if let Some(node_info) =
-        tx.get_node_by_btc_pub_key(&bitvm_graph.parameters.operator_pubkey.to_string()).await?
-    {
+    let operator_peer =
+        super::node_info::operator_peer_id(&bitvm_graph.parameters.operator_pubkey.to_string());
+    let operator_row = match operator_peer {
+        Some(peer) => tx.node_by_id(&peer).await?,
+        None => None,
+    };
+    if let Some(node_info) = operator_row {
         graph.from_addr = node_info.goat_addr.clone();
         graph.to_addr =
             node_p2wsh_address(get_network(), &bitvm_graph.parameters.operator_pubkey).to_string();

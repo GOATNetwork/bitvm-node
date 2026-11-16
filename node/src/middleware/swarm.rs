@@ -139,6 +139,9 @@ pub struct BitvmSwarmConfig {
 /// five minutes.
 const BOOTNODE_REDIAL_DELAY: Duration = Duration::from_secs(5);
 const BOOTNODE_REDIAL_RETRY: Duration = Duration::from_secs(20);
+/// A bootnode asks the network for node info at most this often when peers
+/// subscribe; one it skips is covered by the next heartbeat's request.
+const NODE_INFO_REQUEST_COOLDOWN: Duration = Duration::from_secs(60);
 const BOOTNODE_REDIAL_TICK: Duration = Duration::from_secs(5);
 
 pub struct BitvmNetworkManager {
@@ -152,6 +155,8 @@ pub struct BitvmNetworkManager {
     bootnodes: Vec<(PeerId, Multiaddr)>,
     /// Disconnected bootnodes and when to dial them next.
     bootnode_redials: HashMap<PeerId, Instant>,
+    /// When this bootnode last asked for node info on a subscription.
+    last_node_info_request: Option<Instant>,
 }
 impl BitvmNetworkManager {
     pub fn new(
@@ -202,6 +207,7 @@ impl BitvmNetworkManager {
             pending_graph_requests: PendingGraphRequests::new(),
             bootnodes,
             bootnode_redials: HashMap::new(),
+            last_node_info_request: None,
         })
     }
 
@@ -403,7 +409,13 @@ impl BitvmNetworkManager {
 
                             debug!("subscribed: {:?}, {:?}", peer_id, topic);
                             // Except for the bootNode, all other nodes need to request information from other nodes after registering the event `ALL`.
-                            if self.config.bootnodes.is_empty(){
+                            let now = Instant::now();
+                            // Only an `All` subscription triggers the request.
+                            if self.config.bootnodes.is_empty()
+                                && topic == Actor::All.to_string()
+                                && self.last_node_info_request.is_none_or(|at| now.saturating_duration_since(at) >= NODE_INFO_REQUEST_COOLDOWN)
+                            {
+                                self.last_node_info_request = Some(now);
                                 match msg_handler.finish_subscribe_topic(&mut self.swarm, actor.clone(), topic).await{
                                     Ok(_) => {},Err(e) => { tracing::error!("{e:?}") }
                                 }

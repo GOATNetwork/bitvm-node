@@ -6,7 +6,9 @@ use super::registry::{
     OPERATOR_STAKE_TTL, REFUSED_PEER_LOOKUPS_PER_MINUTE, VERIFIER_SET_RETRY_INTERVAL,
 };
 use super::registry_refresh::{REGISTERED_KIND_COMMITTEE, REGISTERED_KIND_OPERATOR};
-use super::replay::{REPLAY_LOCKOUT_SUSPECT_REJECTIONS, REPLAY_MAX_FUTURE, REPLAY_WINDOW};
+use super::replay::{
+    REPLAY_LOCKOUT_SUSPECT_REJECTIONS, REPLAY_MAX_FUTURE, REPLAY_RESET_AFTER, REPLAY_WINDOW,
+};
 use super::strikes::{STRIKE_BAN, STRIKE_LIMIT, STRIKE_WINDOW};
 use super::*;
 use crate::messages::{AggNonceConsensus, InitGraph, sign_init_graph};
@@ -1088,6 +1090,32 @@ fn global_rate_spends_its_burst_and_refills_at_its_rate() {
     assert!(!rate.allow(now), "the burst is spent");
     assert!(rate.allow(now + Duration::from_secs(1)), "one token per second comes back");
     assert!(!rate.allow(now + Duration::from_secs(1)));
+}
+
+/// Verify an author whose numbering went back is admitted again once it has
+/// been locked out for the reset time, and a replay alongside a live author is not.
+#[test]
+fn an_author_locked_out_by_its_clock_going_back_is_admitted_again() {
+    let guard = ReplayGuard::default();
+    let author = PeerId::random();
+    let reset = REPLAY_RESET_AFTER.as_nanos() as u64;
+    let start = WALL_CLOCK - reset;
+    assert_eq!(guard.admit(&author, Some(start), start), Ok(()));
+    let behind = start - 10 * REPLAY_WINDOW;
+    // Live: the author's own messages are admitted, an old number is not.
+    assert_eq!(guard.admit(&author, Some(start + 1), start + reset - 1), Ok(()));
+    assert_eq!(
+        guard.admit(&author, Some(behind), start + reset),
+        Err(DropReason::ReplayedSequence),
+        "admitted a moment ago"
+    );
+    // Nothing admitted for the reset time: the next number below the window
+    // starts it over, and the window then works as before.
+    let now = start + 2 * reset;
+    assert_eq!(guard.admit(&author, Some(behind), now), Ok(()));
+    assert_eq!(guard.admit(&author, Some(behind + 1), now), Ok(()));
+    assert_eq!(guard.admit(&author, Some(behind), now), Err(DropReason::ReplayedSequence));
+    assert_eq!(guard.admit(&author, Some(behind + 2), now), Ok(()));
 }
 
 /// Verify future sequence numbers do not move the window.
