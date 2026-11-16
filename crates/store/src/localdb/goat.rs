@@ -27,7 +27,7 @@ impl StorageProcessor<'_> {
         &mut self,
         watch_contract: &WatchContract,
     ) -> anyhow::Result<()> {
-        let _ = sqlx::query!(
+        sqlx::query!(
             "INSERT INTO watch_contract (contract_addr, the_graph_url, gap, from_height, status, extra, updated_at, created_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT (contract_addr) DO UPDATE SET the_graph_url = excluded.the_graph_url,
@@ -44,7 +44,7 @@ impl StorageProcessor<'_> {
             watch_contract.extra,
             watch_contract.updated_at,
             watch_contract.created_at
-        ).execute(self.conn()).await;
+        ).execute(self.conn()).await?;
         Ok(())
     }
 
@@ -54,14 +54,14 @@ impl StorageProcessor<'_> {
         status: &str,
         updated_at: i64,
     ) -> anyhow::Result<()> {
-        let _ = sqlx::query!(
+        sqlx::query!(
             "UPDATE watch_contract SET status = ?,  updated_at = ? WHERE contract_addr = ?",
             status,
             updated_at,
             contract_addr,
         )
         .execute(self.conn())
-        .await;
+        .await?;
         Ok(())
     }
 

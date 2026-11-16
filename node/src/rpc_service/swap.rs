@@ -112,6 +112,12 @@ fn get_swap_status_extra(status: &str) -> StatusExtra {
     status_extra
 }
 
+/// Confirmations of a transaction mined at `tx_height`; 0 while this node's view
+/// of the chain is behind the explorer that reported the height.
+fn confirmations(current_height: u32, tx_height: u32) -> u32 {
+    current_height.saturating_add(1).saturating_sub(tx_height)
+}
+
 async fn get_claim_btc_confirm_progress(
     btc_client: &BTCClient,
     current_height: u32,
@@ -121,7 +127,7 @@ async fn get_claim_btc_confirm_progress(
         && let Ok(tx_status) = btc_client.get_tx_status(&txid.0).await
         && let Some(height) = tx_status.block_height
     {
-        (current_height + 1 - height, SWAP_CLAIM_BTC_TARGET_CONFIRMATIONS)
+        (confirmations(current_height, height), SWAP_CLAIM_BTC_TARGET_CONFIRMATIONS)
     } else {
         (0, SWAP_CLAIM_BTC_TARGET_CONFIRMATIONS)
     }
@@ -136,4 +142,17 @@ pub struct SwapListResponse {
 #[derive(Deserialize, Serialize)]
 pub struct SwapGetResponse {
     pub swap: Option<SwapEscrowExtended>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::confirmations;
+
+    #[test]
+    fn confirmations_do_not_wrap_when_the_node_is_behind() {
+        assert_eq!(confirmations(100, 100), 1);
+        assert_eq!(confirmations(105, 100), 6);
+        assert_eq!(confirmations(98, 100), 0);
+        assert_eq!(confirmations(u32::MAX, 0), u32::MAX);
+    }
 }
