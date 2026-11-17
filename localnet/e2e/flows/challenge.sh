@@ -40,7 +40,7 @@ wait_log operator_0 "$gid.*Prover-Assert broadcast\|Prover-Assert broadcast.*$gi
 wait_mempool 60 || exit 1
 mine 1; A=$(tip); log "assert confirmed at A=$A"
 if [[ $MODE == valid ]]; then
-  wait_log verifier_0 "operator assert proof is valid" 240 || { engine_summary; exit 1; }
+  wait_log verifier_0 "$gid.*operator assert proof and committed pubin are valid\|operator assert proof and committed pubin are valid.*$gid" 240 || { engine_summary; exit 1; }
   for i in $(seq 1 15); do
     if fresh_log operator_0 | grep -q "Take-2 broadcast"; then break; fi
     sleep 20; mine 1

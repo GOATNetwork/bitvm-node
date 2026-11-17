@@ -29,7 +29,7 @@ for a in "$@"; do case $a in --list) printf '%s\n' "${CASES_ALL[@]}"; exit 0;; -
 for c in "${CASES[@]}"; do [[ " ${CASES_ALL[*]} " == *" $c "* ]] || { echo "unknown case: $c (see --list)" >&2; rm -rf "$RUN"; exit 2; }; done
 
 # ---- cases: each returns 0 on pass; graph ids for peg-out cases come from the lowest posted slot ----
-need_graph() { local g; g=$(next_posted_graph); if [[ -z $g ]]; then log "no posted graph; running a peg-in first" >&2; "$E/flows/pegin.sh" >&2 || return 1; g=$(cat "$E2E_RUN/graph.txt"); fi; echo "$g"; }
+need_graph() { local g; g=$(next_posted_graph) || return 1; if [[ -z $g ]]; then log "no posted graph; running a peg-in first" >&2; "$E/flows/pegin.sh" >&2 || return 1; g=$(cat "$E2E_RUN/graph.txt"); fi; echo "$g"; }
 case_pegin_happy() { "$E/flows/pegin.sh"; }
 case_pegout_happy() { local g; g=$(need_graph) || return 1; "$E/flows/pegout.sh" "$g"; }
 case_challenge_take2() { local g; g=$(need_graph) || return 1; "$E/flows/challenge.sh" "$g" valid; }
