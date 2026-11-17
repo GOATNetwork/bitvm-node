@@ -20,8 +20,8 @@ use bitvm_lib::babe_adapter::{
     BabeVerifierPrivateState, CACSetupPackage, FinalizedInstanceData, Seed, SolderingData,
     compact_soldering_proof_payload,
 };
-use store::GraphStatus;
-use tracing::warn;
+use store::{EngineJobState, GraphStatus};
+use tracing::{info, warn};
 use uuid::Uuid;
 
 const BABE_SETUP_STATE_ORPHAN_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
@@ -194,6 +194,7 @@ pub(crate) async fn cleanup_babe_setup_states(
     let mut storage = local_db.acquire().await?;
     let now = SystemTime::now();
     let mut deleted = 0;
+    let mut s3_payloads_left = 0;
     for instance_dir in instance_dirs {
         let instance_dir = instance_dir?;
         if !instance_dir.file_type()?.is_dir() {
@@ -228,13 +229,21 @@ pub(crate) async fn cleanup_babe_setup_states(
                     Some(status)
                 }
                 Some(graph) => {
+                    // Not an orphan: the graph exists. Leave the mismatch for an operator.
                     warn!(
-                        "BABE setup state {graph_id} belongs to {instance_id}, but the stored graph belongs to {}",
+                        "Skip BABE setup cleanup: state {graph_id} belongs to {instance_id}, but the stored graph belongs to {}",
                         graph.instance_id
                     );
+                    continue;
+                }
+                // No graph row yet: a setup is saved long before the operator presigns
+                // and the row exists. Only state with no live engine work is an orphan.
+                None => {
+                    if !is_stale || graph_engine_is_live(&mut storage, graph_id, now).await? {
+                        continue;
+                    }
                     None
                 }
-                None => None,
             };
             if !should_cleanup_babe_setup_state(status, is_stale) {
                 continue;
@@ -269,6 +278,12 @@ pub(crate) async fn cleanup_babe_setup_states(
                     ready.candidate_index,
                     &ready.payload_hash,
                 )?;
+                if is_soldering_proof_s3_path(&payload_path) {
+                    // Several nodes may share a bucket prefix; S3 objects are left to
+                    // the bucket's lifecycle rules.
+                    s3_payloads_left += 1;
+                    continue;
+                }
                 delete_soldering_proof_store_payload(&payload_path).await?;
             }
             std::fs::remove_file(&path)
@@ -276,7 +291,37 @@ pub(crate) async fn cleanup_babe_setup_states(
             deleted += 1;
         }
     }
+    if s3_payloads_left > 0 {
+        info!(
+            s3_payloads_left,
+            "BABE setup cleanup left S3 soldering proof payloads to the bucket lifecycle"
+        );
+    }
     Ok(deleted)
+}
+
+/// Whether the graph still has engine work: a pending or running job, or an
+/// aggregate updated within the orphan retention.
+async fn graph_engine_is_live(
+    storage: &mut store::localdb::StorageProcessor<'_>,
+    graph_id: Uuid,
+    now: SystemTime,
+) -> Result<bool> {
+    let aggregate_id = graph_id.to_string();
+    let job_running =
+        storage.list_engine_jobs_for_aggregate("graph", &aggregate_id).await?.iter().any(|job| {
+            job.state == EngineJobState::Pending.to_string()
+                || job.state == EngineJobState::Running.to_string()
+        });
+    if job_running {
+        return Ok(true);
+    }
+    let now_secs = now.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+    let retention = BABE_SETUP_STATE_ORPHAN_RETENTION.as_secs() as i64;
+    Ok(storage
+        .find_engine_aggregate("graph", &aggregate_id)
+        .await?
+        .is_some_and(|aggregate| now_secs.saturating_sub(aggregate.updated_at) < retention))
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -324,4 +369,55 @@ pub struct OperatorBabeSetupState {
     pub selected_verifier_pubkeys: Option<Vec<PublicKey>>,
     #[serde(default)]
     pub asserted_operator_proof: Option<Vec<u8>>,
+}
+
+#[cfg(test)]
+mod cleanup_tests {
+    use super::*;
+    use store::NewEngineJob;
+
+    fn age(path: &Path, by: Duration) {
+        let file = std::fs::File::options().write(true).open(path).unwrap();
+        file.set_modified(SystemTime::now() - by).unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_state_without_a_graph_row_is_kept_while_its_engine_work_is_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = LocalDB::new_with_busy_timeout(
+            &format!("sqlite:{}", dir.path().join("cleanup.db").display()),
+            false,
+            store::DEFAULT_BUSY_TIMEOUT,
+        )
+        .await;
+        db.migrate().await;
+        let (instance_id, graph_id) = (Uuid::new_v4(), Uuid::new_v4());
+        save_babe_setup_state(&db, instance_id, graph_id, &BabeSetupState::default()).unwrap();
+        let path = babe_setup_state_path(&db, instance_id, graph_id);
+        age(&path, BABE_SETUP_STATE_ORPHAN_RETENTION * 2);
+
+        let job = NewEngineJob {
+            job_id: format!("graph:{graph_id}:setup"),
+            aggregate_kind: "graph".to_string(),
+            aggregate_id: graph_id.to_string(),
+            phase: "setup".to_string(),
+            action: "build_graph".to_string(),
+            pool: "default".to_string(),
+            params: Vec::new(),
+            deadline_at: None,
+            first_at: 0,
+        };
+        db.acquire().await.unwrap().insert_engine_job(&job, 0).await.unwrap();
+        assert_eq!(cleanup_babe_setup_states(&db, "/unused").await.unwrap(), 0);
+        assert!(path.exists(), "a setup with a pending job is not an orphan");
+
+        db.acquire()
+            .await
+            .unwrap()
+            .cancel_engine_jobs_for_aggregate("graph", &graph_id.to_string(), 0)
+            .await
+            .unwrap();
+        assert_eq!(cleanup_babe_setup_states(&db, "/unused").await.unwrap(), 1);
+        assert!(!path.exists());
+    }
 }
