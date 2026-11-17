@@ -75,18 +75,50 @@ alerts() { curl -s --max-time 5 "$(metrics_url "$1")" | grep '^bitvm_node_instan
 db() { sqlite3 -noheader -list -cmd ".timeout 8000" "$NODES_DIR/$1/bitvm-node.db" "$2"; }
 # warn_summary role -> new WARN/ERROR lines since the script started, grouped by event/outcome
 warn_summary() { fresh_log "$1" | grep -E ' (WARN|ERROR) ' | sed -E 's/\x1b\[[0-9;]*m//g' | grep -oE 'event=[a-z_]+( outcome=[a-z_]+)?|(WARN|ERROR) [^ ]+' | sort | uniq -c | sort -rn | head -20 | sed 's/^/     /'; }
-graphs_on() { curl -s --max-time 5 "$(rpc_url "$1")/v1/graphs?limit=200" | python3 -c '
-import sys,json
+# Fetch bounded pages and fail on HTTP/API errors before exposing any results.
+graphs_json() {
+  python3 - "$(rpc_url "$1")" <<'PYGRAPH'
+import json
+import sys
+import urllib.request
+
 try:
-    for g in json.load(sys.stdin)["graphs"]:
-        g=g["graph"]
-        if g["instance_id"]=="'"$2"'": print(g["graph_id"])
-except Exception: pass'; }
-graph_of_instance() { curl -s --max-time 5 "$(rpc_url committee_0)/v1/graphs?limit=200" | python3 -c '
-import sys,json
-for g in json.load(sys.stdin)["graphs"]:
-    g=g["graph"]
-    if g["instance_id"]=="'"$1"'": print(g["graph_id"], g["kickoff_index"], g["status"])'; }
+    graphs = []
+    offset = 0
+    while True:
+        with urllib.request.urlopen(
+            f"{sys.argv[1]}/v1/graphs?limit=100&offset={offset}", timeout=10
+        ) as response:
+            page = json.load(response)
+        rows = page["graphs"]
+        if not isinstance(rows, list):
+            raise ValueError("graphs must be a list")
+        graphs.extend(rows)
+        offset += len(rows)
+        if offset >= page["total"]:
+            break
+        if not rows:
+            raise ValueError("empty graph page before total was reached")
+    print(json.dumps(graphs))
+except Exception as error:
+    print(f"graph query failed: {error}", file=sys.stderr)
+    sys.exit(1)
+PYGRAPH
+}
+graphs_on() {
+  local graphs; graphs=$(graphs_json "$1") || return 1
+  python3 -c 'import sys,json
+for item in json.load(sys.stdin):
+    g=item["graph"]
+    if g["instance_id"]==sys.argv[1]: print(g["graph_id"])' "$2" <<<"$graphs"
+}
+graph_of_instance() {
+  local graphs; graphs=$(graphs_json committee_0) || return 1
+  python3 -c 'import sys,json
+for item in json.load(sys.stdin):
+    g=item["graph"]
+    if g["instance_id"]==sys.argv[1]: print(g["graph_id"], g["kickoff_index"], g["status"])' "$1" <<<"$graphs"
+}
 pegbtc_sats() { $CAST call $PEG "balanceOf(address)(uint256)" "$OP0_GOAT_ADDRESS" --rpc-url "$GOAT_CHAIN_URL" | awk '{printf "%d\n", $1/1e10}'; }
 topup_pegbtc() { # ensure the operator holds >= 1_100_000 sats of pegBTC
   local have; have=$(pegbtc_sats); if (( have < 1100000 )); then
@@ -112,11 +144,13 @@ scenario_end() { log "=== SCENARIO $1 END"; snapshot_heights; engine_summary; lo
 
 # ---- e2e helpers ----
 # next_posted_graph -> lowest-slot graph still L2Recorded on the operator (peg-outs go in slot order)
-next_posted_graph() { curl -s --max-time 5 "$(rpc_url operator_0)/v1/graphs?limit=500" | python3 -c '
-import sys,json
-gs=[g["graph"] for g in json.load(sys.stdin)["graphs"] if g["graph"]["status"]=="L2Recorded"]
+next_posted_graph() {
+  local graphs; graphs=$(graphs_json operator_0) || return 1
+  python3 -c 'import sys,json
+gs=[item["graph"] for item in json.load(sys.stdin) if item["graph"]["status"]=="L2Recorded"]
 gs.sort(key=lambda g: g["kickoff_index"])
-print(gs[0]["graph_id"] if gs else "")'; }
+print(gs[0]["graph_id"] if gs else "")' <<<"$graphs"
+}
 # set_tuning VAR VALUE / clear_tuning VAR -> runtime override of one MOCK_* knob in run/tuning.env (sourced by
 # nodes.sh at launch, so it takes effect on the next (re)start of a node; localnet.env itself is never edited)
 set_tuning() { local f="$RUN_DIR/tuning.env"; touch "$f"; sed -i "/^export $1=/d" "$f"; echo "export $1=$2" >> "$f"; }

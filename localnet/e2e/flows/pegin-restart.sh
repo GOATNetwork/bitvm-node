@@ -46,8 +46,11 @@ mine 1
 wait_all inst "$id" RelayerL1Broadcasted 180 || exit 1
 mine 1
 wait_all inst "$id" RelayerL2Minted 600 || exit 1
-gid=$(graph_of_instance "$id" | awk '{print $1}' | head -1); echo "$gid" > "$E2E_RUN/graph.txt"
-log "graph(s): $(graph_of_instance "$id" | tr '\n' ';')"
+graphs=$(graph_of_instance "$id") || { log "graph query failed for instance $id"; exit 1; }
+gid=$(awk 'NR==1 {print $1}' <<<"$graphs")
+[[ -n "$gid" ]] || { log "no graph found for instance $id"; exit 1; }
+echo "$gid" > "$E2E_RUN/graph.txt"
+log "graph(s): $(tr '\n' ';' <<<"$graphs")"
 wait_all graph "$gid" L2Recorded 300 || exit 1
 log "$role recovery lines: $(fresh_log $role | grep -E 'engine_recovery|lost its holder|re-claimed|resumed' | grep -oE '"message":"[^"]*"' | sort | uniq -c | tr '\n' '|')"
 engine_summary
@@ -59,7 +62,8 @@ if [[ $jst != Done ]]; then log "FAIL: the interrupted job $jact did not end Don
 elif (( jatt < 2 && jfin > T_UP )); then log "FAIL: $jact finished after the restart without being re-run (attempts=$jatt)"; rc=1
 elif (( jatt < 2 )); then log "$jact finished in the old process during its graceful shutdown"
 else log "$jact was re-run by the new process"; fi
-ng=$(graph_of_instance "$id" | wc -l)
+graphs=$(graph_of_instance "$id") || exit 1
+ng=$(awk 'NF {n++} END {print n+0}' <<<"$graphs")
 [[ $ng == 1 ]] || { log "FAIL: $ng graphs for the instance, expected 1"; rc=1; }
 nc=$(fresh_log committee_0 | jq -r --arg id "$id" 'select(.message=="Peg-In-Confirm broadcast" and .instance_id==$id) | .txid' 2>/dev/null | sort -u | wc -l)
 [[ $nc == 1 ]] || { log "FAIL: $nc distinct Peg-In-Confirm transactions for the instance, expected 1"; rc=1; }

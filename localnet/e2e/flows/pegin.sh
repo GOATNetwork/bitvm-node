@@ -27,8 +27,11 @@ wait_all inst "$id" RelayerL1Broadcasted 180 || exit 1
 mine 1
 log "SPV fed; waiting for postPeginData"
 wait_all inst "$id" RelayerL2Minted 600 || exit 1
-gid=$(graph_of_instance "$id" | awk '{print $1}' | head -1); echo "$gid" > "$E2E_RUN/graph.txt"
-log "graph(s): $(graph_of_instance "$id" | tr '\n' ';')"
+graphs=$(graph_of_instance "$id") || { log "graph query failed for instance $id"; exit 1; }
+gid=$(awk 'NR==1 {print $1}' <<<"$graphs")
+[[ -n "$gid" ]] || { log "no graph found for instance $id"; exit 1; }
+echo "$gid" > "$E2E_RUN/graph.txt"
+log "graph(s): $(tr '\n' ';' <<<"$graphs")"
 wait_all graph "$gid" L2Recorded 300 || exit 1
 engine_summary
 log "PEGIN DONE instance=$id graph=$gid tip=$(tip)"

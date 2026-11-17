@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Two peg-ins back to back with a slow verifier soldering (MOCK_GC_SOLDER_DELAY_SECS=E2E_BACKTOBACK_SOLDER_SECS:
-# 120 s on anvil, 240 s on testnet3, whose committee answers take ~70 s longer). B is prepared while A's
+# 180 s on anvil, 240 s on testnet3, whose committee answers take ~70 s longer). B is prepared while A's
 # ceremony still runs; the engine's cpu pool runs one GC job per node at a time (ENGINE_CPU_POOL_SLOTS, default 1),
 # so the verifier queues B's setup behind A's solder. Asserted: A is still in its ceremony on every node when B's
 # Prepare confirms, the verifier created B's setup job before A's solder finished, both end L2Minted / L2Recorded,
 # and their graphs take consecutive slots.
 source "$(cd "$(dirname "$0")/.." && pwd)/lib.sh"
 "$ROOT/scripts/miner.sh" stop >/dev/null 2>&1 || true
-SLOW=${E2E_BACKTOBACK_SOLDER_SECS:-$([[ $GOAT_BACKEND == testnet3 ]] && echo 240 || echo 120)}
+SLOW=${E2E_BACKTOBACK_SOLDER_SECS:-$([[ $GOAT_BACKEND == testnet3 ]] && echo 240 || echo 180)}
 SOLDER_BEFORE=$(tuning_get MOCK_GC_SOLDER_DELAY_SECS); set_tuning MOCK_GC_SOLDER_DELAY_SECS "$SLOW"
 NODES_SH restart verifier_0 >/dev/null 2>&1; log "verifier_0 restarted with a $SLOW s solder delay"
 sleep 8
@@ -38,12 +38,15 @@ wait_all inst "$B" RelayerL1Broadcasted 240 || exit 1
 mine 1
 wait_all inst "$A" RelayerL2Minted 600 || exit 1
 wait_all inst "$B" RelayerL2Minted 600 || exit 1
-gA=$(graph_of_instance "$A" | awk '{print $1}' | head -1); gB=$(graph_of_instance "$B" | awk '{print $1}' | head -1)
-log "graphs: A $(graph_of_instance "$A" | tr '\n' ';') B $(graph_of_instance "$B" | tr '\n' ';')"
+graphsA=$(graph_of_instance "$A") || exit 1
+graphsB=$(graph_of_instance "$B") || exit 1
+read -r gA kA _ <<<"$graphsA"
+read -r gB kB _ <<<"$graphsB"
+[[ -n "$gA" && -n "$gB" ]] || { log "FAIL: missing graph for A=$A or B=$B"; exit 1; }
+log "graphs: A $(tr '\n' ';' <<<"$graphsA") B $(tr '\n' ';' <<<"$graphsB")"
 wait_all graph "$gA" L2Recorded 300 || exit 1
 wait_all graph "$gB" L2Recorded 300 || exit 1
 echo "$gB" > "$E2E_RUN/graph.txt"
-kA=$(graph_of_instance "$A" | awk '{print $2}' | head -1); kB=$(graph_of_instance "$B" | awk '{print $2}' | head -1)
 bset=$(db verifier_0 "select created_at from engine_job where aggregate_id='$gB' and action='verifier_setup' order by created_at limit 1")
 asol=$(db verifier_0 "select finished_at from engine_job where aggregate_id='$gA' and action='verifier_solder' order by created_at limit 1")
 log "slots A=$kA B=$kB; verifier: B setup queued at $bset, A solder finished at $asol"
