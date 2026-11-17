@@ -7,6 +7,8 @@ use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::metrics::histogram::{Histogram, exponential_buckets};
 use prometheus_client::registry::Registry;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
@@ -38,6 +40,9 @@ pub struct EngineMetrics {
     outbox_publish_total: Family<OutcomeLabels, Counter>,
     job_runs_total: Family<KindOutcomeLabels, Counter>,
     rows: Family<TableStateLabels, Gauge>,
+    /// Every table/state the row gauge has reported, so a state that empties
+    /// is set back to zero.
+    known_rows: Arc<Mutex<HashSet<TableStateLabels>>>,
     acks_dropped_total: Counter,
     poisoned_total: Counter,
 }
@@ -58,6 +63,7 @@ impl EngineMetrics {
             outbox_publish_total: Family::default(),
             job_runs_total: Family::default(),
             rows: Family::default(),
+            known_rows: Arc::default(),
             acks_dropped_total: Counter::default(),
             poisoned_total: Counter::default(),
         }
@@ -132,10 +138,21 @@ impl EngineMetrics {
             .inc();
     }
 
-    pub fn set_rows(&self, table: &str, state: &str, count: i64) {
-        self.rows
-            .get_or_create(&TableStateLabels { table: table.to_string(), state: state.to_string() })
-            .set(count);
+    /// Publish one refresh of the row counts. The count query only returns
+    /// states that have rows: a state it no longer returns goes to zero
+    /// instead of keeping its last value.
+    pub fn set_row_counts<'a>(&self, counts: impl IntoIterator<Item = (&'a str, &'a str, i64)>) {
+        let mut known = self.known_rows.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut seen = HashSet::new();
+        for (table, state, count) in counts {
+            let labels = TableStateLabels { table: table.to_string(), state: state.to_string() };
+            self.rows.get_or_create(&labels).set(count);
+            known.insert(labels.clone());
+            seen.insert(labels);
+        }
+        for labels in known.iter().filter(|labels| !seen.contains(*labels)) {
+            self.rows.get_or_create(labels).set(0);
+        }
     }
 
     pub fn record_ack_dropped(&self) {
@@ -144,5 +161,28 @@ impl EngineMetrics {
 
     pub fn record_poisoned(&self) {
         self.poisoned_total.inc();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rows(metrics: &EngineMetrics, table: &str, state: &str) -> i64 {
+        metrics
+            .rows
+            .get_or_create(&TableStateLabels { table: table.to_string(), state: state.to_string() })
+            .get()
+    }
+
+    #[test]
+    fn a_state_that_empties_goes_back_to_zero() {
+        let metrics = EngineMetrics::new();
+        metrics.set_row_counts([("job", "pending", 3), ("job", "running", 1)]);
+        metrics.set_row_counts([("job", "pending", 2)]);
+        assert_eq!(rows(&metrics, "job", "pending"), 2);
+        assert_eq!(rows(&metrics, "job", "running"), 0);
+        metrics.set_row_counts([]);
+        assert_eq!(rows(&metrics, "job", "pending"), 0);
     }
 }

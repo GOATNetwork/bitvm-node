@@ -32,8 +32,8 @@ use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use bridge_out::fetch_and_handle_bridge_out_events;
-use gateway::fetch_and_handle_gateway_events;
+use bridge_out::{apply_bridge_out_events, fetch_bridge_out_events};
+use gateway::{apply_gateway_events, fetch_gateway_events};
 
 /// How long a history sync waits when the indexer tip is below its cursor.
 const HISTORY_SYNC_TIP_BEHIND_WAIT: Duration = Duration::from_secs(5);
@@ -109,48 +109,70 @@ async fn refresh_event_watch_metrics(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-pub async fn fetch_and_handle_block_range_events<'a>(
-    actor: Actor,
-    btc_client: Arc<BTCClient>,
-    goat_client: Arc<GOATClient>,
+/// The events of one block range, fetched with every network read they need.
+pub enum RangeEvents {
+    Gateway(gateway::GatewayRange),
+    Swap(bridge_out::SwapRange),
+}
+
+/// Fetch a block range: the subgraph, Goat and Bitcoin reads, outside any
+/// write transaction.
+pub async fn fetch_block_range_events(
+    btc_client: &BTCClient,
+    goat_client: &GOATClient,
     client: &GraphQueryClient,
-    storage_processor: &mut StorageProcessor<'a>,
+    local_db: &LocalDB,
     watch_events_config: &WatchEventConfig,
     from_height: i64,
     to_height: i64,
-) -> anyhow::Result<()> {
-    match watch_events_config {
-        WatchEventConfig::Gateway(config) => {
-            fetch_and_handle_gateway_events(
-                actor,
+) -> anyhow::Result<RangeEvents> {
+    Ok(match watch_events_config {
+        WatchEventConfig::Gateway(config) => RangeEvents::Gateway(
+            fetch_gateway_events(
                 btc_client,
-                goat_client.clone(),
+                goat_client,
                 client,
-                storage_processor,
+                local_db,
                 &config.the_graph_url,
                 &config.event_entities,
                 from_height,
                 to_height,
             )
-            .await?;
-        }
-        WatchEventConfig::Swap(config) => {
-            fetch_and_handle_bridge_out_events(
-                goat_client.clone(),
+            .await?,
+        ),
+        WatchEventConfig::Swap(config) => RangeEvents::Swap(
+            fetch_bridge_out_events(
+                goat_client,
                 client,
-                storage_processor,
                 &config.graph_config.address,
                 &config.graph_config.the_graph_url,
                 &config.graph_config.event_entities,
                 from_height,
                 to_height,
-                config.peg_btc_address,
             )
-            .await?;
+            .await?,
+        ),
+    })
+}
+
+/// Write a fetched range; the caller holds the write transaction.
+pub async fn apply_block_range_events<'a>(
+    actor: &Actor,
+    storage_processor: &mut StorageProcessor<'a>,
+    watch_events_config: &WatchEventConfig,
+    events: RangeEvents,
+) -> anyhow::Result<()> {
+    match (watch_events_config, events) {
+        (_, RangeEvents::Gateway(range)) => {
+            apply_gateway_events(actor, storage_processor, range).await
+        }
+        (WatchEventConfig::Swap(config), RangeEvents::Swap(range)) => {
+            apply_bridge_out_events(storage_processor, range, config.peg_btc_address).await
+        }
+        (WatchEventConfig::Gateway(_), RangeEvents::Swap(_)) => {
+            anyhow::bail!("swap events fetched for a gateway watch")
         }
     }
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -206,19 +228,20 @@ pub async fn fetch_history_events(
             }
 
             let to_height = current_finalized.min(watch_contract.from_height + watch_contract.gap);
-            let mut tx = local_db.start_transaction().await?;
-
-            fetch_and_handle_block_range_events(
-                actor.clone(),
-                btc_client.clone(),
-                goat_client.clone(),
+            let events = fetch_block_range_events(
+                &btc_client,
+                &goat_client,
                 query_client,
-                &mut tx,
+                local_db,
                 &watch_events_config,
                 watch_contract.from_height,
                 to_height,
             )
             .await?;
+            // Only writes from here: IMMEDIATE takes the write lock up front
+            // instead of failing with BUSY_SNAPSHOT after reading.
+            let mut tx = local_db.start_immediate_transaction().await?;
+            apply_block_range_events(&actor, &mut tx, &watch_events_config, events).await?;
             info!(
                 "Contract {task_name} finish load history event from: {}, to: {to_height}",
                 watch_contract.from_height
@@ -363,18 +386,21 @@ pub async fn monitor_events_item(
     }
 
     let to_height = current_finalized.min(watch_contract.from_height + watch_contract.gap);
-    let mut tx = local_db.start_transaction().await?;
-    fetch_and_handle_block_range_events(
-        actor.clone(),
-        btc_client,
-        goat_client,
+    drop(storage_processor);
+    let events = fetch_block_range_events(
+        &btc_client,
+        &goat_client,
         &query_client,
-        &mut tx,
+        local_db,
         &watch_events_config,
         watch_contract.from_height,
         to_height,
     )
     .await?;
+    // Only writes from here: IMMEDIATE takes the write lock up front instead
+    // of failing with BUSY_SNAPSHOT after reading.
+    let mut tx = local_db.start_immediate_transaction().await?;
+    apply_block_range_events(&actor, &mut tx, &watch_events_config, events).await?;
     info!("finish monitor event from: {}, to: {to_height}", watch_contract.from_height);
     watch_contract.from_height = to_height + 1;
     watch_contract.status = WatchContractStatus::Synced.to_string();
