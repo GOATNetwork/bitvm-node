@@ -14,5 +14,17 @@
     "@graphprotocol/graph-cli": "0.98.1",
     "@graphprotocol/graph-ts": "0.37.0"
   },
-  "devDependencies": { "matchstick-as": "0.6.0" }
+  "devDependencies": { "matchstick-as": "0.6.0" },
+  "overrides": {
+    "@libp2p/crypto@5": "5.1.22",
+    "brace-expansion@2": "2.1.7",
+    "cross-spawn@7": "7.0.6",
+    "ejs@3": "3.1.10",
+    "glob@11": "11.1.0",
+    "immutable@5": "5.1.8",
+    "js-yaml@4": "4.3.2",
+    "semver@7": "7.7.3",
+    "undici@7": "7.30.1",
+    "yaml@2": "2.8.3"
+  }
 }
