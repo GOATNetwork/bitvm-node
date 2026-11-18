@@ -515,9 +515,17 @@ pub async fn run_watch_event_task(
             })],
         ),
     ]);
+    let poll_interval = Duration::from_secs(interval.max(12));
+    let mut poll_delay =
+        Duration::from_millis(rand::Rng::gen_range(&mut rand::thread_rng(), 0..=12_000));
     loop {
         tokio::select! {
-            _ = tokio::time::sleep(Duration::from_secs(interval)) => {
+            _ = tokio::time::sleep(poll_delay) => {
+                poll_delay = poll_interval
+                    + Duration::from_millis(rand::Rng::gen_range(
+                        &mut rand::thread_rng(),
+                        0..=6_000,
+                    ));
                 let started_at = Instant::now();
                 // Execute the normal monitoring logic
                 match monitor_events(
