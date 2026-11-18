@@ -1,4 +1,5 @@
 use crate::graphs::graph_query::get_meta_data_query;
+use rand::Rng;
 use std::time::Duration;
 use tokio::time::sleep;
 
@@ -58,7 +59,17 @@ impl GraphQueryClient {
                             body
                         );
                         if attempt < GRAPH_QUERY_RETRY_MAX_ATTEMPTS {
-                            let delay = GRAPH_QUERY_RETRY_BASE_DELAY_MS * attempt as u64;
+                            let delay = match status {
+                                reqwest::StatusCode::SERVICE_UNAVAILABLE
+                                | reqwest::StatusCode::TOO_MANY_REQUESTS => {
+                                    if attempt == 1 {
+                                        rand::thread_rng().gen_range(1_000..=3_000)
+                                    } else {
+                                        rand::thread_rng().gen_range(3_000..=8_000)
+                                    }
+                                }
+                                _ => GRAPH_QUERY_RETRY_BASE_DELAY_MS * attempt as u64,
+                            };
                             sleep(Duration::from_millis(delay)).await;
                             last_err = Some(err);
                             continue;
