@@ -2,7 +2,7 @@ name: Localnet e2e
 
 # The whole localnet e2e suite (localnet/README.md, localnet/e2e/README.md) on the self-hosted
 # bitvm2-node runner: build the mock-gc binaries, rebuild a private localnet, run all 13 cases.
-# ~2 h per run, so it is not a PR gate: same triggers as ci_time_consuming.yml.
+# The suite takes about two hours per run.
 
 on:
   push:

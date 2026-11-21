@@ -51,7 +51,6 @@ tokio = { workspace = true, features = ["macros", "time"] }
 
 [features]
 default = []
-ci-tests = []
 # Replace the real BABE/GC/soldering machinery with deterministic, on-chain-valid
 # mocks. Localnet only. See node feature `mock-gc` which forwards to this one.
 mock-gc = ["dep:zkm-sdk"]
